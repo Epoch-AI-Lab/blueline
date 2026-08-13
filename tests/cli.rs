@@ -75,6 +75,10 @@ fn serve(stream: &mut TcpStream, pack: &str, tar: &[u8]) {
 }
 
 fn make_tarball() -> Vec<u8> {
+    make_tarball_with(b"module.exports = {};")
+}
+
+fn make_tarball_with(code: &[u8]) -> Vec<u8> {
     let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     let mut builder = tar::Builder::new(encoder);
     let pkg_json = br#"{
@@ -91,13 +95,12 @@ fn make_tarball() -> Vec<u8> {
         .append_data(&mut h, "package/package.json", &pkg_json[..])
         .unwrap();
 
-    let code = b"module.exports = {};";
     let mut h2 = tar::Header::new_gnu();
     h2.set_size(code.len() as u64);
     h2.set_mode(0o644);
     h2.set_cksum();
     builder
-        .append_data(&mut h2, "package/lib/index.js", &code[..])
+        .append_data(&mut h2, "package/lib/index.js", code)
         .unwrap();
     builder.into_inner().unwrap().finish().unwrap()
 }
@@ -185,22 +188,24 @@ fn full_flow_json_output() {
     assert_eq!(json["integrity"], "verified (sha512)");
     assert_eq!(json["files"], 2);
     assert_eq!(json["lifecycle_scripts"].as_array().unwrap().len(), 2);
-    assert_eq!(json["baseline"], "recorded as known-clean");
+    assert_eq!(json["baseline"], "verified; no clean verdict yet");
 
-    // Baseline record persisted and queryable.
+    // The witness record exists and is explicitly unclean: a review must not
+    // bless the version it merely looked at.
     let db_path = data_dir.path().join("baseline.db");
     assert!(db_path.exists(), "baseline.db must exist");
     let conn = rusqlite::Connection::open(db_path).unwrap();
-    let (name, version, integrity_row): (String, String, String) = conn
+    let (name, version, integrity_row, clean): (String, String, String, i64) = conn
         .query_row(
-            "SELECT name, version, integrity FROM known_clean WHERE name = 'express'",
+            "SELECT name, version, integrity, clean FROM known_clean WHERE name = 'express'",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .unwrap();
     assert_eq!(name, "express");
     assert_eq!(version, "4.21.2");
     assert_eq!(integrity_row, integrity);
+    assert_eq!(clean, 0, "review records evidence, never a clean blessing");
 }
 
 #[test]
@@ -231,7 +236,7 @@ fn text_output_lists_install_scripts() {
                     "install script: preinstall, postinstall",
                 ))
                 .and(predicate::str::contains(
-                    "baseline:       recorded as known-clean",
+                    "baseline:       verified; no clean verdict yet",
                 )),
         );
 }
@@ -254,4 +259,38 @@ fn tampered_tarball_fails_closed() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("integrity verification failed"));
+}
+
+#[test]
+fn republished_tarball_same_version_fails_closed() {
+    let tarball_a = make_tarball();
+    let tarball_b = make_tarball_with(b"module.exports = 2;");
+    let integrity_a = sha512_b64(&tarball_a);
+    let integrity_b = sha512_b64(&tarball_b);
+    assert_ne!(integrity_a, integrity_b, "fixtures must differ");
+
+    let data_dir = tempfile::tempdir().unwrap();
+
+    // First review witnesses 4.21.2 with tarball A.
+    let fixture_a = spawn_fixture(
+        move |base| packument(base, "4.21.2", &integrity_a),
+        tarball_a,
+    );
+    blueline()
+        .args(["review", "express@4.21.2", "--registry", &fixture_a.base])
+        .env("BLUELINE_DATA_DIR", data_dir.path())
+        .assert()
+        .success();
+
+    // The registry now serves the same version string with different bytes.
+    let fixture_b = spawn_fixture(
+        move |base| packument(base, "4.21.2", &integrity_b),
+        tarball_b,
+    );
+    blueline()
+        .args(["review", "express@4.21.2", "--registry", &fixture_b.base])
+        .env("BLUELINE_DATA_DIR", data_dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("integrity changed"));
 }

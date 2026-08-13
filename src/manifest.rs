@@ -111,4 +111,42 @@ mod tests {
         let err = read_package_json(&dir.path().join("nope.json")).unwrap_err();
         assert!(matches!(err, BluelineError::Manifest(_, _)));
     }
+
+    #[test]
+    fn accepts_small_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("package.json");
+        // Above the false-equivalent cap (10 + 1024 + 1024) but below the real one.
+        let body = format!(
+            "{{\"name\":\"x\",\"description\":\"{}\"}}",
+            "a".repeat(4000)
+        );
+        fs::write(&path, &body).unwrap();
+        assert!(read_package_json(&path).is_ok());
+    }
+
+    #[test]
+    fn rejects_above_manifest_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("package.json");
+        let n = 10 * 1024 * 1024 - 7;
+        let body = format!("{{\"x\":\"{}\"}}", "a".repeat(n));
+        assert_eq!(body.len(), 10 * 1024 * 1024 + 1);
+        fs::write(&path, &body).unwrap();
+        assert!(matches!(
+            read_package_json(&path).unwrap_err(),
+            BluelineError::Manifest(_, _)
+        ));
+    }
+
+    #[test]
+    fn accepts_at_manifest_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("package.json");
+        let n = 10 * 1024 * 1024 - 8;
+        let body = format!("{{\"x\":\"{}\"}}", "a".repeat(n));
+        assert_eq!(body.len(), 10 * 1024 * 1024);
+        fs::write(&path, &body).unwrap();
+        assert!(read_package_json(&path).is_ok());
+    }
 }
