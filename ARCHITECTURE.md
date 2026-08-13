@@ -14,6 +14,12 @@ and any `postinstall`/`preinstall` script is surfaced for a *separate* human dec
 > Note: the README lists the "Diff rendering engine (Rust)" as done. As of the
 > initial commit only README, LICENSE, and brand assets exist. The engine is a
 > design target, not shipped code.
+>
+> Update 2026-08-13: **Phase 0 shipped.** A `blueline` Rust binary exists:
+> `registry::npm` (fetch + sha512-verified tarball download), typed manifest
+> parsing, bounded sandbox extraction, and a SQLite `known_clean` baseline
+> store behind `blueline review <pkg@ver>`. Diff/verdict/card rendering are
+> Phase 1, still unshipped.
 
 ---
 

@@ -3,13 +3,14 @@
 Phased plan from greenfield to hosted service. See `ARCHITECTURE.md` for the
 decisions behind each phase.
 
-## Phase 0 — Foundation
-- Rust crate skeleton + `clap` CLI
-- `registry::npm` client (metadata + tarball fetch, read-only)
-- Manifest parsing (`serde`/`serde_json`)
-- Tarball fetch + sandbox extraction (`tar` + `flate2`)
-- SQLite baseline store (`rusqlite`): installed/known-clean versions, overrides, policy
-- Command: `blueline review <pkg@ver>`
+## Phase 0 — Foundation ✅
+- [x] Rust crate skeleton + `clap` CLI
+- [x] `registry::npm` client (metadata + tarball fetch, read-only) — sha512 integrity verified before extraction, fail closed
+- [x] Manifest parsing (`serde`/`serde_json`) — typed `PackageJson`
+- [x] Tarball fetch + sandbox extraction (`tar` + `flate2`) — bounded, traversal/absolute/symlink/hardlink/dev-file rejected
+- [x] SQLite baseline store (`rusqlite`): known-clean versions (schema v1)
+- [x] Command: `blueline review <pkg@ver>` — text + JSON output, `--registry` override
+- [x] Tests: unit (extract/registry/manifest/store/parse) + integration vs. local fixture registry (no network)
 
 ## Phase 1 — Wedge Primitive
 - Diff engine: file-level + line-level (`similar`)
