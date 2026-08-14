@@ -2,20 +2,22 @@
 
 > Approve the change, not the download.
 
-Blueline reviews package installs one line at a time. It shows what changed between releases and makes you approve it before anything downloads.
+Blueline is a review step for package installs. It extracts the release tarball in an isolated sandbox, calculates what changed against your last verified version, and prompts for approval before anything touches your machine.
 
-## Problem
+## The problem
 
-- **96%** of devs use AI tools; only **18%** apply security continuously <cite>Checkmarx 2026</cite>
-- The TanStack/router worm shipped a malicious npm package with **valid SLSA L3 provenance** <cite>Unit42</cite>
-- **46%** distrust AI output; **96%** don't fully trust its functional accuracy <cite>Stack Overflow 2025</cite>
-- **41%** place managing tech debt in their top-5 frustrations <cite>Sonar State of Code 2026</cite>
+Package managers treat installs as a transport problem. You ask for a package, they fetch the tarball, unpack it, and run whatever install scripts came with it. If an attacker pushed malicious code ten minutes ago, your machine executes it before you can look.
 
-Every install is a failure point. Agents grab packages without reading them. Nothing should execute without a sign-off first.
+- 96% of developers use AI coding tools, but only 18% run security checks continuously (Checkmarx 2026).
+- The TanStack router worm shipped malicious npm packages that carried valid SLSA L3 build provenance (Unit42).
+- 46% of developers distrust AI output, and 96% do not fully trust its functional accuracy (Stack Overflow 2025).
+- 41% of developers rank managing tech debt among their top five daily frustrations (Sonar State of Code 2026).
+
+Autonomous agents install dependencies without reading them. Nobody audits the delta between 4.21.1 and 4.21.2 when an agent runs an install command in a loop.
 
 ## The review card
 
-A drop-in CLI wrapper that prints one review card before any download:
+Blueline intercepts package installs and renders a summary card before extracting files to your project:
 
 ```bash
 $ npx blueline install express@4.21.2
@@ -41,22 +43,23 @@ $ npx blueline install express@4.21.2
   [a]pprove · [h]old · [d]iff
 ```
 
-If the change exceeds policy thresholds, Blueline blocks the install and routes it to a senior engineer for sign-off.
+If a release exceeds risk thresholds, Blueline blocks the install and halts the workflow.
 
-## Status
+## Project status
 
-Building the review flow:
-- [x] Diff rendering engine (Rust)
-- [ ] npm/npx CLI wrapper
-- [ ] GitHub Action + CI check
-- [ ] MCP tool (agent hook)
-- [ ] Revocation index + recall API
+- [x] Sandboxed tarball extraction with path traversal and symlink guards
+- [x] Package manifest parser and integrity verification (SHA-512)
+- [x] SQLite store for verified baseline releases
+- [x] CLI review command (`blueline review <pkg@ver>`)
+- [ ] Line-level diff engine
+- [ ] npm and npx wrapper shim
+- [ ] GitHub Action PR check
+- [ ] Agent hook via Model Context Protocol (MCP)
+- [ ] Revocation index and recall API
 
-## License
+## Quickstart
 
-The CLI, CI check, and diff engine are MIT-licensed. The hosted verdict model and recall index will be a paid service for orgs that want it. A trust tool that audits itself in secret is a contradiction.
-
-## Try it
+Clone the repository and build the release binary:
 
 ```bash
 git clone https://github.com/Epoch-AI-Lab/blueline.git
@@ -65,18 +68,14 @@ cargo build --release
 ./target/release/blueline review express@4.21.2
 ```
 
-## Contribute
+## Contributors
 
-- Language experts for the diff heuristic (what makes a change "risky"?)
-- Security engineers who've reviewed real supply-chain incidents
-- Anyone who's ever been burned by `npm install` and wants to fix it
+See [CONTRIBUTORS.md](./CONTRIBUTORS.md) for maintainers, contributors, and details on how to get involved.
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md).
+## License
+
+The CLI, diff engine, and CI checks are licensed under the MIT License. See [LICENSE](./LICENSE) for details.
 
 ## Sources
 
-All figures are verbatim from the [Developer Workflow Bottlenecks](https://github.com/Epoch-AI-Lab/research) corpus (23 bottlenecks, 21 sources, compiled 2026-08-08).
-
----
-
-*Never generate faster. Always verify sooner.*
+Metrics quoted above come from the [Developer Workflow Bottlenecks](https://github.com/Epoch-AI-Lab/research) dataset (compiled August 8, 2026).
