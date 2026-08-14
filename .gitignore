@@ -1,2 +1,10 @@
 /target
 mutants.out
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+.env*
+pr.diff
+node_modules/

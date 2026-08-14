@@ -1,0 +1,16 @@
+{
+  "name": "@blueline/binary-linux-arm64-gnu",
+  "version": "0.1.0",
+  "description": "Native blueline binary for linux-arm64-gnu",
+  "license": "MIT",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "preferUnplugged": true
+}

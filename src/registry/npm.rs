@@ -14,6 +14,8 @@ use crate::registry::{Package, Registry};
 const CORGI_ACCEPT: &str = "application/vnd.npm.install-v1+json";
 const USER_AGENT: &str = concat!("blueline/", env!("CARGO_PKG_VERSION"));
 const SRI_PREFIX: &str = "sha512-";
+const MAX_PACKUMENT_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_TARBALL_BYTES: usize = 256 * 1024 * 1024;
 
 pub struct NpmRegistry {
     agent: Agent,
@@ -33,7 +35,46 @@ impl NpmRegistry {
         }
     }
 
+    fn validate_tarball_url(&self, tarball_url: &str) -> Result<(), BluelineError> {
+        let (tarball_scheme, tarball_host) =
+            parse_url_scheme_and_host(tarball_url).map_err(|e| {
+                BluelineError::Network(format!("invalid tarball URL `{tarball_url}`: {e}"))
+            })?;
+
+        let (base_scheme, base_host) = parse_url_scheme_and_host(&self.base).map_err(|e| {
+            BluelineError::Network(format!("invalid registry base URL `{}`: {e}", self.base))
+        })?;
+
+        if base_scheme == "https" {
+            if tarball_scheme != "https" {
+                return Err(BluelineError::Network(format!(
+                    "insecure tarball scheme `{tarball_scheme}` in `{tarball_url}`; registry base requires HTTPS"
+                )));
+            }
+        } else if base_scheme == "http" {
+            if tarball_scheme != "http" && tarball_scheme != "https" {
+                return Err(BluelineError::Network(format!(
+                    "unsupported tarball scheme `{tarball_scheme}` in `{tarball_url}`"
+                )));
+            }
+        } else {
+            return Err(BluelineError::Network(format!(
+                "unsupported registry base scheme `{base_scheme}` in `{}`",
+                self.base
+            )));
+        }
+
+        if is_private_or_local_host(&tarball_host) && base_host != tarball_host {
+            return Err(BluelineError::Network(format!(
+                "tarball URL `{tarball_url}` targets private/local host `{tarball_host}`, which does not match registry base host `{base_host}`"
+            )));
+        }
+
+        Ok(())
+    }
+
     fn packument(&self, name: &str) -> Result<Packument, BluelineError> {
+        validate_package_name(name)?;
         // Scoped packages must have the slash percent-encoded in the path.
         let encoded = name.replace('/', "%2f");
         let url = format!("{}/{}", self.base, encoded);
@@ -43,17 +84,22 @@ impl NpmRegistry {
             .set("accept", CORGI_ACCEPT)
             .call()
             .map_err(|e| BluelineError::Network(format!("GET {url}: {e}")))?;
-        let body = resp
-            .into_string()
+        let mut body = String::new();
+        resp.into_reader()
+            .take(MAX_PACKUMENT_BYTES)
+            .read_to_string(&mut body)
             .map_err(|e| BluelineError::Network(format!("reading {url}: {e}")))?;
-        serde_json::from_str(&body).map_err(|e| {
+        let packument: Packument = serde_json::from_str(&body).map_err(|e| {
             BluelineError::Manifest(name.to_string(), format!("invalid packument JSON: {e}"))
-        })
+        })?;
+        validate_package_name(&packument.name)?;
+        Ok(packument)
     }
 
     /// Stream-download the tarball, hashing as we go, then fail closed unless
     /// the sha512 matches the registry's `dist.integrity`.
     fn fetch_url_verified(&self, pkg: &Package) -> Result<Vec<u8>, BluelineError> {
+        self.validate_tarball_url(&pkg.tarball_url)?;
         let resp = self
             .agent
             .get(&pkg.tarball_url)
@@ -69,6 +115,11 @@ impl NpmRegistry {
             })?;
             if n == 0 {
                 break;
+            }
+            if bytes.len().saturating_add(n) > MAX_TARBALL_BYTES {
+                return Err(BluelineError::ExtractionLimit(format!(
+                    "tarball download exceeded maximum allowed size of {MAX_TARBALL_BYTES} bytes"
+                )));
             }
             hasher.update(&buf[..n]);
             bytes.extend_from_slice(&buf[..n]);
@@ -112,10 +163,12 @@ impl Registry for NpmRegistry {
                 name.to_string(),
                 format!(
                     "no version `{version}` (have: {})",
-                    list_versions(&packument)
+                    summarize_versions(&packument)
                 ),
             )
         })?;
+        self.validate_tarball_url(&meta.dist.tarball)?;
+        validate_package_name(&meta.name)?;
         Ok(Package {
             name: meta.name.clone(),
             version: meta.version.clone(),
@@ -127,15 +180,111 @@ impl Registry for NpmRegistry {
     fn fetch_tarball(&self, pkg: &Package) -> Result<Vec<u8>, BluelineError> {
         self.fetch_url_verified(pkg)
     }
+
+    fn list_versions(&self, name: &str) -> Result<Vec<semver::Version>, BluelineError> {
+        let packument = self.packument(name)?;
+        let mut versions: Vec<semver::Version> = packument
+            .versions
+            .keys()
+            .filter_map(|v| semver::Version::parse(v).ok())
+            .collect();
+        versions.sort();
+        Ok(versions)
+    }
 }
 
-fn list_versions(packument: &Packument) -> String {
-    let mut keys: Vec<&String> = packument.versions.keys().collect();
-    keys.sort();
-    keys.iter()
+fn validate_package_name(name: &str) -> Result<(), BluelineError> {
+    if name.is_empty() || name.chars().any(|c| c.is_control()) {
+        return Err(BluelineError::Manifest(
+            name.to_string(),
+            "invalid package name: empty or contains control characters".to_string(),
+        ));
+    }
+    if name.contains('\\')
+        || name
+            .split('/')
+            .any(|part| part == "." || part == ".." || part.is_empty())
+    {
+        return Err(BluelineError::Manifest(
+            name.to_string(),
+            "invalid package name: contains path traversal or invalid segments".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_url_scheme_and_host(raw_url: &str) -> Result<(String, String), String> {
+    let (scheme, rest) = raw_url
+        .split_once("://")
+        .ok_or_else(|| format!("URL `{raw_url}` is missing `://` scheme separator"))?;
+    let scheme = scheme.to_lowercase();
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        return Err(format!("URL `{raw_url}` has empty host"));
+    }
+    let host_port = if let Some((_, hp)) = authority.rsplit_once('@') {
+        hp
+    } else {
+        authority
+    };
+    let host = if host_port.starts_with('[') {
+        let closing = host_port
+            .find(']')
+            .ok_or_else(|| format!("URL `{raw_url}` has unmatched `[` in IPv6 address"))?;
+        &host_port[1..closing]
+    } else if let Some((h, _port)) = host_port.split_once(':') {
+        h
+    } else {
+        host_port
+    };
+    if host.is_empty() {
+        return Err(format!("URL `{raw_url}` has empty host"));
+    }
+    Ok((scheme, host.to_lowercase()))
+}
+
+fn is_private_or_local_host(host: &str) -> bool {
+    if host == "localhost"
+        || host.ends_with(".localhost")
+        || host == "metadata.google.internal"
+        || host == "instance-data"
+    {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_link_local()
+                    || v4.is_private()
+                    || v4.is_unspecified()
+                    || v4.is_broadcast()
+                    || v4.octets() == [169, 254, 169, 254]
+            }
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || (v6.segments()[0] & 0xffc0) == 0xfe80
+                    || (v6.segments()[0] & 0xfe00) == 0xfc00
+            }
+        }
+    } else {
+        false
+    }
+}
+
+fn summarize_versions(packument: &Packument) -> String {
+    let mut semvers: Vec<semver::Version> = packument
+        .versions
+        .keys()
+        .filter_map(|v| semver::Version::parse(v).ok())
+        .collect();
+    semvers.sort();
+    semvers
+        .iter()
         .rev()
         .take(8)
-        .map(|v| v.as_str())
+        .map(|v| v.to_string())
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -189,12 +338,103 @@ mod tests {
             dist_tags: BTreeMap::new(),
             versions,
         };
-        // Current behaviour: lexical sort, reversed, capped at 8. This locks the
-        // output so a regression (e.g. returning a constant) is caught. Must
-        // become semver-precedence in Phase 1 baseline resolution.
+        // Semver precedence in descending order capped at 8
         assert_eq!(
-            list_versions(&pm),
-            "2.0.0, 10.0.0, 1.2.0, 1.10.0, 1.0.1, 1.0.0"
+            summarize_versions(&pm),
+            "10.0.0, 2.0.0, 1.10.0, 1.2.0, 1.0.1, 1.0.0"
+        );
+    }
+
+    #[test]
+    fn validates_package_names() {
+        assert!(validate_package_name("express").is_ok());
+        assert!(validate_package_name("@scope/pkg").is_ok());
+        assert!(validate_package_name("lodash.debounce").is_ok());
+        assert!(validate_package_name("my-package-123_x").is_ok());
+
+        assert!(validate_package_name("").is_err());
+        assert!(validate_package_name("../evil").is_err());
+        assert!(validate_package_name("evil/..").is_err());
+        assert!(validate_package_name("a/../b").is_err());
+        assert!(validate_package_name("./a").is_err());
+        assert!(validate_package_name("/a").is_err());
+        assert!(validate_package_name("a/").is_err());
+        assert!(validate_package_name("a//b").is_err());
+        assert!(validate_package_name("a\\b").is_err());
+        assert!(validate_package_name("a\0b").is_err());
+        assert!(validate_package_name("a\nb").is_err());
+    }
+
+    #[test]
+    fn validates_tarball_url_ssrf_and_schemes() {
+        let reg = NpmRegistry::new("https://registry.npmjs.org");
+
+        // Public https is valid
+        assert!(
+            reg.validate_tarball_url("https://registry.npmjs.org/express/-/express-4.21.2.tgz")
+                .is_ok()
+        );
+        assert!(
+            reg.validate_tarball_url("https://cdn.example.com/express.tgz")
+                .is_ok()
+        );
+
+        // Insecure http rejected when base is https
+        assert!(
+            reg.validate_tarball_url("http://registry.npmjs.org/express.tgz")
+                .is_err()
+        );
+
+        // Localhost / Loopback rejected
+        assert!(
+            reg.validate_tarball_url("https://127.0.0.1/express.tgz")
+                .is_err()
+        );
+        assert!(
+            reg.validate_tarball_url("https://localhost/express.tgz")
+                .is_err()
+        );
+        assert!(
+            reg.validate_tarball_url("https://[::1]/express.tgz")
+                .is_err()
+        );
+
+        // Cloud metadata rejected
+        assert!(
+            reg.validate_tarball_url("https://169.254.169.254/latest/meta-data")
+                .is_err()
+        );
+        assert!(
+            reg.validate_tarball_url("https://metadata.google.internal/computeMetadata")
+                .is_err()
+        );
+
+        // RFC 1918 private IPs rejected
+        assert!(
+            reg.validate_tarball_url("https://10.0.0.1/tarball.tgz")
+                .is_err()
+        );
+        assert!(
+            reg.validate_tarball_url("https://192.168.1.50/tarball.tgz")
+                .is_err()
+        );
+        assert!(
+            reg.validate_tarball_url("https://172.16.0.10/tarball.tgz")
+                .is_err()
+        );
+
+        // Local registry allows matching local host
+        let local_reg = NpmRegistry::new("http://127.0.0.1:8080");
+        assert!(
+            local_reg
+                .validate_tarball_url("http://127.0.0.1:8080/express/-/express-1.0.0.tgz")
+                .is_ok()
+        );
+        // But local registry cannot be bounced to metadata
+        assert!(
+            local_reg
+                .validate_tarball_url("http://169.254.169.254/latest/meta-data")
+                .is_err()
         );
     }
 }

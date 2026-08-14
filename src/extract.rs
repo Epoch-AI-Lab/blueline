@@ -55,6 +55,14 @@ pub fn safe_extract(
     let mut seen = 0usize;
 
     for entry in entries {
+        seen += 1;
+        if seen > limits.max_entries {
+            return Err(BluelineError::ExtractionLimit(format!(
+                "entry count exceeded ({seen}/{})",
+                limits.max_entries
+            )));
+        }
+
         let mut entry =
             entry.map_err(|e| BluelineError::Extraction(format!("reading tar entry: {e}")))?;
 
@@ -70,14 +78,6 @@ pub fn safe_extract(
         if !entry_type.is_file() && !entry_type.is_dir() {
             return Err(BluelineError::ExtractionLimit(format!(
                 "unsupported entry type {entry_type:?} (symlinks/hardlinks/special files are rejected)"
-            )));
-        }
-
-        seen += 1;
-        if seen > limits.max_entries {
-            return Err(BluelineError::ExtractionLimit(format!(
-                "entry count exceeded ({seen}/{})",
-                limits.max_entries
             )));
         }
 
@@ -108,10 +108,10 @@ pub fn safe_extract(
             BluelineError::Extraction(format!("unpacking `{}`: {e}", path.display()))
         })?;
 
+        strip_special_bits(&dest.join(&path));
         if entry_type.is_file() {
             stats.files += 1;
             stats.unpacked_bytes += size;
-            strip_special_bits(&dest.join(&path));
         } else {
             stats.dirs += 1;
         }
@@ -127,11 +127,23 @@ fn validate_entry_path(path: &Path) -> Result<(), String> {
     if path.is_absolute() {
         return Err(format!("absolute entry path `{}` rejected", path.display()));
     }
+    if path.to_string_lossy().contains('\\') {
+        return Err(format!(
+            "entry path `{}` containing backslash rejected",
+            path.display()
+        ));
+    }
     for comp in path.components() {
         match comp {
             Component::ParentDir => {
                 return Err(format!(
                     "parent traversal in entry path `{}` rejected",
+                    path.display()
+                ));
+            }
+            Component::RootDir => {
+                return Err(format!(
+                    "root directory component in entry path `{}` rejected",
                     path.display()
                 ));
             }
@@ -141,13 +153,13 @@ fn validate_entry_path(path: &Path) -> Result<(), String> {
                     path.display()
                 ));
             }
-            Component::RootDir | Component::CurDir | Component::Normal(_) => {}
+            Component::CurDir | Component::Normal(_) => {}
         }
     }
     Ok(())
 }
 
-/// Strip setuid/setgid/sticky from unpacked files (they must never run here).
+/// Strip setuid/setgid/sticky from unpacked files and directories (they must never run here).
 #[cfg(unix)]
 fn strip_special_bits(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -403,5 +415,54 @@ mod tests {
         let mode = fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o755, "permission bits preserved");
         assert_eq!(mode & 0o4000, 0, "setuid bit must be stripped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strips_special_bits_on_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("evildir");
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o2755)).unwrap();
+        strip_special_bits(&path);
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "directory permission bits preserved");
+        assert_eq!(
+            mode & 0o2000,
+            0,
+            "setgid bit must be stripped from directory"
+        );
+    }
+
+    #[test]
+    fn rejects_backslash_in_path() {
+        let tarball = raw_tarball(&[(r"foo\bar".into(), 0x30, "")]);
+        let dir = tempfile::tempdir().unwrap();
+        let err = safe_extract(&tarball, dir.path(), &ExtractionLimits::default()).unwrap_err();
+        assert!(err.to_string().contains("backslash"));
+    }
+
+    #[test]
+    fn rejects_root_dir_component() {
+        let err = validate_entry_path(Path::new("/root/foo")).unwrap_err();
+        assert!(err.contains("absolute") || err.contains("root directory"));
+    }
+
+    #[test]
+    fn metadata_entries_counted_against_limit() {
+        let entries = vec![
+            ("meta1".to_string(), 0x4c_u8, ""),
+            ("meta2".to_string(), 0x4c_u8, ""),
+            ("meta3".to_string(), 0x4c_u8, ""),
+        ];
+        let tarball = raw_tarball(&entries);
+        let dir = tempfile::tempdir().unwrap();
+        let limits = ExtractionLimits {
+            max_entries: 2,
+            ..ExtractionLimits::default()
+        };
+        let err = safe_extract(&tarball, dir.path(), &limits).unwrap_err();
+        assert!(matches!(err, BluelineError::ExtractionLimit(_)));
     }
 }
