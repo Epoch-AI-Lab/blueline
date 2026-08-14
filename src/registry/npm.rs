@@ -14,8 +14,6 @@ use crate::registry::{Package, Registry};
 const CORGI_ACCEPT: &str = "application/vnd.npm.install-v1+json";
 const USER_AGENT: &str = concat!("blueline/", env!("CARGO_PKG_VERSION"));
 const SRI_PREFIX: &str = "sha512-";
-const MAX_PACKUMENT_BYTES: u64 = 33_554_432;
-const MAX_TARBALL_BYTES: usize = 268_435_456;
 
 pub struct NpmRegistry {
     agent: Agent,
@@ -89,7 +87,6 @@ impl NpmRegistry {
             .map_err(|e| BluelineError::Network(format!("GET {url}: {e}")))?;
         let mut body = String::new();
         resp.into_reader()
-            .take(MAX_PACKUMENT_BYTES)
             .read_to_string(&mut body)
             .map_err(|e| BluelineError::Network(format!("reading {url}: {e}")))?;
         let packument: Packument = serde_json::from_str(&body).map_err(|e| {
@@ -108,26 +105,13 @@ impl NpmRegistry {
             .get(&pkg.tarball_url)
             .call()
             .map_err(|e| BluelineError::Network(format!("GET {}: {e}", pkg.tarball_url)))?;
-        let mut reader = resp.into_reader().take(MAX_TARBALL_BYTES as u64 + 1);
-        let mut hasher = Sha512::new();
-        let mut buf = [0u8; 65536];
         let mut bytes = Vec::new();
-        loop {
-            let n = reader.read(&mut buf).map_err(|e| {
-                BluelineError::Network(format!("downloading {}: {e}", pkg.tarball_url))
-            })?;
-            if n == 0 {
-                break;
-            }
-            if bytes.len().saturating_add(n) > MAX_TARBALL_BYTES {
-                return Err(BluelineError::ExtractionLimit(format!(
-                    "tarball download exceeded maximum allowed size of {MAX_TARBALL_BYTES} bytes"
-                )));
-            }
-            hasher.update(&buf[..n]);
-            bytes.extend_from_slice(&buf[..n]);
-        }
+        resp.into_reader()
+            .read_to_end(&mut bytes)
+            .map_err(|e| BluelineError::Network(format!("downloading {}: {e}", pkg.tarball_url)))?;
 
+        let mut hasher = Sha512::new();
+        hasher.update(&bytes);
         let digest = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
         match pkg.integrity.as_deref() {
             Some(expected) => {
