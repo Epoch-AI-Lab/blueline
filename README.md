@@ -76,6 +76,3 @@ See [CONTRIBUTORS.md](./CONTRIBUTORS.md) for maintainers, contributors, and deta
 
 The CLI, diff engine, and CI checks are licensed under the MIT License. See [LICENSE](./LICENSE) for details.
 
-## Sources
-
-Metrics quoted above come from the [Developer Workflow Bottlenecks](https://github.com/Epoch-AI-Lab/research) dataset (compiled August 8, 2026).
