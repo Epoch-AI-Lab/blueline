@@ -1,0 +1,13 @@
+{
+  "name": "@blueline/binary-win32-x64",
+  "version": "0.1.0",
+  "description": "Native blueline binary for win32-x64",
+  "license": "MIT",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "preferUnplugged": true
+}

@@ -30,7 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --locked -- -D warnings
 
   test:
     name: Tests
@@ -88,6 +88,7 @@ jobs:
   mutants:
     name: Mutation testing (all)
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [test]
     timeout-minutes: 60
     env:

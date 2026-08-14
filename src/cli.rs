@@ -1,5 +1,13 @@
 use clap::{Parser, Subcommand, ValueEnum};
 
+fn trim_pkg(s: &str) -> Result<String, String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err("package spec cannot be empty".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "blueline",
@@ -18,16 +26,28 @@ pub struct Cli {
     pub registry: String,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum Command {
     /// Fetch, verify, and baseline a package release
     Review {
         /// `<name>@<version>` to review, e.g. `express@4.21.2`
+        #[arg(value_parser = trim_pkg)]
         pkg: String,
 
         /// Output format: auto (text on a TTY, JSON otherwise), text, or json
         #[arg(long, value_enum, default_value_t = Output::Auto)]
         output: Output,
+    },
+
+    /// Review and install a package with `--ignore-scripts` upon approval
+    Install {
+        /// `<name>` or `<name>@<version>` to review and install
+        #[arg(value_parser = trim_pkg)]
+        pkg: String,
+
+        /// Additional arguments forwarded to npm install
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        npm_args: Vec<String>,
     },
 }
 
@@ -52,5 +72,34 @@ impl Output {
             Output::Text => OutputFormat::Text,
             Output::Json => OutputFormat::Json,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trims_package_spec_in_review() {
+        let cli = Cli::try_parse_from(["blueline", "review", "  express@4.21.2  "]).unwrap();
+        match cli.command {
+            Command::Review { pkg, .. } => assert_eq!(pkg, "express@4.21.2"),
+            _ => panic!("expected Review command"),
+        }
+    }
+
+    #[test]
+    fn trims_package_spec_in_install() {
+        let cli = Cli::try_parse_from(["blueline", "install", "\tlodash@4.17.21\n"]).unwrap();
+        match cli.command {
+            Command::Install { pkg, .. } => assert_eq!(pkg, "lodash@4.17.21"),
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    #[test]
+    fn rejects_empty_package_spec() {
+        let res = Cli::try_parse_from(["blueline", "review", "   "]);
+        assert!(res.is_err());
     }
 }

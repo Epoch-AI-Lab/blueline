@@ -9,8 +9,31 @@ use crate::error::BluelineError;
 /// Cap on the extracted package.json before parsing (untrusted input).
 const MAX_MANIFEST_BYTES: u64 = 10 * 1024 * 1024;
 
-/// npm lifecycle scripts that execute during `npm install`.
-const LIFECYCLE_SCRIPTS: [&str; 3] = ["preinstall", "install", "postinstall"];
+/// npm lifecycle scripts that execute during `npm install` or build.
+const LIFECYCLE_SCRIPTS: [&str; 22] = [
+    "preinstall",
+    "install",
+    "postinstall",
+    "preprepare",
+    "prepare",
+    "postprepare",
+    "prepack",
+    "postpack",
+    "prepublish",
+    "prepublishOnly",
+    "preshrinkwrap",
+    "shrinkwrap",
+    "postshrinkwrap",
+    "preversion",
+    "version",
+    "postversion",
+    "prestop",
+    "stop",
+    "poststop",
+    "prerestart",
+    "restart",
+    "postrestart",
+];
 
 /// Typed view of the extracted `package.json`. The `scripts` / dependency
 /// fields are attack surface — parsed strictly, never executed. The unused
@@ -78,10 +101,14 @@ mod tests {
 
     #[test]
     fn flags_lifecycle_scripts() {
-        let m: PackageJson =
-            serde_json::from_str(r#"{"scripts":{"preinstall":"a","postinstall":"b","test":"c"}}"#)
-                .unwrap();
-        assert_eq!(m.lifecycle_scripts(), vec!["preinstall", "postinstall"]);
+        let m: PackageJson = serde_json::from_str(
+            r#"{"scripts":{"preinstall":"a","postinstall":"b","prepublishOnly":"c","prepare":"d","test":"e"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            m.lifecycle_scripts(),
+            vec!["preinstall", "postinstall", "prepare", "prepublishOnly"]
+        );
     }
 
     #[test]

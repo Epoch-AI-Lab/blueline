@@ -51,8 +51,8 @@ If a release exceeds risk thresholds, Blueline blocks the install and halts the 
 - [x] Package manifest parser and integrity verification (SHA-512)
 - [x] SQLite store for verified baseline releases
 - [x] CLI review command (`blueline review <pkg@ver>`)
-- [ ] Line-level diff engine
-- [ ] npm and npx wrapper shim
+- [x] Line-level diff engine
+- [x] npm and npx wrapper shim (`@blueline/cli`)
 - [ ] GitHub Action PR check
 - [ ] Agent hook via Model Context Protocol (MCP)
 - [ ] Revocation index and recall API

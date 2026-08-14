@@ -1,68 +1,297 @@
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 
+use crate::baseline::resolve_baseline;
 use crate::cli::{Output, OutputFormat};
+use crate::diff::compute_delta;
 use crate::extract::{ExtractionLimits, safe_extract};
+use crate::heuristic::evaluate;
 use crate::manifest::read_package_json;
 use crate::registry::Registry;
 use crate::registry::npm::NpmRegistry;
+use crate::render::{render_json, render_text};
 use crate::store::BaselineStore;
 
-pub struct ReviewSummary {
-    pub name: String,
-    pub version: String,
-    pub integrity: String,
-    pub files: usize,
-    pub unpacked_bytes: u64,
-    pub install_scripts: Vec<String>,
-    pub baseline: String,
-}
-
 pub fn run(pkg_spec: &str, registry_base: &str, output: Output) -> anyhow::Result<()> {
-    let (name, version) = parse_spec(pkg_spec)?;
+    let (name, version_str) = parse_spec(pkg_spec)?;
+    let target_semver = semver::Version::parse(&version_str)
+        .map_err(|e| anyhow::anyhow!("invalid semver for `{version_str}`: {e}"))?;
 
     let registry = NpmRegistry::new(registry_base);
-    let pkg = registry.resolve(&name, &version)?;
+    let target_pkg = registry.resolve(&name, &version_str)?;
 
     // fetch_tarball verifies sha512 against dist.integrity and fails closed
     // on any mismatch, so the bytes below are integrity-verified.
-    let tarball = registry.fetch_tarball(&pkg)?;
+    let target_tarball = registry.fetch_tarball(&target_pkg)?;
 
-    let temp = tempfile::tempdir().map_err(|e| anyhow::anyhow!("creating temp dir: {e}"))?;
-    let stats = safe_extract(&tarball, temp.path(), &ExtractionLimits::default())
-        .map_err(|e| anyhow::anyhow!("failed to extract {}@{}: {e}", pkg.name, pkg.version))?;
-
-    let manifest_path = package_json_path(temp.path());
-    let manifest = read_package_json(&manifest_path).map_err(|e| {
+    let target_temp = tempfile::tempdir().map_err(|e| anyhow::anyhow!("creating temp dir: {e}"))?;
+    safe_extract(
+        &target_tarball,
+        target_temp.path(),
+        &ExtractionLimits::default(),
+    )
+    .map_err(|e| {
         anyhow::anyhow!(
-            "failed to parse package.json for {}@{}: {e}",
-            pkg.name,
-            pkg.version
+            "failed to extract {}@{}: {e}",
+            target_pkg.name,
+            target_pkg.version
         )
     })?;
 
-    // Persist the verified tarball as evidence, not a blessing: the row is
-    // recorded dirty (clean = 0) until a verdict (Phase 1) cleans it.
+    let target_manifest_path = package_json_path(target_temp.path());
+    let target_manifest = read_package_json(&target_manifest_path).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to parse package.json for {}@{}: {e}",
+            target_pkg.name,
+            target_pkg.version
+        )
+    })?;
+
     let store = BaselineStore::open().map_err(|e| anyhow::anyhow!("baseline store: {e}"))?;
-    let integrity = pkg.integrity.clone().unwrap_or_default();
+    let integrity = target_pkg.integrity.clone().unwrap_or_default();
     store
-        .record_verified(&pkg.name, &pkg.version, &integrity)
+        .record_verified(&target_pkg.name, &target_pkg.version, &integrity)
         .map_err(|e| anyhow::anyhow!("baseline store: {e}"))?;
 
-    let summary = ReviewSummary {
-        name: pkg.name.clone(),
-        version: pkg.version.clone(),
-        integrity: "verified (sha512)".to_string(),
-        files: stats.files,
-        unpacked_bytes: stats.unpacked_bytes,
-        install_scripts: manifest.lifecycle_scripts(),
-        baseline: "verified; no clean verdict yet".to_string(),
+    let baseline_res = resolve_baseline(&name, &target_semver, &registry, &store)
+        .map_err(|e| anyhow::anyhow!("baseline resolution: {e}"))?;
+
+    let delta = if let Some(base_pkg) = baseline_res.package() {
+        let base_tarball = registry.fetch_tarball(base_pkg)?;
+        let base_temp =
+            tempfile::tempdir().map_err(|e| anyhow::anyhow!("creating temp dir: {e}"))?;
+        safe_extract(
+            &base_tarball,
+            base_temp.path(),
+            &ExtractionLimits::default(),
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to extract baseline {}@{}: {e}",
+                base_pkg.name,
+                base_pkg.version
+            )
+        })?;
+        let base_manifest_path = package_json_path(base_temp.path());
+        let base_manifest = read_package_json(&base_manifest_path).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to parse package.json for baseline {}@{}: {e}",
+                base_pkg.name,
+                base_pkg.version
+            )
+        })?;
+
+        compute_delta(
+            Some(base_temp.path()),
+            Some(&base_manifest),
+            Some(&base_pkg.version),
+            target_temp.path(),
+            &target_manifest,
+            &target_pkg.version,
+        )?
+    } else {
+        compute_delta(
+            None,
+            None,
+            None,
+            target_temp.path(),
+            &target_manifest,
+            &target_pkg.version,
+        )?
     };
 
+    let is_unreviewed = matches!(
+        baseline_res,
+        crate::baseline::BaselineResolution::RegistryPredecessor(_)
+    );
+    let verdict = evaluate(&target_pkg.name, "verified (sha512)", &delta, is_unreviewed);
+
     match output.resolve(std::io::stdout().is_terminal()) {
-        OutputFormat::Text => render_text(&summary),
-        OutputFormat::Json => render_json(&summary)?,
+        OutputFormat::Json => {
+            render_json(&verdict)?;
+        }
+        OutputFormat::Text => {
+            render_text(&verdict, &delta);
+        }
     }
+
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        interactive_prompt(&store, &target_pkg.name, &target_pkg.version, &delta)?;
+    } else if verdict.band != crate::verdict::VerdictBand::Low {
+        std::process::exit(2);
+    }
+
     Ok(())
+}
+
+pub fn install(pkg_spec: &str, registry_base: &str, npm_args: &[String]) -> anyhow::Result<()> {
+    crate::executor::validate_extra_args(npm_args)?;
+    let registry = NpmRegistry::new(registry_base);
+    let (name, version_str) = parse_spec_flexible(pkg_spec, &registry)?;
+    let target_semver = semver::Version::parse(&version_str)
+        .map_err(|e| anyhow::anyhow!("invalid semver for `{version_str}`: {e}"))?;
+
+    let target_pkg = registry.resolve(&name, &version_str)?;
+    let target_tarball = registry.fetch_tarball(&target_pkg)?;
+
+    let target_temp = tempfile::tempdir().map_err(|e| anyhow::anyhow!("creating temp dir: {e}"))?;
+    safe_extract(
+        &target_tarball,
+        target_temp.path(),
+        &ExtractionLimits::default(),
+    )
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "failed to extract {}@{}: {e}",
+            target_pkg.name,
+            target_pkg.version
+        )
+    })?;
+
+    let target_manifest_path = package_json_path(target_temp.path());
+    let target_manifest = read_package_json(&target_manifest_path).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to parse package.json for {}@{}: {e}",
+            target_pkg.name,
+            target_pkg.version
+        )
+    })?;
+
+    let store = BaselineStore::open().map_err(|e| anyhow::anyhow!("baseline store: {e}"))?;
+    let integrity = target_pkg.integrity.clone().unwrap_or_default();
+    store
+        .record_verified(&target_pkg.name, &target_pkg.version, &integrity)
+        .map_err(|e| anyhow::anyhow!("baseline store: {e}"))?;
+
+    let baseline_res = resolve_baseline(&name, &target_semver, &registry, &store)
+        .map_err(|e| anyhow::anyhow!("baseline resolution: {e}"))?;
+
+    let delta = if let Some(base_pkg) = baseline_res.package() {
+        let base_tarball = registry.fetch_tarball(base_pkg)?;
+        let base_temp =
+            tempfile::tempdir().map_err(|e| anyhow::anyhow!("creating temp dir: {e}"))?;
+        safe_extract(
+            &base_tarball,
+            base_temp.path(),
+            &ExtractionLimits::default(),
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to extract baseline {}@{}: {e}",
+                base_pkg.name,
+                base_pkg.version
+            )
+        })?;
+        let base_manifest_path = package_json_path(base_temp.path());
+        let base_manifest = read_package_json(&base_manifest_path).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to parse package.json for baseline {}@{}: {e}",
+                base_pkg.name,
+                base_pkg.version
+            )
+        })?;
+
+        compute_delta(
+            Some(base_temp.path()),
+            Some(&base_manifest),
+            Some(&base_pkg.version),
+            target_temp.path(),
+            &target_manifest,
+            &target_pkg.version,
+        )?
+    } else {
+        compute_delta(
+            None,
+            None,
+            None,
+            target_temp.path(),
+            &target_manifest,
+            &target_pkg.version,
+        )?
+    };
+
+    let is_unreviewed = matches!(
+        baseline_res,
+        crate::baseline::BaselineResolution::RegistryPredecessor(_)
+    );
+    let verdict = evaluate(&target_pkg.name, "verified (sha512)", &delta, is_unreviewed);
+    render_text(&verdict, &delta);
+
+    let is_interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let approved = if is_interactive {
+        interactive_prompt(&store, &target_pkg.name, &target_pkg.version, &delta)?
+    } else {
+        verdict.band == crate::verdict::VerdictBand::Low
+    };
+
+    if approved {
+        let install_spec = format!("{name}@{version_str}");
+        crate::executor::install_with_ignore_scripts(&install_spec, npm_args)?;
+        Ok(())
+    } else {
+        eprintln!(
+            "Held {}@{}; installation blocked.",
+            target_pkg.name, target_pkg.version
+        );
+        std::process::exit(2);
+    }
+}
+
+fn interactive_prompt(
+    store: &BaselineStore,
+    name: &str,
+    version: &str,
+    delta: &crate::diff::Delta,
+) -> anyhow::Result<bool> {
+    loop {
+        print!("\n[a]pprove · [h]old · [d]iff > ");
+        std::io::stdout().flush()?;
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input)? == 0 {
+            eprintln!("Held (EOF)");
+            std::process::exit(2);
+        }
+        let choice = input.trim().to_lowercase();
+        match choice.as_str() {
+            "a" | "approve" => {
+                store.mark_clean(name, version)?;
+                println!(
+                    "Approved {}@{} and marked clean in baseline store.",
+                    name, version
+                );
+                return Ok(true);
+            }
+            "h" | "hold" => {
+                eprintln!("Held {}@{}; release unapproved.", name, version);
+                std::process::exit(2);
+            }
+            "d" | "diff" => {
+                let mut showed_any = false;
+                for file in delta
+                    .files_added
+                    .iter()
+                    .chain(delta.files_modified.iter())
+                    .chain(delta.files_removed.iter())
+                {
+                    if let Some(diff) = &file.unified_diff {
+                        println!(
+                            "\n--- {}",
+                            crate::render::sanitize_terminal(&file.relative_path)
+                        );
+                        print!("{}", crate::render::sanitize_terminal(diff));
+                        showed_any = true;
+                    }
+                }
+                if !showed_any {
+                    println!("\nNo text diffs available.");
+                }
+            }
+            _ => {
+                println!(
+                    "Invalid choice. Enter 'a' to approve, 'h' to hold, or 'd' to view diffs."
+                );
+            }
+        }
+    }
 }
 
 /// `<name>@<version>` → (name, version). Scoped names (`@scope/pkg@1.0.0`)
@@ -80,35 +309,28 @@ fn parse_spec(spec: &str) -> anyhow::Result<(String, String)> {
     Ok((name.to_string(), version.to_string()))
 }
 
-fn render_text(s: &ReviewSummary) {
-    let scripts = if s.install_scripts.is_empty() {
-        "none".to_string()
+/// Flexible parser for install: `<name>` or `<name>@<version>`.
+/// If version is omitted, queries the registry for the latest semver release.
+fn parse_spec_flexible(spec: &str, registry: &dyn Registry) -> anyhow::Result<(String, String)> {
+    let has_version_sep = if let Some(rest) = spec.strip_prefix('@') {
+        rest.contains('@')
     } else {
-        s.install_scripts.join(", ")
+        spec.contains('@')
     };
-    println!("reviewed {}@{}", s.name, s.version);
-    println!("  integrity:      {}", s.integrity);
-    println!(
-        "  files:          {} ({})",
-        s.files,
-        human_bytes(s.unpacked_bytes)
-    );
-    println!("  install script: {scripts}");
-    println!("  baseline:       {}", s.baseline);
-}
 
-fn render_json(s: &ReviewSummary) -> anyhow::Result<()> {
-    let out = serde_json::json!({
-        "name": s.name,
-        "version": s.version,
-        "integrity": s.integrity,
-        "files": s.files,
-        "unpacked_bytes": s.unpacked_bytes,
-        "lifecycle_scripts": s.install_scripts,
-        "baseline": s.baseline,
-    });
-    println!("{}", serde_json::to_string(&out)?);
-    Ok(())
+    if has_version_sep {
+        parse_spec(spec)
+    } else {
+        let name = spec.trim();
+        if name.is_empty() {
+            return Err(crate::error::BluelineError::InvalidPackageSpec(spec.to_string()).into());
+        }
+        let versions = registry.list_versions(name)?;
+        let latest = versions
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("no versions found for `{name}`"))?;
+        Ok((name.to_string(), latest.to_string()))
+    }
 }
 
 /// npm tarballs nest every file under a `package/` prefix.
@@ -118,21 +340,6 @@ fn package_json_path(root: &std::path::Path) -> std::path::PathBuf {
         nested
     } else {
         root.join("package.json")
-    }
-}
-
-fn human_bytes(n: u64) -> String {
-    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
-    let mut value = n as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{value:.0} {}", UNITS[unit])
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
     }
 }
 
@@ -164,12 +371,5 @@ mod tests {
     #[test]
     fn rejects_bad_semver() {
         assert!(parse_spec("express@latest").is_err());
-    }
-
-    #[test]
-    fn human_bytes_formats() {
-        assert_eq!(human_bytes(0), "0 B");
-        assert_eq!(human_bytes(1024), "1.0 KiB");
-        assert_eq!(human_bytes(3 * 1024 * 1024), "3.0 MiB");
     }
 }

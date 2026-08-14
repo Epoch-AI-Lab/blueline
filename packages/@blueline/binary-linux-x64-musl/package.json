@@ -1,0 +1,16 @@
+{
+  "name": "@blueline/binary-linux-x64-musl",
+  "version": "0.1.0",
+  "description": "Native blueline binary for linux-x64-musl",
+  "license": "MIT",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "libc": [
+    "musl"
+  ],
+  "preferUnplugged": true
+}

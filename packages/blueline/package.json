@@ -1,0 +1,26 @@
+{
+  "name": "@blueline/cli",
+  "version": "0.1.0",
+  "description": "Approve the delta, not the download — security fail-closed CLI review desk for package installs",
+  "license": "MIT",
+  "bin": {
+    "blueline": "bin/blueline.js"
+  },
+  "files": [
+    "bin",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "optionalDependencies": {
+    "@blueline/binary-linux-x64-gnu": "0.1.0",
+    "@blueline/binary-linux-x64-musl": "0.1.0",
+    "@blueline/binary-linux-arm64-gnu": "0.1.0",
+    "@blueline/binary-linux-arm64-musl": "0.1.0",
+    "@blueline/binary-darwin-x64": "0.1.0",
+    "@blueline/binary-darwin-arm64": "0.1.0",
+    "@blueline/binary-win32-x64": "0.1.0",
+    "@blueline/binary-win32-arm64": "0.1.0"
+  }
+}

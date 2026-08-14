@@ -1,7 +1,7 @@
 use crate::error::BluelineError;
 
 /// A resolved package release point from the registry (metadata only).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Package {
     pub name: String,
     pub version: String,
@@ -18,6 +18,9 @@ pub trait Registry {
     /// Download the release tarball. Bytes returned are integrity-verified
     /// against the manifest before returning (fail closed on mismatch).
     fn fetch_tarball(&self, pkg: &Package) -> Result<Vec<u8>, BluelineError>;
+
+    /// List all published versions for a package, sorted in semver ascending order.
+    fn list_versions(&self, name: &str) -> Result<Vec<semver::Version>, BluelineError>;
 }
 
 pub mod npm;

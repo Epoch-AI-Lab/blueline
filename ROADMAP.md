@@ -12,13 +12,13 @@ decisions behind each phase.
 - [x] Command: `blueline review <pkg@ver>` — text + JSON output, `--registry` override
 - [x] Tests: unit (extract/registry/manifest/store/parse) + integration vs. local fixture registry (no network)
 
-## Phase 1 — Wedge Primitive
-- Diff engine: file-level + line-level (`similar`)
-- ASCII review card rendering (`comfy-table`)
-- Heuristic verdict engine + scoring (rules in `ARCHITECTURE.md` §2)
-- Interactive prompt: `[a]pprove · [h]old · [d]iff`
-- Node shim (`@blueline/cli`) + `npx blueline install` that performs/blocks the real `npm install`
-- Baseline "known-clean" resolution (installed version → prior registry version)
+## Phase 1 — Wedge Primitive ✅
+- [x] Baseline "known-clean" resolution (installed clean store version → semver registry predecessor)
+- [x] Diff engine: dual-release file-level + line-level (`similar`)
+- [x] Heuristic verdict engine + scoring (rules in `ARCHITECTURE.md` §2)
+- [x] ASCII review card rendering (`comfy-table`) + stable JSON verdict schema
+- [x] Interactive prompt: `[a]pprove · [h]old · [d]iff` with `clean = 1` SQLite store persistence
+- [x] Node shim (`@blueline/cli`) + `npx blueline install` that performs/blocks the real `npm install`
 
 ## Phase 2 — Trust Sources
 - OSV + GitHub Advisory revocation cache
@@ -44,8 +44,8 @@ decisions behind each phase.
 ---
 
 ## Status (from README)
-- [x] Diff rendering engine (Rust) — *design target; no code shipped yet*
-- [ ] npm/npx CLI wrapper
+- [x] Diff rendering engine (Rust)
+- [x] npm/npx CLI wrapper
 - [ ] GitHub Action + CI check
 - [ ] MCP tool (agent hook)
 - [ ] Revocation index + recall API

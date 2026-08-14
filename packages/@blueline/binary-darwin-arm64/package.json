@@ -1,0 +1,13 @@
+{
+  "name": "@blueline/binary-darwin-arm64",
+  "version": "0.1.0",
+  "description": "Native blueline binary for darwin-arm64",
+  "license": "MIT",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "preferUnplugged": true
+}

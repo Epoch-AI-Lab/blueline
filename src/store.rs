@@ -35,11 +35,44 @@ impl BaselineStore {
 
     pub fn open_at(path: &Path) -> Result<Self, BluelineError> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| BluelineError::Store(format!("creating {}: {e}", parent.display())))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                let mut builder = fs::DirBuilder::new();
+                builder.recursive(true);
+                builder.mode(0o700);
+                builder.create(parent).map_err(|e| {
+                    BluelineError::Store(format!("creating {}: {e}", parent.display()))
+                })?;
+                if let Ok(meta) = fs::metadata(parent) {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut perms = meta.permissions();
+                    perms.set_mode(0o700);
+                    let _ = fs::set_permissions(parent, perms);
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                fs::create_dir_all(parent).map_err(|e| {
+                    BluelineError::Store(format!("creating {}: {e}", parent.display()))
+                })?;
+            }
         }
         let mut conn = rusqlite::Connection::open(path)
             .map_err(|e| BluelineError::Store(format!("opening {}: {e}", path.display())))?;
+        conn.busy_timeout(std::time::Duration::from_millis(5000))
+            .map_err(|e| BluelineError::Store(format!("setting busy timeout: {e}")))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = fs::metadata(path) {
+                let mut perms = meta.permissions();
+                perms.set_mode(0o600);
+                let _ = fs::set_permissions(path, perms);
+            }
+        }
+
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| BluelineError::Store(format!("enabling WAL: {e}")))?;
 
@@ -82,6 +115,57 @@ impl BaselineStore {
             )));
         }
         Ok(())
+    }
+
+    /// Mark a verified version as clean (user approved).
+    pub fn mark_clean(&self, name: &str, version: &str) -> Result<(), BluelineError> {
+        let affected = self
+            .conn
+            .prepare_cached(
+                "UPDATE known_clean SET clean = 1, reviewed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                 WHERE name = ?1 AND version = ?2",
+            )
+            .map_err(|e| BluelineError::Store(format!("preparing mark_clean: {e}")))?
+            .execute(rusqlite::params![name, version])
+            .map_err(|e| BluelineError::Store(format!("marking clean {name}@{version}: {e}")))?;
+        if affected == 0 {
+            return Err(BluelineError::Store(format!(
+                "cannot mark clean {name}@{version}: no record exists to approve"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Retrieve all versions marked clean for a package, sorted by semver descending.
+    pub fn list_clean_versions(
+        &self,
+        name: &str,
+    ) -> Result<Vec<(semver::Version, String)>, BluelineError> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT version, integrity FROM known_clean WHERE name = ?1 AND clean = 1",
+            )
+            .map_err(|e| BluelineError::Store(format!("preparing select clean: {e}")))?;
+        let rows = stmt
+            .query_map(rusqlite::params![name], |row| {
+                let ver_str: String = row.get(0)?;
+                let integrity: String = row.get(1)?;
+                Ok((ver_str, integrity))
+            })
+            .map_err(|e| {
+                BluelineError::Store(format!("querying clean versions for {name}: {e}"))
+            })?;
+        let mut versions = Vec::new();
+        for row in rows {
+            let (v_str, integ) = row
+                .map_err(|e| BluelineError::Store(format!("reading clean row for {name}: {e}")))?;
+            if let Ok(v) = semver::Version::parse(&v_str) {
+                versions.push((v, integ));
+            }
+        }
+        versions.sort_by(|a, b| b.0.cmp(&a.0));
+        Ok(versions)
     }
 
     #[cfg(test)]
@@ -178,6 +262,57 @@ mod tests {
         let path = dir.path().join("t.db");
         BaselineStore::open_at(&path).unwrap();
         BaselineStore::open_at(&path).unwrap();
+    }
+
+    #[test]
+    fn mark_clean_and_list_clean_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
+        store.record_verified("pkg", "1.0.0", "sha512-v1").unwrap();
+        store.record_verified("pkg", "1.1.0", "sha512-v2").unwrap();
+        store.record_verified("pkg", "2.0.0", "sha512-v3").unwrap();
+
+        assert!(store.list_clean_versions("pkg").unwrap().is_empty());
+
+        store.mark_clean("pkg", "1.0.0").unwrap();
+        store.mark_clean("pkg", "2.0.0").unwrap();
+
+        let clean = store.list_clean_versions("pkg").unwrap();
+        assert_eq!(clean.len(), 2);
+        assert_eq!(clean[0].0, semver::Version::parse("2.0.0").unwrap());
+        assert_eq!(clean[0].1, "sha512-v3");
+        assert_eq!(clean[1].0, semver::Version::parse("1.0.0").unwrap());
+        assert_eq!(clean[1].1, "sha512-v1");
+
+        // Marking unrecorded version errors
+        assert!(store.mark_clean("pkg", "3.0.0").is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn enforces_unix_file_and_directory_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_dir = dir.path().join("secure_subdir");
+        let db_path = db_dir.join("t.db");
+        let _store = BaselineStore::open_at(&db_path).unwrap();
+
+        let dir_meta = fs::metadata(&db_dir).unwrap();
+        assert_eq!(dir_meta.permissions().mode() & 0o777, 0o700);
+
+        let file_meta = fs::metadata(&db_path).unwrap();
+        assert_eq!(file_meta.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn sets_busy_timeout_properly() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.db");
+        let store = BaselineStore::open_at(&db_path).unwrap();
+        store
+            .record_verified("pkg", "1.0.0", "sha512-test")
+            .unwrap();
     }
 
     mod proptest_invariants {
