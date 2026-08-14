@@ -52,10 +52,13 @@ impl NpmRegistry {
                 )));
             }
         } else if base_scheme == "http" {
-            if tarball_scheme != "http" && tarball_scheme != "https" {
-                return Err(BluelineError::Network(format!(
-                    "unsupported tarball scheme `{tarball_scheme}` in `{tarball_url}`"
-                )));
+            match tarball_scheme.as_str() {
+                "http" | "https" => {}
+                _ => {
+                    return Err(BluelineError::Network(format!(
+                        "unsupported tarball scheme `{tarball_scheme}` in `{tarball_url}`"
+                    )));
+                }
             }
         } else {
             return Err(BluelineError::Network(format!(
@@ -105,7 +108,7 @@ impl NpmRegistry {
             .get(&pkg.tarball_url)
             .call()
             .map_err(|e| BluelineError::Network(format!("GET {}: {e}", pkg.tarball_url)))?;
-        let mut reader = resp.into_reader();
+        let mut reader = resp.into_reader().take(MAX_TARBALL_BYTES as u64 + 1);
         let mut hasher = Sha512::new();
         let mut buf = [0u8; 65536];
         let mut bytes = Vec::new();
@@ -428,6 +431,27 @@ mod tests {
             local_reg
                 .validate_tarball_url("http://127.0.0.1:8080/express/-/express-1.0.0.tgz")
                 .is_ok()
+        );
+        assert!(
+            local_reg
+                .validate_tarball_url("https://127.0.0.1:8080/express/-/express-1.0.0.tgz")
+                .is_ok()
+        );
+        assert!(
+            local_reg
+                .validate_tarball_url("ftp://127.0.0.1:8080/express/-/express-1.0.0.tgz")
+                .is_err()
+        );
+        assert!(
+            local_reg
+                .validate_tarball_url("file:///etc/passwd")
+                .is_err()
+        );
+        let ftp_reg = NpmRegistry::new("ftp://127.0.0.1:8080");
+        assert!(
+            ftp_reg
+                .validate_tarball_url("ftp://127.0.0.1:8080/pkg.tgz")
+                .is_err()
         );
         // But local registry cannot be bounced to metadata
         assert!(
