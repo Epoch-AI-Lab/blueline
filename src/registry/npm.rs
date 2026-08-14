@@ -14,8 +14,8 @@ use crate::registry::{Package, Registry};
 const CORGI_ACCEPT: &str = "application/vnd.npm.install-v1+json";
 const USER_AGENT: &str = concat!("blueline/", env!("CARGO_PKG_VERSION"));
 const SRI_PREFIX: &str = "sha512-";
-const MAX_PACKUMENT_BYTES: u64 = 32 * 1024 * 1024;
-const MAX_TARBALL_BYTES: usize = 256 * 1024 * 1024;
+const MAX_PACKUMENT_BYTES: u64 = 33_554_432;
+const MAX_TARBALL_BYTES: usize = 268_435_456;
 
 pub struct NpmRegistry {
     agent: Agent,
@@ -259,7 +259,6 @@ fn is_private_or_local_host(host: &str) -> bool {
                     || v4.is_private()
                     || v4.is_unspecified()
                     || v4.is_broadcast()
-                    || v4.octets() == [169, 254, 169, 254]
             }
             std::net::IpAddr::V6(v6) => {
                 v6.is_loopback()
@@ -436,5 +435,30 @@ mod tests {
                 .validate_tarball_url("http://169.254.169.254/latest/meta-data")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn is_private_or_local_host_covers_all_ranges() {
+        assert!(is_private_or_local_host("localhost"));
+        assert!(is_private_or_local_host("foo.localhost"));
+        assert!(is_private_or_local_host("metadata.google.internal"));
+        assert!(is_private_or_local_host("instance-data"));
+        assert!(is_private_or_local_host("127.0.0.1"));
+        assert!(is_private_or_local_host("169.254.169.254"));
+        assert!(is_private_or_local_host("10.0.0.1"));
+        assert!(is_private_or_local_host("172.16.0.1"));
+        assert!(is_private_or_local_host("192.168.1.1"));
+        assert!(is_private_or_local_host("0.0.0.0"));
+        assert!(is_private_or_local_host("255.255.255.255"));
+        assert!(is_private_or_local_host("::1"));
+        assert!(is_private_or_local_host("::"));
+        assert!(is_private_or_local_host("fe80::1"));
+        assert!(is_private_or_local_host("fc00::1"));
+        assert!(is_private_or_local_host("fd00::1"));
+
+        assert!(!is_private_or_local_host("registry.npmjs.org"));
+        assert!(!is_private_or_local_host("8.8.8.8"));
+        assert!(!is_private_or_local_host("1.1.1.1"));
+        assert!(!is_private_or_local_host("2607:f8b0:4005:805::200e"));
     }
 }
