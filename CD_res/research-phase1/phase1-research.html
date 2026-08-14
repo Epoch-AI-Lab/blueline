@@ -1,0 +1,651 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blueline — Phase 1 Research: The Wedge Primitive</title>
+<meta name="description" content="Consolidated research findings for Blueline Phase 1: diff engine, verdict heuristics, review card, interactive prompt, node shim, baseline resolution. Compiled 2026-08-13, adversarial-verified.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,100..900;1,9..144,100..900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --paper:#F6F1E8; --paper-2:#EFE8DA; --ink:#191919; --ink-2:#4F4A40;
+  --accent:#CC785C; --accent-ink:#A34C2B; --rule:#D9D1C0; --rule-soft:#E6DFCF;
+  --serif:"Fraunces", Georgia, "Times New Roman", serif;
+  --sans:system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --mono:"JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto} *,*::before,*::after{animation:none!important;transition:none!important}}
+body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.75 var(--sans);font-variant-ligatures:none;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+::selection{background:var(--accent);color:#fff}
+a{color:var(--accent-ink);text-decoration-color:var(--rule);text-underline-offset:3px}
+a:hover{text-decoration-color:var(--accent-ink)}
+:focus-visible{outline:2px solid var(--accent-ink);outline-offset:2px;border-radius:2px}
+.wrap{max-width:1080px;margin:0 auto;padding:0 clamp(18px,4vw,48px)}
+#progress{position:fixed;top:0;left:0;height:3px;width:100%;background:transparent;z-index:50}
+#progress i{display:block;height:100%;background:var(--accent);transform-origin:0 50%;transform:scaleX(0)}
+
+/* ---------- masthead ---------- */
+.masthead{padding:clamp(48px,8vw,96px) 0 8px;border-bottom:1px solid var(--rule-soft)}
+.kicker{font-family:var(--mono);font-size:12px;letter-spacing:.18em;text-transform:uppercase;color:var(--accent-ink);margin:0 0 18px;font-variant-numeric:tabular-nums}
+h1{font-family:var(--serif);font-weight:560;font-size:clamp(40px,6.4vw,74px);line-height:1.02;letter-spacing:-.015em;margin:0 0 14px;text-wrap:balance}
+h1 em{font-style:italic;color:var(--accent-ink)}
+.subtitle{font-family:var(--serif);font-style:italic;font-size:clamp(18px,2.2vw,23px);line-height:1.45;color:var(--ink-2);max-width:60ch;margin:0 0 30px;text-wrap:balance}
+.meta{display:flex;flex-wrap:wrap;gap:0;border-top:1px solid var(--rule);border-bottom:1px solid var(--rule);margin:0 0 26px}
+.meta div{flex:1 1 200px;padding:14px 20px 14px 0;border-right:1px solid var(--rule-soft)}
+.meta div+div{padding-left:20px}
+.meta div:last-child{border-right:0}
+.meta dt{font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-2);margin:0 0 4px}
+.meta dd{margin:0;font-size:13.5px;line-height:1.55;color:var(--ink)}
+.lede{max-width:64ch;margin:0 0 8px;font-size:15.5px;color:var(--ink-2)}
+.lede b{color:var(--ink);font-weight:600}
+
+.flow{margin:34px 0 0;padding:18px 0 22px;border-top:1px solid var(--rule-soft)}
+.flow svg{display:block;width:100%;max-width:960px;height:auto;margin:0 auto}
+.fl-label{font-family:var(--serif);font-style:italic;font-size:13.5px;fill:var(--ink-2)}
+.fl-num{font-family:var(--mono);font-size:12px;fill:var(--accent-ink);font-variant-numeric:tabular-nums}
+.fl-gap{font-family:var(--mono);font-size:12px;letter-spacing:.06em;fill:var(--accent-ink);font-variant-numeric:tabular-nums}
+
+/* ---------- contents ---------- */
+.contents{max-width:640px;margin:34px 0 6px}
+.contents h2{font-family:var(--mono);font-size:12px;letter-spacing:.18em;text-transform:uppercase;color:var(--ink-2);margin:0 0 12px}
+.contents ol{list-style:none;margin:0;padding:0;counter-reset:sec}
+.contents li{margin:0}
+.contents a{display:flex;align-items:baseline;gap:10px;padding:5px 0;font-family:var(--serif);font-size:16.5px;color:var(--ink);text-decoration:none;border-bottom:1px dotted var(--rule)}
+.contents a:hover{color:var(--accent-ink)}
+.contents .c-dots{flex:1;border-bottom:2px dotted var(--rule-soft);transform:translateY(-4px)}
+.contents .c-no{font-family:var(--mono);font-size:12px;color:var(--accent-ink);font-variant-numeric:tabular-nums}
+
+/* ---------- sections ---------- */
+main{padding:8px 0 0}
+section{padding:clamp(40px,7vw,72px) 0 0}
+.sec-head{border-bottom:1px solid var(--rule);padding-bottom:16px;margin-bottom:26px}
+.sec-kick{font-family:var(--mono);font-size:12px;letter-spacing:.18em;text-transform:uppercase;color:var(--accent-ink);margin:0 0 10px;font-variant-numeric:tabular-nums}
+h2.sec-title{font-family:var(--serif);font-weight:560;font-size:clamp(28px,4vw,40px);line-height:1.1;margin:0 0 8px;letter-spacing:-.01em;text-wrap:balance}
+.sec-sub{font-family:var(--serif);font-style:italic;font-size:17px;color:var(--ink-2);margin:0}
+.sec-no{font-family:var(--mono);font-size:13px;color:var(--accent-ink);letter-spacing:.1em}
+
+/* ---------- bottleneck list ---------- */
+.bnlist{list-style:none;margin:0;padding:0}
+.bn{display:grid;grid-template-columns:clamp(46px,7vw,84px) 1fr;gap:clamp(14px,3vw,34px);padding:26px 0 28px;border-top:1px solid var(--rule)}
+.bn:first-child{border-top:0}
+.bn-num{font-family:var(--serif);font-weight:500;font-size:clamp(26px,3vw,34px);line-height:1;color:var(--accent);font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+.bn-body{min-width:0}
+.bn-title{font-family:var(--serif);font-weight:560;font-size:clamp(20px,2.4vw,25px);line-height:1.25;margin:0 0 6px;letter-spacing:-.01em}
+.bn-title .bn-kind{display:block;font-family:var(--mono);font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:var(--ink-2);margin-bottom:4px;font-weight:500}
+.bn-stat{display:flex;align-items:baseline;flex-wrap:wrap;gap:8px 14px;margin:10px 0 10px}
+.bn-stat .stat-n{font-family:var(--serif);font-weight:540;font-style:italic;font-size:clamp(21px,2.6vw,28px);color:var(--accent-ink);font-variant-numeric:tabular-nums;line-height:1.1}
+.bn-stat .stat-c{font-size:13.5px;color:var(--ink-2)}
+.bn-data{margin:0;padding:0;list-style:none}
+.bn-data li{position:relative;padding:3px 0 3px 18px;font-size:14.5px;line-height:1.65;color:var(--ink)}
+.bn-data li::before{content:"";position:absolute;left:2px;top:.82em;width:7px;height:7px;border-radius:50%;background:var(--accent);opacity:.55}
+.k{font-family:var(--mono);font-weight:600;font-size:.96em;color:var(--ink);font-variant-numeric:tabular-nums;white-space:nowrap}
+.kr{font-family:var(--mono);font-weight:500;font-size:.94em;color:var(--accent-ink);font-variant-numeric:tabular-nums;white-space:nowrap}
+cite{font-style:normal;font-family:var(--mono);font-size:12px;color:var(--ink-2);white-space:nowrap}
+cite::before{content:"· ";color:var(--rule)}
+.pull{max-width:60ch;margin:24px 0 6px;padding:6px 0 6px 20px;border-left:2px solid var(--accent);font-family:var(--serif);font-style:italic;font-size:19px;line-height:1.55;color:var(--ink)}
+.pull span{color:var(--accent-ink)}
+
+/* ---------- threads ---------- */
+.threads{list-style:none;margin:0;padding:0;counter-reset:t}
+.threads li{display:grid;grid-template-columns:1fr auto;gap:6px 14px;padding:10px 0;border-top:1px solid var(--rule-soft);font-size:14px}
+.threads li:first-child{border-top:0}
+.threads .t-t{font-weight:600}
+.threads .t-n{font-family:var(--mono);font-size:12px;color:var(--accent-ink);font-variant-numeric:tabular-nums;white-space:nowrap}
+.threads .t-s{grid-column:1/-1;color:var(--ink-2);font-size:13.5px;line-height:1.6}
+
+/* ---------- table ---------- */
+.table-scroll{overflow-x:auto;margin:0 -4px;padding:0 4px}
+table{border-collapse:collapse;width:100%;font-size:13.5px;line-height:1.55}
+caption{caption-side:top;text-align:left;font-family:var(--serif);font-style:italic;font-size:16px;color:var(--ink-2);padding:0 0 14px}
+th{font-family:var(--mono);font-size:12px;letter-spacing:.13em;text-transform:uppercase;color:var(--accent-ink);text-align:left;padding:10px 12px;border-bottom:2px solid var(--ink);vertical-align:bottom}
+td{padding:12px;border-bottom:1px solid var(--rule);vertical-align:top}
+tr:last-child td{border-bottom:0}
+td[data-h] .vh{display:block;font-family:var(--mono);font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-2);margin-bottom:2px}
+.verdict b{display:inline-block;font-size:12px;letter-spacing:.1em;text-transform:uppercase;padding:3px 8px;border:1px solid var(--accent);color:var(--accent-ink);border-radius:999px;white-space:nowrap}
+.verdict b.w{color:var(--ink-2);border-color:var(--rule)}
+.verdict b.g{color:#1d6b3e;border-color:#b8cfc0}
+.tag-cat{display:inline-block;font-family:var(--mono);font-size:12px;padding:2px 8px;border-radius:999px;border:1px solid var(--rule);color:var(--ink-2);white-space:nowrap}
+.tag-cat.hum{color:var(--ink);border-color:var(--accent)}
+.takeaway{background:var(--paper-2);border-left:2px solid var(--accent);padding:22px 26px;margin-top:28px}
+.takeaway h3{font-family:var(--serif);font-size:20px;margin:0 0 8px}
+.takeaway p{margin:0;font-size:14.5px;line-height:1.7;color:var(--ink)}
+.takeaway p+p{margin-top:8px}
+
+/* ---------- method ---------- */
+.method{max-width:70ch}
+.method h3{font-family:var(--serif);font-size:19px;margin:22px 0 6px}
+.method ul{margin:0;padding:0;list-style:none}
+.method li{padding:6px 0 6px 18px;position:relative;font-size:14px;line-height:1.65;color:var(--ink)}
+.method li::before{content:"—";position:absolute;left:0;color:var(--accent-ink);font-family:var(--mono);font-size:12px}
+.srcs{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0 0}
+.srcs span{font-family:var(--mono);font-size:12px;color:var(--ink);border:1px solid var(--rule);border-radius:999px;padding:3px 10px;font-variant-numeric:tabular-nums}
+.srcs span i{font-style:normal;color:var(--accent-ink)}
+
+/* ---------- appendix ---------- */
+#appendix .sec-head{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap}
+.apx-btn{font-family:var(--mono);font-size:12px;color:var(--accent-ink);background:none;border:1px solid var(--accent);border-radius:999px;padding:6px 14px;cursor:pointer}
+.apx-btn:hover{background:var(--accent);color:#fff}
+details.appx{border-top:1px solid var(--rule)}
+details.appx:last-of-type{border-bottom:1px solid var(--rule)}
+.appx summary{list-style:none;display:flex;align-items:baseline;gap:16px;padding:18px 4px;cursor:pointer}
+.appx summary::-webkit-details-marker{display:none}
+.appx summary::before{content:"+";font-family:var(--mono);font-size:16px;color:var(--accent-ink);width:18px;flex:none}
+details[open].appx summary::before{content:"−"}
+.appx-letter{font-family:var(--mono);font-size:12px;color:var(--accent-ink);letter-spacing:.06em;font-variant-numeric:tabular-nums}
+.appx-title{font-family:var(--serif);font-weight:560;font-size:19px;line-height:1.2}
+.appx-count{font-family:var(--mono);font-size:12px;color:var(--ink-2);margin-left:auto;white-space:nowrap;font-variant-numeric:tabular-nums}
+.appx-body{padding:4px 4px 26px clamp(28px,4vw,40px)}
+.appx-body>p{max-width:70ch}
+.sg{margin:0 0 16px}
+.sg h4{font-family:var(--serif);font-size:16px;margin:0 0 4px}
+.sg h4 .cid{font-family:var(--mono);font-size:12px;color:var(--accent-ink);font-weight:500}
+.sg ul{margin:2px 0 0;padding:0;list-style:none}
+.sg li{position:relative;padding:2px 0 2px 16px;font-size:13.5px;line-height:1.6;color:var(--ink)}
+.sg li::before{content:"";position:absolute;left:1px;top:.8em;width:5px;height:5px;border-radius:50%;background:var(--accent);opacity:.6}
+.sg p{margin:2px 0 0;font-size:13.5px;color:var(--ink-2)}
+.legend{font-family:var(--mono);font-size:12px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-2);margin:26px 0 0}
+.legend b{color:var(--accent-ink);font-weight:500}
+
+/* ---------- footer ---------- */
+.mastfoot{margin-top:clamp(48px,8vw,80px);border-top:1px solid var(--rule);padding:26px 0 60px;font-family:var(--mono);font-size:12px;color:var(--ink-2);letter-spacing:.06em}
+
+@media (max-width:640px){
+  .bn{grid-template-columns:44px 1fr}
+  .meta div{border-right:0;border-bottom:1px solid var(--rule-soft);padding:12px 0}
+  .meta div+div{padding-left:0}
+  .appx summary{flex-wrap:wrap;gap:6px 14px}
+  .appx-count{margin-left:0}
+  .threads li{grid-template-columns:1fr}
+  .threads .t-s{grid-column:auto}
+  .table-scroll{margin:0}
+}
+@media print{
+  body{background:#fff}
+  #progress,.apx-btn,.contents{display:none}
+  details.appx{break-inside:avoid}
+  a{color:inherit;text-decoration:none}
+  .bn,.sg{break-inside:avoid}
+}
+</style>
+</head>
+<body>
+<div id="progress" aria-hidden="true"><i></i></div>
+
+<header class="masthead">
+  <div class="wrap">
+    <p class="kicker">Internal research document · Consolidated findings · No. 01</p>
+    <h1>Blueline · Building the <em>Wedge Primitive</em></h1>
+    <p class="subtitle">Phase 1 research for the release-diff review desk: what to diff, how to score a delta, how to make the human say no by default, and how to wrap the real npm install.</p>
+    <div class="meta">
+      <div><dt>Compiled</dt><dd>2026-08-13</dd></div>
+      <div><dt>Coverage</dt><dd>5 reports · ~1,800 lines · 6 decision areas</dd></div>
+      <div><dt>Adversarial pass</dt><dd>10 claims refuted · all fixed · status GREEN</dd></div>
+      <div><dt>Primary sources</dt><dd>crates.io · docs.rs · GitHub · npm registry &amp; RFCs · Snyk · Mandiant · GHSA</dd></div>
+    </div>
+    <p class="lede"><b>Scope.</b> Five subagents researched the six Phase 1 components in parallel, each grounded in cited primary sources. An adversarial verifier then tried to refute every load-bearing claim by fetching the originals; 10 claims failed and were corrected, then re-confirmed. Raw reports live in <code>CD_res/research-phase1/</code>. All figures below are the verified ones.</p>
+  </div>
+  <figure class="flow" role="img" aria-label="Schematic: the review pipeline is read-only until the prompt; only the 'a' key reaches the real install">
+    <svg viewBox="0 0 960 132">
+      <defs>
+        <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#191919"/>
+        </marker>
+      </defs>
+      <line x1="90" y1="44" x2="600" y2="44" stroke="#191919" stroke-width="2.5" marker-end="url(#arrow)"/>
+      <text x="90" y="30" class="fl-num">fetch + sha512 verify · sandbox extract · diff vs baseline · score</text>
+      <line x1="600" y1="54" x2="600" y2="96" stroke="#A34C2B" stroke-width="1.5" stroke-dasharray="3 3"/>
+      <text x="614" y="68" class="fl-gap">fail closed · only [a] passes</text>
+      <line x1="600" y1="104" x2="884" y2="104" stroke="#191919" stroke-width="2.5" marker-end="url(#arrow)"/>
+      <text x="90" y="124" class="fl-label">card + prompt</text>
+      <text x="884" y="124" class="fl-num" text-anchor="end">npm install --ignore-scripts</text>
+    </svg>
+  </figure>
+</header>
+
+<main class="wrap">
+
+  <nav class="contents" aria-label="Contents">
+    <h2>Contents</h2>
+    <ol>
+      <li><a href="#areas"><span>Part I · Decision areas</span><span class="c-dots"></span><span class="c-no">01–06</span></a></li>
+      <li><a href="#incidents"><span>Part II · What actually catches attacks</span><span class="c-dots"></span><span class="c-no">7</span></a></li>
+      <li><a href="#adversarial"><span>Part III · The adversarial pass</span><span class="c-dots"></span><span class="c-no">10</span></a></li>
+      <li><a href="#method"><span>Part IV · Method &amp; caveats</span><span class="c-dots"></span><span class="c-no">—</span></a></li>
+      <li><a href="#appendix"><span>Appendix · Per-report detail &amp; sources</span><span class="c-dots"></span><span class="c-no">A–F</span></a></li>
+    </ol>
+  </nav>
+
+  <!-- ================= PART I ================= -->
+  <section id="areas">
+    <div class="sec-head">
+      <p class="sec-kick"><span class="sec-no">Part I</span> · Decision areas · ranks 01–06</p>
+      <h2 class="sec-title">Six decision areas, one build order</h2>
+      <p class="sec-sub">The research voted with evidence: fix the trust store first, then diff, score, card, prompt, shim.</p>
+    </div>
+
+    <ol class="bnlist">
+      <li class="bn" id="b06">
+        <div class="bn-num">06</div>
+        <div class="bn-body">
+          <h3 class="bn-title"><span class="bn-kind">Security debt · fix first</span>Phase 0 bugs: the store records approval as truth</h3>
+          <p class="bn-stat"><span class="stat-n">2 paths</span><span class="stat-c">in shipped Phase 0 code that let a backdoored version become "known-clean"</span></p>
+          <ul class="bn-data">
+            <li><span class="k">review.rs:43-48</span> records the version as known-clean <em>before any verdict runs</em>.</li>
+            <li><span class="k">store.rs</span> silently overwrites the stored integrity when the same <span class="k">(name, version)</span> is seen again.</li>
+            <li><span class="k">npm.rs:132</span> sorts the version list lexically; the registry orders by semver precedence, and lexical sort is wrong for <span class="k">10.x</span> vs <span class="k">9.x</span>.</li>
+            <li>Consequence: review a poisoned release, press approve, and your store now blesses it. The fix is to record <em>verified</em> not <em>approved</em>, gate writes on verdict, and fail on integrity change.</li>
+          </ul>
+        </div>
+      </li>
+
+      <li class="bn" id="b01">
+        <div class="bn-num">01</div>
+        <div class="bn-body">
+          <h3 class="bn-title"><span class="bn-kind">Diff engine</span>Files first, lines later</h3>
+          <p class="bn-stat"><span class="stat-n">similar 3.1.2 + walkdir 2.5.0</span><span class="stat-c">the entire v1 dependency bill for diffing</span></p>
+          <ul class="bn-data">
+            <li>File-level ops first: a path-keyed <span class="k">BTreeMap</span> merge, not an edit script. Every 2018-2026 npm incident shows up at the file-op level without any line diffing.</li>
+            <li>Binary detection before any line diff, git's rule: NUL byte in the first <span class="k">8 KiB</span>. "Changed but unreadable" is a first-class signal, never a skip; flatmap-stream hid in a minified file, the TanStack worm was a <span class="k">2.3 MB</span> obfuscated new file.</li>
+            <li>Deadline and size caps on <span class="k">TextDiff</span> (Myers, <span class="k">O((N+M)D)</span>); oversized input degrades to <span class="k">OpaqueChanged</span> instead of an OOM. Never <span class="k">Algorithm::Lcs</span>.</li>
+            <li><span class="k">similar</span>'s inline refinement is documented "not defined, will change": use it for display only, never score on it.</li>
+            <li>The old <span class="k">diff</span>/<span class="k">difference</span> crates are frozen since 2018-2022; <span class="k">diffy</span> is apply-oriented. Not contenders.</li>
+          </ul>
+        </div>
+      </li>
+
+      <li class="bn" id="b02">
+        <div class="bn-num">02</div>
+        <div class="bn-body">
+          <h3 class="bn-title"><span class="bn-kind">Verdict heuristics</span>Additive weights, hard latches</h3>
+          <p class="bn-stat"><span class="stat-n">5 BLOCK latches</span><span class="stat-c">score can't override; everything else is a weighted sum to 100</span></p>
+          <ul class="bn-data">
+            <li>Weights derived from the incident corpus: obfuscation <span class="k">45</span> · new script <span class="k">40</span> · exec/net <span class="k">35</span> · maintainer <span class="k">30</span> · dormant <span class="k">30</span> · version burst <span class="k">25</span> · new binary <span class="k">25</span> · new dep <span class="k">10</span> (dep cap <span class="k">30</span>). Soft cap <span class="k">100</span>, monotonic, offline-deterministic.</li>
+            <li>Bands: <span class="k">LOW 0–19</span> · <span class="k">MEDIUM 20–49</span> · <span class="k">HIGH 50+</span>. <span class="k">BLOCK</span> is a latch: revocation, new install script vs clean baseline, non-registry dependency, provenance regression, integrity failure.</li>
+            <li>Script presence alone cannot block. <span class="k">2.2%</span> of npm packages ship lifecycle scripts, <span class="k">81%</span> of malware uses them; keyword matching alone misfires on <span class="k">11/74</span> legit packages.</li>
+            <li>Output is a typed <span class="k">Verdict</span> enum feeding the D7 JSON schema, with per-signal evidence and a <span class="k">registry_snapshot_at</span> timestamp so the same input forever yields the same verdict.</li>
+          </ul>
+        </div>
+      </li>
+
+      <li class="bn" id="b03">
+        <div class="bn-num">03</div>
+        <div class="bn-body">
+          <h3 class="bn-title"><span class="bn-kind">Card + prompt</span>The human says no by default</h3>
+          <p class="bn-stat"><span class="stat-n">null default</span><span class="stat-c">no implicit allow: bare Enter re-prompts, everything else denies</span></p>
+          <ul class="bn-data">
+            <li><span class="k">comfy-table 8.0.0</span> (2026-08-05). The adversarial pass caught the original pin: <span class="k">7.2.2</span> was stale and its API is gone. <span class="k">load_preset</span> and the modifiers module were removed; presets are now <span class="k">TableStyle</span> constants loaded via <span class="k">load_style</span>.</li>
+            <li>Color via <span class="k">owo-colors 4.3.0</span> + <span class="k">supports-colors</span>; honors <span class="k">NO_COLOR</span> and non-TTY.</li>
+            <li>No prompt crate. <span class="k">inquire</span> and <span class="k">dialoguer</span> are Enter-to-submit; neither does single-key <span class="k">[a]/[h]/[d]</span>. Hand-roll a single-key reader on <span class="k">crossterm</span>, which is already in the tree.</li>
+            <li>Fail-closed contract: prompt only when <span class="k">stdin.is_terminal()</span> and <span class="k">TERM != dumb</span>; <span class="k">h</span>/<span class="k">Ctrl+C</span>/<span class="k">Ctrl+D</span>/EOF all exit non-zero; only <span class="k">a</span> reaches the install.</li>
+            <li>Inverts the anti-patterns: npx's <span class="k">(y)</span> default-allow and npq's 15s auto-continue are the models to avoid; socket's <span class="k">--no-interactive</span> = cancel is the model to copy.</li>
+          </ul>
+        </div>
+      </li>
+
+      <li class="bn" id="b04">
+        <div class="bn-num">04</div>
+        <div class="bn-body">
+          <h3 class="bn-title"><span class="bn-kind">Node shim</span>Zero scripts, real binaries</h3>
+          <p class="bn-stat"><span class="stat-n">0 postinstall</span><span class="stat-c">works under --ignore-scripts, which the whole product depends on</span></p>
+          <ul class="bn-data">
+            <li><span class="k">@blueline/cli</span> is a launcher with exact-pinned <span class="k">optionalDependencies</span> on <span class="k">@blueline/binary-{linux,darwin,win32}-{x64,arm64}[-gnu|-musl]</span>. This is the esbuild/oxc/biome pattern; a postinstall downloader would be blocked by <span class="k">--ignore-scripts</span> and is a footgun.</li>
+            <li>Launcher resolves via a platform map + <span class="k">require.resolve</span>, honors a <span class="k">BLUELINE_BINARY</span> env override, and <span class="k">spawnSync</span>s the binary with <span class="k">stdio: "inherit"</span> and verbatim status passthrough.</li>
+            <li>npm's programmatic API is gone (removed in v8.0.0). Install runs by spawning the CLI via <span class="k">npm_execpath</span>. The original report cited npm/cli#6407 for this; the adversarial pass proved the citation fabricated, corrected to <span class="k">npm/npm#11130</span>.</li>
+            <li>Release: GitHub Actions matrix, <span class="k">cargo-zigbuild</span> for linux gnu/musl, native runners elsewhere, platform packages published before the metapackage, smoke test on win/ubuntu/alpine. <span class="k">cargo install</span> coexists cleanly.</li>
+          </ul>
+        </div>
+      </li>
+
+      <li class="bn" id="b05">
+        <div class="bn-num">05</div>
+        <div class="bn-body">
+          <h3 class="bn-title"><span class="bn-kind">Baseline resolution</span>Last known-clean, semver-ordered</h3>
+          <p class="bn-stat"><span class="stat-n">4 sources</span><span class="stat-c">lockfile → store → registry → first sighting, in that order</span></p>
+          <ul class="bn-data">
+            <li>Priority: lockfile <span class="k">packages</span> map (binds name+version+integrity, path-stable across hoisting and pnpm symlinks), then the <span class="k">known_clean</span> store, then the registry version list ordered by <em>semver precedence</em>, then first sighting with a loud <span class="k">no_known_clean_baseline</span> flag.</li>
+            <li>The registry hides unpublished versions from <span class="k">versions</span> but the packument <span class="k">time</span> entries linger; ordering by publish time is unreliable.</li>
+            <li>Neutral first sighting is defensible: the ecosystem warns rather than blocks on unknown-new, and ua-parser-js shows the high-risk event is a new version of a <em>known</em> package, not the first install.</li>
+            <li>"Known-clean" must be a cache of what was verified, never a judgment: re-verify integrity at consumption time.</li>
+          </ul>
+        </div>
+      </li>
+    </ol>
+  </section>
+
+  <!-- ================= PART II ================= -->
+  <section id="incidents">
+    <div class="sec-head">
+      <p class="sec-kick"><span class="sec-no">Part II</span> · Incident evidence · 7 events</p>
+      <h2 class="sec-title">What the diff should have caught</h2>
+      <p class="sec-sub">Every major npm supply-chain incident mapped to the signal that would have flagged it, against the proposed v1 rule set.</p>
+    </div>
+
+    <div class="table-scroll">
+      <table>
+        <caption>The rule set is not invented from vibes; it is reverse-engineered from what these attacks actually looked like.</caption>
+        <thead>
+          <tr><th scope="col">Incident</th><th scope="col">Year</th><th scope="col">The signal</th><th scope="col">v1 rule that fires</th><th scope="col">Caught</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><span class="k">event-stream</span> / flatmap-stream</td>
+            <td class="k">2018</td>
+            <td data-h><span class="vh">Signal</span>New maintainer, near-zero-download dep added with a caret range, hex string tables in minified code, no install script (payload ran at require time)</td>
+            <td data-h><span class="vh">Rule</span>new dep + obfuscation + maintainer</td>
+            <td class="verdict"><b class="g">yes</b></td>
+          </tr>
+          <tr>
+            <td><span class="k">eslint-scope</span></td>
+            <td class="k">2018</td>
+            <td data-h><span class="vh">Signal</span>Account takeover, new postinstall script fetching a paste and evaling it, auth token exfil</td>
+            <td data-h><span class="vh">Rule</span>new install script, BLOCK</td>
+            <td class="verdict"><b class="g">yes</b></td>
+          </tr>
+          <tr>
+            <td><span class="k">ua-parser-js</span></td>
+            <td class="k">2021</td>
+            <td data-h><span class="vh">Signal</span>Dormant package resurrected, install scripts added, many versions in one burst. <span class="k">&gt;7M</span> weekly downloads <cite>Mandiant</cite></td>
+            <td data-h><span class="vh">Rule</span>new script + dormant + version burst</td>
+            <td class="verdict"><b class="g">yes</b></td>
+          </tr>
+          <tr>
+            <td><span class="k">coa + rc</span></td>
+            <td class="k">2021</td>
+            <td data-h><span class="vh">Signal</span>Compromised maintainer, install scripts added to years-old packages</td>
+            <td data-h><span class="vh">Rule</span>new install script, BLOCK</td>
+            <td class="verdict"><b class="g">yes</b></td>
+          </tr>
+          <tr>
+            <td><span class="k">node-ipc</span></td>
+            <td class="k">2022</td>
+            <td data-h><span class="vh">Signal</span>Author-led, base64 obfuscated payload, overwrite files in the user's home dir</td>
+            <td data-h><span class="vh">Rule</span>obfuscation + annotation</td>
+            <td class="verdict"><b class="g">yes</b></td>
+          </tr>
+          <tr>
+            <td><span class="k">keyv</span> family</td>
+            <td class="k">2026</td>
+            <td data-h><span class="vh">Signal</span>Preinstall script on ten sibling packages; valid provenance present and useless. Snyk names the packages outright</td>
+            <td data-h><span class="vh">Rule</span>new install script, BLOCK</td>
+            <td class="verdict"><b class="g">yes</b></td>
+          </tr>
+          <tr>
+            <td><span class="k">TanStack/router</span> worm</td>
+            <td class="k">2026</td>
+            <td data-h><span class="vh">Signal</span>Git-dep optionalDependency, a <span class="k">2.3 MB</span> obfuscated new file, two versions six minutes apart, valid attestations throughout</td>
+            <td data-h><span class="vh">Rule</span>opaque new file + non-registry dep, BLOCK</td>
+            <td class="verdict"><b class="g">yes</b></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="takeaway">
+      <h3>Provenance is a display, not a blessing</h3>
+      <p>The TanStack worm shipped with valid SLSA provenance and still installed malware. v1 surfaces attestations and never trusts them; the diff and the script latch are where the decision lives.</p>
+    </div>
+  </section>
+
+  <!-- ================= PART III ================= -->
+  <section id="adversarial">
+    <div class="sec-head">
+      <p class="sec-kick"><span class="sec-no">Part III</span> · Verification · 10 refuted, 0 standing</p>
+      <h2 class="sec-title">Every claim tried against its source</h2>
+      <p class="sec-sub">A hostile verifier fetched the originals for the load-bearing facts. Ten failed. All ten are corrected in the reports and re-confirmed.</p>
+    </div>
+
+    <div class="table-scroll">
+      <table>
+        <caption>Refuted claims, where they lived, and the verified correction. The engineering conclusions survived in every case.</caption>
+        <thead>
+          <tr><th scope="col">#</th><th scope="col">Refuted claim</th><th scope="col">Verified reality</th><th scope="col">Status</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="k">01</td><td>comfy-table <span class="k">7.2.2</span> is current</td><td data-h><span class="vh">Reality</span><span class="k">8.0.0</span> shipped 2026-08-05, API-breaking: load_preset and modifiers removed, load_style added. The pin and code snippets would not compile</td><td class="verdict"><b class="g">fixed</b></td></tr>
+          <tr><td class="k">02</td><td>comfy-table <span class="k">88.3M</span> downloads</td><td data-h><span class="vh">Reality</span><span class="k">91.2M</span> per crates.io API</td><td class="verdict"><b class="g">fixed</b></td></tr>
+          <tr><td class="k">03</td><td>comfy-table <span class="k">1,001</span> reverse dependents</td><td data-h><span class="vh">Reality</span><span class="k">1,147</span> per crates.io API</td><td class="verdict"><b class="g">fixed</b></td></tr>
+          <tr><td class="k">04</td><td>event-stream wallet threshold <span class="k">100 BTC</span></td><td data-h><span class="vh">Reality</span><span class="k">1,000 BTC / 1,000 BCH</span> per npm postmortem</td><td class="verdict"><b class="g">fixed</b></td></tr>
+          <tr><td class="k">05</td><td>walkdir <span class="k">2.5.0</span> published 2026-06-07</td><td data-h><span class="vh">Reality</span>Published <span class="k">2024-03-01</span> per crates.io</td><td class="verdict"><b class="g">fixed</b></td></tr>
+          <tr><td class="k">06</td><td>npm CLI citation <span class="k">npm/cli#6407</span></td><td data-h><span class="vh">Reality</span>That issue is an unrelated bug. Correct citation: <span class="k">npm/npm#11130</span>, programmatic API removed in v8.0.0</td><td class="verdict"><b class="g">fixed</b></td></tr>
+          <tr><td class="k">07</td><td>Socket gamma coefficients "not published"</td><td data-h><span class="vh">Reality</span>Published in the formula docs: <span class="k">c0 = c1 = 0.05</span></td><td class="verdict"><b class="g">fixed</b></td></tr>
+          <tr><td class="k">08</td><td>keyv package names "redacted"</td><td data-h><span class="vh">Reality</span>Snyk names all ten packages outright</td><td class="verdict"><b class="g">fixed</b></td></tr>
+          <tr><td class="k">09</td><td>ua-parser-js <span class="k">~8M</span> weekly downloads</td><td data-h><span class="vh">Reality</span><span class="k">&gt;7M</span> per the cited Mandiant analysis</td><td class="verdict"><b class="g">fixed</b></td></tr>
+          <tr><td class="k">10</td><td>tabled <span class="k">34.2M</span> downloads</td><td data-h><span class="vh">Reality</span><span class="k">35.4M</span> per crates.io</td><td class="verdict"><b class="g">fixed</b></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="pull"><span>Trust the research, not the claim</span> — the numbers changed, the engineering did not.</p>
+
+    <div class="takeaway">
+      <h3>What stayed unverifiable</h3>
+      <p>Eight items remain hedged in the reports: the TanStack worm's exact byte count and six-minute spacing, node-ipc's CVSS score, an OSV coverage figure, an ACSAC malware-detection rate, sandworm's weights. Each is already flagged in its report instead of asserted.</p>
+    </div>
+  </section>
+
+  <!-- ================= PART IV ================= -->
+  <section id="method">
+    <div class="sec-head">
+      <p class="sec-kick"><span class="sec-no">Part IV</span> · Method</p>
+      <h2 class="sec-title">Raw material &amp; caveats</h2>
+      <p class="sec-sub">How the five reports were produced, and where to distrust them anyway.</p>
+    </div>
+    <div class="method">
+      <h3>How the research ran</h3>
+      <ul>
+        <li>Five subagents in parallel, one per decision area, each owning exactly one output file under <span class="k">CD_res/research-phase1/</span>.</li>
+        <li>Each claim grounded in a fetched primary source: crates.io and docs.rs for crates, GitHub repos and release notes for tools, npm registry behavior against the live packument, and incident postmortems against the vendors that wrote them.</li>
+        <li>An adversarial verifier then attacked the load-bearing claims, fetching the same sources. Refuted claims were corrected in the reports and passed a confirmation pass. Status GREEN.</li>
+      </ul>
+      <h3>Caveats</h3>
+      <ul>
+        <li>Reverse-dependency counts drift: the report says <span class="k">1,147</span>, one live check read <span class="k">1,020</span>. These are point-in-time numbers, cosmetic either way.</li>
+        <li>nan-crate activity dates ("maintained 2026") were framed from release history, which for walkdir is quiet since 2024-03-01.</li>
+        <li>Vendor numbers (Socket's formula, Snyk's priority score) are published reference models, not evidence about live deployments.</li>
+        <li>Nothing here covers Phases 2-5: revocation caches, provenance verification, hosted recall, or the ML verdict model. Scope is Phase 1 only.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ================= APPENDIX ================= -->
+  <section id="appendix">
+    <div class="sec-head">
+      <div>
+        <p class="sec-kick"><span class="sec-no">Appendix</span> · Per-report detail · A–F</p>
+        <h2 class="sec-title">The deep dive</h2>
+        <p class="sec-sub">Per-area detail and the primary sources behind it. Collapsible so the main flow stays readable.</p>
+      </div>
+      <button class="apx-btn" id="apx-toggle" type="button" aria-controls="appendix">Expand all</button>
+    </div>
+
+    <details class="appx" id="apxA">
+      <summary><span class="appx-letter">A</span><span class="appx-title">Diff engine</span><span class="appx-count">diff-engine.md</span></summary>
+      <div class="appx-body">
+        <div class="sg">
+          <h4>Dependencies<span class="cid">the whole bill</span></h4>
+          <p><span class="k">similar</span> 3.1.2 with the <span class="k">inline</span> feature only, plus <span class="k">walkdir</span> 2.5.0. The old diff and difference crates are frozen; diffy is apply-oriented and unnecessary.</p>
+        </div>
+        <div class="sg">
+          <h4>Output shape<span class="cid">typed Delta</span></h4>
+          <ul>
+            <li>Per-path operations from a BTreeMap merge, not an edit script; hunks are a render-time concern.</li>
+            <li>Binary and oversized files become <span class="k">OpaqueChanged</span>: present in the delta, unreadable to the diff, never silently skipped.</li>
+            <li>Empty delta between distinct versions is a note, not an error; missing baseline is an error, never a fake empty diff.</li>
+          </ul>
+        </div>
+        <div class="sg">
+          <h4>Sources<span class="cid">primary</span></h4>
+          <ul>
+            <li>docs.rs/similar · crates.io/crates/similar · docs.rs/walkdir · crates.io/crates/walkdir</li>
+            <li>git documentation on binary attributes (NUL-byte detection) · GitHub docs on diff limits</li>
+            <li>npm blog event-stream postmortem · Snyk event-stream postmortem · GHSA-9x64-5r7x-2q53 · eslint-scope postmortem</li>
+            <li>Mandiant ua-parser-js analysis · Snyk keyv compromise analysis</li>
+          </ul>
+        </div>
+      </div>
+    </details>
+
+    <details class="appx" id="apxB">
+      <summary><span class="appx-letter">B</span><span class="appx-title">Verdict heuristics</span><span class="appx-count">verdict-heuristics.md</span></summary>
+      <div class="appx-body">
+        <div class="sg">
+          <h4>Scoring model<span class="cid">v1 weights</span></h4>
+          <p>Weighted additive sum with per-signal soft caps, a global cap of 100, and monotonic risk-only movement. Five hard latches bypass the score entirely.</p>
+        </div>
+        <div class="sg">
+          <h4>Where the weights come from<span class="cid">evidence</span></h4>
+          <ul>
+            <li>Obfuscation and new-script signals derive from event-stream, node-ipc, eslint-scope, keyv, and TanStack.</li>
+            <li>Dormancy and version-burst signals derive from ua-parser-js and coa/rc.</li>
+            <li>False-positive calibration: legitimate postinstall in sharp, esbuild, core-js; keyword matching alone misfires on 11 of 74 samples.</li>
+          </ul>
+        </div>
+        <div class="sg">
+          <h4>Sources<span class="cid">primary</span></h4>
+          <ul>
+            <li>docs.socket.dev package scores (published formula, gamma coefficients) · npm audit and OSV-Scanner docs</li>
+            <li>npq documentation and thresholds · sandworm-audit docs · Snyk and Mandiant incident write-ups</li>
+            <li>ACSAC 2023 cross-language malware detection · ICSE 2022 Amalfi study</li>
+          </ul>
+        </div>
+      </div>
+    </details>
+
+    <details class="appx" id="apxC">
+      <summary><span class="appx-letter">C</span><span class="appx-title">Card + interactive prompt</span><span class="appx-count">card-and-prompt.md</span></summary>
+      <div class="appx-body">
+        <div class="sg">
+          <h4>Dependencies<span class="cid">two crates</span></h4>
+          <p><span class="k">comfy-table 8.0.0</span> (default features) and <span class="k">owo-colors 4.3.0</span> with <span class="k">supports-colors</span>. No prompt crate; single-key reading rides crossterm.</p>
+        </div>
+        <div class="sg">
+          <h4>The interactive contract<span class="cid">fail closed</span></h4>
+          <ul>
+            <li>Prompt only on a real TTY with a sane TERM; piped and dumb-terminal runs emit the JSON verdict instead.</li>
+            <li>Bare Enter re-prompts, unknown keys re-prompt, h and Ctrl+C and Ctrl+D and EOF all exit non-zero.</li>
+            <li>Only an explicit <span class="k">a</span> proceeds to the install. There is no auto-allow and no timeout that advances to allow.</li>
+          </ul>
+        </div>
+        <div class="sg">
+          <h4>Sources<span class="cid">primary</span></h4>
+          <ul>
+            <li>crates.io/crates/comfy-table · github.com/Nukesor/comfy-table/releases/tag/v8.0.0 · docs.rs/comfy-table</li>
+            <li>crates.io/crates/owo-colors · crates.io/crates/tabled · docs.rs inquire and dialoguer</li>
+            <li>npm exec and npx prompt behavior · socket --no-interactive docs · gh CLI docs</li>
+          </ul>
+        </div>
+      </div>
+    </details>
+
+    <details class="appx" id="apxD">
+      <summary><span class="appx-letter">D</span><span class="appx-title">Node shim + release</span><span class="appx-count">node-shim.md</span></summary>
+      <div class="appx-body">
+        <div class="sg">
+          <h4>Package layout<span class="cid">zero-scripts</span></h4>
+          <p>Metapackage with exact logical optionalDependencies on eight platform packages. No install.js, no postinstall, no repair fallback. The pattern is proven by esbuild, oxc, and biome.</p>
+        </div>
+        <div class="sg">
+          <h4>Execution chain<span class="cid">shim to install</span></h4>
+          <ul>
+            <li>Launcher: platform map + require.resolve, BLUELINE_BINARY override, spawnSync with inherited stdio, verbatim exit code.</li>
+            <li>Approve path spawns the real npm through <span class="k">npm_execpath</span> with <span class="k">--ignore-scripts</span>; stdio and signal passthrough keep the TTY and the contract intact.</li>
+            <li>npm CLI was the supported way to do this since the programmatic API was removed in v8.0.0.</li>
+          </ul>
+        </div>
+        <div class="sg">
+          <h4>Sources<span class="cid">primary</span></h4>
+          <ul>
+            <li>github.com/npm/npm/pull/11130 · npm CLI docs (npm-install, npm exec) · npm scripts docs</li>
+            <li>esbuild lib/main.js and install layout · oxc and biome package layout and release workflows</li>
+            <li>cargo-zigbuild docs · GitHub Actions release work</li>
+          </ul>
+        </div>
+      </div>
+    </details>
+
+    <details class="appx" id="apxE">
+      <summary><span class="appx-letter">E</span><span class="appx-title">Baseline resolution</span><span class="appx-count">baseline-resolution.md</span></summary>
+      <div class="appx-body">
+        <div class="sg">
+          <h4>Resolution algorithm<span class="cid">priority order</span></h4>
+          <p>Lockfile v3 packages map, then the known-clean store, then the registry list ordered by semver precedence, then first sighting with a machine-readable no-baseline flag and a neutral verdict.</p>
+        </div>
+        <div class="sg">
+          <h4>Anti-poisoning rules<span class="cid">fixes Phase 0</span></h4>
+          <ul>
+            <li>Only a LOW verdict writes to known-clean; witnessed but unjudged versions are recorded as verified, not clean.</li>
+            <li>Integrity changes on a stored version fail the review instead of silently overwriting.</li>
+            <li>The registry version ordering bug (lexical vs semver) is corrected with npm's resolutor behavior as the reference.</li>
+          </ul>
+        </div>
+        <div class="sg">
+          <h4>Sources<span class="cid">primary</span></h4>
+          <ul>
+            <li>registry.npmjs.org live packuments (versions, time, dist) · npm-pick-manifest and pacote docs</li>
+            <li>npm lockfile v3 documentation · npm ls and npm query docs · RFC 0054</li>
+            <li>npq, audit-ci, npm-audit-resolver, and Socket allowlist behavior</li>
+          </ul>
+        </div>
+      </div>
+    </details>
+
+    <details class="appx" id="apxF">
+      <summary><span class="appx-letter">F</span><span class="appx-title">Adversarial verification</span><span class="appx-count">10 refuted · 8 hedged</span></summary>
+      <div class="appx-body">
+        <div class="sg">
+          <h4>What held<span class="cid">the load-bearing core</span></h4>
+          <p>Registry mechanics (corgi packuments, time entries, variant parsing), npm v11 min-release-age RFC and v12 defaults, the esbuild/oxc/biome launcher patterns, git and GitHub diff limits, and every incident fact survived the pass.</p>
+        </div>
+        <div class="sg">
+          <h4>Where claims died<span class="cid">the honest accounting</span></h4>
+          <ul>
+            <li>Ten refuted claims are listed in Part III; every correction was confirmed against a fetched primary source.</li>
+            <li>Eight unreachable numbers were flagged as unverifiable in the reports rather than asserted.</li>
+            <li>No recommendation turned out to be unsafe for a fail-closed tool; the fixes were version rebases and citation swaps.</li>
+          </ul>
+        </div>
+      </div>
+    </details>
+  </section>
+
+</main>
+
+<footer class="mastfoot">
+  <div class="wrap">Blueline · Phase 1 research · Compiled 2026-08-13 · Internal use · All figures verbatim from cited sources</div>
+</footer>
+
+<script>
+(function(){
+  "use strict";
+  var bar = document.getElementById("progress");
+  var barIn = bar ? bar.querySelector("i") : null;
+  function updateBar(){
+    var h = document.documentElement;
+    var max = h.scrollHeight - h.clientHeight;
+    var p = max > 0 ? h.scrollTop / max : 0;
+    if(barIn) barIn.style.transform = "scaleX(" + p + ")";
+  }
+  if(barIn){
+    updateBar();
+    window.addEventListener("scroll", updateBar, { passive: true });
+    window.addEventListener("resize", updateBar, { passive: true });
+  }
+
+  var toggle = document.getElementById("apx-toggle");
+  var group = document.getElementById("appendix");
+  if(toggle && group){
+    toggle.addEventListener("click", function(){
+      var details = group.querySelectorAll("details.appx");
+      var anyClosed = Array.prototype.some.call(details, function(d){ return !d.open; });
+      details.forEach(function(d){ d.open = anyClosed; });
+      toggle.textContent = anyClosed ? "Collapse all" : "Expand all";
+    });
+  }
+})();
+</script>
+</body>
+</html>

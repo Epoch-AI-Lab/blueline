@@ -40,11 +40,12 @@ pub fn run(pkg_spec: &str, registry_base: &str, output: Output) -> anyhow::Resul
         )
     })?;
 
-    // Persist "this exact tarball, integrity-verified" as the known-clean baseline.
+    // Persist the verified tarball as evidence, not a blessing: the row is
+    // recorded dirty (clean = 0) until a verdict (Phase 1) cleans it.
     let store = BaselineStore::open().map_err(|e| anyhow::anyhow!("baseline store: {e}"))?;
     let integrity = pkg.integrity.clone().unwrap_or_default();
     store
-        .record_known_clean(&pkg.name, &pkg.version, &integrity)
+        .record_verified(&pkg.name, &pkg.version, &integrity)
         .map_err(|e| anyhow::anyhow!("baseline store: {e}"))?;
 
     let summary = ReviewSummary {
@@ -54,7 +55,7 @@ pub fn run(pkg_spec: &str, registry_base: &str, output: Output) -> anyhow::Resul
         files: stats.files,
         unpacked_bytes: stats.unpacked_bytes,
         install_scripts: manifest.lifecycle_scripts(),
-        baseline: "recorded as known-clean".to_string(),
+        baseline: "verified; no clean verdict yet".to_string(),
     };
 
     match output.resolve(std::io::stdout().is_terminal()) {

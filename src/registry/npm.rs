@@ -61,7 +61,7 @@ impl NpmRegistry {
             .map_err(|e| BluelineError::Network(format!("GET {}: {e}", pkg.tarball_url)))?;
         let mut reader = resp.into_reader();
         let mut hasher = Sha512::new();
-        let mut buf = [0u8; 64 * 1024];
+        let mut buf = [0u8; 65536];
         let mut bytes = Vec::new();
         loop {
             let n = reader.read(&mut buf).map_err(|e| {
@@ -161,4 +161,40 @@ struct VersionMeta {
 struct Dist {
     tarball: String,
     integrity: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_versions_orders_and_limits() {
+        let versions: BTreeMap<String, VersionMeta> =
+            ["1.0.0", "1.0.1", "1.2.0", "1.10.0", "2.0.0", "10.0.0"]
+                .iter()
+                .map(|v| {
+                    let vm = VersionMeta {
+                        name: "p".into(),
+                        version: v.to_string(),
+                        dist: Dist {
+                            tarball: String::new(),
+                            integrity: None,
+                        },
+                    };
+                    (v.to_string(), vm)
+                })
+                .collect();
+        let pm = Packument {
+            name: "p".into(),
+            dist_tags: BTreeMap::new(),
+            versions,
+        };
+        // Current behaviour: lexical sort, reversed, capped at 8. This locks the
+        // output so a regression (e.g. returning a constant) is caught. Must
+        // become semver-precedence in Phase 1 baseline resolution.
+        assert_eq!(
+            list_versions(&pm),
+            "2.0.0, 10.0.0, 1.2.0, 1.10.0, 1.0.1, 1.0.0"
+        );
+    }
 }

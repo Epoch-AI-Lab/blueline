@@ -181,25 +181,25 @@ mod tests {
     /// Hand-crafted raw tar bytes. `typeflag`: 0x30 regular, 0x32 symlink,
     /// 0x31 hardlink, 0x35 directory. The tar *builder* refuses such paths,
     /// so malicious archives are written by hand — as they arrive on the wire.
+    fn raw_header(name: &str, typeflag: u8, size: u64, linkname: &str, mode: u32) -> Vec<u8> {
+        let mut h = [0u8; 512];
+        h[..name.len()].copy_from_slice(name.as_bytes());
+        h[100..108].copy_from_slice(format!("{:07o}\x00", mode).as_bytes());
+        h[108..116].copy_from_slice(b"0000000\x00");
+        h[116..124].copy_from_slice(b"0000000\x00");
+        h[124..136].copy_from_slice(format!("{:011o}\x00", size).as_bytes());
+        h[136..148].copy_from_slice(b"00000000000\x00");
+        h[156] = typeflag;
+        h[157..157 + linkname.len()].copy_from_slice(linkname.as_bytes());
+        h[148..156].fill(b' ');
+        let sum: u64 = h.iter().map(|&b| u64::from(b)).sum();
+        let chksum = format!("{:06o}\x00 ", sum);
+        h[148..156].copy_from_slice(chksum.as_bytes());
+        h.to_vec()
+    }
+
     fn raw_tarball(entries: &[(String, u8, &str)]) -> Vec<u8> {
         use std::io::Write;
-
-        fn raw_header(name: &str, typeflag: u8, size: u64, linkname: &str) -> Vec<u8> {
-            let mut h = [0u8; 512];
-            h[..name.len()].copy_from_slice(name.as_bytes());
-            h[100..108].copy_from_slice(b"0000644\x00");
-            h[108..116].copy_from_slice(b"0000000\x00");
-            h[116..124].copy_from_slice(b"0000000\x00");
-            h[124..136].copy_from_slice(format!("{:011o}\x00", size).as_bytes());
-            h[136..148].copy_from_slice(b"00000000000\x00");
-            h[156] = typeflag;
-            h[157..157 + linkname.len()].copy_from_slice(linkname.as_bytes());
-            h[148..156].fill(b' ');
-            let sum: u64 = h.iter().map(|&b| u64::from(b)).sum();
-            let chksum = format!("{:06o}\x00 ", sum);
-            h[148..156].copy_from_slice(chksum.as_bytes());
-            h.to_vec()
-        }
 
         let mut out = Vec::new();
         for (name, typeflag, linkname) in entries {
@@ -210,7 +210,7 @@ mod tests {
             } else {
                 0
             };
-            out.extend_from_slice(&raw_header(name, *typeflag, size, linkname));
+            out.extend_from_slice(&raw_header(name, *typeflag, size, linkname, 0o644));
             if size == 1 {
                 out.extend_from_slice(&data);
             }
@@ -307,5 +307,101 @@ mod tests {
         };
         let err = safe_extract(&tarball, dir.path(), &limits).unwrap_err();
         assert!(matches!(err, BluelineError::ExtractionLimit(_)));
+    }
+
+    #[test]
+    fn defaults_are_sane() {
+        let d = ExtractionLimits::default();
+        assert_eq!(d.max_unpacked_bytes, 512 * 1024 * 1024);
+        assert_eq!(d.max_entries, 100_000);
+        assert_eq!(d.max_entry_bytes, 128 * 1024 * 1024);
+    }
+
+    #[test]
+    fn skips_metadata_entries() {
+        // GNU long-name / long-link and pax extension entries carry no
+        // payload and must be skipped, never extracted or rejected.
+        for (name, typeflag) in [
+            ("longname", 0x4c_u8),
+            ("longlink", 0x4b_u8),
+            ("paxglobal", 0x67_u8),
+            ("paxlocal", 0x78_u8),
+        ] {
+            let tarball = raw_tarball(&[(name.to_string(), typeflag, "")]);
+            let dir = tempfile::tempdir().unwrap();
+            let stats = safe_extract(&tarball, dir.path(), &ExtractionLimits::default()).unwrap();
+            assert_eq!(stats.files, 0, "metadata entry {name} must be skipped");
+        }
+    }
+
+    #[test]
+    fn entry_count_at_boundary() {
+        let entries: Vec<(&str, &[u8])> = (0..2)
+            .map(|i| {
+                let name: &'static str = Box::leak(format!("f{i}").into_boxed_str());
+                (name, &b"x"[..])
+            })
+            .collect();
+        let tarball = make_tarball(&entries);
+        let dir = tempfile::tempdir().unwrap();
+        let limits = ExtractionLimits {
+            max_entries: 2,
+            ..ExtractionLimits::default()
+        };
+        let stats = safe_extract(&tarball, dir.path(), &limits).unwrap();
+        assert_eq!(stats.files, 2, "exactly max_entries files must extract");
+    }
+
+    #[test]
+    fn per_entry_size_at_boundary() {
+        let tarball = make_tarball(&[("big", &[0u8; 1024])]);
+        let dir = tempfile::tempdir().unwrap();
+        let limits = ExtractionLimits {
+            max_entry_bytes: 1024,
+            ..ExtractionLimits::default()
+        };
+        let stats = safe_extract(&tarball, dir.path(), &limits).unwrap();
+        assert_eq!(
+            stats.files, 1,
+            "entry at exactly the per-entry cap must extract"
+        );
+    }
+
+    #[test]
+    fn total_size_at_boundary() {
+        let tarball = make_tarball(&[("big", &[0u8; 512])]);
+        let dir = tempfile::tempdir().unwrap();
+        let limits = ExtractionLimits {
+            max_unpacked_bytes: 512,
+            ..ExtractionLimits::default()
+        };
+        let stats = safe_extract(&tarball, dir.path(), &limits).unwrap();
+        assert_eq!(
+            stats.unpacked_bytes, 512,
+            "total at exactly the cap must extract"
+        );
+    }
+
+    #[test]
+    fn counts_directories() {
+        let tarball = raw_tarball(&[("sub".into(), 0x35, ""), ("file2".into(), 0x30, "")]);
+        let dir = tempfile::tempdir().unwrap();
+        let stats = safe_extract(&tarball, dir.path(), &ExtractionLimits::default()).unwrap();
+        assert_eq!(stats.dirs, 1);
+        assert_eq!(stats.files, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strips_setuid_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("evil");
+        fs::write(&path, b"x").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o4755)).unwrap();
+        strip_special_bits(&path);
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "permission bits preserved");
+        assert_eq!(mode & 0o4000, 0, "setuid bit must be stripped");
     }
 }
