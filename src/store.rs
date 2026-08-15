@@ -314,6 +314,15 @@ mod tests {
     }
 
     #[test]
+    fn rejects_empty_or_whitespace_only_integrity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
+        assert!(store.record_verified("pkg", "1.0.0", "").is_err());
+        assert!(store.record_verified("pkg", "1.0.0", "   ").is_err());
+        assert!(store.record_verified("pkg", "1.0.0", "\t\n").is_err());
+    }
+
+    #[test]
     #[cfg(unix)]
     fn enforces_unix_file_and_directory_permissions() {
         use std::os::unix::fs::PermissionsExt;

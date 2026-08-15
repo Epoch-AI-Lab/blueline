@@ -16,7 +16,7 @@ const USER_AGENT: &str = concat!("blueline/", env!("CARGO_PKG_VERSION"));
 const SRI_PREFIX: &str = "sha512-";
 
 const MAX_PACKUMENT_BYTES: u64 = 64 * 1024 * 1024; // 64 MB cap on packument JSON
-const MAX_TARBALL_BYTES: u64 = 512 * 1024 * 1024; // 512 MB cap on compressed tarball
+const MAX_TARBALL_BYTES: u64 = 512 * 1024 + /* ~ changed by cargo-mutants ~ */ 1024; // 512 MB cap on compressed tarball
 
 pub struct NpmRegistry {
     agent: Agent,
@@ -120,6 +120,22 @@ impl NpmRegistry {
             self.validate_tarball_url(&current_url)?;
             let res = self.agent.get(&current_url).call();
             match res {
+                Ok(response) if (301..=308).contains(&response.status()) => {
+                    redirects_followed += 1;
+                    if redirects_followed > MAX_REDIRECTS {
+                        return Err(BluelineError::Network(format!(
+                            "too many redirects downloading {}",
+                            pkg.tarball_url
+                        )));
+                    }
+                    let location = response.header("location").ok_or_else(|| {
+                        BluelineError::Network(format!(
+                            "redirect {} missing Location header for {current_url}",
+                            response.status()
+                        ))
+                    })?;
+                    current_url = location.to_string();
+                }
                 Ok(response) => break response,
                 Err(ureq::Error::Status(code, response)) if (301..=308).contains(&code) => {
                     redirects_followed += 1;
@@ -245,6 +261,8 @@ fn is_valid_name_segment(s: &str) -> bool {
     !s.is_empty()
         && s != "."
         && s != ".."
+        && !s.starts_with('.')
+        && !s.starts_with('_')
         && s.chars().all(|c| {
             c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_' || c == '.'
         })
@@ -582,5 +600,183 @@ mod tests {
         assert!(validate_package_name("@scope/pkg/extra").is_err());
         assert!(validate_package_name("@/pkg").is_err());
         assert!(validate_package_name("@scope/").is_err());
+        assert!(validate_package_name(".pkg").is_err());
+        assert!(validate_package_name("_pkg").is_err());
+        assert!(validate_package_name("@.scope/pkg").is_err());
+        assert!(validate_package_name("@_scope/pkg").is_err());
+        assert!(validate_package_name("@scope/.pkg").is_err());
+        assert!(validate_package_name("@scope/_pkg").is_err());
+
+        // Test length boundaries: 214 is max allowed by npm, 215 is rejected
+        let len214 = "a".repeat(214);
+        assert!(validate_package_name(&len214).is_ok());
+        let len215 = "a".repeat(215);
+        assert!(validate_package_name(&len215).is_err());
+
+        // Test individual forbidden characters in name and scope
+        let forbidden = [
+            '~', '\'', '(', ')', '*', '!', '\0', '\n', '\r', '\t', '\x07',
+        ];
+        for c in forbidden {
+            assert!(validate_package_name(&format!("pkg{c}")).is_err());
+            assert!(validate_package_name(&format!("@scope/pkg{c}")).is_err());
+            assert!(validate_package_name(&format!("@scope{c}/pkg")).is_err());
+        }
+    }
+
+    #[test]
+    fn mock_http_resolve_and_dist_tags() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            // Exactly 4 requests: testpkg dist-tag, testpkg resolve, mismatchname, mismatchver
+            for _ in 0..4 {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 1024];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+
+                    if req.contains("GET /testpkg ") {
+                        let body = r#"{"name":"testpkg","dist-tags":{"latest":"2.1.0"},"versions":{"2.1.0":{"name":"testpkg","version":"2.1.0","dist":{"tarball":"http://127.0.0.1:1/pkg.tgz","integrity":"sha512-test"}}}}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    } else if req.contains("GET /mismatchname ") {
+                        let body = r#"{"name":"otherpkg","dist-tags":{},"versions":{"1.0.0":{"name":"otherpkg","version":"1.0.0","dist":{"tarball":"http://127.0.0.1:1/pkg.tgz","integrity":null}}}}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    } else if req.contains("GET /mismatchver ") {
+                        let body = r#"{"name":"mismatchver","dist-tags":{},"versions":{"1.0.0":{"name":"mismatchver","version":"2.0.0","dist":{"tarball":"http://127.0.0.1:1/pkg.tgz","integrity":null}}}}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    }
+                }
+            }
+        });
+
+        let reg = NpmRegistry::new(&base);
+        let tag = reg.resolve_dist_tag("testpkg", "latest").unwrap();
+        assert_eq!(tag, Some("2.1.0".into()));
+
+        let pkg = reg.resolve("testpkg", "2.1.0").unwrap();
+        assert_eq!(pkg.name, "testpkg");
+        assert_eq!(pkg.version, "2.1.0");
+
+        let err_name = reg.resolve("mismatchname", "1.0.0").unwrap_err();
+        assert!(err_name.to_string().contains("registry metadata mismatch"));
+
+        let err_ver = reg.resolve("mismatchver", "1.0.0").unwrap_err();
+        assert!(err_ver.to_string().contains("registry metadata mismatch"));
+
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn mock_http_redirect_handling() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            // Handle redirect loop (302 redirecting to same URL; initial request + 5 redirects = 6 requests)
+            for _ in 0..6 {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf);
+                    let resp = format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/loop\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+            }
+        });
+
+        let reg = NpmRegistry::new(&base);
+        let pkg = Package {
+            name: "test".into(),
+            version: "1.0.0".into(),
+            tarball_url: format!("{base}/loop"),
+            integrity: Some("sha512-test".into()),
+        };
+        let err = reg.fetch_url_verified(&pkg).unwrap_err();
+        assert!(err.to_string().contains("too many redirects"));
+
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn packument_and_tarball_size_above_false_equivalent_cap() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base = format!("http://127.0.0.1:{port}");
+
+        // Build a tarball of 6000 bytes (above 512 + 1024 + 1024 = 2560 bytes)
+        let payload = vec![b'a'; 6000];
+        let mut hasher = sha2::Sha512::new();
+        hasher.update(&payload);
+        let hash = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
+        let integrity = format!("sha512-{hash}");
+
+        let handle = std::thread::spawn(move || {
+            for _ in 0..2 {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 1024];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+
+                    if req.contains("GET /bigpkg ") {
+                        // Packument of 6000 bytes (above 64 + 1024 + 1024 = 2112 bytes)
+                        let padding = "a".repeat(5000);
+                        let body = format!(
+                            r#"{{"name":"bigpkg","description":"{padding}","dist-tags":{{"latest":"1.0.0"}},"versions":{{"1.0.0":{{"name":"bigpkg","version":"1.0.0","dist":{{"tarball":"http://127.0.0.1:{port}/big.tgz","integrity":"{integrity}"}}}}}}}}"#
+                        );
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    } else if req.contains("GET /big.tgz ") {
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            payload.len()
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                        let _ = stream.write_all(&payload);
+                    }
+                }
+            }
+        });
+
+        let reg = NpmRegistry::new(&base);
+        let pkg = reg.resolve("bigpkg", "1.0.0").unwrap();
+        assert_eq!(pkg.name, "bigpkg");
+
+        let tarball_bytes = reg.fetch_tarball(&pkg).unwrap();
+        assert_eq!(tarball_bytes.len(), 6000);
+
+        let _ = handle.join();
     }
 }

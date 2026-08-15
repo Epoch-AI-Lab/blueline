@@ -164,10 +164,8 @@ mod tests {
         let body = format!("{{\"x\":\"{}\"}}", "a".repeat(n));
         assert_eq!(body.len(), 10 * 1024 * 1024 + 1);
         fs::write(&path, &body).unwrap();
-        assert!(matches!(
-            read_package_json(&path).unwrap_err(),
-            BluelineError::Manifest(_, _)
-        ));
+        let err = read_package_json(&path).unwrap_err();
+        assert!(err.to_string().contains("manifest exceeds cap"));
     }
 
     #[test]
