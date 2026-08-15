@@ -15,16 +15,35 @@ const CORGI_ACCEPT: &str = "application/vnd.npm.install-v1+json";
 const USER_AGENT: &str = concat!("blueline/", env!("CARGO_PKG_VERSION"));
 const SRI_PREFIX: &str = "sha512-";
 
-const MAX_PACKUMENT_BYTES: u64 = 64 * 1024 * 1024; // 64 MB cap on packument JSON
-const MAX_TARBALL_BYTES: u64 = 512 * 1024 + /* ~ changed by cargo-mutants ~ */ 1024; // 512 MB cap on compressed tarball
+#[derive(Debug, Clone, Copy)]
+pub struct RegistryLimits {
+    pub max_packument_bytes: u64,
+    pub max_tarball_bytes: u64,
+    pub max_redirects: usize,
+}
+
+impl Default for RegistryLimits {
+    fn default() -> Self {
+        Self {
+            max_packument_bytes: 64 * 1024 * 1024,
+            max_tarball_bytes: 512 * 1024 * 1024,
+            max_redirects: 5,
+        }
+    }
+}
 
 pub struct NpmRegistry {
     agent: Agent,
     base: String,
+    limits: RegistryLimits,
 }
 
 impl NpmRegistry {
     pub fn new(base: &str) -> Self {
+        Self::with_limits(base, RegistryLimits::default())
+    }
+
+    pub fn with_limits(base: &str, limits: RegistryLimits) -> Self {
         let agent = ureq::AgentBuilder::new()
             .timeout(std::time::Duration::from_secs(90))
             .user_agent(USER_AGENT)
@@ -33,6 +52,7 @@ impl NpmRegistry {
         Self {
             agent,
             base: base.trim_end_matches('/').to_string(),
+            limits,
         }
     }
 
@@ -90,20 +110,23 @@ impl NpmRegistry {
             .map_err(|e| BluelineError::Network(format!("GET {url}: {e}")))?;
 
         let mut body = String::new();
-        let mut reader = resp.into_reader().take(MAX_PACKUMENT_BYTES + 1);
+        let mut reader = resp.into_reader().take(self.limits.max_packument_bytes + 1);
         reader
             .read_to_string(&mut body)
             .map_err(|e| BluelineError::Network(format!("reading {url}: {e}")))?;
 
-        if body.len() as u64 > MAX_PACKUMENT_BYTES {
+        if body.len() as u64 > self.limits.max_packument_bytes {
             return Err(BluelineError::Manifest(
                 name.to_string(),
-                format!("packument exceeds maximum cap of {MAX_PACKUMENT_BYTES} bytes"),
+                format!(
+                    "packument exceeds maximum cap of {} bytes",
+                    self.limits.max_packument_bytes
+                ),
             ));
         }
 
         let packument: Packument = serde_json::from_str(&body).map_err(|e| {
-            BluelineError::Manifest(name.to_string(), format!("invalid packument JSON: {e}"))
+            BluelineError::Manifest(name.to_string(), format!("corrupt packument JSON: {e}"))
         })?;
         validate_package_name(&packument.name)?;
         Ok(packument)
@@ -114,7 +137,6 @@ impl NpmRegistry {
     fn fetch_url_verified(&self, pkg: &Package) -> Result<Vec<u8>, BluelineError> {
         let mut current_url = pkg.tarball_url.clone();
         let mut redirects_followed = 0;
-        const MAX_REDIRECTS: usize = 5;
 
         let resp = loop {
             self.validate_tarball_url(&current_url)?;
@@ -122,7 +144,7 @@ impl NpmRegistry {
             match res {
                 Ok(response) if (301..=308).contains(&response.status()) => {
                     redirects_followed += 1;
-                    if redirects_followed > MAX_REDIRECTS {
+                    if redirects_followed > self.limits.max_redirects {
                         return Err(BluelineError::Network(format!(
                             "too many redirects downloading {}",
                             pkg.tarball_url
@@ -147,14 +169,15 @@ impl NpmRegistry {
         };
 
         let mut bytes = Vec::new();
-        let mut reader = resp.into_reader().take(MAX_TARBALL_BYTES + 1);
+        let mut reader = resp.into_reader().take(self.limits.max_tarball_bytes + 1);
         reader
             .read_to_end(&mut bytes)
             .map_err(|e| BluelineError::Network(format!("downloading {}: {e}", pkg.tarball_url)))?;
 
-        if bytes.len() as u64 > MAX_TARBALL_BYTES {
+        if bytes.len() as u64 > self.limits.max_tarball_bytes {
             return Err(BluelineError::ExtractionLimit(format!(
-                "tarball exceeds maximum size cap of {MAX_TARBALL_BYTES} bytes"
+                "tarball exceeds maximum size cap of {} bytes",
+                self.limits.max_tarball_bytes
             )));
         }
 
@@ -798,6 +821,226 @@ mod tests {
 
         let tarball_bytes = reg.fetch_tarball(&pkg).unwrap();
         assert_eq!(tarball_bytes.len(), 6000);
+
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn packument_exact_limits_boundary() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base = format!("http://127.0.0.1:{port}");
+
+        let body_exact = r#"{"name":"exactpkg","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"exactpkg","version":"1.0.0","dist":{"tarball":"http://127.0.0.1:1/p.tgz","integrity":null}}}}"#;
+        let exact_len = body_exact.len();
+        let body_over = format!("{body_exact} ");
+
+        let handle = std::thread::spawn(move || {
+            for _ in 0..2 {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 1024];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+
+                    if req.contains("GET /exactpkg ") {
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body_exact.len(),
+                            body_exact
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    } else if req.contains("GET /overpkg ") {
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body_over.len(),
+                            body_over
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    }
+                }
+            }
+        });
+
+        let reg_exact = NpmRegistry::with_limits(
+            &base,
+            RegistryLimits {
+                max_packument_bytes: exact_len as u64,
+                ..RegistryLimits::default()
+            },
+        );
+        let pkg = reg_exact.resolve("exactpkg", "1.0.0").unwrap();
+        assert_eq!(pkg.name, "exactpkg");
+
+        // Over cap: over body length is exact_len + 1 with limit exact_len
+        let err = reg_exact.resolve("overpkg", "1.0.0").unwrap_err();
+        assert!(err.to_string().contains("packument exceeds maximum cap"));
+
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn tarball_exact_limits_boundary() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base = format!("http://127.0.0.1:{port}");
+
+        let exact_payload = vec![b'x'; 50];
+        let mut hasher = sha2::Sha512::new();
+        hasher.update(&exact_payload);
+        let hash = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
+        let exact_integrity = format!("sha512-{hash}");
+
+        let over_payload = vec![b'y'; 51];
+        let mut hasher2 = sha2::Sha512::new();
+        hasher2.update(&over_payload);
+        let hash2 = base64::engine::general_purpose::STANDARD.encode(hasher2.finalize());
+        let over_integrity = format!("sha512-{hash2}");
+
+        let handle = std::thread::spawn(move || {
+            for _ in 0..2 {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 1024];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+
+                    if req.contains("GET /exact.tgz ") {
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            exact_payload.len()
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                        let _ = stream.write_all(&exact_payload);
+                    } else if req.contains("GET /over.tgz ") {
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            over_payload.len()
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                        let _ = stream.write_all(&over_payload);
+                    }
+                }
+            }
+        });
+
+        let reg = NpmRegistry::with_limits(
+            &base,
+            RegistryLimits {
+                max_tarball_bytes: 50,
+                ..RegistryLimits::default()
+            },
+        );
+
+        let pkg_exact = Package {
+            name: "exact".into(),
+            version: "1.0.0".into(),
+            tarball_url: format!("{base}/exact.tgz"),
+            integrity: Some(exact_integrity),
+        };
+        let bytes = reg.fetch_url_verified(&pkg_exact).unwrap();
+        assert_eq!(bytes.len(), 50);
+
+        let pkg_over = Package {
+            name: "over".into(),
+            version: "1.0.0".into(),
+            tarball_url: format!("{base}/over.tgz"),
+            integrity: Some(over_integrity),
+        };
+        let err = reg.fetch_url_verified(&pkg_over).unwrap_err();
+        assert!(err.to_string().contains("tarball exceeds maximum size cap"));
+
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn redirect_exact_limits_boundary() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base = format!("http://127.0.0.1:{port}");
+
+        let payload = b"ok";
+        let mut hasher = sha2::Sha512::new();
+        hasher.update(payload);
+        let hash = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
+        let integrity = format!("sha512-{hash}");
+
+        let handle = std::thread::spawn(move || {
+            // Test 1: Exactly 2 redirects -> /r1 -> /r2 -> /ok.tgz (3 requests)
+            for i in 1..=2 {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf);
+                    let target = if i == 1 {
+                        format!("http://127.0.0.1:{port}/r2")
+                    } else {
+                        format!("http://127.0.0.1:{port}/ok.tgz")
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+            }
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.write_all(payload);
+            }
+
+            // Test 2: 3 redirects with limit 2 -> /over1 -> /over2 -> /over3 (3 redirects = 3 302 responses)
+            for i in 1..=3 {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf);
+                    let target = format!("http://127.0.0.1:{port}/over{}", i + 1);
+                    let resp = format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+            }
+        });
+
+        let reg = NpmRegistry::with_limits(
+            &base,
+            RegistryLimits {
+                max_redirects: 2,
+                ..RegistryLimits::default()
+            },
+        );
+
+        // Exactly 2 redirects: succeeds
+        let pkg_ok = Package {
+            name: "test".into(),
+            version: "1.0.0".into(),
+            tarball_url: format!("{base}/r1"),
+            integrity: Some(integrity),
+        };
+        let bytes = reg.fetch_url_verified(&pkg_ok).unwrap();
+        assert_eq!(bytes, payload);
+
+        // 3 redirects: exceeds max_redirects (2) and fails
+        let pkg_over = Package {
+            name: "test".into(),
+            version: "1.0.0".into(),
+            tarball_url: format!("{base}/over1"),
+            integrity: Some("sha512-test".into()),
+        };
+        let err = reg.fetch_url_verified(&pkg_over).unwrap_err();
+        assert!(err.to_string().contains("too many redirects"));
 
         let _ = handle.join();
     }
