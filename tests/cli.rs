@@ -976,3 +976,48 @@ fn regression_sqlite_busy_timeout() {
         .unwrap();
     assert_eq!(count, 1);
 }
+
+#[test]
+fn regression_leading_hyphen_package_spec_rejected() {
+    blueline()
+        .args(["review", "-badpkg@1.0.0"])
+        .assert()
+        .failure();
+
+    blueline()
+        .args(["install", "--", "--badpkg"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn regression_forwarded_flags_underscore_and_config_injection_blocked() {
+    let variations = [
+        vec!["install", "express@4.21.2", "--", "--ignore_scripts=false"],
+        vec!["install", "express@4.21.2", "--", "--ignoreScripts=false"],
+        vec![
+            "install",
+            "express@4.21.2",
+            "--",
+            "--userconfig=/tmp/evil.npmrc",
+        ],
+        vec![
+            "install",
+            "express@4.21.2",
+            "--",
+            "--node-options=--require /tmp/pwn.js",
+        ],
+        vec!["install", "express@4.21.2", "--", "--prefix=/tmp/evil"],
+        vec![
+            "install",
+            "express@4.21.2",
+            "--",
+            "--script-shell",
+            "/bin/sh",
+        ],
+    ];
+
+    for args in variations {
+        blueline().args(&args).assert().failure();
+    }
+}

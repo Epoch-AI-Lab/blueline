@@ -67,14 +67,31 @@ pub fn safe_extract(
             entry.map_err(|e| BluelineError::Extraction(format!("reading tar entry: {e}")))?;
 
         let entry_type = entry.header().entry_type();
-        // Metadata entries (GNU long names, pax extensions) carry no payload.
+        let size = entry.size();
+
+        // Metadata entries (GNU long names, pax extensions) carry headers in the stream.
+        // Cap their size and count them towards total unpacked bytes to prevent tar bombs.
         if entry_type.is_gnu_longname()
             || entry_type.is_gnu_longlink()
             || entry_type.is_pax_global_extensions()
             || entry_type.is_pax_local_extensions()
         {
+            const MAX_METADATA_ENTRY_BYTES: u64 = 64 * 1024;
+            if size > MAX_METADATA_ENTRY_BYTES {
+                return Err(BluelineError::ExtractionLimit(format!(
+                    "metadata entry exceeds cap of {MAX_METADATA_ENTRY_BYTES} bytes"
+                )));
+            }
+            if stats.unpacked_bytes.saturating_add(size) > limits.max_unpacked_bytes {
+                return Err(BluelineError::ExtractionLimit(format!(
+                    "total unpacked size would exceed cap {}",
+                    limits.max_unpacked_bytes
+                )));
+            }
+            stats.unpacked_bytes += size;
             continue;
         }
+
         if !entry_type.is_file() && !entry_type.is_dir() {
             return Err(BluelineError::ExtractionLimit(format!(
                 "unsupported entry type {entry_type:?} (symlinks/hardlinks/special files are rejected)"
@@ -87,7 +104,6 @@ pub fn safe_extract(
             .to_path_buf();
         validate_entry_path(&path).map_err(BluelineError::Extraction)?;
 
-        let size = entry.size();
         if entry_type.is_file() {
             if size > limits.max_entry_bytes {
                 return Err(BluelineError::ExtractionLimit(format!(
@@ -133,6 +149,7 @@ fn validate_entry_path(path: &Path) -> Result<(), String> {
             path.display()
         ));
     }
+    let mut has_normal = false;
     for comp in path.components() {
         match comp {
             Component::ParentDir => {
@@ -153,8 +170,17 @@ fn validate_entry_path(path: &Path) -> Result<(), String> {
                     path.display()
                 ));
             }
-            Component::CurDir | Component::Normal(_) => {}
+            Component::Normal(_) => {
+                has_normal = true;
+            }
+            Component::CurDir => {}
         }
+    }
+    if !has_normal {
+        return Err(format!(
+            "entry path `{}` resolving to current directory rejected",
+            path.display()
+        ));
     }
     Ok(())
 }
@@ -163,7 +189,10 @@ fn validate_entry_path(path: &Path) -> Result<(), String> {
 #[cfg(unix)]
 fn strip_special_bits(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
-    if let Ok(md) = fs::metadata(path) {
+    if let Ok(md) = fs::symlink_metadata(path) {
+        if md.is_symlink() {
+            return;
+        }
         let mut perm = md.permissions();
         perm.set_mode(perm.mode() & 0o777);
         let _ = fs::set_permissions(path, perm);

@@ -155,26 +155,41 @@ pub fn evaluate(
         });
     }
 
-    // R05: Large diff anomaly on patch
-    if let Some(base_ver_str) = &delta.baseline_version
-        && let (Ok(base_v), Ok(target_v)) = (
+    // R05: Large diff anomaly on patch or non-standard semver
+    if let Some(base_ver_str) = &delta.baseline_version {
+        match (
             semver::Version::parse(base_ver_str),
             semver::Version::parse(&delta.target_version),
-        )
-        && base_v.major == target_v.major
-        && base_v.minor == target_v.minor
-        && delta.total_lines_added > 500
-    {
-        findings.push(Finding {
-            rule_id: "R05_LARGE_PATCH_DIFF".into(),
-            severity: VerdictBand::Medium,
-            title: format!("Large patch delta (+{} lines)", delta.total_lines_added),
-            description: format!(
-                "Patch release {base_v} -> {target_v} added {} lines across {} files.",
-                delta.total_lines_added,
-                delta.files_added.len() + delta.files_modified.len()
-            ),
-        });
+        ) {
+            (Ok(base_v), Ok(target_v)) => {
+                if base_v.major == target_v.major
+                    && base_v.minor == target_v.minor
+                    && delta.total_lines_added > 500
+                {
+                    findings.push(Finding {
+                        rule_id: "R05_LARGE_PATCH_DIFF".into(),
+                        severity: VerdictBand::Medium,
+                        title: format!("Large patch delta (+{} lines)", delta.total_lines_added),
+                        description: format!(
+                            "Patch release {base_v} -> {target_v} added {} lines across {} files.",
+                            delta.total_lines_added,
+                            delta.files_added.len() + delta.files_modified.len()
+                        ),
+                    });
+                }
+            }
+            _ => {
+                findings.push(Finding {
+                    rule_id: "R05_NON_STANDARD_VERSION".into(),
+                    severity: VerdictBand::Medium,
+                    title: "Non-standard version format".into(),
+                    description: format!(
+                        "Baseline `{base_ver_str}` or target `{}` does not conform to strict semver.",
+                        delta.target_version
+                    ),
+                });
+            }
+        }
     }
 
     // R06: First sighting
@@ -232,6 +247,11 @@ pub fn evaluate(
     }
 
     let capped_score = score.min(100);
+
+    // Escalate to Block if accumulated risk score reaches 80+
+    if capped_score >= 80 {
+        band = VerdictBand::Block;
+    }
 
     Verdict {
         name: name.to_string(),
@@ -430,6 +450,26 @@ fn unescape_js(s: &str) -> String {
                         }
                     }
                 }
+                Some(&d) if ('0'..='7').contains(&d) => {
+                    // Octal escape sequence (e.g. \145 \166 \141 \154)
+                    let mut oct = String::new();
+                    oct.push(chars.next().unwrap());
+                    for _ in 0..2 {
+                        if let Some(&o) = chars.peek()
+                            && ('0'..='7').contains(&o)
+                        {
+                            oct.push(chars.next().unwrap());
+                        } else {
+                            break;
+                        }
+                    }
+                    if let Ok(val) = u8::from_str_radix(&oct, 8) {
+                        out.push(val as char);
+                    } else {
+                        out.push('\\');
+                        out.push_str(&oct);
+                    }
+                }
                 _ => {
                     out.push(c);
                 }
@@ -441,11 +481,46 @@ fn unescape_js(s: &str) -> String {
     out
 }
 
+fn strip_comments_and_whitespace(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '/' {
+            if let Some(&'*') = chars.peek() {
+                chars.next();
+                while let Some(ch) = chars.next() {
+                    if ch == '*' && chars.peek() == Some(&'/') {
+                        chars.next();
+                        break;
+                    }
+                }
+                continue;
+            } else if let Some(&'/') = chars.peek() {
+                chars.next();
+                for ch in chars.by_ref() {
+                    if ch == '\n' {
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+        if !c.is_whitespace() {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn is_eval_invocation(s: &str) -> bool {
     let unescaped = unescape_js(s);
-    let s_clean: String = unescaped.chars().filter(|c| !c.is_whitespace()).collect();
+    let s_clean = strip_comments_and_whitespace(&unescaped);
     s_clean.contains("eval(")
+        || s_clean.contains("eval`")
         || s_clean.contains("newFunction(")
+        || s_clean.contains("newFunction`")
+        || s_clean.contains("Function(")
+        || s_clean.contains("Function`")
         || s_clean.contains("globalThis.eval")
         || s_clean.contains("window.eval")
         || s_clean.contains("global.eval")
@@ -465,7 +540,7 @@ fn is_eval_invocation(s: &str) -> bool {
 
 fn is_child_proc_invocation(s: &str) -> bool {
     let unescaped = unescape_js(s);
-    let s_clean: String = unescaped.chars().filter(|c| !c.is_whitespace()).collect();
+    let s_clean = strip_comments_and_whitespace(&unescaped);
     s_clean.contains("child_process")
         || s_clean.contains("execSync(")
         || s_clean.contains("spawnSync(")
@@ -491,15 +566,21 @@ fn is_child_proc_invocation(s: &str) -> bool {
         || s_clean.contains("['execFileSync'](")
         || s_clean.contains("[\"fork\"](")
         || s_clean.contains("['fork'](")
+        || s_clean.contains("process.binding('spawn_sync')")
+        || s_clean.contains("process.binding(\"spawn_sync\")")
+        || s_clean.contains("process._linkedBinding")
 }
 
 fn is_base64_decode(s: &str) -> bool {
     let unescaped = unescape_js(s);
-    let s_clean: String = unescaped.chars().filter(|c| !c.is_whitespace()).collect();
-    (s_clean.contains("Buffer.from(")
+    let s_clean = strip_comments_and_whitespace(&unescaped).to_ascii_lowercase();
+    (s_clean.contains("buffer.from(")
         && (s_clean.contains("'base64'")
             || s_clean.contains("\"base64\"")
-            || s_clean.contains("`base64`")))
+            || s_clean.contains("`base64`")
+            || s_clean.contains("'base64url'")
+            || s_clean.contains("\"base64url\"")
+            || s_clean.contains("`base64url`")))
         || s_clean.contains("atob(")
         || s_clean.contains("btoa(")
 }
@@ -796,5 +877,86 @@ mod tests {
                 .iter()
                 .any(|f| f.rule_id == "R07_UNREVIEWED_PREDECESSOR_BASELINE")
         );
+    }
+
+    #[test]
+    fn detects_octal_and_comment_obfuscations() {
+        assert!(is_eval_invocation(r#"\145\166\141\154(payload)"#));
+        assert!(is_eval_invocation("eval/*comment*/(payload)"));
+        assert!(is_eval_invocation("new/**/Function(payload)"));
+        assert!(is_eval_invocation("eval`payload`"));
+        assert!(is_eval_invocation("Function('return this')()"));
+    }
+
+    #[test]
+    fn detects_base64_variants_and_child_proc_bindings() {
+        assert!(is_base64_decode("Buffer.from(x, 'base64url')"));
+        assert!(is_base64_decode("Buffer.from(x, \"BASE64\")"));
+        assert!(is_child_proc_invocation("process.binding('spawn_sync')"));
+        assert!(is_child_proc_invocation(
+            "process._linkedBinding('spawn_sync')"
+        ));
+    }
+
+    #[test]
+    fn escalates_to_block_on_high_accumulated_score() {
+        let delta = Delta {
+            baseline_version: Some("1.0.0".into()),
+            target_version: "1.1.0".into(),
+            files_added: vec![
+                FileChange {
+                    relative_path: "p1.exe".into(),
+                    kind: FileKind::Binary,
+                    lines_added: 0,
+                    lines_deleted: 0,
+                    is_executable: true,
+                    unified_diff: None,
+                },
+                FileChange {
+                    relative_path: "p2.exe".into(),
+                    kind: FileKind::Binary,
+                    lines_added: 0,
+                    lines_deleted: 0,
+                    is_executable: true,
+                    unified_diff: None,
+                },
+                FileChange {
+                    relative_path: "p3.exe".into(),
+                    kind: FileKind::Binary,
+                    lines_added: 0,
+                    lines_deleted: 0,
+                    is_executable: true,
+                    unified_diff: None,
+                },
+                FileChange {
+                    relative_path: "p4.exe".into(),
+                    kind: FileKind::Binary,
+                    lines_added: 0,
+                    lines_deleted: 0,
+                    is_executable: true,
+                    unified_diff: None,
+                },
+            ],
+            files_removed: vec![],
+            files_modified: vec![],
+            total_lines_added: 0,
+            total_lines_deleted: 0,
+            new_executables: vec![
+                "p1.exe".into(),
+                "p2.exe".into(),
+                "p3.exe".into(),
+                "p4.exe".into(),
+            ],
+            new_binaries: vec![],
+            new_lifecycle_scripts: vec![],
+            modified_lifecycle_scripts: vec![],
+            new_dependencies: vec![],
+            removed_dependencies: vec![],
+            binding_gyp_added: false,
+        };
+
+        let verdict = evaluate("test-pkg", "verified (sha512)", &delta, false);
+        assert_eq!(verdict.risk_score, 100);
+        assert_eq!(verdict.band, VerdictBand::Block);
     }
 }

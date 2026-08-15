@@ -8,7 +8,7 @@ use walkdir::WalkDir;
 use crate::error::BluelineError;
 use crate::manifest::PackageJson;
 
-const MAX_DIFF_FILE_BYTES: u64 = 10 * 1024 * 1024; // 10 MiB cap for line diffing
+const MAX_DIFF_FILE_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB cap for line diffing
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileKind {
@@ -198,7 +198,13 @@ pub fn compute_delta(
         }
     }
 
-    let binding_gyp_added = files_added.iter().any(|f| f.relative_path == "binding.gyp");
+    let binding_gyp_added = files_added.iter().any(|f| {
+        f.relative_path.eq_ignore_ascii_case("binding.gyp")
+            || Path::new(&f.relative_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().eq_ignore_ascii_case("binding.gyp"))
+                .unwrap_or(false)
+    }) || target_manifest.gypfile == Some(true);
 
     Ok(Delta {
         baseline_version: baseline_version.map(|s| s.to_string()),
@@ -355,10 +361,19 @@ fn diff_single_file(
 fn find_package_prefix(root: &Path) -> PathBuf {
     let nested = root.join("package");
     if nested.is_dir() {
-        nested
-    } else {
-        root.to_path_buf()
+        let has_siblings = fs::read_dir(root)
+            .map(|mut r| {
+                r.any(|e| {
+                    e.map(|entry| entry.file_name() != "package")
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        if !has_siblings {
+            return nested;
+        }
     }
+    root.to_path_buf()
 }
 
 fn check_is_executable(path: &Path) -> bool {
@@ -412,6 +427,7 @@ mod tests {
         let base_m = PackageJson {
             name: "test".into(),
             version: "1.0.0".into(),
+            gypfile: None,
             scripts: BTreeMap::new(),
             dependencies: BTreeMap::new(),
             optional_dependencies: BTreeMap::new(),
@@ -420,6 +436,7 @@ mod tests {
         let target_m = PackageJson {
             name: "test".into(),
             version: "1.1.0".into(),
+            gypfile: None,
             scripts: BTreeMap::new(),
             dependencies: BTreeMap::new(),
             optional_dependencies: BTreeMap::new(),
@@ -454,6 +471,7 @@ mod tests {
         let target_m = PackageJson {
             name: "test".into(),
             version: "1.0.0".into(),
+            gypfile: None,
             scripts: BTreeMap::new(),
             dependencies: BTreeMap::new(),
             optional_dependencies: BTreeMap::new(),
@@ -484,6 +502,7 @@ mod tests {
         let base_m = PackageJson {
             name: "test".into(),
             version: "1.0.0".into(),
+            gypfile: None,
             scripts: BTreeMap::new(),
             dependencies: BTreeMap::new(),
             optional_dependencies: BTreeMap::new(),
@@ -492,6 +511,7 @@ mod tests {
         let mut target_m = PackageJson {
             name: "test".into(),
             version: "1.1.0".into(),
+            gypfile: None,
             scripts: BTreeMap::new(),
             dependencies: BTreeMap::new(),
             optional_dependencies: BTreeMap::new(),
@@ -535,6 +555,25 @@ mod tests {
         let target_m = PackageJson {
             name: "test".into(),
             version: "1.0.0".into(),
+            gypfile: None,
+            scripts: BTreeMap::new(),
+            dependencies: BTreeMap::new(),
+            optional_dependencies: BTreeMap::new(),
+            peer_dependencies: BTreeMap::new(),
+        };
+
+        let delta = compute_delta(None, None, None, new_dir.path(), &target_m, "1.0.0").unwrap();
+        assert!(delta.binding_gyp_added);
+    }
+
+    #[test]
+    fn detects_gypfile_in_manifest() {
+        let new_dir = tempfile::tempdir().unwrap();
+
+        let target_m = PackageJson {
+            name: "test".into(),
+            version: "1.0.0".into(),
+            gypfile: Some(true),
             scripts: BTreeMap::new(),
             dependencies: BTreeMap::new(),
             optional_dependencies: BTreeMap::new(),

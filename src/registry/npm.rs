@@ -15,6 +15,9 @@ const CORGI_ACCEPT: &str = "application/vnd.npm.install-v1+json";
 const USER_AGENT: &str = concat!("blueline/", env!("CARGO_PKG_VERSION"));
 const SRI_PREFIX: &str = "sha512-";
 
+const MAX_PACKUMENT_BYTES: u64 = 64 * 1024 * 1024; // 64 MB cap on packument JSON
+const MAX_TARBALL_BYTES: u64 = 512 * 1024 * 1024; // 512 MB cap on compressed tarball
+
 pub struct NpmRegistry {
     agent: Agent,
     base: String,
@@ -25,7 +28,7 @@ impl NpmRegistry {
         let agent = ureq::AgentBuilder::new()
             .timeout(std::time::Duration::from_secs(90))
             .user_agent(USER_AGENT)
-            .redirects(10)
+            .redirects(0) // Do not follow redirects automatically without SSRF validation
             .build();
         Self {
             agent,
@@ -85,10 +88,20 @@ impl NpmRegistry {
             .set("accept", CORGI_ACCEPT)
             .call()
             .map_err(|e| BluelineError::Network(format!("GET {url}: {e}")))?;
+
         let mut body = String::new();
-        resp.into_reader()
+        let mut reader = resp.into_reader().take(MAX_PACKUMENT_BYTES + 1);
+        reader
             .read_to_string(&mut body)
             .map_err(|e| BluelineError::Network(format!("reading {url}: {e}")))?;
+
+        if body.len() as u64 > MAX_PACKUMENT_BYTES {
+            return Err(BluelineError::Manifest(
+                name.to_string(),
+                format!("packument exceeds maximum cap of {MAX_PACKUMENT_BYTES} bytes"),
+            ));
+        }
+
         let packument: Packument = serde_json::from_str(&body).map_err(|e| {
             BluelineError::Manifest(name.to_string(), format!("invalid packument JSON: {e}"))
         })?;
@@ -99,16 +112,50 @@ impl NpmRegistry {
     /// Stream-download the tarball, hashing as we go, then fail closed unless
     /// the sha512 matches the registry's `dist.integrity`.
     fn fetch_url_verified(&self, pkg: &Package) -> Result<Vec<u8>, BluelineError> {
-        self.validate_tarball_url(&pkg.tarball_url)?;
-        let resp = self
-            .agent
-            .get(&pkg.tarball_url)
-            .call()
-            .map_err(|e| BluelineError::Network(format!("GET {}: {e}", pkg.tarball_url)))?;
+        let mut current_url = pkg.tarball_url.clone();
+        let mut redirects_followed = 0;
+        const MAX_REDIRECTS: usize = 5;
+
+        let resp = loop {
+            self.validate_tarball_url(&current_url)?;
+            let res = self.agent.get(&current_url).call();
+            match res {
+                Ok(response) => break response,
+                Err(ureq::Error::Status(code, response)) if (301..=308).contains(&code) => {
+                    redirects_followed += 1;
+                    if redirects_followed > MAX_REDIRECTS {
+                        return Err(BluelineError::Network(format!(
+                            "too many redirects downloading {}",
+                            pkg.tarball_url
+                        )));
+                    }
+                    let location = response.header("location").ok_or_else(|| {
+                        BluelineError::Network(format!(
+                            "redirect {code} missing Location header for {current_url}"
+                        ))
+                    })?;
+                    current_url = location.to_string();
+                }
+                Err(e) => {
+                    return Err(BluelineError::Network(format!(
+                        "GET {}: {e}",
+                        pkg.tarball_url
+                    )));
+                }
+            }
+        };
+
         let mut bytes = Vec::new();
-        resp.into_reader()
+        let mut reader = resp.into_reader().take(MAX_TARBALL_BYTES + 1);
+        reader
             .read_to_end(&mut bytes)
             .map_err(|e| BluelineError::Network(format!("downloading {}: {e}", pkg.tarball_url)))?;
+
+        if bytes.len() as u64 > MAX_TARBALL_BYTES {
+            return Err(BluelineError::ExtractionLimit(format!(
+                "tarball exceeds maximum size cap of {MAX_TARBALL_BYTES} bytes"
+            )));
+        }
 
         let mut hasher = Sha512::new();
         hasher.update(&bytes);
@@ -154,6 +201,15 @@ impl Registry for NpmRegistry {
                 ),
             )
         })?;
+        if meta.name != name || meta.version != version {
+            return Err(BluelineError::Manifest(
+                name.to_string(),
+                format!(
+                    "registry metadata mismatch: expected {name}@{version}, got {}@{}",
+                    meta.name, meta.version
+                ),
+            ));
+        }
         self.validate_tarball_url(&meta.dist.tarball)?;
         validate_package_name(&meta.name)?;
         Ok(Package {
@@ -178,23 +234,56 @@ impl Registry for NpmRegistry {
         versions.sort();
         Ok(versions)
     }
+
+    fn resolve_dist_tag(&self, name: &str, tag: &str) -> Result<Option<String>, BluelineError> {
+        let packument = self.packument(name)?;
+        Ok(packument.dist_tags.get(tag).cloned())
+    }
+}
+
+fn is_valid_name_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && s.chars().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_' || c == '.'
+        })
 }
 
 fn validate_package_name(name: &str) -> Result<(), BluelineError> {
-    if name.is_empty() || name.chars().any(|c| c.is_control()) {
+    if name.is_empty() || name.len() > 214 {
         return Err(BluelineError::Manifest(
             name.to_string(),
-            "invalid package name: empty or contains control characters".to_string(),
+            "invalid package name: empty or exceeds 214 characters".to_string(),
         ));
     }
     if name.contains('\\')
-        || name
-            .split('/')
-            .any(|part| part == "." || part == ".." || part.is_empty())
+        || name.contains('?')
+        || name.contains('#')
+        || name.contains('&')
+        || name.contains('%')
+        || name.chars().any(|c| c.is_control() || c.is_whitespace())
     {
         return Err(BluelineError::Manifest(
             name.to_string(),
-            "invalid package name: contains path traversal or invalid segments".to_string(),
+            "invalid package name: contains forbidden characters".to_string(),
+        ));
+    }
+
+    let is_valid = if let Some(stripped) = name.strip_prefix('@') {
+        if let Some((scope, rest)) = stripped.split_once('/') {
+            is_valid_name_segment(scope) && is_valid_name_segment(rest) && !rest.contains('/')
+        } else {
+            false
+        }
+    } else {
+        is_valid_name_segment(name) && !name.contains('/')
+    };
+
+    if !is_valid {
+        return Err(BluelineError::Manifest(
+            name.to_string(),
+            "invalid package name format".to_string(),
         ));
     }
     Ok(())
@@ -230,6 +319,17 @@ fn parse_url_scheme_and_host(raw_url: &str) -> Result<(String, String), String> 
     Ok((scheme, host.to_lowercase()))
 }
 
+fn is_private_v4(v4: std::net::Ipv4Addr) -> bool {
+    let octets = v4.octets();
+    v4.is_loopback()
+        || v4.is_link_local()
+        || v4.is_private()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        // CGNAT RFC 6598 (100.64.0.0/10)
+        || (octets[0] == 100 && (octets[1] & 0xc0) == 64)
+}
+
 fn is_private_or_local_host(host: &str) -> bool {
     if host == "localhost"
         || host.ends_with(".localhost")
@@ -240,18 +340,16 @@ fn is_private_or_local_host(host: &str) -> bool {
     }
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         match ip {
-            std::net::IpAddr::V4(v4) => {
-                v4.is_loopback()
-                    || v4.is_link_local()
-                    || v4.is_private()
-                    || v4.is_unspecified()
-                    || v4.is_broadcast()
-            }
+            std::net::IpAddr::V4(v4) => is_private_v4(v4),
             std::net::IpAddr::V6(v6) => {
-                v6.is_loopback()
-                    || v6.is_unspecified()
-                    || (v6.segments()[0] & 0xffc0) == 0xfe80
-                    || (v6.segments()[0] & 0xfe00) == 0xfc00
+                if let Some(v4) = v6.to_ipv4_mapped() {
+                    is_private_v4(v4)
+                } else {
+                    v6.is_loopback()
+                        || v6.is_unspecified()
+                        || (v6.segments()[0] & 0xffc0) == 0xfe80
+                        || (v6.segments()[0] & 0xfe00) == 0xfc00
+                }
             }
         }
     } else {
@@ -280,7 +378,6 @@ struct Packument {
     #[allow(dead_code)]
     name: String,
     #[serde(rename = "dist-tags")]
-    #[allow(dead_code)]
     dist_tags: BTreeMap<String, String>,
     versions: BTreeMap<String, VersionMeta>,
 }
@@ -462,11 +559,28 @@ mod tests {
         assert!(is_private_or_local_host("::"));
         assert!(is_private_or_local_host("fe80::1"));
         assert!(is_private_or_local_host("fc00::1"));
-        assert!(is_private_or_local_host("fd00::1"));
+        assert!(is_private_or_local_host("::ffff:127.0.0.1"));
+        assert!(is_private_or_local_host("::ffff:169.254.169.254"));
+        assert!(is_private_or_local_host("::ffff:10.0.0.1"));
+        assert!(is_private_or_local_host("100.64.0.1"));
+        assert!(is_private_or_local_host("100.127.255.254"));
 
         assert!(!is_private_or_local_host("registry.npmjs.org"));
         assert!(!is_private_or_local_host("8.8.8.8"));
         assert!(!is_private_or_local_host("1.1.1.1"));
+        assert!(!is_private_or_local_host("100.63.255.255"));
+        assert!(!is_private_or_local_host("100.128.0.1"));
         assert!(!is_private_or_local_host("2607:f8b0:4005:805::200e"));
+    }
+
+    #[test]
+    fn validates_package_names_rejects_query_and_specials() {
+        assert!(validate_package_name("express?foo=bar").is_err());
+        assert!(validate_package_name("express#anchor").is_err());
+        assert!(validate_package_name("express&cmd=1").is_err());
+        assert!(validate_package_name("express%2fother").is_err());
+        assert!(validate_package_name("@scope/pkg/extra").is_err());
+        assert!(validate_package_name("@/pkg").is_err());
+        assert!(validate_package_name("@scope/").is_err());
     }
 }

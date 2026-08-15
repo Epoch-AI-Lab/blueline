@@ -22,6 +22,21 @@ pub fn install_with_ignore_scripts(pkg: &str, extra_args: &[String]) -> anyhow::
         _ => Command::new("npm"),
     };
 
+    // Scrub sensitive environment variables to enforce script isolation
+    cmd.env_remove("NODE_OPTIONS")
+        .env_remove("npm_config_script_shell")
+        .env_remove("NPM_CONFIG_SCRIPT_SHELL")
+        .env_remove("npm_config_userconfig")
+        .env_remove("NPM_CONFIG_USERCONFIG")
+        .env_remove("npm_config_globalconfig")
+        .env_remove("NPM_CONFIG_GLOBALCONFIG")
+        .env_remove("npm_config_foreground_scripts")
+        .env_remove("NPM_CONFIG_FOREGROUND_SCRIPTS")
+        .env_remove("npm_config_ignore_scripts")
+        .env_remove("NPM_CONFIG_IGNORE_SCRIPTS")
+        .env_remove("npm_config_node_options")
+        .env_remove("NPM_CONFIG_NODE_OPTIONS");
+
     cmd.arg("install")
         .arg("--ignore-scripts")
         .arg(pkg.trim())
@@ -56,41 +71,93 @@ pub fn install_with_ignore_scripts(pkg: &str, extra_args: &[String]) -> anyhow::
     Ok(())
 }
 
+fn normalize_key(arg: &str) -> String {
+    arg.trim_start_matches('-')
+        .chars()
+        .map(|c| {
+            if c == '_' {
+                '-'
+            } else {
+                c.to_ascii_lowercase()
+            }
+        })
+        .collect()
+}
+
+fn is_falsy_value(val: &str) -> bool {
+    let lower = val.trim().to_ascii_lowercase();
+    matches!(lower.as_str(), "false" | "0" | "no" | "off")
+}
+
 pub fn validate_extra_args(extra_args: &[String]) -> anyhow::Result<()> {
     let mut iter = extra_args.iter().peekable();
     while let Some(arg) = iter.next() {
         let trimmed = arg.trim();
-        if is_forbidden_flag(trimmed) {
+        if !trimmed.starts_with('-') {
+            continue;
+        }
+
+        let (raw_key, val_opt) = if let Some((k, v)) = trimmed.split_once('=') {
+            (k, Some(v))
+        } else {
+            (trimmed, None)
+        };
+
+        let key = normalize_key(raw_key);
+
+        // Disallow configuration and shell injection flags
+        if matches!(
+            key.as_str(),
+            "userconfig"
+                | "globalconfig"
+                | "config"
+                | "prefix"
+                | "node-options"
+                | "nodeoptions"
+                | "script-shell"
+                | "scriptshell"
+                | "shell"
+        ) {
+            anyhow::bail!(
+                "forbidden flag `{trimmed}`: cannot override configuration or process options"
+            );
+        }
+
+        // Disallow explicit no-ignore-scripts
+        if key == "no-ignore-scripts" || key == "no-ignore_scripts" || key == "noignorescripts" {
             anyhow::bail!("forbidden flag `{trimmed}`: cannot override script isolation");
         }
-        if trimmed == "--ignore-scripts" {
-            let next_is_negation = iter.peek().is_some_and(|next| {
-                let next_lower = next.trim().to_ascii_lowercase();
-                matches!(next_lower.as_str(), "false" | "0" | "no" | "off")
-            });
-            if next_is_negation {
+
+        // Disallow ignore-scripts=false/0/no/off
+        if key == "ignore-scripts" || key == "ignorescripts" {
+            if let Some(val) = val_opt {
+                if is_falsy_value(val) {
+                    anyhow::bail!("forbidden flag `{trimmed}`: cannot override script isolation");
+                }
+            } else if let Some(next) = iter.peek()
+                && is_falsy_value(next)
+            {
                 anyhow::bail!(
-                    "forbidden flag `--ignore-scripts`: cannot override script isolation"
+                    "forbidden flag `{trimmed} {next}`: cannot override script isolation"
                 );
+            }
+        }
+
+        // Disallow foreground-scripts
+        if key == "foreground-scripts" || key == "foregroundscripts" {
+            if let Some(val) = val_opt {
+                if !is_falsy_value(val) {
+                    anyhow::bail!("forbidden flag `{trimmed}`: cannot override script isolation");
+                }
+            } else {
+                let next_is_falsy = iter.peek().is_some_and(|next| is_falsy_value(next));
+                if !next_is_falsy {
+                    anyhow::bail!("forbidden flag `{trimmed}`: cannot override script isolation");
+                }
             }
         }
     }
     Ok(())
-}
-
-fn is_forbidden_flag(arg: &str) -> bool {
-    let lower = arg.to_ascii_lowercase();
-    lower == "--no-ignore-scripts"
-        || lower.starts_with("--no-ignore-scripts=")
-        || lower == "--ignore-scripts=false"
-        || lower.starts_with("--ignore-scripts=false")
-        || lower.starts_with("--ignore-scripts=0")
-        || lower.starts_with("--ignore-scripts=no")
-        || lower.starts_with("--ignore-scripts=off")
-        || lower == "--foreground-scripts"
-        || lower.starts_with("--foreground-scripts=")
-        || lower == "--script-shell"
-        || lower.starts_with("--script-shell=")
 }
 
 #[cfg(test)]
@@ -103,40 +170,157 @@ mod tests {
             "--save-dev".to_string(),
             "--legacy-peer-deps".to_string(),
             "--verbose".to_string(),
+            "--dry-run".to_string(),
         ];
         assert!(validate_extra_args(&args).is_ok());
     }
 
     #[test]
     fn rejects_no_ignore_scripts() {
-        let args = vec!["--no-ignore-scripts".to_string()];
-        assert!(validate_extra_args(&args).is_err());
+        let variations = [
+            "--no-ignore-scripts",
+            "--no_ignore_scripts",
+            "-no-ignore-scripts",
+            "--no-ignore-scripts=true",
+        ];
+        for flag in variations {
+            assert!(
+                validate_extra_args(&[flag.to_string()]).is_err(),
+                "should reject {flag}"
+            );
+        }
     }
 
     #[test]
     fn rejects_ignore_scripts_false() {
-        let args = vec!["--ignore-scripts=false".to_string()];
-        assert!(validate_extra_args(&args).is_err());
-
-        let args2 = vec!["--ignore-scripts".to_string(), "false".to_string()];
-        assert!(validate_extra_args(&args2).is_err());
+        let variations = [
+            vec!["--ignore-scripts=false"],
+            vec!["--ignore_scripts=false"],
+            vec!["--ignoreScripts=false"],
+            vec!["--ignore-scripts=0"],
+            vec!["--ignore-scripts=no"],
+            vec!["--ignore-scripts=off"],
+            vec!["--ignore-scripts", "false"],
+            vec!["--ignore_scripts", "0"],
+            vec!["--ignoreScripts", "no"],
+        ];
+        for args in variations {
+            let string_args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            assert!(
+                validate_extra_args(&string_args).is_err(),
+                "should reject {:?}",
+                args
+            );
+        }
     }
 
     #[test]
     fn rejects_foreground_scripts() {
-        let args = vec!["--foreground-scripts".to_string()];
-        assert!(validate_extra_args(&args).is_err());
-
-        let args2 = vec!["--foreground-scripts=true".to_string()];
-        assert!(validate_extra_args(&args2).is_err());
+        let variations = [
+            vec!["--foreground-scripts"],
+            vec!["--foreground_scripts"],
+            vec!["--foregroundScripts"],
+            vec!["--foreground-scripts=true"],
+            vec!["--foreground_scripts=1"],
+            vec!["--foreground-scripts", "true"],
+        ];
+        for args in variations {
+            let string_args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            assert!(
+                validate_extra_args(&string_args).is_err(),
+                "should reject {:?}",
+                args
+            );
+        }
     }
 
     #[test]
     fn rejects_script_shell() {
-        let args = vec!["--script-shell".to_string(), "/bin/sh".to_string()];
-        assert!(validate_extra_args(&args).is_err());
+        let variations = [
+            vec!["--script-shell", "/bin/sh"],
+            vec!["--script_shell", "/bin/sh"],
+            vec!["--scriptShell", "/bin/sh"],
+            vec!["--script-shell=/bin/sh"],
+            vec!["--script_shell=/bin/sh"],
+            vec!["--shell=/bin/sh"],
+        ];
+        for args in variations {
+            let string_args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            assert!(
+                validate_extra_args(&string_args).is_err(),
+                "should reject {:?}",
+                args
+            );
+        }
+    }
 
-        let args2 = vec!["--script-shell=/bin/sh".to_string()];
-        assert!(validate_extra_args(&args2).is_err());
+    #[test]
+    fn rejects_config_and_node_options_injection() {
+        let variations = [
+            vec!["--userconfig=/tmp/bad.npmrc"],
+            vec!["--globalconfig=/tmp/bad.npmrc"],
+            vec!["--config=/tmp/bad.npmrc"],
+            vec!["--prefix=/tmp/bad"],
+            vec!["--node-options=--require /tmp/pwn.js"],
+            vec!["--node_options=--require /tmp/pwn.js"],
+            vec!["--nodeOptions", "--require /tmp/pwn.js"],
+        ];
+        for args in variations {
+            let string_args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            assert!(
+                validate_extra_args(&string_args).is_err(),
+                "should reject {:?}",
+                args
+            );
+        }
+    }
+
+    mod proptest_invariants {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                failure_persistence: None,
+                cases: 64,
+                ..ProptestConfig::default()
+            })]
+
+            #[test]
+            fn rejects_all_ignore_scripts_false_permutations(
+                dashes in "[-]{1,3}",
+                sep in "[-_]",
+                val in "false|0|no|off",
+                delimiter in "[= ]",
+                extra_ws in "[ ]{0,2}"
+            ) {
+                let flag_str = format!("{extra_ws}{dashes}ignore{sep}scripts{delimiter}{val}{extra_ws}");
+                let args = if delimiter == " " {
+                    vec![
+                        format!("{dashes}ignore{sep}scripts"),
+                        val.to_string()
+                    ]
+                } else {
+                    vec![flag_str]
+                };
+                prop_assert!(validate_extra_args(&args).is_err());
+            }
+
+            #[test]
+            fn rejects_all_forbidden_flag_variations(
+                dashes in "[-]{1,3}",
+                flag in "userconfig|globalconfig|config|prefix|node-options|node_options|script-shell|script_shell|foreground-scripts|foreground_scripts",
+                suffix in "(=[^ ]*| /[^ ]*)?"
+            ) {
+                let arg = format!("{dashes}{flag}{suffix}");
+                let args = if suffix.starts_with(' ') {
+                    let parts: Vec<String> = arg.split_whitespace().map(|s| s.to_string()).collect();
+                    parts
+                } else {
+                    vec![arg]
+                };
+                prop_assert!(validate_extra_args(&args).is_err());
+            }
+        }
     }
 }

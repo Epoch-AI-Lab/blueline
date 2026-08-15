@@ -58,6 +58,18 @@ impl BaselineStore {
                 })?;
             }
         }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let _ = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(path);
+        }
+
         let mut conn = rusqlite::Connection::open(path)
             .map_err(|e| BluelineError::Store(format!("opening {}: {e}", path.display())))?;
         conn.busy_timeout(std::time::Duration::from_millis(5000))
@@ -96,6 +108,12 @@ impl BaselineStore {
         version: &str,
         integrity: &str,
     ) -> Result<(), BluelineError> {
+        if integrity.is_empty() || !integrity.starts_with("sha512-") {
+            return Err(BluelineError::Verification(format!(
+                "invalid integrity hash `{integrity}` for {name}@{version}"
+            )));
+        }
+
         let affected = self
             .conn
             .prepare_cached(
@@ -118,19 +136,24 @@ impl BaselineStore {
     }
 
     /// Mark a verified version as clean (user approved).
-    pub fn mark_clean(&self, name: &str, version: &str) -> Result<(), BluelineError> {
+    pub fn mark_clean(
+        &self,
+        name: &str,
+        version: &str,
+        integrity: &str,
+    ) -> Result<(), BluelineError> {
         let affected = self
             .conn
             .prepare_cached(
                 "UPDATE known_clean SET clean = 1, reviewed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-                 WHERE name = ?1 AND version = ?2",
+                 WHERE name = ?1 AND version = ?2 AND integrity = ?3",
             )
             .map_err(|e| BluelineError::Store(format!("preparing mark_clean: {e}")))?
-            .execute(rusqlite::params![name, version])
+            .execute(rusqlite::params![name, version, integrity])
             .map_err(|e| BluelineError::Store(format!("marking clean {name}@{version}: {e}")))?;
         if affected == 0 {
             return Err(BluelineError::Store(format!(
-                "cannot mark clean {name}@{version}: no record exists to approve"
+                "cannot mark clean {name}@{version}: record missing or integrity mismatch"
             )));
         }
         Ok(())
@@ -274,8 +297,8 @@ mod tests {
 
         assert!(store.list_clean_versions("pkg").unwrap().is_empty());
 
-        store.mark_clean("pkg", "1.0.0").unwrap();
-        store.mark_clean("pkg", "2.0.0").unwrap();
+        store.mark_clean("pkg", "1.0.0", "sha512-v1").unwrap();
+        store.mark_clean("pkg", "2.0.0", "sha512-v3").unwrap();
 
         let clean = store.list_clean_versions("pkg").unwrap();
         assert_eq!(clean.len(), 2);
@@ -285,7 +308,9 @@ mod tests {
         assert_eq!(clean[1].1, "sha512-v1");
 
         // Marking unrecorded version errors
-        assert!(store.mark_clean("pkg", "3.0.0").is_err());
+        assert!(store.mark_clean("pkg", "3.0.0", "sha512-v4").is_err());
+        // Marking with mismatched integrity errors
+        assert!(store.mark_clean("pkg", "1.0.0", "sha512-wrong").is_err());
     }
 
     #[test]

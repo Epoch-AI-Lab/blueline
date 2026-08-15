@@ -115,7 +115,13 @@ pub fn run(pkg_spec: &str, registry_base: &str, output: Output) -> anyhow::Resul
     }
 
     if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-        interactive_prompt(&store, &target_pkg.name, &target_pkg.version, &delta)?;
+        interactive_prompt(
+            &store,
+            &target_pkg.name,
+            &target_pkg.version,
+            &integrity,
+            &delta,
+        )?;
     } else if verdict.band != crate::verdict::VerdictBand::Low {
         std::process::exit(2);
     }
@@ -218,7 +224,13 @@ pub fn install(pkg_spec: &str, registry_base: &str, npm_args: &[String]) -> anyh
 
     let is_interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let approved = if is_interactive {
-        interactive_prompt(&store, &target_pkg.name, &target_pkg.version, &delta)?
+        interactive_prompt(
+            &store,
+            &target_pkg.name,
+            &target_pkg.version,
+            &integrity,
+            &delta,
+        )?
     } else {
         verdict.band == crate::verdict::VerdictBand::Low
     };
@@ -240,6 +252,7 @@ fn interactive_prompt(
     store: &BaselineStore,
     name: &str,
     version: &str,
+    integrity: &str,
     delta: &crate::diff::Delta,
 ) -> anyhow::Result<bool> {
     loop {
@@ -253,7 +266,7 @@ fn interactive_prompt(
         let choice = input.trim().to_lowercase();
         match choice.as_str() {
             "a" | "approve" => {
-                store.mark_clean(name, version)?;
+                store.mark_clean(name, version, integrity)?;
                 println!(
                     "Approved {}@{} and marked clean in baseline store.",
                     name, version
@@ -310,7 +323,7 @@ fn parse_spec(spec: &str) -> anyhow::Result<(String, String)> {
 }
 
 /// Flexible parser for install: `<name>` or `<name>@<version>`.
-/// If version is omitted, queries the registry for the latest semver release.
+/// If version is omitted, resolves `dist-tags.latest` or falls back to latest stable semver release.
 fn parse_spec_flexible(spec: &str, registry: &dyn Registry) -> anyhow::Result<(String, String)> {
     let has_version_sep = if let Some(rest) = spec.strip_prefix('@') {
         rest.contains('@')
@@ -325,9 +338,14 @@ fn parse_spec_flexible(spec: &str, registry: &dyn Registry) -> anyhow::Result<(S
         if name.is_empty() {
             return Err(crate::error::BluelineError::InvalidPackageSpec(spec.to_string()).into());
         }
+        if let Ok(Some(latest_tag)) = registry.resolve_dist_tag(name, "latest") {
+            return Ok((name.to_string(), latest_tag));
+        }
         let versions = registry.list_versions(name)?;
         let latest = versions
-            .last()
+            .iter()
+            .rfind(|v| v.pre.is_empty())
+            .or_else(|| versions.last())
             .ok_or_else(|| anyhow::anyhow!("no versions found for `{name}`"))?;
         Ok((name.to_string(), latest.to_string()))
     }

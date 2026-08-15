@@ -53,8 +53,14 @@ function getPlatformTarget() {
   return null;
 }
 
+const os = require("node:os");
+
 function resolveBinaryPath() {
   if (process.env.BLUELINE_BINARY) {
+    if (!path.isAbsolute(process.env.BLUELINE_BINARY)) {
+      console.error(`BLUELINE_BINARY must be an absolute path (got '${process.env.BLUELINE_BINARY}').`);
+      process.exit(1);
+    }
     const override = path.resolve(process.env.BLUELINE_BINARY);
     if (fs.existsSync(override)) {
       return override;
@@ -110,7 +116,8 @@ function main() {
     if (typeof util.convertProcessSignalToExitCode === "function") {
       process.exit(util.convertProcessSignalToExitCode(result.signal));
     } else {
-      process.exit(128);
+      const sigNum = os.constants.signals[result.signal] || 0;
+      process.exit(128 + sigNum);
     }
   }
 

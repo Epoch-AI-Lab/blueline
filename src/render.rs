@@ -5,6 +5,17 @@ use comfy_table::{Cell, Color, ContentArrangement, Table};
 use crate::diff::Delta;
 use crate::verdict::{Verdict, VerdictBand};
 
+fn is_dangerous_unicode(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}' // Arabic letter mark
+            | '\u{200B}'..='\u{200F}' // Zero-width spaces & directional marks
+            | '\u{202A}'..='\u{202E}' // BiDi embedding / override
+            | '\u{2066}'..='\u{2069}' // BiDi isolate
+            | '\u{FEFF}' // Byte order mark / zero-width no-break space
+    )
+}
+
 pub fn sanitize_for_terminal(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -12,20 +23,24 @@ pub fn sanitize_for_terminal(s: &str) -> String {
         if c == '\x1b' {
             if let Some(&next) = chars.peek() {
                 if next == '[' {
-                    // CSI sequence: consume until 0x40..=0x7E
+                    // CSI sequence: consume until 0x40..=0x7E with 64-char bound
                     chars.next();
+                    let mut count = 0;
                     for csi in chars.by_ref() {
-                        if (0x40..=0x7E).contains(&(csi as u32)) {
+                        count += 1;
+                        if (0x40..=0x7E).contains(&(csi as u32)) || count > 64 {
                             break;
                         }
                     }
                     continue;
                 } else if next == ']' || next == 'P' || next == '_' || next == '^' || next == 'X' {
-                    // OSC / DCS / APC / PM / SOS: consume until \x07 (BEL) or \x1b\ (ST)
+                    // OSC / DCS / APC / PM / SOS: consume until \x07 (BEL) or \x1b\ (ST) with 64-char bound
                     chars.next();
                     let mut prev = '\0';
+                    let mut count = 0;
                     for osc in chars.by_ref() {
-                        if osc == '\x07' || (prev == '\x1b' && osc == '\\') {
+                        count += 1;
+                        if osc == '\x07' || (prev == '\x1b' && osc == '\\') || count > 64 {
                             break;
                         }
                         prev = osc;
@@ -39,6 +54,11 @@ pub fn sanitize_for_terminal(s: &str) -> String {
             }
             continue;
         }
+
+        if is_dangerous_unicode(c) {
+            continue;
+        }
+
         // Control chars (< 0x20, \r, DEL 0x7F, C1 controls 0x80..=0x9F)
         let code = c as u32;
         if c == '\n' || c == '\t' {
@@ -51,6 +71,19 @@ pub fn sanitize_for_terminal(s: &str) -> String {
         }
     }
     out
+}
+
+pub fn sanitize_single_line(s: &str) -> String {
+    sanitize_for_terminal(s)
+        .chars()
+        .map(|c| {
+            if c == '\n' || c == '\r' || c == '\t' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 pub fn sanitize_terminal(input: &str) -> String {
@@ -70,11 +103,11 @@ pub fn render_text(verdict: &Verdict, delta: &Delta) {
         None => "no baseline (first sighting)".to_string(),
     };
 
-    let title = sanitize_for_terminal(&format!(
+    let title = sanitize_single_line(&format!(
         "BLUELINE REVIEW: {}@{}",
         verdict.name, verdict.target_version
     ));
-    let base_header = sanitize_for_terminal(&base_display);
+    let base_header = sanitize_single_line(&base_display);
 
     table.set_header(vec![
         Cell::new(title).fg(Color::Cyan),
@@ -84,7 +117,7 @@ pub fn render_text(verdict: &Verdict, delta: &Delta) {
     // Integrity row
     table.add_row(vec![
         Cell::new("Integrity").fg(Color::White),
-        Cell::new(sanitize_for_terminal(&verdict.integrity)).fg(Color::Green),
+        Cell::new(sanitize_single_line(&verdict.integrity)).fg(Color::Green),
     ]);
 
     // Verdict row
@@ -96,14 +129,14 @@ pub fn render_text(verdict: &Verdict, delta: &Delta) {
     };
 
     let verdict_str =
-        sanitize_for_terminal(&format!("{band_label} (Score: {}/100)", verdict.risk_score));
+        sanitize_single_line(&format!("{band_label} (Score: {}/100)", verdict.risk_score));
     table.add_row(vec![
         Cell::new("Verdict").fg(Color::White),
         Cell::new(verdict_str).fg(band_color),
     ]);
 
     // Delta summary row
-    let delta_str = sanitize_for_terminal(&format!(
+    let delta_str = sanitize_single_line(&format!(
         "Files: +{} / -{} / ~{}  |  Lines: +{} / -{}",
         verdict.diff_summary.files_added,
         verdict.diff_summary.files_removed,
@@ -123,10 +156,10 @@ pub fn render_text(verdict: &Verdict, delta: &Delta) {
         } else {
             let mut parts = Vec::new();
             for s in &delta.new_lifecycle_scripts {
-                parts.push(format!("+{}", sanitize_for_terminal(s)));
+                parts.push(format!("+{}", sanitize_single_line(s)));
             }
             for s in &delta.modified_lifecycle_scripts {
-                parts.push(format!("~{}", sanitize_for_terminal(s)));
+                parts.push(format!("~{}", sanitize_single_line(s)));
             }
             parts.join(", ")
         };
@@ -137,7 +170,7 @@ pub fn render_text(verdict: &Verdict, delta: &Delta) {
     };
     table.add_row(vec![
         Cell::new("Install Scripts").fg(Color::White),
-        Cell::new(sanitize_for_terminal(&scripts_str)).fg(script_color),
+        Cell::new(sanitize_single_line(&scripts_str)).fg(script_color),
     ]);
 
     println!("{table}");
@@ -155,8 +188,8 @@ pub fn render_text(verdict: &Verdict, delta: &Delta) {
             println!(
                 "{} {}: {}",
                 tag,
-                sanitize_for_terminal(&f.title),
-                sanitize_for_terminal(&f.description)
+                sanitize_single_line(&f.title),
+                sanitize_single_line(&f.description)
             );
         }
     }
@@ -189,5 +222,52 @@ mod tests {
         let normal = "Normal Title: 1.0.0\nLine 2\tTabbed";
         let clean = sanitize_for_terminal(normal);
         assert_eq!(clean, normal);
+    }
+
+    #[test]
+    fn filters_bidi_and_trojan_source_characters() {
+        let bidi = "legit\u{202E}txt.exe\u{202D}end";
+        let clean = sanitize_for_terminal(bidi);
+        assert!(!clean.contains('\u{202E}'));
+        assert!(!clean.contains('\u{202D}'));
+        assert_eq!(clean, "legittxt.exeend");
+    }
+
+    #[test]
+    fn sanitize_single_line_removes_newlines_and_tabs() {
+        let multi = "Header\n[ BLOCK ] fake\tline";
+        let single = sanitize_single_line(multi);
+        assert!(!single.contains('\n'));
+        assert!(!single.contains('\t'));
+        assert_eq!(single, "Header [ BLOCK ] fake line");
+    }
+
+    mod proptest_invariants {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                failure_persistence: None,
+                cases: 128,
+                ..ProptestConfig::default()
+            })]
+
+            #[test]
+            fn output_never_contains_bidi_characters(s in "\\PC*") {
+                let clean = sanitize_for_terminal(&s);
+                for c in clean.chars() {
+                    prop_assert!(!is_dangerous_unicode(c));
+                }
+            }
+
+            #[test]
+            fn single_line_never_contains_linebreaks_or_tabs(s in "\\PC*") {
+                let single = sanitize_single_line(&s);
+                prop_assert!(!single.contains('\n'));
+                prop_assert!(!single.contains('\r'));
+                prop_assert!(!single.contains('\t'));
+            }
+        }
     }
 }
