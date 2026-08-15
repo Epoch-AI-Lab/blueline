@@ -5,6 +5,11 @@ fn trim_pkg(s: &str) -> Result<String, String> {
     if trimmed.is_empty() {
         return Err("package spec cannot be empty".to_string());
     }
+    if trimmed.starts_with('-') {
+        return Err(format!(
+            "package spec `{trimmed}` cannot start with a hyphen"
+        ));
+    }
     Ok(trimmed.to_string())
 }
 

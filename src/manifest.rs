@@ -39,7 +39,7 @@ const LIFECYCLE_SCRIPTS: [&str; 22] = [
 /// fields are attack surface — parsed strictly, never executed. The unused
 /// fields feed the Phase 1 heuristic (maintainer/dep/script delta); they are
 /// parsed now so the type is stable and validated.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 pub struct PackageJson {
@@ -47,6 +47,8 @@ pub struct PackageJson {
     pub name: String,
     #[serde(default)]
     pub version: String,
+    #[serde(default)]
+    pub gypfile: Option<bool>,
     #[serde(default)]
     pub scripts: BTreeMap<String, String>,
     #[serde(default)]
@@ -69,21 +71,23 @@ impl PackageJson {
 }
 
 pub fn read_package_json(path: &Path) -> Result<PackageJson, BluelineError> {
-    let metadata = fs::metadata(path)
-        .map_err(|e| BluelineError::Manifest(format!("{:?}", path), format!("cannot stat: {e}")))?;
-    if metadata.len() > MAX_MANIFEST_BYTES {
+    use std::io::Read;
+    let display_path = path.display().to_string();
+    let file = fs::File::open(path)
+        .map_err(|e| BluelineError::Manifest(display_path.clone(), format!("cannot open: {e}")))?;
+    let mut bytes = Vec::new();
+    let mut handle = file.take(MAX_MANIFEST_BYTES + 1);
+    handle
+        .read_to_end(&mut bytes)
+        .map_err(|e| BluelineError::Manifest(display_path.clone(), format!("cannot read: {e}")))?;
+    if bytes.len() as u64 > MAX_MANIFEST_BYTES {
         return Err(BluelineError::Manifest(
-            format!("{:?}", path),
-            format!(
-                "manifest is {} bytes, exceeding cap {MAX_MANIFEST_BYTES}",
-                metadata.len()
-            ),
+            display_path,
+            format!("manifest exceeds cap of {MAX_MANIFEST_BYTES} bytes"),
         ));
     }
-    let bytes = fs::read(path)
-        .map_err(|e| BluelineError::Manifest(format!("{:?}", path), format!("cannot read: {e}")))?;
     serde_json::from_slice(&bytes)
-        .map_err(|e| BluelineError::Manifest(format!("{:?}", path), format!("invalid JSON: {e}")))
+        .map_err(|e| BluelineError::Manifest(display_path, format!("invalid JSON: {e}")))
 }
 
 #[cfg(test)]
@@ -160,10 +164,8 @@ mod tests {
         let body = format!("{{\"x\":\"{}\"}}", "a".repeat(n));
         assert_eq!(body.len(), 10 * 1024 * 1024 + 1);
         fs::write(&path, &body).unwrap();
-        assert!(matches!(
-            read_package_json(&path).unwrap_err(),
-            BluelineError::Manifest(_, _)
-        ));
+        let err = read_package_json(&path).unwrap_err();
+        assert!(err.to_string().contains("manifest exceeds cap"));
     }
 
     #[test]

@@ -21,6 +21,9 @@ pub trait Registry {
 
     /// List all published versions for a package, sorted in semver ascending order.
     fn list_versions(&self, name: &str) -> Result<Vec<semver::Version>, BluelineError>;
+
+    /// Resolve a dist-tag (e.g. "latest") to a concrete version string if present.
+    fn resolve_dist_tag(&self, name: &str, tag: &str) -> Result<Option<String>, BluelineError>;
 }
 
 pub mod npm;

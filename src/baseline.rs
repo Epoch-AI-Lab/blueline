@@ -43,29 +43,36 @@ pub fn resolve_baseline<R: Registry>(
     store: &BaselineStore,
 ) -> Result<BaselineResolution, BluelineError> {
     let clean_versions = store.list_clean_versions(name)?;
+    let target_is_prerelease = !target_ver.pre.is_empty();
+
     for (clean_ver, stored_integrity) in clean_versions {
-        if clean_ver < *target_ver {
-            let pkg = registry.resolve(name, &clean_ver.to_string())?;
-            match &pkg.integrity {
-                Some(reg_integ) if reg_integ == &stored_integrity => {
-                    return Ok(BaselineResolution::LocalApproved(pkg));
+        if clean_ver < *target_ver && (target_is_prerelease || clean_ver.pre.is_empty()) {
+            match registry.resolve(name, &clean_ver.to_string()) {
+                Ok(pkg) => match &pkg.integrity {
+                    Some(reg_integ) if reg_integ == &stored_integrity => {
+                        return Ok(BaselineResolution::LocalApproved(pkg));
+                    }
+                    Some(reg_integ) => {
+                        return Err(BluelineError::Verification(format!(
+                            "stored clean baseline for {name}@{clean_ver} had integrity `{stored_integrity}`, but registry reported `{reg_integ}`; refusing to trust tampered baseline"
+                        )));
+                    }
+                    None => {
+                        return Err(BluelineError::Verification(format!(
+                            "stored clean baseline for {name}@{clean_ver} had integrity `{stored_integrity}`, but registry reported no integrity; refusing to trust unverified baseline"
+                        )));
+                    }
+                },
+                Err(BluelineError::Manifest(_, _)) => {
+                    // Version yanked/missing from registry; continue looking for older clean versions
+                    continue;
                 }
-                Some(reg_integ) => {
-                    return Err(BluelineError::Verification(format!(
-                        "stored clean baseline for {name}@{clean_ver} had integrity `{stored_integrity}`, but registry reported `{reg_integ}`; refusing to trust tampered baseline"
-                    )));
-                }
-                None => {
-                    return Err(BluelineError::Verification(format!(
-                        "stored clean baseline for {name}@{clean_ver} had integrity `{stored_integrity}`, but registry reported no integrity; refusing to trust unverified baseline"
-                    )));
-                }
+                Err(e) => return Err(e),
             }
         }
     }
 
     let reg_versions = registry.list_versions(name)?;
-    let target_is_prerelease = !target_ver.pre.is_empty();
     let predecessor = reg_versions
         .into_iter()
         .filter(|v| v < target_ver && (target_is_prerelease || v.pre.is_empty()))
@@ -131,6 +138,14 @@ mod tests {
             v.sort();
             Ok(v)
         }
+
+        fn resolve_dist_tag(
+            &self,
+            _name: &str,
+            _tag: &str,
+        ) -> Result<Option<String>, BluelineError> {
+            Ok(self.versions.last().cloned())
+        }
     }
 
     #[test]
@@ -143,7 +158,7 @@ mod tests {
         store
             .record_verified("pkg", "1.1.0", "sha512-1.1.0")
             .unwrap();
-        store.mark_clean("pkg", "1.0.0").unwrap();
+        store.mark_clean("pkg", "1.0.0", "sha512-1.0.0").unwrap();
 
         let registry = MockRegistry::new(vec!["1.0.0".into(), "1.1.0".into(), "1.2.0".into()]);
 
@@ -183,7 +198,9 @@ mod tests {
         store
             .record_verified("pkg", "1.0.0", "sha512-authentic")
             .unwrap();
-        store.mark_clean("pkg", "1.0.0").unwrap();
+        store
+            .mark_clean("pkg", "1.0.0", "sha512-authentic")
+            .unwrap();
 
         // Registry serves a tampered integrity for 1.0.0
         let registry = MockRegistry::new(vec!["1.0.0".into(), "1.1.0".into()]);
@@ -200,7 +217,9 @@ mod tests {
         store
             .record_verified("pkg", "1.0.0", "sha512-authentic")
             .unwrap();
-        store.mark_clean("pkg", "1.0.0").unwrap();
+        store
+            .mark_clean("pkg", "1.0.0", "sha512-authentic")
+            .unwrap();
 
         let mut registry = MockRegistry::new(vec!["1.0.0".into(), "1.1.0".into()]);
         registry.integrity_override = Some(None);

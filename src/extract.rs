@@ -67,14 +67,31 @@ pub fn safe_extract(
             entry.map_err(|e| BluelineError::Extraction(format!("reading tar entry: {e}")))?;
 
         let entry_type = entry.header().entry_type();
-        // Metadata entries (GNU long names, pax extensions) carry no payload.
+        let size = entry.size();
+
+        // Metadata entries (GNU long names, pax extensions) carry headers in the stream.
+        // Cap their size and count them towards total unpacked bytes to prevent tar bombs.
         if entry_type.is_gnu_longname()
             || entry_type.is_gnu_longlink()
             || entry_type.is_pax_global_extensions()
             || entry_type.is_pax_local_extensions()
         {
+            const MAX_METADATA_ENTRY_BYTES: u64 = 64 * 1024;
+            if size > MAX_METADATA_ENTRY_BYTES {
+                return Err(BluelineError::ExtractionLimit(format!(
+                    "metadata entry exceeds cap of {MAX_METADATA_ENTRY_BYTES} bytes"
+                )));
+            }
+            if stats.unpacked_bytes.saturating_add(size) > limits.max_unpacked_bytes {
+                return Err(BluelineError::ExtractionLimit(format!(
+                    "total unpacked size would exceed cap {}",
+                    limits.max_unpacked_bytes
+                )));
+            }
+            stats.unpacked_bytes += size;
             continue;
         }
+
         if !entry_type.is_file() && !entry_type.is_dir() {
             return Err(BluelineError::ExtractionLimit(format!(
                 "unsupported entry type {entry_type:?} (symlinks/hardlinks/special files are rejected)"
@@ -87,7 +104,6 @@ pub fn safe_extract(
             .to_path_buf();
         validate_entry_path(&path).map_err(BluelineError::Extraction)?;
 
-        let size = entry.size();
         if entry_type.is_file() {
             if size > limits.max_entry_bytes {
                 return Err(BluelineError::ExtractionLimit(format!(
@@ -133,6 +149,7 @@ fn validate_entry_path(path: &Path) -> Result<(), String> {
             path.display()
         ));
     }
+    let mut has_normal = false;
     for comp in path.components() {
         match comp {
             Component::ParentDir => {
@@ -153,8 +170,17 @@ fn validate_entry_path(path: &Path) -> Result<(), String> {
                     path.display()
                 ));
             }
-            Component::CurDir | Component::Normal(_) => {}
+            Component::Normal(_) => {
+                has_normal = true;
+            }
+            Component::CurDir => {}
         }
+    }
+    if !has_normal {
+        return Err(format!(
+            "entry path `{}` resolving to current directory rejected",
+            path.display()
+        ));
     }
     Ok(())
 }
@@ -163,7 +189,10 @@ fn validate_entry_path(path: &Path) -> Result<(), String> {
 #[cfg(unix)]
 fn strip_special_bits(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
-    if let Ok(md) = fs::metadata(path) {
+    if let Ok(md) = fs::symlink_metadata(path) {
+        if md.is_symlink() {
+            return;
+        }
         let mut perm = md.permissions();
         perm.set_mode(perm.mode() & 0o777);
         let _ = fs::set_permissions(path, perm);
@@ -464,5 +493,96 @@ mod tests {
         };
         let err = safe_extract(&tarball, dir.path(), &limits).unwrap_err();
         assert!(matches!(err, BluelineError::ExtractionLimit(_)));
+    }
+
+    fn raw_tarball_with_payload(entries: &[(String, u8, Vec<u8>)]) -> Vec<u8> {
+        use std::io::Write;
+        let mut out = Vec::new();
+        for (name, typeflag, data) in entries {
+            let size = data.len() as u64;
+            out.extend_from_slice(&raw_header(name, *typeflag, size, "", 0o644));
+            out.extend_from_slice(data);
+            let pad = (512 - (data.len() % 512)) % 512;
+            out.extend_from_slice(&vec![0u8; pad]);
+        }
+        out.extend_from_slice(&[0u8; 1024]);
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&out).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn metadata_entry_size_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        // Exact metadata cap 64 KiB succeeds
+        let valid_meta = raw_tarball_with_payload(&[
+            ("././@LongLink".into(), 0x4c, vec![b'a'; 64 * 1024]),
+            ("file.txt".into(), 0x30, vec![b'x'; 1]),
+        ]);
+        let stats = safe_extract(&valid_meta, dir.path(), &ExtractionLimits::default()).unwrap();
+        assert_eq!(stats.files, 1);
+        assert_eq!(stats.unpacked_bytes, (64 * 1024) + 1);
+
+        // 64 KiB + 1 fails
+        let invalid_meta = raw_tarball_with_payload(&[(
+            "././@LongLink".into(),
+            0x4c,
+            vec![b'a'; (64 * 1024) + 1],
+        )]);
+        let err =
+            safe_extract(&invalid_meta, dir.path(), &ExtractionLimits::default()).unwrap_err();
+        assert!(err.to_string().contains("metadata entry exceeds cap"));
+    }
+
+    #[test]
+    fn metadata_entry_accounts_for_total_unpacked_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = ExtractionLimits {
+            max_unpacked_bytes: 200,
+            ..ExtractionLimits::default()
+        };
+
+        // Exactly at cap: 100 metadata bytes + 100 file bytes = 200 bytes total
+        let exact_tarball = raw_tarball_with_payload(&[
+            ("././@LongLink".into(), 0x4c, vec![b'a'; 100]),
+            ("file.txt".into(), 0x30, vec![b'x'; 100]),
+        ]);
+        let stats = safe_extract(&exact_tarball, dir.path(), &limits).unwrap();
+        assert_eq!(stats.unpacked_bytes, 200);
+
+        // Exceeds total unpacked bytes: 100 metadata bytes + 101 file bytes = 201 bytes
+        let exceed_tarball = raw_tarball_with_payload(&[
+            ("././@LongLink".into(), 0x4c, vec![b'a'; 100]),
+            ("file.txt".into(), 0x30, vec![b'x'; 101]),
+        ]);
+        let err = safe_extract(&exceed_tarball, dir.path(), &limits).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("total unpacked size would exceed cap")
+        );
+    }
+
+    #[test]
+    fn metadata_entry_accounts_for_total_unpacked_bytes_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = ExtractionLimits {
+            max_unpacked_bytes: 200,
+            ..ExtractionLimits::default()
+        };
+
+        // Exactly at cap for metadata entry alone: 200 metadata bytes
+        let exact_meta_alone =
+            raw_tarball_with_payload(&[("././@LongLink".into(), 0x4c, vec![b'a'; 200])]);
+        let stats = safe_extract(&exact_meta_alone, dir.path(), &limits).unwrap();
+        assert_eq!(stats.unpacked_bytes, 200);
+
+        // Exceeds total unpacked bytes for metadata entry alone: 201 bytes
+        let exceed_meta_alone =
+            raw_tarball_with_payload(&[("././@LongLink".into(), 0x4c, vec![b'a'; 201])]);
+        let err = safe_extract(&exceed_meta_alone, dir.path(), &limits).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("total unpacked size would exceed cap")
+        );
     }
 }
