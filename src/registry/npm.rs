@@ -710,35 +710,33 @@ mod tests {
         let integrity = format!("sha512-{hash}");
 
         let handle = std::thread::spawn(move || {
-            // Request 1 & 2: successful redirect (1 redirect)
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 1024];
-                let _ = stream.read(&mut buf);
-                let resp = format!(
-                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/final.tgz\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                );
-                let _ = stream.write_all(resp.as_bytes());
-            }
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 1024];
-                let _ = stream.read(&mut buf);
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    payload.len()
-                );
-                let _ = stream.write_all(resp.as_bytes());
-                let _ = stream.write_all(payload);
-            }
-
-            // Next 6 requests: loop of 6 redirects
-            for _ in 0..6 {
+            let _ = listener.set_nonblocking(true);
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_millis(600) {
                 if let Ok((mut stream, _)) = listener.accept() {
                     let mut buf = [0u8; 1024];
-                    let _ = stream.read(&mut buf);
-                    let resp = format!(
-                        "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/loop\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                    );
-                    let _ = stream.write_all(resp.as_bytes());
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    if req.contains("GET /redirect1 ") {
+                        let resp = format!(
+                            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/final.tgz\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    } else if req.contains("GET /final.tgz ") {
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            payload.len()
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                        let _ = stream.write_all(payload);
+                    } else if req.contains("GET /loop ") {
+                        let resp = format!(
+                            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/loop\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    }
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
                 }
             }
         });
@@ -785,7 +783,9 @@ mod tests {
         let integrity = format!("sha512-{hash}");
 
         let handle = std::thread::spawn(move || {
-            for _ in 0..2 {
+            let _ = listener.set_nonblocking(true);
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_millis(600) {
                 if let Ok((mut stream, _)) = listener.accept() {
                     let mut buf = [0u8; 1024];
                     let n = stream.read(&mut buf).unwrap_or(0);
@@ -811,6 +811,8 @@ mod tests {
                         let _ = stream.write_all(resp.as_bytes());
                         let _ = stream.write_all(&payload);
                     }
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
                 }
             }
         });
@@ -839,7 +841,9 @@ mod tests {
         let body_over = format!("{body_exact} ");
 
         let handle = std::thread::spawn(move || {
-            for _ in 0..2 {
+            let _ = listener.set_nonblocking(true);
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_millis(600) {
                 if let Ok((mut stream, _)) = listener.accept() {
                     let mut buf = [0u8; 1024];
                     let n = stream.read(&mut buf).unwrap_or(0);
@@ -860,6 +864,8 @@ mod tests {
                         );
                         let _ = stream.write_all(resp.as_bytes());
                     }
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
                 }
             }
         });
@@ -903,7 +909,9 @@ mod tests {
         let over_integrity = format!("sha512-{hash2}");
 
         let handle = std::thread::spawn(move || {
-            for _ in 0..2 {
+            let _ = listener.set_nonblocking(true);
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_millis(600) {
                 if let Ok((mut stream, _)) = listener.accept() {
                     let mut buf = [0u8; 1024];
                     let n = stream.read(&mut buf).unwrap_or(0);
@@ -924,6 +932,8 @@ mod tests {
                         let _ = stream.write_all(resp.as_bytes());
                         let _ = stream.write_all(&over_payload);
                     }
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
                 }
             }
         });
@@ -973,43 +983,49 @@ mod tests {
         let integrity = format!("sha512-{hash}");
 
         let handle = std::thread::spawn(move || {
-            // Test 1: Exactly 2 redirects -> /r1 -> /r2 -> /ok.tgz (3 requests)
-            for i in 1..=2 {
+            let _ = listener.set_nonblocking(true);
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_millis(600) {
                 if let Ok((mut stream, _)) = listener.accept() {
                     let mut buf = [0u8; 1024];
-                    let _ = stream.read(&mut buf);
-                    let target = if i == 1 {
-                        format!("http://127.0.0.1:{port}/r2")
-                    } else {
-                        format!("http://127.0.0.1:{port}/ok.tgz")
-                    };
-                    let resp = format!(
-                        "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                    );
-                    let _ = stream.write_all(resp.as_bytes());
-                }
-            }
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 1024];
-                let _ = stream.read(&mut buf);
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    payload.len()
-                );
-                let _ = stream.write_all(resp.as_bytes());
-                let _ = stream.write_all(payload);
-            }
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
 
-            // Test 2: 3 redirects with limit 2 -> /over1 -> /over2 -> /over3 (3 redirects = 3 302 responses)
-            for i in 1..=3 {
-                if let Ok((mut stream, _)) = listener.accept() {
-                    let mut buf = [0u8; 1024];
-                    let _ = stream.read(&mut buf);
-                    let target = format!("http://127.0.0.1:{port}/over{}", i + 1);
-                    let resp = format!(
-                        "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                    );
-                    let _ = stream.write_all(resp.as_bytes());
+                    if req.contains("GET /r1 ") {
+                        let resp = format!(
+                            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/r2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    } else if req.contains("GET /r2 ") {
+                        let resp = format!(
+                            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/ok.tgz\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    } else if req.contains("GET /ok.tgz ") {
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            payload.len()
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                        let _ = stream.write_all(payload);
+                    } else if req.contains("GET /over1 ") {
+                        let resp = format!(
+                            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/over2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    } else if req.contains("GET /over2 ") {
+                        let resp = format!(
+                            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/over3\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    } else if req.contains("GET /over3 ") {
+                        let resp = format!(
+                            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/over4\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    }
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
                 }
             }
         });
