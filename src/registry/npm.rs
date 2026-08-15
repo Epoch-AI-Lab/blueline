@@ -137,21 +137,6 @@ impl NpmRegistry {
                     current_url = location.to_string();
                 }
                 Ok(response) => break response,
-                Err(ureq::Error::Status(code, response)) if (301..=308).contains(&code) => {
-                    redirects_followed += 1;
-                    if redirects_followed > MAX_REDIRECTS {
-                        return Err(BluelineError::Network(format!(
-                            "too many redirects downloading {}",
-                            pkg.tarball_url
-                        )));
-                    }
-                    let location = response.header("location").ok_or_else(|| {
-                        BluelineError::Network(format!(
-                            "redirect {code} missing Location header for {current_url}"
-                        ))
-                    })?;
-                    current_url = location.to_string();
-                }
                 Err(e) => {
                     return Err(BluelineError::Network(format!(
                         "GET {}: {e}",
@@ -613,12 +598,11 @@ mod tests {
         let len215 = "a".repeat(215);
         assert!(validate_package_name(&len215).is_err());
 
-        // Test individual forbidden characters in name and scope
-        let forbidden = [
-            '~', '\'', '(', ')', '*', '!', '\0', '\n', '\r', '\t', '\x07',
-        ];
+        // Test individual forbidden characters in name and scope with exact error message
+        let forbidden = ['\\', '?', '#', '&', '%', '\0', '\n', '\r', '\t', ' '];
         for c in forbidden {
-            assert!(validate_package_name(&format!("pkg{c}")).is_err());
+            let err = validate_package_name(&format!("pkg{c}")).unwrap_err();
+            assert!(err.to_string().contains("contains forbidden characters"));
             assert!(validate_package_name(&format!("@scope/pkg{c}")).is_err());
             assert!(validate_package_name(&format!("@scope{c}/pkg")).is_err());
         }
@@ -696,8 +680,34 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let base = format!("http://127.0.0.1:{port}");
 
+        let payload = b"tarball-content";
+        let mut hasher = sha2::Sha512::new();
+        hasher.update(payload);
+        let hash = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
+        let integrity = format!("sha512-{hash}");
+
         let handle = std::thread::spawn(move || {
-            // Handle redirect loop (302 redirecting to same URL; initial request + 5 redirects = 6 requests)
+            // Request 1 & 2: successful redirect (1 redirect)
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/final.tgz\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.write_all(payload);
+            }
+
+            // Next 6 requests: loop of 6 redirects
             for _ in 0..6 {
                 if let Ok((mut stream, _)) = listener.accept() {
                     let mut buf = [0u8; 1024];
@@ -711,13 +721,25 @@ mod tests {
         });
 
         let reg = NpmRegistry::new(&base);
-        let pkg = Package {
+
+        // 1 redirect succeeds and fetches tarball bytes
+        let pkg_ok = Package {
+            name: "test".into(),
+            version: "1.0.0".into(),
+            tarball_url: format!("{base}/redirect1"),
+            integrity: Some(integrity),
+        };
+        let bytes = reg.fetch_url_verified(&pkg_ok).unwrap();
+        assert_eq!(bytes, payload);
+
+        // 6 redirects exceeds MAX_REDIRECTS (5) and errors out
+        let pkg_loop = Package {
             name: "test".into(),
             version: "1.0.0".into(),
             tarball_url: format!("{base}/loop"),
             integrity: Some("sha512-test".into()),
         };
-        let err = reg.fetch_url_verified(&pkg).unwrap_err();
+        let err = reg.fetch_url_verified(&pkg_loop).unwrap_err();
         assert!(err.to_string().contains("too many redirects"));
 
         let _ = handle.join();
