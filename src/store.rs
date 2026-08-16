@@ -322,7 +322,7 @@ impl BaselineStore {
                 has_blocking: has_blocking != 0,
                 fetched_at,
                 expires_at,
-                is_expired: now > expires_at,
+                is_expired: now >= expires_at,
             })
         })
         .optional()
@@ -347,7 +347,7 @@ impl BaselineStore {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        let expires_at = now.saturating_add(ttl_secs.max(0));
+        let expires_at = now.saturating_add(ttl_secs);
 
         self.conn
             .prepare_cached(
@@ -683,12 +683,30 @@ mod tests {
         assert!(!cached.has_blocking);
         assert!(!cached.is_expired);
 
+        // Test expired advisory cache entry
+        store
+            .put_cached_advisories("pkg", "2.0.0", r#"{"vulns":[]}"#, 1, true, -10)
+            .unwrap();
+        let expired = store
+            .get_cached_advisories("pkg", "2.0.0")
+            .unwrap()
+            .unwrap();
+        assert!(expired.is_expired);
+        assert_eq!(expired.hit_count, 1);
+        assert!(expired.has_blocking);
+
         // Test clearing cache
         let cleared = store.clear_advisory_cache().unwrap();
-        assert_eq!(cleared, 1);
+        assert_eq!(cleared, 2);
         assert!(
             store
                 .get_cached_advisories("pkg", "1.0.0")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_cached_advisories("pkg", "2.0.0")
                 .unwrap()
                 .is_none()
         );
@@ -743,7 +761,8 @@ mod tests {
     #[test]
     fn audit_log_recording() {
         let dir = tempfile::tempdir().unwrap();
-        let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
+        let db_path = dir.path().join("t.db");
+        let store = BaselineStore::open_at(&db_path).unwrap();
 
         store
             .record_audit_log(
@@ -757,6 +776,34 @@ mod tests {
                 Some("Reviewed zero dangerous deltas"),
             )
             .unwrap();
+
+        // Verify direct row insertion in SQLite
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let (pkg, ver, integrity, action, score, verdict, decided_by, notes): (
+            String,
+            String,
+            String,
+            String,
+            i64,
+            String,
+            String,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT package, version, integrity, action, score, verdict, decided_by, notes FROM audit_log WHERE package = 'pkg'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
+            )
+            .unwrap();
+
+        assert_eq!(pkg, "pkg");
+        assert_eq!(ver, "1.0.0");
+        assert_eq!(integrity, "sha512-test");
+        assert_eq!(action, "approve");
+        assert_eq!(score, 15);
+        assert_eq!(verdict, "LOW");
+        assert_eq!(decided_by, "ci-bot");
+        assert_eq!(notes.as_deref(), Some("Reviewed zero dangerous deltas"));
     }
 
     mod proptest_invariants {
