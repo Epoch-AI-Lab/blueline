@@ -4,14 +4,21 @@ use crate::baseline::resolve_baseline;
 use crate::cli::{Output, OutputFormat};
 use crate::diff::compute_delta;
 use crate::extract::{ExtractionLimits, safe_extract};
-use crate::heuristic::evaluate;
+use crate::heuristic::evaluate_with_policy;
 use crate::manifest::read_package_json;
+use crate::policy::Policy;
 use crate::registry::Registry;
 use crate::registry::npm::NpmRegistry;
 use crate::render::{render_json, render_text};
 use crate::store::BaselineStore;
 
-pub fn run(pkg_spec: &str, registry_base: &str, output: Output) -> anyhow::Result<()> {
+pub fn run(
+    pkg_spec: &str,
+    registry_base: &str,
+    output: Output,
+    policy_path: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    let policy = Policy::load_or_default(policy_path)?;
     let (name, version_str) = parse_spec(pkg_spec)?;
     let target_semver = semver::Version::parse(&version_str)
         .map_err(|e| anyhow::anyhow!("invalid semver for `{version_str}`: {e}"))?;
@@ -103,7 +110,13 @@ pub fn run(pkg_spec: &str, registry_base: &str, output: Output) -> anyhow::Resul
         baseline_res,
         crate::baseline::BaselineResolution::RegistryPredecessor(_)
     );
-    let verdict = evaluate(&target_pkg.name, "verified (sha512)", &delta, is_unreviewed);
+    let verdict = evaluate_with_policy(
+        &target_pkg.name,
+        "verified (sha512)",
+        &delta,
+        is_unreviewed,
+        &policy,
+    );
 
     match output.resolve(std::io::stdout().is_terminal()) {
         OutputFormat::Json => {
@@ -129,8 +142,14 @@ pub fn run(pkg_spec: &str, registry_base: &str, output: Output) -> anyhow::Resul
     Ok(())
 }
 
-pub fn install(pkg_spec: &str, registry_base: &str, npm_args: &[String]) -> anyhow::Result<()> {
+pub fn install(
+    pkg_spec: &str,
+    registry_base: &str,
+    npm_args: &[String],
+    policy_path: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
     crate::executor::validate_extra_args(npm_args)?;
+    let policy = Policy::load_or_default(policy_path)?;
     let registry = NpmRegistry::new(registry_base);
     let (name, version_str) = parse_spec_flexible(pkg_spec, &registry)?;
     let target_semver = semver::Version::parse(&version_str)
@@ -219,7 +238,13 @@ pub fn install(pkg_spec: &str, registry_base: &str, npm_args: &[String]) -> anyh
         baseline_res,
         crate::baseline::BaselineResolution::RegistryPredecessor(_)
     );
-    let verdict = evaluate(&target_pkg.name, "verified (sha512)", &delta, is_unreviewed);
+    let verdict = evaluate_with_policy(
+        &target_pkg.name,
+        "verified (sha512)",
+        &delta,
+        is_unreviewed,
+        &policy,
+    );
     render_text(&verdict, &delta);
 
     let is_interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();

@@ -1021,3 +1021,55 @@ fn regression_forwarded_flags_underscore_and_config_injection_blocked() {
         blueline().args(&args).assert().failure();
     }
 }
+
+#[test]
+fn regression_policy_missing_file_fails_closed() {
+    blueline()
+        .args([
+            "review",
+            "express@4.21.2",
+            "--policy",
+            "nonexistent_policy_file.toml",
+        ])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn regression_policy_blocks_package_via_cli() {
+    let tarball = make_tarball();
+    let integrity = sha512_b64(&tarball);
+    let pack_integrity = integrity.clone();
+    let fix = spawn_fixture(
+        move |base| packument(base, "4.21.2", &pack_integrity),
+        tarball,
+    );
+
+    let temp_policy = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        temp_policy.path(),
+        r#"
+[blocklist]
+packages = ["express"]
+"#,
+    )
+    .unwrap();
+
+    let data_dir = tempfile::tempdir().unwrap();
+    blueline()
+        .args([
+            "review",
+            "express@4.21.2",
+            "--registry",
+            &fix.base,
+            "--policy",
+            temp_policy.path().to_str().unwrap(),
+            "--output",
+            "json",
+        ])
+        .env("BLUELINE_DATA_DIR", data_dir.path())
+        .assert()
+        .code(2)
+        .stdout(predicates::str::contains(r#""band":"BLOCK""#))
+        .stdout(predicates::str::contains("P01_PACKAGE_BLOCKED"));
+}

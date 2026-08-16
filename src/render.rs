@@ -76,12 +76,11 @@ pub fn sanitize_for_terminal(s: &str) -> String {
 pub fn sanitize_single_line(s: &str) -> String {
     sanitize_for_terminal(s)
         .chars()
-        .map(|c| {
-            if c == '\n' || c == '\r' || c == '\t' {
+        .map(|c| match c {
+            '\n' | '\r' | '\t' | '\u{000B}' | '\u{000C}' | '\u{0085}' | '\u{2028}' | '\u{2029}' => {
                 ' '
-            } else {
-                c
             }
+            _ => c,
         })
         .collect()
 }
@@ -235,11 +234,13 @@ mod tests {
 
     #[test]
     fn sanitize_single_line_removes_newlines_and_tabs() {
-        let multi = "Header\n[ BLOCK ] fake\tline";
+        let multi = "Header\n[ BLOCK ] fake\tline\u{2028}line2\u{2029}line3";
         let single = sanitize_single_line(multi);
         assert!(!single.contains('\n'));
         assert!(!single.contains('\t'));
-        assert_eq!(single, "Header [ BLOCK ] fake line");
+        assert!(!single.contains('\u{2028}'));
+        assert!(!single.contains('\u{2029}'));
+        assert_eq!(single, "Header [ BLOCK ] fake line line2 line3");
     }
 
     mod proptest_invariants {
