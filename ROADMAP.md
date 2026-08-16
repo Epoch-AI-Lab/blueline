@@ -20,11 +20,11 @@ decisions behind each phase.
 - [x] Interactive prompt: `[a]pprove · [h]old · [d]iff` with `clean = 1` SQLite store persistence
 - [x] Node shim (`@blueline/cli`) + `npx blueline install` that performs/blocks the real `npm install`
 
-## Phase 2 — Trust Sources
-- OSV + GitHub Advisory revocation cache
-- Provenance / attestation surfacing (sigstore / SLSA) — displayed, never trusted
-- `blueline.toml` policy-as-code (thresholds, allow/blocklists, required-provenance)
-- Persisted approval allowlist
+## Phase 2 — Trust Sources ✅
+- [x] OSV + GitHub Advisory revocation cache & engine (`src/advisory.rs`)
+- [x] Provenance / attestation surfacing (Sigstore / SLSA) (`src/provenance.rs`)
+- [x] `blueline.toml` policy-as-code (advisories, provenance enforcement, allow/blocklists) (`src/policy.rs`)
+- [x] SQLite schema v2 (`advisory_cache`, `provenance_cache`, `audit_log`) (`src/store.rs`)
 
 ## Phase 3 — CI & Agents
 - GitHub composite Action: `blueline ci` scans lockfile / `package.json` PR diffs → comment + status check

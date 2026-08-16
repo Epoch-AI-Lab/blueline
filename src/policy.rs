@@ -16,6 +16,8 @@ pub const MAX_POLICY_FILE_SIZE: u64 = 64 * 1024;
 pub struct Policy {
     pub thresholds: ThresholdsConfig,
     pub policy: GeneralPolicyConfig,
+    pub advisories: AdvisoriesPolicyConfig,
+    pub provenance: ProvenancePolicyConfig,
     pub allowlist: AllowlistConfig,
     pub blocklist: BlocklistConfig,
 }
@@ -194,6 +196,10 @@ pub struct GeneralPolicyConfig {
     pub block_unreviewed_scripts: bool,
     /// Allow non-registry git/http dependencies without blocking (default false).
     pub allow_git_dependencies: bool,
+    /// Query and check OSV vulnerability advisories (default true).
+    pub check_advisories: bool,
+    /// Fail closed if advisory or registry network calls fail (default false).
+    pub fail_closed_network: bool,
 }
 
 impl Default for GeneralPolicyConfig {
@@ -202,8 +208,51 @@ impl Default for GeneralPolicyConfig {
             require_provenance: false,
             block_unreviewed_scripts: true,
             allow_git_dependencies: false,
+            check_advisories: true,
+            fail_closed_network: false,
         }
     }
+}
+
+/// Advisory policy configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AdvisoriesPolicyConfig {
+    pub block_on_malware: bool,
+    pub block_on_critical_cve: bool,
+    pub cache_ttl_hours_clean: u64,
+    pub cache_ttl_hours_vulnerable: u64,
+}
+
+impl Default for AdvisoriesPolicyConfig {
+    fn default() -> Self {
+        Self {
+            block_on_malware: true,
+            block_on_critical_cve: true,
+            cache_ttl_hours_clean: 12,
+            cache_ttl_hours_vulnerable: 1,
+        }
+    }
+}
+
+impl AdvisoriesPolicyConfig {
+    pub fn clean_cache_ttl_secs(&self) -> i64 {
+        (self.cache_ttl_hours_clean.saturating_mul(3600)) as i64
+    }
+
+    pub fn vulnerable_cache_ttl_secs(&self) -> i64 {
+        (self.cache_ttl_hours_vulnerable.saturating_mul(3600)) as i64
+    }
+}
+
+/// Provenance and attestation policy configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProvenancePolicyConfig {
+    pub require_provenance: bool,
+    pub require_signatures: bool,
+    pub allowed_builders: Vec<String>,
+    pub allowed_repositories: Vec<String>,
 }
 
 /// Allowlist configuration for verified packages and lifecycle scripts.

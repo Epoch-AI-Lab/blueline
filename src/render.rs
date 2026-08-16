@@ -218,6 +218,70 @@ pub fn render_text(verdict: &Verdict, delta: &Delta) {
         Cell::new(sanitize_single_line(&scripts_str)).fg(script_color),
     ]);
 
+    // Trust Sources (Phase 2)
+    if let Some(ref ts) = verdict.trust_sources {
+        if let Some(ref adv) = ts.advisories {
+            let (adv_label, adv_color) = match adv.status {
+                crate::advisory::AdvisoryStatus::Clean => (
+                    "[ CLEAN ] 0 known OSV/GHSA advisories".to_string(),
+                    Color::Green,
+                ),
+                crate::advisory::AdvisoryStatus::Vulnerable => (
+                    format!("[ VULNERABLE ] {} advisory hit(s)", adv.hits.len()),
+                    Color::Red,
+                ),
+                crate::advisory::AdvisoryStatus::StaleCache => (
+                    "[ STALE CACHE ] offline fallback".to_string(),
+                    Color::Yellow,
+                ),
+                crate::advisory::AdvisoryStatus::Unverified => (
+                    "[ UNVERIFIED ] unreachable (offline)".to_string(),
+                    Color::Yellow,
+                ),
+            };
+            table.add_row(vec![
+                Cell::new("Advisories (OSV)").fg(Color::White),
+                Cell::new(sanitize_single_line(&adv_label)).fg(adv_color),
+            ]);
+        }
+
+        if let Some(ref prov) = ts.provenance {
+            let (prov_label, prov_color) = match prov.status {
+                crate::provenance::ProvenanceStatus::Verified => (
+                    format!("[ SLSA Level {} ] Verified Builder", prov.slsa_level),
+                    Color::Green,
+                ),
+                crate::provenance::ProvenanceStatus::FailedMismatch => {
+                    ("[ DIGEST MISMATCH ]".to_string(), Color::DarkRed)
+                }
+                crate::provenance::ProvenanceStatus::Missing => {
+                    ("none (unattested)".to_string(), Color::DarkGrey)
+                }
+                crate::provenance::ProvenanceStatus::Unverified => {
+                    ("unverified".to_string(), Color::Yellow)
+                }
+            };
+            table.add_row(vec![
+                Cell::new("Provenance").fg(Color::White),
+                Cell::new(sanitize_single_line(&prov_label)).fg(prov_color),
+            ]);
+
+            if let Some(ref repo) = prov.source_repo {
+                table.add_row(vec![
+                    Cell::new("Source Repo").fg(Color::White),
+                    Cell::new(sanitize_single_line(repo)).fg(Color::Cyan),
+                ]);
+            }
+
+            if prov.registry_signature_present {
+                table.add_row(vec![
+                    Cell::new("Registry Signature").fg(Color::White),
+                    Cell::new("[ VALID ] Signed by npm Registry").fg(Color::Green),
+                ]);
+            }
+        }
+    }
+
     println!("{table}");
 
     // Findings breakdown

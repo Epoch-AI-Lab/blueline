@@ -18,7 +18,70 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE known_clean ADD COLUMN clean INTEGER NOT NULL DEFAULT 0;
     ",
+    "
+    CREATE TABLE advisory_cache (
+        package               TEXT NOT NULL,
+        version               TEXT NOT NULL,
+        advisories_json       TEXT NOT NULL,
+        hit_count             INTEGER NOT NULL DEFAULT 0,
+        has_blocking_advisory INTEGER NOT NULL DEFAULT 0,
+        fetched_at            INTEGER NOT NULL,
+        expires_at            INTEGER NOT NULL,
+        PRIMARY KEY (package, version)
+    ) STRICT;
+
+    CREATE INDEX idx_advisory_cache_expiry ON advisory_cache(expires_at);
+
+    CREATE TABLE provenance_cache (
+        package          TEXT NOT NULL,
+        version          TEXT NOT NULL,
+        builder_id       TEXT,
+        source_repo      TEXT,
+        commit_sha       TEXT,
+        workflow_path    TEXT,
+        slsa_level       INTEGER NOT NULL DEFAULT 0,
+        signature_valid  INTEGER NOT NULL DEFAULT 0,
+        verified_at      INTEGER NOT NULL,
+        PRIMARY KEY (package, version)
+    ) STRICT;
+
+    CREATE TABLE audit_log (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        package    TEXT NOT NULL,
+        version    TEXT NOT NULL,
+        integrity  TEXT NOT NULL,
+        action     TEXT NOT NULL,
+        score      INTEGER NOT NULL,
+        verdict    TEXT NOT NULL,
+        decided_by TEXT NOT NULL,
+        notes      TEXT,
+        decided_at INTEGER NOT NULL
+    ) STRICT;
+
+    CREATE INDEX idx_audit_pkg_ver ON audit_log(package, version);
+    ",
 ];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedAdvisories {
+    pub advisories_json: String,
+    pub hit_count: usize,
+    pub has_blocking: bool,
+    pub fetched_at: i64,
+    pub expires_at: i64,
+    pub is_expired: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedProvenance {
+    pub builder_id: Option<String>,
+    pub source_repo: Option<String>,
+    pub commit_sha: Option<String>,
+    pub workflow_path: Option<String>,
+    pub slsa_level: u32,
+    pub signature_valid: bool,
+    pub verified_at: i64,
+}
 
 /// SQLite store for the review baseline. A row records that `name@version`
 /// was integrity-verified, with `clean = 0` the default: only a verdict
@@ -226,6 +289,238 @@ impl BaselineStore {
             .optional()
             .map_err(|e| BluelineError::Store(format!("reading {name}@{version}: {e}")))
     }
+
+    /// Retrieve cached advisories for `package@version` if present.
+    pub fn get_cached_advisories(
+        &self,
+        package: &str,
+        version: &str,
+    ) -> Result<Option<CachedAdvisories>, BluelineError> {
+        use rusqlite::OptionalExtension;
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT advisories_json, hit_count, has_blocking_advisory, fetched_at, expires_at
+                 FROM advisory_cache WHERE package = ?1 AND version = ?2",
+            )
+            .map_err(|e| BluelineError::Store(format!("preparing get_cached_advisories: {e}")))?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        stmt.query_row(rusqlite::params![package, version], |row| {
+            let json: String = row.get(0)?;
+            let hit_count: i64 = row.get(1)?;
+            let has_blocking: i64 = row.get(2)?;
+            let fetched_at: i64 = row.get(3)?;
+            let expires_at: i64 = row.get(4)?;
+            Ok(CachedAdvisories {
+                advisories_json: json,
+                hit_count: hit_count.max(0) as usize,
+                has_blocking: has_blocking != 0,
+                fetched_at,
+                expires_at,
+                is_expired: now > expires_at,
+            })
+        })
+        .optional()
+        .map_err(|e| {
+            BluelineError::Store(format!(
+                "reading cached advisories for {package}@{version}: {e}"
+            ))
+        })
+    }
+
+    /// Cache advisory results for `package@version` with a specified TTL in seconds.
+    pub fn put_cached_advisories(
+        &self,
+        package: &str,
+        version: &str,
+        advisories_json: &str,
+        hit_count: usize,
+        has_blocking: bool,
+        ttl_secs: i64,
+    ) -> Result<(), BluelineError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let expires_at = now.saturating_add(ttl_secs.max(0));
+
+        self.conn
+            .prepare_cached(
+                "INSERT INTO advisory_cache (package, version, advisories_json, hit_count, has_blocking_advisory, fetched_at, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(package, version) DO UPDATE SET
+                     advisories_json = excluded.advisories_json,
+                     hit_count = excluded.hit_count,
+                     has_blocking_advisory = excluded.has_blocking_advisory,
+                     fetched_at = excluded.fetched_at,
+                     expires_at = excluded.expires_at",
+            )
+            .map_err(|e| BluelineError::Store(format!("preparing put_cached_advisories: {e}")))?
+            .execute(rusqlite::params![
+                package,
+                version,
+                advisories_json,
+                hit_count as i64,
+                if has_blocking { 1 } else { 0 },
+                now,
+                expires_at,
+            ])
+            .map_err(|e| {
+                BluelineError::Store(format!("storing advisories for {package}@{version}: {e}"))
+            })?;
+
+        Ok(())
+    }
+
+    /// Clear all cached advisories. Returns the number of deleted cache rows.
+    #[allow(dead_code)]
+    pub fn clear_advisory_cache(&self) -> Result<usize, BluelineError> {
+        let count = self
+            .conn
+            .execute("DELETE FROM advisory_cache", [])
+            .map_err(|e| BluelineError::Store(format!("clearing advisory cache: {e}")))?;
+        Ok(count)
+    }
+
+    /// Cache verified provenance and registry signatures for `package@version`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_provenance(
+        &self,
+        package: &str,
+        version: &str,
+        builder_id: Option<&str>,
+        source_repo: Option<&str>,
+        commit_sha: Option<&str>,
+        workflow_path: Option<&str>,
+        slsa_level: u32,
+        signature_valid: bool,
+    ) -> Result<(), BluelineError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        self.conn
+            .prepare_cached(
+                "INSERT INTO provenance_cache (package, version, builder_id, source_repo, commit_sha, workflow_path, slsa_level, signature_valid, verified_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(package, version) DO UPDATE SET
+                     builder_id = excluded.builder_id,
+                     source_repo = excluded.source_repo,
+                     commit_sha = excluded.commit_sha,
+                     workflow_path = excluded.workflow_path,
+                     slsa_level = excluded.slsa_level,
+                     signature_valid = excluded.signature_valid,
+                     verified_at = excluded.verified_at",
+            )
+            .map_err(|e| BluelineError::Store(format!("preparing record_provenance: {e}")))?
+            .execute(rusqlite::params![
+                package,
+                version,
+                builder_id,
+                source_repo,
+                commit_sha,
+                workflow_path,
+                slsa_level as i64,
+                if signature_valid { 1 } else { 0 },
+                now,
+            ])
+            .map_err(|e| {
+                BluelineError::Store(format!("storing provenance for {package}@{version}: {e}"))
+            })?;
+
+        Ok(())
+    }
+
+    /// Retrieve cached provenance metadata for `package@version`.
+    pub fn get_cached_provenance(
+        &self,
+        package: &str,
+        version: &str,
+    ) -> Result<Option<CachedProvenance>, BluelineError> {
+        use rusqlite::OptionalExtension;
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT builder_id, source_repo, commit_sha, workflow_path, slsa_level, signature_valid, verified_at
+                 FROM provenance_cache WHERE package = ?1 AND version = ?2",
+            )
+            .map_err(|e| BluelineError::Store(format!("preparing get_cached_provenance: {e}")))?;
+
+        stmt.query_row(rusqlite::params![package, version], |row| {
+            let builder_id: Option<String> = row.get(0)?;
+            let source_repo: Option<String> = row.get(1)?;
+            let commit_sha: Option<String> = row.get(2)?;
+            let workflow_path: Option<String> = row.get(3)?;
+            let slsa_level: i64 = row.get(4)?;
+            let signature_valid: i64 = row.get(5)?;
+            let verified_at: i64 = row.get(6)?;
+            Ok(CachedProvenance {
+                builder_id,
+                source_repo,
+                commit_sha,
+                workflow_path,
+                slsa_level: slsa_level.max(0) as u32,
+                signature_valid: signature_valid != 0,
+                verified_at,
+            })
+        })
+        .optional()
+        .map_err(|e| {
+            BluelineError::Store(format!(
+                "reading cached provenance for {package}@{version}: {e}"
+            ))
+        })
+    }
+
+    /// Record an audit decision (e.g. approve, hold, block) into the audit trail.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_audit_log(
+        &self,
+        package: &str,
+        version: &str,
+        integrity: &str,
+        action: &str,
+        score: u32,
+        verdict: &str,
+        decided_by: &str,
+        notes: Option<&str>,
+    ) -> Result<(), BluelineError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        self.conn
+            .prepare_cached(
+                "INSERT INTO audit_log (package, version, integrity, action, score, verdict, decided_by, notes, decided_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )
+            .map_err(|e| BluelineError::Store(format!("preparing record_audit_log: {e}")))?
+            .execute(rusqlite::params![
+                package,
+                version,
+                integrity,
+                action,
+                score as i64,
+                verdict,
+                decided_by,
+                notes,
+                now,
+            ])
+            .map_err(|e| {
+                BluelineError::Store(format!(
+                    "recording audit log for {package}@{version}: {e}"
+                ))
+            })?;
+
+        Ok(())
+    }
 }
 
 fn default_db_path() -> Result<std::path::PathBuf, BluelineError> {
@@ -364,12 +659,103 @@ mod tests {
     }
 
     #[test]
-    fn sets_busy_timeout_properly() {
+    fn advisory_cache_roundtrip_and_clear() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("t.db");
-        let store = BaselineStore::open_at(&db_path).unwrap();
+        let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
+
+        assert!(
+            store
+                .get_cached_advisories("pkg", "1.0.0")
+                .unwrap()
+                .is_none()
+        );
+
         store
-            .record_verified("pkg", "1.0.0", "sha512-test")
+            .put_cached_advisories("pkg", "1.0.0", r#"{"vulns":[]}"#, 0, false, 3600)
+            .unwrap();
+
+        let cached = store
+            .get_cached_advisories("pkg", "1.0.0")
+            .unwrap()
+            .unwrap();
+        assert_eq!(cached.advisories_json, r#"{"vulns":[]}"#);
+        assert_eq!(cached.hit_count, 0);
+        assert!(!cached.has_blocking);
+        assert!(!cached.is_expired);
+
+        // Test clearing cache
+        let cleared = store.clear_advisory_cache().unwrap();
+        assert_eq!(cleared, 1);
+        assert!(
+            store
+                .get_cached_advisories("pkg", "1.0.0")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn provenance_cache_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
+
+        assert!(
+            store
+                .get_cached_provenance("pkg", "1.0.0")
+                .unwrap()
+                .is_none()
+        );
+
+        store
+            .record_provenance(
+                "pkg",
+                "1.0.0",
+                Some("https://github.com/actions/runner"),
+                Some("https://github.com/org/repo"),
+                Some("abc123sha"),
+                Some(".github/workflows/release.yml"),
+                3,
+                true,
+            )
+            .unwrap();
+
+        let prov = store
+            .get_cached_provenance("pkg", "1.0.0")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            prov.builder_id.as_deref(),
+            Some("https://github.com/actions/runner")
+        );
+        assert_eq!(
+            prov.source_repo.as_deref(),
+            Some("https://github.com/org/repo")
+        );
+        assert_eq!(prov.commit_sha.as_deref(), Some("abc123sha"));
+        assert_eq!(
+            prov.workflow_path.as_deref(),
+            Some(".github/workflows/release.yml")
+        );
+        assert_eq!(prov.slsa_level, 3);
+        assert!(prov.signature_valid);
+    }
+
+    #[test]
+    fn audit_log_recording() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
+
+        store
+            .record_audit_log(
+                "pkg",
+                "1.0.0",
+                "sha512-test",
+                "approve",
+                15,
+                "LOW",
+                "ci-bot",
+                Some("Reviewed zero dangerous deltas"),
+            )
             .unwrap();
     }
 

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod advisory;
 mod baseline;
 mod cli;
 mod diff;
@@ -9,6 +10,7 @@ mod extract;
 mod heuristic;
 mod manifest;
 mod policy;
+mod provenance;
 mod registry;
 mod render;
 mod review;
