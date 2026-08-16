@@ -37,6 +37,17 @@ pub struct DiffSummary {
     pub lines_deleted: usize,
 }
 
+use crate::advisory::AdvisoryReport;
+use crate::provenance::ProvenanceReport;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TrustSources {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisories: Option<AdvisoryReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<ProvenanceReport>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Verdict {
     pub name: String,
@@ -47,4 +58,6 @@ pub struct Verdict {
     pub risk_score: u32,
     pub findings: Vec<Finding>,
     pub diff_summary: DiffSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_sources: Option<TrustSources>,
 }

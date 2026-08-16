@@ -27,4 +27,10 @@ pub enum BluelineError {
 
     #[error("policy error: {0}")]
     Policy(String),
+
+    #[error("advisory error: {0}")]
+    Advisory(String),
+
+    #[error("provenance error: {0}")]
+    Provenance(String),
 }

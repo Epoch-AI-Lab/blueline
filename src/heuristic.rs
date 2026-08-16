@@ -1,6 +1,8 @@
+use crate::advisory::AdvisoryReport;
 use crate::diff::{Delta, FileKind};
 use crate::policy::Policy;
-use crate::verdict::{DiffSummary, Finding, Verdict, VerdictBand};
+use crate::provenance::{ProvenanceReport, ProvenanceStatus};
+use crate::verdict::{DiffSummary, Finding, TrustSources, Verdict, VerdictBand};
 
 #[allow(dead_code)]
 pub fn evaluate(
@@ -25,6 +27,26 @@ pub fn evaluate_with_policy(
     is_unreviewed_baseline: bool,
     policy: &Policy,
 ) -> Verdict {
+    evaluate_with_trust(
+        name,
+        integrity,
+        delta,
+        is_unreviewed_baseline,
+        policy,
+        None,
+        None,
+    )
+}
+
+pub fn evaluate_with_trust(
+    name: &str,
+    integrity: &str,
+    delta: &Delta,
+    is_unreviewed_baseline: bool,
+    policy: &Policy,
+    advisories: Option<&AdvisoryReport>,
+    provenance: Option<&ProvenanceReport>,
+) -> Verdict {
     let mut findings = Vec::new();
 
     // P01: Check if package is explicitly blocked by policy
@@ -35,6 +57,91 @@ pub fn evaluate_with_policy(
             title: format!("Package `{name}` is blocked by policy"),
             description: "The package matches an active blocklist rule in blueline.toml.".into(),
         });
+    }
+
+    // Advisory Findings (Phase 2)
+    if let Some(adv_rep) = advisories {
+        for hit in &adv_rep.hits {
+            if hit.is_malware {
+                findings.push(Finding {
+                    rule_id: "R09_ADVISORY_MALWARE".into(),
+                    severity: VerdictBand::Block,
+                    title: format!("Known malware advisory: {}", hit.id),
+                    description: hit.summary.clone(),
+                });
+            } else if hit.severity == VerdictBand::Block {
+                findings.push(Finding {
+                    rule_id: "R09_ADVISORY_CRITICAL_CVE".into(),
+                    severity: VerdictBand::Block,
+                    title: format!("Critical vulnerability: {}", hit.id),
+                    description: hit.summary.clone(),
+                });
+            } else {
+                findings.push(Finding {
+                    rule_id: "R09_ADVISORY_CVE".into(),
+                    severity: hit.severity,
+                    title: format!("Known vulnerability ({}): {}", hit.severity, hit.id),
+                    description: hit.summary.clone(),
+                });
+            }
+        }
+    }
+
+    // Provenance Findings (Phase 2)
+    if let Some(prov_rep) = provenance {
+        if prov_rep.status == ProvenanceStatus::FailedMismatch {
+            findings.push(Finding {
+                rule_id: "P03_PROVENANCE_DIGEST_MISMATCH".into(),
+                severity: VerdictBand::Block,
+                title: "Provenance digest mismatch".into(),
+                description: prov_rep.message.clone().unwrap_or_else(|| {
+                    "Tarball SHA512 does not match in-toto attestation subject digest".into()
+                }),
+            });
+        }
+
+        if (policy.policy.require_provenance || policy.provenance.require_provenance)
+            && prov_rep.status != ProvenanceStatus::Verified
+        {
+            findings.push(Finding {
+                rule_id: "P03_PROVENANCE_REQUIRED_MISSING".into(),
+                severity: VerdictBand::Block,
+                title: "Required build provenance missing".into(),
+                description:
+                    "Policy requires verified SLSA build provenance, but none was present.".into(),
+            });
+        }
+
+        if policy.provenance.require_signatures && !prov_rep.registry_signature_present {
+            findings.push(Finding {
+                rule_id: "P03_SIGNATURE_REQUIRED_MISSING".into(),
+                severity: VerdictBand::Block,
+                title: "Required registry signature missing".into(),
+                description:
+                    "Policy requires npm registry signatures, but no valid signature was attached."
+                        .into(),
+            });
+        }
+
+        if !policy.provenance.allowed_repositories.is_empty()
+            && let Some(ref repo) = prov_rep.source_repo
+        {
+            let allowed = policy
+                .provenance
+                .allowed_repositories
+                .iter()
+                .any(|a| is_repo_allowed(repo, a));
+            if !allowed {
+                findings.push(Finding {
+                    rule_id: "P03_UNAUTHORIZED_BUILD_REPO".into(),
+                    severity: VerdictBand::Block,
+                    title: format!("Unauthorized source repository `{repo}`"),
+                    description:
+                        "The build provenance repository is not in the allowed repositories list."
+                            .into(),
+                });
+            }
+        }
     }
 
     // R01: Lifecycle scripts
@@ -375,6 +482,14 @@ pub fn evaluate_with_policy(
             files_modified: delta.files_modified.len(),
             lines_added: delta.total_lines_added,
             lines_deleted: delta.total_lines_deleted,
+        },
+        trust_sources: if advisories.is_some() || provenance.is_some() {
+            Some(TrustSources {
+                advisories: advisories.cloned(),
+                provenance: provenance.cloned(),
+            })
+        } else {
+            None
         },
     }
 }
@@ -816,6 +931,52 @@ fn shannon_entropy(s: &str) -> f64 {
         }
     }
     entropy
+}
+
+fn normalize_repo_uri(mut s: &str) -> &str {
+    s = s.trim();
+    for prefix in &[
+        "git+https://",
+        "git+http://",
+        "git+ssh://",
+        "https://",
+        "http://",
+        "ssh://",
+        "git://",
+    ] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest;
+            break;
+        }
+    }
+    if let Some(rest) = s.strip_prefix("git@") {
+        s = rest;
+    }
+    if let Some(idx) = s.find('@') {
+        s = &s[..idx];
+    }
+    if let Some(rest) = s.strip_suffix(".git") {
+        s = rest;
+    }
+    s.trim_end_matches('/')
+}
+
+/// Check if a provenance repository matches an allowed repository pattern on path boundaries.
+pub fn is_repo_allowed(provenance_repo: &str, allowed_pattern: &str) -> bool {
+    let norm_repo = normalize_repo_uri(provenance_repo);
+    let norm_pattern = normalize_repo_uri(allowed_pattern);
+
+    if norm_repo.eq_ignore_ascii_case(norm_pattern) {
+        return true;
+    }
+
+    if let Some(stripped) = norm_repo.strip_suffix(norm_pattern)
+        && (stripped.ends_with('/') || stripped.ends_with(':'))
+    {
+        return true;
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -1356,5 +1517,267 @@ mod tests {
         assert!(is_vm_invocation("vm.compileFunction('code')"));
         assert!(is_base64_decode("atob?.('payload')"));
         assert!(is_child_proc_invocation("cp?.spawn('sh')"));
+    }
+
+    #[test]
+    fn blocks_on_malware_advisory() {
+        let delta = Delta {
+            baseline_version: Some("1.0.0".into()),
+            target_version: "1.0.1".into(),
+            files_added: vec![],
+            files_removed: vec![],
+            files_modified: vec![],
+            total_lines_added: 0,
+            total_lines_deleted: 0,
+            new_executables: vec![],
+            new_binaries: vec![],
+            modified_binaries: vec![],
+            new_lifecycle_scripts: vec![],
+            modified_lifecycle_scripts: vec![],
+            new_dependencies: vec![],
+            modified_dependencies: vec![],
+            removed_dependencies: vec![],
+            binding_gyp_added: false,
+        };
+
+        let adv = AdvisoryReport {
+            status: crate::advisory::AdvisoryStatus::Vulnerable,
+            hits: vec![crate::advisory::AdvisoryItem {
+                id: "MAL-2026-9999".into(),
+                summary: "Credential stealer in package".into(),
+                details: "".into(),
+                aliases: vec![],
+                severity: VerdictBand::Block,
+                cvss_score: None,
+                is_malware: true,
+            }],
+            source: "osv.dev".into(),
+            message: None,
+        };
+
+        let verdict = evaluate_with_trust(
+            "pkg",
+            "verified (sha512)",
+            &delta,
+            false,
+            &Policy::default(),
+            Some(&adv),
+            None,
+        );
+
+        assert_eq!(verdict.band, VerdictBand::Block);
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "R09_ADVISORY_MALWARE")
+        );
+    }
+
+    #[test]
+    fn blocks_on_critical_cve_advisory() {
+        let delta = Delta {
+            baseline_version: Some("1.0.0".into()),
+            target_version: "1.0.1".into(),
+            files_added: vec![],
+            files_removed: vec![],
+            files_modified: vec![],
+            total_lines_added: 0,
+            total_lines_deleted: 0,
+            new_executables: vec![],
+            new_binaries: vec![],
+            modified_binaries: vec![],
+            new_lifecycle_scripts: vec![],
+            modified_lifecycle_scripts: vec![],
+            new_dependencies: vec![],
+            modified_dependencies: vec![],
+            removed_dependencies: vec![],
+            binding_gyp_added: false,
+        };
+
+        let adv = AdvisoryReport {
+            status: crate::advisory::AdvisoryStatus::Vulnerable,
+            hits: vec![crate::advisory::AdvisoryItem {
+                id: "GHSA-xxxx".into(),
+                summary: "Remote code execution".into(),
+                details: "".into(),
+                aliases: vec!["CVE-2026-1111".into()],
+                severity: VerdictBand::Block,
+                cvss_score: Some(9.8),
+                is_malware: false,
+            }],
+            source: "osv.dev".into(),
+            message: None,
+        };
+
+        let verdict = evaluate_with_trust(
+            "pkg",
+            "verified (sha512)",
+            &delta,
+            false,
+            &Policy::default(),
+            Some(&adv),
+            None,
+        );
+
+        assert_eq!(verdict.band, VerdictBand::Block);
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "R09_ADVISORY_CRITICAL_CVE")
+        );
+    }
+
+    #[test]
+    fn blocks_on_provenance_digest_mismatch() {
+        let delta = Delta {
+            baseline_version: Some("1.0.0".into()),
+            target_version: "1.0.1".into(),
+            files_added: vec![],
+            files_removed: vec![],
+            files_modified: vec![],
+            total_lines_added: 0,
+            total_lines_deleted: 0,
+            new_executables: vec![],
+            new_binaries: vec![],
+            modified_binaries: vec![],
+            new_lifecycle_scripts: vec![],
+            modified_lifecycle_scripts: vec![],
+            new_dependencies: vec![],
+            modified_dependencies: vec![],
+            removed_dependencies: vec![],
+            binding_gyp_added: false,
+        };
+
+        let prov = ProvenanceReport::failed_mismatch("digest hash mismatch");
+
+        let verdict = evaluate_with_trust(
+            "pkg",
+            "verified (sha512)",
+            &delta,
+            false,
+            &Policy::default(),
+            None,
+            Some(&prov),
+        );
+
+        assert_eq!(verdict.band, VerdictBand::Block);
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "P03_PROVENANCE_DIGEST_MISMATCH")
+        );
+    }
+
+    #[test]
+    fn blocks_when_required_provenance_missing_or_repo_unauthorized() {
+        let delta = Delta {
+            baseline_version: Some("1.0.0".into()),
+            target_version: "1.0.1".into(),
+            files_added: vec![],
+            files_removed: vec![],
+            files_modified: vec![],
+            total_lines_added: 0,
+            total_lines_deleted: 0,
+            new_executables: vec![],
+            new_binaries: vec![],
+            modified_binaries: vec![],
+            new_lifecycle_scripts: vec![],
+            modified_lifecycle_scripts: vec![],
+            new_dependencies: vec![],
+            modified_dependencies: vec![],
+            removed_dependencies: vec![],
+            binding_gyp_added: false,
+        };
+
+        let mut policy = Policy::default();
+        policy.provenance.require_provenance = true;
+
+        let prov_missing = ProvenanceReport::missing(false, None);
+        let verdict = evaluate_with_trust(
+            "pkg",
+            "verified (sha512)",
+            &delta,
+            false,
+            &policy,
+            None,
+            Some(&prov_missing),
+        );
+        assert_eq!(verdict.band, VerdictBand::Block);
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "P03_PROVENANCE_REQUIRED_MISSING")
+        );
+
+        // Test unauthorized repository
+        let mut policy_repo = Policy::default();
+        policy_repo
+            .provenance
+            .allowed_repositories
+            .push("github.com/trusted-org/".into());
+
+        let prov_untrusted_repo = ProvenanceReport {
+            status: ProvenanceStatus::Verified,
+            slsa_level: 3,
+            builder_id: Some("https://github.com/actions/runner".into()),
+            source_repo: Some("https://github.com/attacker-org/malicious".into()),
+            commit_sha: Some("1234567".into()),
+            workflow_path: Some(".github/workflows/release.yml".into()),
+            registry_signature_present: true,
+            registry_signature_key_id: None,
+            message: None,
+        };
+
+        let verdict_repo = evaluate_with_trust(
+            "pkg",
+            "verified (sha512)",
+            &delta,
+            false,
+            &policy_repo,
+            None,
+            Some(&prov_untrusted_repo),
+        );
+        assert_eq!(verdict_repo.band, VerdictBand::Block);
+        assert!(
+            verdict_repo
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "P03_UNAUTHORIZED_BUILD_REPO")
+        );
+    }
+
+    #[test]
+    fn enforces_repository_boundary_matching() {
+        assert!(is_repo_allowed(
+            "https://github.com/org/app",
+            "github.com/org/app"
+        ));
+        assert!(is_repo_allowed(
+            "git+https://github.com/org/app.git@refs/heads/main",
+            "github.com/org/app"
+        ));
+        assert!(is_repo_allowed(
+            "git+ssh://git@github.com/org/app.git",
+            "org/app"
+        ));
+        assert!(is_repo_allowed("https://github.com/org/app", "org/app"));
+
+        // Reject prefix / suffix / substring spoofing
+        assert!(!is_repo_allowed(
+            "https://github.com/org/app-malicious",
+            "org/app"
+        ));
+        assert!(!is_repo_allowed(
+            "https://github.com/attacker-org/app",
+            "org/app"
+        ));
+        assert!(!is_repo_allowed(
+            "https://github.com/attacker/org/app",
+            "github.com/org/app"
+        ));
     }
 }

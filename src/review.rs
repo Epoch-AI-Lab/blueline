@@ -4,7 +4,7 @@ use crate::baseline::resolve_baseline;
 use crate::cli::{Output, OutputFormat};
 use crate::diff::compute_delta;
 use crate::extract::{ExtractionLimits, safe_extract};
-use crate::heuristic::evaluate_with_policy;
+use crate::heuristic::evaluate_with_trust;
 use crate::manifest::read_package_json;
 use crate::policy::Policy;
 use crate::registry::Registry;
@@ -110,12 +110,32 @@ pub fn run(
         baseline_res,
         crate::baseline::BaselineResolution::RegistryPredecessor(_)
     );
-    let verdict = evaluate_with_policy(
+
+    let advisories = crate::advisory::fetch_advisories(
+        &target_pkg.name,
+        &target_pkg.version,
+        Some(&store),
+        &policy,
+    )
+    .unwrap_or_else(|e| crate::advisory::AdvisoryReport::unverified(&e.to_string()));
+
+    let provenance = crate::provenance::inspect_provenance(
+        &target_pkg.name,
+        &target_pkg.version,
+        &integrity,
+        None,
+        Some(&store),
+        &policy,
+    );
+
+    let verdict = evaluate_with_trust(
         &target_pkg.name,
         "verified (sha512)",
         &delta,
         is_unreviewed,
         &policy,
+        Some(&advisories),
+        Some(&provenance),
     );
 
     match output.resolve(std::io::stdout().is_terminal()) {
@@ -238,12 +258,32 @@ pub fn install(
         baseline_res,
         crate::baseline::BaselineResolution::RegistryPredecessor(_)
     );
-    let verdict = evaluate_with_policy(
+
+    let advisories = crate::advisory::fetch_advisories(
+        &target_pkg.name,
+        &target_pkg.version,
+        Some(&store),
+        &policy,
+    )
+    .unwrap_or_else(|e| crate::advisory::AdvisoryReport::unverified(&e.to_string()));
+
+    let provenance = crate::provenance::inspect_provenance(
+        &target_pkg.name,
+        &target_pkg.version,
+        &integrity,
+        None,
+        Some(&store),
+        &policy,
+    );
+
+    let verdict = evaluate_with_trust(
         &target_pkg.name,
         "verified (sha512)",
         &delta,
         is_unreviewed,
         &policy,
+        Some(&advisories),
+        Some(&provenance),
     );
     render_text(&verdict, &delta);
 
@@ -292,6 +332,9 @@ fn interactive_prompt(
         match choice.as_str() {
             "a" | "approve" => {
                 store.mark_clean(name, version, integrity)?;
+                let _ = store.record_audit_log(
+                    name, version, integrity, "approve", 0, "approved", "user", None,
+                );
                 println!(
                     "Approved {}@{} and marked clean in baseline store.",
                     name, version
@@ -299,6 +342,8 @@ fn interactive_prompt(
                 return Ok(true);
             }
             "h" | "hold" => {
+                let _ = store
+                    .record_audit_log(name, version, integrity, "hold", 0, "held", "user", None);
                 eprintln!("Held {}@{}; release unapproved.", name, version);
                 std::process::exit(2);
             }
