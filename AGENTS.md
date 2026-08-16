@@ -38,7 +38,7 @@ passes locally it passes CI. The toolchain is pinned in `rust-toolchain.toml`
 - Skipping the CI gate. If CI breaks, fix it in the same branch.
 
 ## Conventions
-
+- Do NOT USE Other languages to code. Use your harness tools
 - Errors surface with alternate (`{e:#}`) formatting so the cause chain
   prints — see `src/main.rs`.
 - Modules are self-contained under `src/`; `registry/` is a directory module.
