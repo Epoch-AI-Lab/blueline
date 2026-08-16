@@ -410,11 +410,8 @@ fn is_private_or_local_host(host: &str) -> bool {
     }
 
     // Reject hex/octal/integer/short IP representations (e.g. 0x7f000001, 2130706433, 0177.0.0.1, 127.1)
-    if host.starts_with("0x")
-        || host.starts_with("0X")
-        || host.contains(".0x")
-        || host.contains(".0X")
-    {
+    let lower = host.to_ascii_lowercase();
+    if lower.starts_with("0x") || lower.contains(".0x") {
         return true;
     }
     if host.chars().all(|c| c.is_ascii_digit()) {
@@ -436,14 +433,9 @@ fn is_private_or_local_host(host: &str) -> bool {
                 if let Some(v4) = v6.to_ipv4_mapped() {
                     is_private_v4(v4)
                 } else {
-                    let segments = v6.segments();
-                    if segments[0..6] == [0, 0, 0, 0, 0, 0] {
-                        let v4 = std::net::Ipv4Addr::new(
-                            (segments[6] >> 8) as u8,
-                            (segments[6] & 0xff) as u8,
-                            (segments[7] >> 8) as u8,
-                            (segments[7] & 0xff) as u8,
-                        );
+                    let oct = v6.octets();
+                    if oct[0..12] == [0; 12] {
+                        let v4 = std::net::Ipv4Addr::new(oct[12], oct[13], oct[14], oct[15]);
                         return is_private_v4(v4);
                     }
                     v6.is_loopback()
@@ -1145,6 +1137,9 @@ mod tests {
         assert!(is_private_or_local_host("10.0.0.1"));
         assert!(is_private_or_local_host("169.254.169.254"));
         assert!(is_private_or_local_host("0x7f000001"));
+        assert!(is_private_or_local_host("0X7F000001"));
+        assert!(is_private_or_local_host("127.0x0.0.1"));
+        assert!(is_private_or_local_host("127.0X0.0.1"));
         assert!(is_private_or_local_host("0177.0.0.1"));
         assert!(is_private_or_local_host("2130706433"));
         assert!(is_private_or_local_host("127.1"));
@@ -1152,6 +1147,8 @@ mod tests {
         assert!(is_private_or_local_host("::127.0.0.1"));
         assert!(is_private_or_local_host("::ffff:127.0.0.1"));
         assert!(is_private_or_local_host("::10.0.0.1"));
+        assert!(is_private_or_local_host("::172.16.0.1"));
+        assert!(is_private_or_local_host("::192.168.1.1"));
         assert!(is_private_or_local_host("metadata.google.internal"));
         assert!(is_private_or_local_host("instance-data"));
         assert!(is_private_or_local_host("localhost"));
@@ -1160,6 +1157,8 @@ mod tests {
         assert!(!is_private_or_local_host("registry.npmjs.org"));
         assert!(!is_private_or_local_host("8.8.8.8"));
         assert!(!is_private_or_local_host("1.1.1.1"));
+        assert!(!is_private_or_local_host("::8.8.8.8"));
+        assert!(!is_private_or_local_host("::1.1.1.1"));
     }
 
     #[test]
