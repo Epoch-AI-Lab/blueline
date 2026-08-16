@@ -57,9 +57,9 @@ pub fn install_with_ignore_scripts(
         .arg("--ignore-scripts")
         .arg("--registry")
         .arg(registry_base)
+        .args(extra_args)
         .arg("--")
         .arg(pkg.trim())
-        .args(extra_args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());

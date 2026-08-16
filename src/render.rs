@@ -23,24 +23,20 @@ pub fn sanitize_for_terminal(s: &str) -> String {
         if c == '\x1b' {
             if let Some(&next) = chars.peek() {
                 if next == '[' {
-                    // CSI sequence: consume until 0x40..=0x7E with 64-char bound
+                    // CSI sequence: consume until 0x40..=0x7E (final byte)
                     chars.next();
-                    let mut count = 0;
                     for csi in chars.by_ref() {
-                        count += 1;
-                        if (0x40..=0x7E).contains(&(csi as u32)) || count > 64 {
+                        if (0x40..=0x7E).contains(&(csi as u32)) {
                             break;
                         }
                     }
                     continue;
                 } else if next == ']' || next == 'P' || next == '_' || next == '^' || next == 'X' {
-                    // OSC / DCS / APC / PM / SOS: consume until \x07 (BEL) or \x1b\ (ST) with 64-char bound
+                    // OSC / DCS / APC / PM / SOS: consume until \x07 (BEL) or \x1b\ (ST)
                     chars.next();
                     let mut prev = '\0';
-                    let mut count = 0;
                     for osc in chars.by_ref() {
-                        count += 1;
-                        if osc == '\x07' || (prev == '\x1b' && osc == '\\') || count > 64 {
+                        if osc == '\x07' || (prev == '\x1b' && osc == '\\') {
                             break;
                         }
                         prev = osc;
@@ -80,24 +76,20 @@ pub fn sanitize_single_line(s: &str) -> String {
         if c == '\x1b' {
             if let Some(&next) = chars.peek() {
                 if next == '[' {
-                    // CSI sequence: consume until 0x40..=0x7E with 64-char bound
+                    // CSI sequence: consume until 0x40..=0x7E (final byte)
                     chars.next();
-                    let mut count = 0;
                     for csi in chars.by_ref() {
-                        count += 1;
-                        if (0x40..=0x7E).contains(&(csi as u32)) || count > 64 {
+                        if (0x40..=0x7E).contains(&(csi as u32)) {
                             break;
                         }
                     }
                     continue;
                 } else if next == ']' || next == 'P' || next == '_' || next == '^' || next == 'X' {
-                    // OSC / DCS / APC / PM / SOS: consume until \x07 (BEL) or \x1b\ (ST) with 64-char bound
+                    // OSC / DCS / APC / PM / SOS: consume until \x07 (BEL) or \x1b\ (ST)
                     chars.next();
                     let mut prev = '\0';
-                    let mut count = 0;
                     for osc in chars.by_ref() {
-                        count += 1;
-                        if osc == '\x07' || (prev == '\x1b' && osc == '\\') || count > 64 {
+                        if osc == '\x07' || (prev == '\x1b' && osc == '\\') {
                             break;
                         }
                         prev = osc;
@@ -327,10 +319,58 @@ mod tests {
     }
 
     #[test]
+    fn sanitizes_long_osc_hyperlinks_and_payloads() {
+        let long_osc = "\x1b]8;;https://attacker.com/very/long/malicious/url/that/exceeds/sixty/four/characters/payload\x07Click Me\x1b]8;;\x07";
+        let clean = sanitize_for_terminal(long_osc);
+        assert_eq!(clean, "Click Me");
+
+        let single = sanitize_single_line(long_osc);
+        assert_eq!(single, "Click Me");
+    }
+
+    #[test]
+    fn sanitizes_dcs_apc_pm_sos_and_st_terminators() {
+        // DCS with ST
+        let dcs = "\x1bPpayload\x1b\\Normal";
+        assert_eq!(sanitize_for_terminal(dcs), "Normal");
+        assert_eq!(sanitize_single_line(dcs), "Normal");
+
+        // DCS with backslashes in payload before ST terminator
+        let dcs_with_slashes = "\x1bPdata\\with\\backslashes\x1b\\Normal";
+        assert_eq!(sanitize_for_terminal(dcs_with_slashes), "Normal");
+        assert_eq!(sanitize_single_line(dcs_with_slashes), "Normal");
+
+        // APC with BEL
+        let apc = "\x1b_apc_data\x07Normal";
+        assert_eq!(sanitize_for_terminal(apc), "Normal");
+        assert_eq!(sanitize_single_line(apc), "Normal");
+
+        // PM with ST
+        let pm = "\x1b^pm_data\x1b\\Normal";
+        assert_eq!(sanitize_for_terminal(pm), "Normal");
+        assert_eq!(sanitize_single_line(pm), "Normal");
+
+        // SOS with BEL
+        let sos = "\x1bXsos_data\x07Normal";
+        assert_eq!(sanitize_for_terminal(sos), "Normal");
+        assert_eq!(sanitize_single_line(sos), "Normal");
+
+        // 2-byte escapes (e.g. \x1bN, \x1bO)
+        let two_byte = "\x1bN\x1bONormal";
+        assert_eq!(sanitize_for_terminal(two_byte), "Normal");
+        assert_eq!(sanitize_single_line(two_byte), "Normal");
+    }
+
+    #[test]
     fn preserves_newlines_tabs_and_normal_text() {
         let normal = "Normal Title: 1.0.0\nLine 2\tTabbed";
         let clean = sanitize_for_terminal(normal);
         assert_eq!(clean, normal);
+
+        // Only newline
+        assert_eq!(sanitize_for_terminal("Line 1\nLine 2"), "Line 1\nLine 2");
+        // Only tab
+        assert_eq!(sanitize_for_terminal("Col 1\tCol 2"), "Col 1\tCol 2");
     }
 
     #[test]

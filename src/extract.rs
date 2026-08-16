@@ -138,7 +138,8 @@ pub fn safe_extract(
 
 const WINDOWS_RESERVED_NAMES: &[&str] = &[
     "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "CONIN$",
+    "CONOUT$",
 ];
 
 fn validate_entry_path(path: &Path) -> Result<(), String> {
@@ -352,6 +353,16 @@ mod tests {
         let tarball_com1 = make_tarball(&[("dir/com1.js", b"")]);
         let err =
             safe_extract(&tarball_com1, dir.path(), &ExtractionLimits::default()).unwrap_err();
+        assert!(err.to_string().contains("reserved device name"));
+
+        let tarball_conin = make_tarball(&[("conin$.txt", b"")]);
+        let err =
+            safe_extract(&tarball_conin, dir.path(), &ExtractionLimits::default()).unwrap_err();
+        assert!(err.to_string().contains("reserved device name"));
+
+        let tarball_conout = make_tarball(&[("dir/conout$.dat", b"")]);
+        let err =
+            safe_extract(&tarball_conout, dir.path(), &ExtractionLimits::default()).unwrap_err();
         assert!(err.to_string().contains("reserved device name"));
     }
 

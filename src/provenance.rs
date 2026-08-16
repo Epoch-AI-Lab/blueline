@@ -252,8 +252,9 @@ pub fn inspect_provenance(
         .timeout(std::time::Duration::from_millis(3000))
         .build();
 
+    let encoded_pkg = package.replace('/', "%2f");
     let attestations_url =
-        format!("https://registry.npmjs.org/-/npm/v1/attestations/{package}@{version}");
+        format!("https://registry.npmjs.org/-/npm/v1/attestations/{encoded_pkg}@{version}");
     let resp_res = agent
         .get(&attestations_url)
         .set("Accept", "application/json")
