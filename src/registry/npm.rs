@@ -156,7 +156,7 @@ impl NpmRegistry {
                             response.status()
                         ))
                     })?;
-                    current_url = location.to_string();
+                    current_url = resolve_redirect_url(&current_url, location)?;
                 }
                 Ok(response) => break response,
                 Err(e) => {
@@ -186,16 +186,24 @@ impl NpmRegistry {
         let digest = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
         match pkg.integrity.as_deref() {
             Some(expected) => {
-                let expected_b64 = expected
-                    .strip_prefix(SRI_PREFIX)
-                    .ok_or_else(|| {
-                        BluelineError::Verification(format!(
-                            "{}@{}: unsupported dist.integrity `{expected}`, expected `{SRI_PREFIX}<base64>`",
-                            pkg.name, pkg.version
-                        ))
-                    })?
-                    .trim();
-                if digest != expected_b64 {
+                let mut matched = false;
+                let mut has_sha512 = false;
+                for token in expected.split_whitespace() {
+                    if let Some(expected_b64) = token.strip_prefix(SRI_PREFIX) {
+                        has_sha512 = true;
+                        if digest == expected_b64.trim() {
+                            matched = true;
+                            break;
+                        }
+                    }
+                }
+                if !has_sha512 {
+                    return Err(BluelineError::Verification(format!(
+                        "{}@{}: unsupported dist.integrity `{expected}`, expected `{SRI_PREFIX}<base64>`",
+                        pkg.name, pkg.version
+                    )));
+                }
+                if !matched {
                     return Err(BluelineError::Verification(format!(
                         "{}@{}: tarball sha512 mismatch (expected {expected}, got {SRI_PREFIX}{digest})",
                         pkg.name, pkg.version
@@ -210,6 +218,41 @@ impl NpmRegistry {
             }
         }
         Ok(bytes)
+    }
+}
+
+fn resolve_redirect_url(base_url: &str, location: &str) -> Result<String, BluelineError> {
+    if location.contains("://") {
+        return Ok(location.to_string());
+    }
+    let (scheme, _host) = parse_url_scheme_and_host(base_url).map_err(|e| {
+        BluelineError::Network(format!(
+            "resolving redirect `{location}` from `{base_url}`: {e}"
+        ))
+    })?;
+    let base_without_scheme = base_url
+        .split_once("://")
+        .map(|(_, r)| r)
+        .unwrap_or(base_url);
+    let authority = base_without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("");
+    if location.starts_with('/') {
+        Ok(format!("{scheme}://{authority}{location}"))
+    } else {
+        let path_part = match base_without_scheme.split_once('/') {
+            Some((_, rest)) => {
+                let p = rest.split(['?', '#']).next().unwrap_or("");
+                if let Some((dir, _)) = p.rsplit_once('/') {
+                    format!("/{dir}/")
+                } else {
+                    "/".to_string()
+                }
+            }
+            None => "/".to_string(),
+        };
+        Ok(format!("{scheme}://{authority}{path_part}{location}"))
     }
 }
 
@@ -347,7 +390,8 @@ fn parse_url_scheme_and_host(raw_url: &str) -> Result<(String, String), String> 
 
 fn is_private_v4(v4: std::net::Ipv4Addr) -> bool {
     let octets = v4.octets();
-    v4.is_loopback()
+    octets[0] == 0 // 0.0.0.0/8 (This host on this network / Linux localhost alias)
+        || v4.is_loopback()
         || v4.is_link_local()
         || v4.is_private()
         || v4.is_unspecified()
@@ -364,6 +408,24 @@ fn is_private_or_local_host(host: &str) -> bool {
     {
         return true;
     }
+
+    // Reject hex/octal/integer/short IP representations (e.g. 0x7f000001, 2130706433, 0177.0.0.1, 127.1)
+    let lower = host.to_ascii_lowercase();
+    if lower.starts_with("0x") || lower.contains(".0x") {
+        return true;
+    }
+    if host.chars().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts
+        .iter()
+        .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        && (parts.len() != 4 || parts.iter().any(|p| p.len() > 1 && p.starts_with('0')))
+    {
+        return true;
+    }
+
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         match ip {
             std::net::IpAddr::V4(v4) => is_private_v4(v4),
@@ -371,6 +433,11 @@ fn is_private_or_local_host(host: &str) -> bool {
                 if let Some(v4) = v6.to_ipv4_mapped() {
                     is_private_v4(v4)
                 } else {
+                    let oct = v6.octets();
+                    if oct[0..12] == [0; 12] {
+                        let v4 = std::net::Ipv4Addr::new(oct[12], oct[13], oct[14], oct[15]);
+                        return is_private_v4(v4);
+                    }
                     v6.is_loopback()
                         || v6.is_unspecified()
                         || (v6.segments()[0] & 0xffc0) == 0xfe80
@@ -1059,5 +1126,55 @@ mod tests {
         assert!(err.to_string().contains("too many redirects"));
 
         let _ = handle.join();
+    }
+
+    #[test]
+    fn ssrf_rejects_alternative_encodings_and_ranges() {
+        assert!(is_private_or_local_host("0.0.0.0"));
+        assert!(is_private_or_local_host("0.0.0.1"));
+        assert!(is_private_or_local_host("0.42.42.42"));
+        assert!(is_private_or_local_host("127.0.0.1"));
+        assert!(is_private_or_local_host("10.0.0.1"));
+        assert!(is_private_or_local_host("169.254.169.254"));
+        assert!(is_private_or_local_host("0x7f000001"));
+        assert!(is_private_or_local_host("0X7F000001"));
+        assert!(is_private_or_local_host("127.0x0.0.1"));
+        assert!(is_private_or_local_host("127.0X0.0.1"));
+        assert!(is_private_or_local_host("0177.0.0.1"));
+        assert!(is_private_or_local_host("2130706433"));
+        assert!(is_private_or_local_host("127.1"));
+        assert!(is_private_or_local_host("::1"));
+        assert!(is_private_or_local_host("::127.0.0.1"));
+        assert!(is_private_or_local_host("::ffff:127.0.0.1"));
+        assert!(is_private_or_local_host("::10.0.0.1"));
+        assert!(is_private_or_local_host("::172.16.0.1"));
+        assert!(is_private_or_local_host("::192.168.1.1"));
+        assert!(is_private_or_local_host("metadata.google.internal"));
+        assert!(is_private_or_local_host("instance-data"));
+        assert!(is_private_or_local_host("localhost"));
+        assert!(is_private_or_local_host("sub.localhost"));
+
+        assert!(!is_private_or_local_host("registry.npmjs.org"));
+        assert!(!is_private_or_local_host("8.8.8.8"));
+        assert!(!is_private_or_local_host("1.1.1.1"));
+        assert!(!is_private_or_local_host("::8.8.8.8"));
+        assert!(!is_private_or_local_host("::1.1.1.1"));
+    }
+
+    #[test]
+    fn relative_redirect_resolution() {
+        let base = "https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz";
+        assert_eq!(
+            resolve_redirect_url(base, "/downloads/pkg-1.0.0.tgz").unwrap(),
+            "https://registry.npmjs.org/downloads/pkg-1.0.0.tgz"
+        );
+        assert_eq!(
+            resolve_redirect_url(base, "relative.tgz").unwrap(),
+            "https://registry.npmjs.org/pkg/-/relative.tgz"
+        );
+        assert_eq!(
+            resolve_redirect_url(base, "https://cdn.npmjs.org/pkg.tgz").unwrap(),
+            "https://cdn.npmjs.org/pkg.tgz"
+        );
     }
 }

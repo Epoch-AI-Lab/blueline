@@ -29,6 +29,10 @@ pub struct Cli {
     /// npm registry base URL (override for mirrors / local fixtures)
     #[arg(long, global = true, default_value = "https://registry.npmjs.org")]
     pub registry: String,
+
+    /// Path to blueline.toml policy file
+    #[arg(long, global = true)]
+    pub policy: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]

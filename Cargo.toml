@@ -24,6 +24,7 @@ walkdir = "2"
 comfy-table = "7"
 tempfile = "3"
 dirs = "6"
+toml = "0.8"
 
 [dev-dependencies]
 assert_cmd = "2"

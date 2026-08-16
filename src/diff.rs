@@ -38,9 +38,11 @@ pub struct Delta {
     pub total_lines_deleted: usize,
     pub new_executables: Vec<String>,
     pub new_binaries: Vec<String>,
+    pub modified_binaries: Vec<String>,
     pub new_lifecycle_scripts: Vec<String>,
     pub modified_lifecycle_scripts: Vec<String>,
     pub new_dependencies: Vec<(String, String)>,
+    pub modified_dependencies: Vec<(String, String, String)>,
     #[allow(dead_code)]
     pub removed_dependencies: Vec<String>,
     #[allow(dead_code)]
@@ -74,6 +76,7 @@ pub fn compute_delta(
     let mut total_lines_deleted = 0;
     let mut new_executables = Vec::new();
     let mut new_binaries = Vec::new();
+    let mut modified_binaries = Vec::new();
 
     if let Some(base_root) = baseline_root {
         let base_base = find_package_prefix(base_root);
@@ -122,6 +125,11 @@ pub fn compute_delta(
                         )?;
                         if !base_meta.is_executable && target_meta.is_executable {
                             new_executables.push(rel_path.clone());
+                        }
+                        if base_meta.kind == FileKind::Binary
+                            && target_meta.kind == FileKind::Binary
+                        {
+                            modified_binaries.push(rel_path.clone());
                         }
                         if (base_meta.kind != FileKind::Binary
                             && target_meta.kind == FileKind::Binary)
@@ -177,13 +185,18 @@ pub fn compute_delta(
     }
 
     let mut new_dependencies = Vec::new();
+    let mut modified_dependencies = Vec::new();
     let mut removed_dependencies = Vec::new();
 
     let target_deps = collect_all_dependencies(target_manifest);
     if let Some(base_m) = baseline_manifest {
         let base_deps = collect_all_dependencies(base_m);
         for (dep, ver) in &target_deps {
-            if !base_deps.contains_key(dep) {
+            if let Some(base_ver) = base_deps.get(dep) {
+                if base_ver != ver {
+                    modified_dependencies.push((dep.clone(), base_ver.clone(), ver.clone()));
+                }
+            } else {
                 new_dependencies.push((dep.clone(), ver.clone()));
             }
         }
@@ -216,9 +229,11 @@ pub fn compute_delta(
         total_lines_deleted,
         new_executables,
         new_binaries,
+        modified_binaries,
         new_lifecycle_scripts,
         modified_lifecycle_scripts,
         new_dependencies,
+        modified_dependencies,
         removed_dependencies,
         binding_gyp_added,
     })

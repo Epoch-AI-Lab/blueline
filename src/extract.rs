@@ -136,6 +136,11 @@ pub fn safe_extract(
     Ok(stats)
 }
 
+const WINDOWS_RESERVED_NAMES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
 fn validate_entry_path(path: &Path) -> Result<(), String> {
     if path.as_os_str().is_empty() {
         return Err("empty entry path".to_string());
@@ -146,6 +151,12 @@ fn validate_entry_path(path: &Path) -> Result<(), String> {
     if path.to_string_lossy().contains('\\') {
         return Err(format!(
             "entry path `{}` containing backslash rejected",
+            path.display()
+        ));
+    }
+    if path.to_string_lossy().contains(':') {
+        return Err(format!(
+            "entry path `{}` containing colon rejected",
             path.display()
         ));
     }
@@ -170,8 +181,20 @@ fn validate_entry_path(path: &Path) -> Result<(), String> {
                     path.display()
                 ));
             }
-            Component::Normal(_) => {
+            Component::Normal(os_name) => {
                 has_normal = true;
+                let name = os_name.to_string_lossy();
+                let stem = name.split('.').next().unwrap_or(&name);
+                if WINDOWS_RESERVED_NAMES
+                    .iter()
+                    .any(|&r| r.eq_ignore_ascii_case(stem))
+                {
+                    return Err(format!(
+                        "reserved device name `{}` in entry path `{}` rejected",
+                        name,
+                        path.display()
+                    ));
+                }
             }
             Component::CurDir => {}
         }
@@ -186,6 +209,7 @@ fn validate_entry_path(path: &Path) -> Result<(), String> {
 }
 
 /// Strip setuid/setgid/sticky from unpacked files and directories (they must never run here).
+/// Ensures directories retain owner read/write/execute permissions so tempdir deletion succeeds.
 #[cfg(unix)]
 fn strip_special_bits(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -194,7 +218,11 @@ fn strip_special_bits(path: &Path) {
             return;
         }
         let mut perm = md.permissions();
-        perm.set_mode(perm.mode() & 0o777);
+        let mut mode = perm.mode() & 0o777;
+        if md.is_dir() {
+            mode |= 0o700;
+        }
+        perm.set_mode(mode);
         let _ = fs::set_permissions(path, perm);
     }
 }
@@ -305,6 +333,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = safe_extract(&tarball, dir.path(), &ExtractionLimits::default()).unwrap_err();
         assert!(err.to_string().contains("unsupported entry type"));
+    }
+
+    #[test]
+    fn rejects_colons_and_reserved_dos_names() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let tarball_colon = make_tarball(&[("foo:bar.js", b"console.log(1);")]);
+        let err =
+            safe_extract(&tarball_colon, dir.path(), &ExtractionLimits::default()).unwrap_err();
+        assert!(err.to_string().contains("colon"));
+
+        let tarball_aux = make_tarball(&[("aux.json", b"{}")]);
+        let err = safe_extract(&tarball_aux, dir.path(), &ExtractionLimits::default()).unwrap_err();
+        assert!(err.to_string().contains("reserved device name"));
+
+        let tarball_com1 = make_tarball(&[("dir/com1.js", b"")]);
+        let err =
+            safe_extract(&tarball_com1, dir.path(), &ExtractionLimits::default()).unwrap_err();
+        assert!(err.to_string().contains("reserved device name"));
     }
 
     #[test]

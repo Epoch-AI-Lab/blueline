@@ -22,7 +22,17 @@ pub fn install_with_ignore_scripts(pkg: &str, extra_args: &[String]) -> anyhow::
         _ => Command::new("npm"),
     };
 
-    // Scrub sensitive environment variables to enforce script isolation
+    // Scrub sensitive environment variables to enforce script isolation.
+    // Iterating over std::env::vars() ensures mixed-case keys (e.g. Npm_Config_*) are stripped on Unix.
+    for (key, _) in std::env::vars() {
+        let lower = key.to_ascii_lowercase();
+        if lower.starts_with("npm_config_")
+            || lower == "node_options"
+            || lower == "node_extra_ca_certs"
+        {
+            cmd.env_remove(&key);
+        }
+    }
     cmd.env_remove("NODE_OPTIONS")
         .env_remove("npm_config_script_shell")
         .env_remove("NPM_CONFIG_SCRIPT_SHELL")
@@ -35,7 +45,9 @@ pub fn install_with_ignore_scripts(pkg: &str, extra_args: &[String]) -> anyhow::
         .env_remove("npm_config_ignore_scripts")
         .env_remove("NPM_CONFIG_IGNORE_SCRIPTS")
         .env_remove("npm_config_node_options")
-        .env_remove("NPM_CONFIG_NODE_OPTIONS");
+        .env_remove("NPM_CONFIG_NODE_OPTIONS")
+        .env_remove("npm_config_onload_script")
+        .env_remove("NPM_CONFIG_ONLOAD_SCRIPT");
 
     cmd.arg("install")
         .arg("--ignore-scripts")
@@ -117,6 +129,9 @@ pub fn validate_extra_args(extra_args: &[String]) -> anyhow::Result<()> {
                 | "script-shell"
                 | "scriptshell"
                 | "shell"
+                | "onload-script"
+                | "onloadscript"
+                | "scripts-prepend-node-path"
         ) {
             anyhow::bail!(
                 "forbidden flag `{trimmed}`: cannot override configuration or process options"
@@ -264,6 +279,10 @@ mod tests {
             vec!["--node-options=--require /tmp/pwn.js"],
             vec!["--node_options=--require /tmp/pwn.js"],
             vec!["--nodeOptions", "--require /tmp/pwn.js"],
+            vec!["--onload-script=/tmp/pwn.js"],
+            vec!["--onload_script=/tmp/pwn.js"],
+            vec!["--onloadscript", "/tmp/pwn.js"],
+            vec!["--scripts-prepend-node-path"],
         ];
         for args in variations {
             let string_args: Vec<String> = args.iter().map(|s| s.to_string()).collect();

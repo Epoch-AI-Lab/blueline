@@ -44,7 +44,12 @@ impl BaselineStore {
                 builder.create(parent).map_err(|e| {
                     BluelineError::Store(format!("creating {}: {e}", parent.display()))
                 })?;
-                if let Ok(meta) = fs::metadata(parent) {
+                if let Ok(meta) = fs::symlink_metadata(parent) {
+                    if meta.file_type().is_symlink() {
+                        return Err(BluelineError::Store(
+                            "data directory cannot be a symbolic link".into(),
+                        ));
+                    }
                     use std::os::unix::fs::PermissionsExt;
                     let mut perms = meta.permissions();
                     perms.set_mode(0o700);
@@ -78,7 +83,12 @@ impl BaselineStore {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = fs::metadata(path) {
+            if let Ok(meta) = fs::symlink_metadata(path) {
+                if meta.file_type().is_symlink() {
+                    return Err(BluelineError::Store(
+                        "database path cannot be a symbolic link".into(),
+                    ));
+                }
                 let mut perms = meta.permissions();
                 perms.set_mode(0o600);
                 let _ = fs::set_permissions(path, perms);

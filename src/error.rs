@@ -24,4 +24,7 @@ pub enum BluelineError {
 
     #[error("baseline store: {0}")]
     Store(String),
+
+    #[error("policy error: {0}")]
+    Policy(String),
 }

@@ -8,6 +8,7 @@ mod executor;
 mod extract;
 mod heuristic;
 mod manifest;
+mod policy;
 mod registry;
 mod render;
 mod review;
@@ -26,7 +27,11 @@ fn main() {
 fn run() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
     match cli.command {
-        cli::Command::Review { pkg, output } => review::run(&pkg, &cli.registry, output),
-        cli::Command::Install { pkg, npm_args } => review::install(&pkg, &cli.registry, &npm_args),
+        cli::Command::Review { pkg, output } => {
+            review::run(&pkg, &cli.registry, output, cli.policy.as_deref())
+        }
+        cli::Command::Install { pkg, npm_args } => {
+            review::install(&pkg, &cli.registry, &npm_args, cli.policy.as_deref())
+        }
     }
 }
