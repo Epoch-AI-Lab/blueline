@@ -130,7 +130,7 @@ pub fn evaluate_with_trust(
                 .provenance
                 .allowed_repositories
                 .iter()
-                .any(|a| repo.contains(a));
+                .any(|a| is_repo_allowed(repo, a));
             if !allowed {
                 findings.push(Finding {
                     rule_id: "P03_UNAUTHORIZED_BUILD_REPO".into(),
@@ -933,6 +933,52 @@ fn shannon_entropy(s: &str) -> f64 {
     entropy
 }
 
+fn normalize_repo_uri(mut s: &str) -> &str {
+    s = s.trim();
+    for prefix in &[
+        "git+https://",
+        "git+http://",
+        "git+ssh://",
+        "https://",
+        "http://",
+        "ssh://",
+        "git://",
+    ] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest;
+            break;
+        }
+    }
+    if let Some(rest) = s.strip_prefix("git@") {
+        s = rest;
+    }
+    if let Some(idx) = s.find('@') {
+        s = &s[..idx];
+    }
+    if let Some(rest) = s.strip_suffix(".git") {
+        s = rest;
+    }
+    s.trim_end_matches('/')
+}
+
+/// Check if a provenance repository matches an allowed repository pattern on path boundaries.
+pub fn is_repo_allowed(provenance_repo: &str, allowed_pattern: &str) -> bool {
+    let norm_repo = normalize_repo_uri(provenance_repo);
+    let norm_pattern = normalize_repo_uri(allowed_pattern);
+
+    if norm_repo.eq_ignore_ascii_case(norm_pattern) {
+        return true;
+    }
+
+    if let Some(stripped) = norm_repo.strip_suffix(norm_pattern)
+        && (stripped.ends_with('/') || stripped.ends_with(':'))
+    {
+        return true;
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1702,5 +1748,36 @@ mod tests {
                 .iter()
                 .any(|f| f.rule_id == "P03_UNAUTHORIZED_BUILD_REPO")
         );
+    }
+
+    #[test]
+    fn enforces_repository_boundary_matching() {
+        assert!(is_repo_allowed(
+            "https://github.com/org/app",
+            "github.com/org/app"
+        ));
+        assert!(is_repo_allowed(
+            "git+https://github.com/org/app.git@refs/heads/main",
+            "github.com/org/app"
+        ));
+        assert!(is_repo_allowed(
+            "git+ssh://git@github.com/org/app.git",
+            "org/app"
+        ));
+        assert!(is_repo_allowed("https://github.com/org/app", "org/app"));
+
+        // Reject prefix / suffix / substring spoofing
+        assert!(!is_repo_allowed(
+            "https://github.com/org/app-malicious",
+            "org/app"
+        ));
+        assert!(!is_repo_allowed(
+            "https://github.com/attacker-org/app",
+            "org/app"
+        ));
+        assert!(!is_repo_allowed(
+            "https://github.com/attacker/org/app",
+            "github.com/org/app"
+        ));
     }
 }

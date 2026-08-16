@@ -277,13 +277,133 @@ fn check_is_malware(v: &OsvVuln) -> bool {
     false
 }
 
+/// Parse standard CVSS v3.0 / v3.1 vector string and calculate the base score (0.0 to 10.0).
+pub fn parse_cvss_vector(vector: &str) -> Option<f64> {
+    if !vector.starts_with("CVSS:3.0") && !vector.starts_with("CVSS:3.1") {
+        return None;
+    }
+
+    let mut av: Option<f64> = None;
+    let mut ac: Option<f64> = None;
+    let mut pr: Option<&str> = None;
+    let mut ui: Option<f64> = None;
+    let mut scope_changed = false;
+    let mut c: Option<f64> = None;
+    let mut i: Option<f64> = None;
+    let mut a: Option<f64> = None;
+
+    for part in vector.split('/') {
+        let mut kv = part.splitn(2, ':');
+        let k = kv.next()?;
+        let v = kv.next().unwrap_or_default();
+        match k {
+            "AV" => {
+                av = match v {
+                    "N" => Some(0.85),
+                    "A" => Some(0.62),
+                    "L" => Some(0.55),
+                    "P" => Some(0.20),
+                    _ => None,
+                };
+            }
+            "AC" => {
+                ac = match v {
+                    "L" => Some(0.77),
+                    "H" => Some(0.44),
+                    _ => None,
+                };
+            }
+            "PR" => {
+                pr = Some(v);
+            }
+            "UI" => {
+                ui = match v {
+                    "N" => Some(0.85),
+                    "R" => Some(0.62),
+                    _ => None,
+                };
+            }
+            "S" => {
+                scope_changed = v == "C";
+            }
+            "C" => {
+                c = match v {
+                    "H" => Some(0.56),
+                    "L" => Some(0.22),
+                    "N" => Some(0.0),
+                    _ => None,
+                };
+            }
+            "I" => {
+                i = match v {
+                    "H" => Some(0.56),
+                    "L" => Some(0.22),
+                    "N" => Some(0.0),
+                    _ => None,
+                };
+            }
+            "A" => {
+                a = match v {
+                    "H" => Some(0.56),
+                    "L" => Some(0.22),
+                    "N" => Some(0.0),
+                    _ => None,
+                };
+            }
+            _ => {}
+        }
+    }
+
+    let av = av?;
+    let ac = ac?;
+    let ui = ui?;
+    let c = c?;
+    let i = i?;
+    let a = a?;
+    let pr_code = pr?;
+
+    let pr_val = match (scope_changed, pr_code) {
+        (false, "N") => 0.85,
+        (false, "L") => 0.62,
+        (false, "H") => 0.27,
+        (true, "N") => 0.85,
+        (true, "L") => 0.68,
+        (true, "H") => 0.50,
+        _ => return None,
+    };
+
+    let iss = 1.0 - ((1.0 - c) * (1.0 - i) * (1.0 - a));
+    if iss <= 0.0 {
+        return Some(0.0);
+    }
+
+    let impact = if scope_changed {
+        7.52 * (iss - 0.029) - 3.25 * (iss - 0.02).powi(15)
+    } else {
+        6.42 * iss
+    };
+
+    let exploitability = 8.22 * av * ac * pr_val * ui;
+
+    let base_score = if scope_changed {
+        1.08 * (impact + exploitability)
+    } else {
+        impact + exploitability
+    };
+
+    let rounded = ((base_score.clamp(0.0, 10.0) * 10.0).ceil()) / 10.0;
+    Some(rounded)
+}
+
 fn extract_cvss_score(v: &OsvVuln) -> Option<f64> {
     for s in &v.severity {
-        // Parse numeric CVSS from e.g. "CVSS:3.1/AV:N/.../C:H/I:H/A:H" or explicit float strings
+        // Parse explicit numeric float or full CVSS vector string
         if let Ok(score) = s.score.parse::<f64>() {
             return Some(score);
         }
-        // In CVSS vector strings, if a base score isn't embedded, check if database_specific has one
+        if let Some(score) = parse_cvss_vector(&s.score) {
+            return Some(score);
+        }
     }
     None
 }
@@ -368,5 +488,18 @@ mod tests {
         assert!(report.hits[0].is_malware);
         assert_eq!(report.hits[0].severity, VerdictBand::Block);
         assert!(report.has_blocking());
+    }
+
+    #[test]
+    fn parses_cvss_vector_strings_correctly() {
+        // Critical RCE vector
+        let vector = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H";
+        let score = parse_cvss_vector(vector).unwrap();
+        assert_eq!(score, 9.8);
+
+        // High privilege escalation vector
+        let vector_high = "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N";
+        let score_high = parse_cvss_vector(vector_high).unwrap();
+        assert_eq!(score_high, 6.5);
     }
 }
