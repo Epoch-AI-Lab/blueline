@@ -430,19 +430,13 @@ fn is_private_or_local_host(host: &str) -> bool {
         match ip {
             std::net::IpAddr::V4(v4) => is_private_v4(v4),
             std::net::IpAddr::V6(v6) => {
-                if let Some(v4) = v6.to_ipv4_mapped() {
-                    is_private_v4(v4)
-                } else {
-                    let oct = v6.octets();
-                    if oct[0..12] == [0; 12] {
-                        let v4 = std::net::Ipv4Addr::new(oct[12], oct[13], oct[14], oct[15]);
-                        return is_private_v4(v4);
-                    }
-                    v6.is_loopback()
-                        || v6.is_unspecified()
-                        || (v6.segments()[0] & 0xffc0) == 0xfe80
-                        || (v6.segments()[0] & 0xfe00) == 0xfc00
+                if (v6.segments()[0] & 0xffc0) == 0xfe80 || (v6.segments()[0] & 0xfe00) == 0xfc00 {
+                    return true;
                 }
+                if let Some(v4) = v6.to_ipv4() {
+                    return is_private_v4(v4);
+                }
+                false
             }
         }
     } else {
@@ -652,6 +646,7 @@ mod tests {
         assert!(is_private_or_local_host("::"));
         assert!(is_private_or_local_host("fe80::1"));
         assert!(is_private_or_local_host("fc00::1"));
+        assert!(is_private_or_local_host("fd00::1"));
         assert!(is_private_or_local_host("::ffff:127.0.0.1"));
         assert!(is_private_or_local_host("::ffff:169.254.169.254"));
         assert!(is_private_or_local_host("::ffff:10.0.0.1"));
