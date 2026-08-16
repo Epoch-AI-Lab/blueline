@@ -2,6 +2,7 @@
 
 const child_process = require("node:child_process");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 const process = require("node:process");
 const util = require("node:util");
@@ -52,8 +53,6 @@ function getPlatformTarget() {
 
   return null;
 }
-
-const os = require("node:os");
 
 function resolveBinaryPath() {
   if (process.env.BLUELINE_BINARY) {

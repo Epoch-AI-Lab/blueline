@@ -394,25 +394,22 @@ fn is_non_semver_url(v: &str) -> bool {
 }
 
 fn scan_diff_for_suspicious_patterns(path: &str, diff: &str, findings: &mut Vec<Finding>) {
-    let mut flagged_eval = false;
-    let mut flagged_child_proc = false;
-    let mut flagged_vm = false;
-    let mut flagged_network = false;
-    let mut flagged_base64_exec = false;
-    let mut flagged_high_entropy = false;
-
     let mut added_lines = Vec::new();
     for line in diff.lines() {
         if line.starts_with('+') && !line.starts_with("+++ ") && !line.starts_with("+++ b/") {
             added_lines.push(&line[1..]);
         }
     }
+    if added_lines.is_empty() {
+        return;
+    }
 
     let combined_added = added_lines.join("\n");
+    let unescaped = unescape_js(&combined_added);
+    let s_clean = strip_comments_and_whitespace(&unescaped);
+    let s_clean_lower = s_clean.to_ascii_lowercase();
 
-    // Check multi-line combined added text
-    if is_eval_invocation(&combined_added) {
-        flagged_eval = true;
+    if has_eval_invocation(&s_clean) {
         findings.push(Finding {
             rule_id: "R03_EVAL_USAGE".into(),
             severity: VerdictBand::High,
@@ -421,8 +418,7 @@ fn scan_diff_for_suspicious_patterns(path: &str, diff: &str, findings: &mut Vec<
         });
     }
 
-    if is_child_proc_invocation(&combined_added) {
-        flagged_child_proc = true;
+    if has_child_proc_invocation(&s_clean) {
         findings.push(Finding {
             rule_id: "R03_CHILD_PROCESS".into(),
             severity: VerdictBand::High,
@@ -431,8 +427,7 @@ fn scan_diff_for_suspicious_patterns(path: &str, diff: &str, findings: &mut Vec<
         });
     }
 
-    if is_vm_invocation(&combined_added) {
-        flagged_vm = true;
+    if has_vm_invocation(&s_clean) {
         findings.push(Finding {
             rule_id: "R03_VM_EXECUTION".into(),
             severity: VerdictBand::High,
@@ -441,8 +436,7 @@ fn scan_diff_for_suspicious_patterns(path: &str, diff: &str, findings: &mut Vec<
         });
     }
 
-    if is_network_invocation(&combined_added) {
-        flagged_network = true;
+    if has_network_invocation(&s_clean) {
         findings.push(Finding {
             rule_id: "R03_NETWORK_PRIMITIVE".into(),
             severity: VerdictBand::Medium,
@@ -453,8 +447,7 @@ fn scan_diff_for_suspicious_patterns(path: &str, diff: &str, findings: &mut Vec<
         });
     }
 
-    if is_base64_decode(&combined_added) {
-        flagged_base64_exec = true;
+    if has_base64_decode(&s_clean_lower) {
         findings.push(Finding {
             rule_id: "R03_BASE64_DECODE".into(),
             severity: VerdictBand::Medium,
@@ -463,61 +456,8 @@ fn scan_diff_for_suspicious_patterns(path: &str, diff: &str, findings: &mut Vec<
         });
     }
 
-    for line in &added_lines {
-        if !flagged_eval && is_eval_invocation(line) {
-            flagged_eval = true;
-            findings.push(Finding {
-                rule_id: "R03_EVAL_USAGE".into(),
-                severity: VerdictBand::High,
-                title: format!("Dynamic code evaluation in `{path}`"),
-                description: format!("Diff introduced `eval()` or `new Function()` in `{path}`."),
-            });
-        }
-
-        if !flagged_child_proc && is_child_proc_invocation(line) {
-            flagged_child_proc = true;
-            findings.push(Finding {
-                rule_id: "R03_CHILD_PROCESS".into(),
-                severity: VerdictBand::High,
-                title: format!("Process execution primitive in `{path}`"),
-                description: format!("Diff introduced child_process execution calls in `{path}`."),
-            });
-        }
-
-        if !flagged_vm && is_vm_invocation(line) {
-            flagged_vm = true;
-            findings.push(Finding {
-                rule_id: "R03_VM_EXECUTION".into(),
-                severity: VerdictBand::High,
-                title: format!("Dynamic VM code execution in `{path}`"),
-                description: format!("Diff introduced Node.js `vm` module execution in `{path}`."),
-            });
-        }
-
-        if !flagged_network && is_network_invocation(line) {
-            flagged_network = true;
-            findings.push(Finding {
-                rule_id: "R03_NETWORK_PRIMITIVE".into(),
-                severity: VerdictBand::Medium,
-                title: format!("Network request primitive in `{path}`"),
-                description: format!(
-                    "Diff introduced outbound network communication calls in `{path}`."
-                ),
-            });
-        }
-
-        if !flagged_base64_exec && is_base64_decode(line) {
-            flagged_base64_exec = true;
-            findings.push(Finding {
-                rule_id: "R03_BASE64_DECODE".into(),
-                severity: VerdictBand::Medium,
-                title: format!("Base64 decoding in `{path}`"),
-                description: format!("Diff introduced base64 decode calls in `{path}`."),
-            });
-        }
-
-        if !flagged_high_entropy && is_suspicious_high_entropy(line) {
-            flagged_high_entropy = true;
+    for line in added_lines {
+        if is_suspicious_high_entropy(line) {
             findings.push(Finding {
                 rule_id: "R03_HIGH_ENTROPY".into(),
                 severity: VerdictBand::High,
@@ -526,6 +466,7 @@ fn scan_diff_for_suspicious_patterns(path: &str, diff: &str, findings: &mut Vec<
                     "Diff introduced high-entropy obfuscated string/payload in `{path}`."
                 ),
             });
+            break;
         }
     }
 }
@@ -664,6 +605,16 @@ fn strip_comments_and_whitespace(s: &str) -> String {
             continue;
         }
 
+        if c == '?' && chars.peek() == Some(&'.') {
+            chars.next();
+            if chars.peek() == Some(&'(') {
+                continue;
+            } else {
+                out.push('.');
+                continue;
+            }
+        }
+
         if c == '"' || c == '\'' || c == '`' {
             in_quote = Some(c);
             out.push(c);
@@ -697,21 +648,26 @@ fn strip_comments_and_whitespace(s: &str) -> String {
     out
 }
 
-fn is_vm_invocation(s: &str) -> bool {
-    let unescaped = unescape_js(s);
-    let s_clean = strip_comments_and_whitespace(&unescaped);
+fn has_vm_invocation(s_clean: &str) -> bool {
     s_clean.contains("vm.runInThisContext")
         || s_clean.contains("vm.runInNewContext")
         || s_clean.contains("vm.runInContext")
+        || s_clean.contains("vm.compileFunction")
+        || s_clean.contains("compileFunction(")
         || s_clean.contains("vm.Script(")
         || s_clean.contains("vm.createScript(")
         || s_clean.contains("runInThisContext(")
         || s_clean.contains("runInNewContext(")
 }
 
-fn is_network_invocation(s: &str) -> bool {
+#[cfg(test)]
+fn is_vm_invocation(s: &str) -> bool {
     let unescaped = unescape_js(s);
     let s_clean = strip_comments_and_whitespace(&unescaped);
+    has_vm_invocation(&s_clean)
+}
+
+fn has_network_invocation(s_clean: &str) -> bool {
     s_clean.contains("fetch(")
         || s_clean.contains("http.request(")
         || s_clean.contains("http.get(")
@@ -724,11 +680,25 @@ fn is_network_invocation(s: &str) -> bool {
         || s_clean.contains("newWebSocket(")
 }
 
-fn is_eval_invocation(s: &str) -> bool {
+#[cfg(test)]
+fn is_network_invocation(s: &str) -> bool {
     let unescaped = unescape_js(s);
     let s_clean = strip_comments_and_whitespace(&unescaped);
+    has_network_invocation(&s_clean)
+}
+
+fn has_eval_invocation(s_clean: &str) -> bool {
     s_clean.contains("eval(")
         || s_clean.contains("eval`")
+        || s_clean.contains("(eval)(")
+        || s_clean.contains(",eval)(")
+        || s_clean.contains("eval)(")
+        || s_clean.contains("eval.call(")
+        || s_clean.contains("eval.apply(")
+        || s_clean.contains("eval.bind(")
+        || s_clean.contains("Function.call(")
+        || s_clean.contains("Function.apply(")
+        || s_clean.contains("Function.bind(")
         || s_clean.contains("newFunction(")
         || s_clean.contains("newFunction`")
         || s_clean.contains("Function(")
@@ -750,9 +720,14 @@ fn is_eval_invocation(s: &str) -> bool {
         || s_clean.contains("this[`eval`]")
 }
 
-fn is_child_proc_invocation(s: &str) -> bool {
+#[cfg(test)]
+fn is_eval_invocation(s: &str) -> bool {
     let unescaped = unescape_js(s);
     let s_clean = strip_comments_and_whitespace(&unescaped);
+    has_eval_invocation(&s_clean)
+}
+
+fn has_child_proc_invocation(s_clean: &str) -> bool {
     s_clean.contains("child_process")
         || s_clean.contains("execSync(")
         || s_clean.contains("spawnSync(")
@@ -783,18 +758,30 @@ fn is_child_proc_invocation(s: &str) -> bool {
         || s_clean.contains("process._linkedBinding")
 }
 
+#[cfg(test)]
+fn is_child_proc_invocation(s: &str) -> bool {
+    let unescaped = unescape_js(s);
+    let s_clean = strip_comments_and_whitespace(&unescaped);
+    has_child_proc_invocation(&s_clean)
+}
+
+fn has_base64_decode(s_clean_lower: &str) -> bool {
+    (s_clean_lower.contains("buffer.from(")
+        && (s_clean_lower.contains("'base64'")
+            || s_clean_lower.contains("\"base64\"")
+            || s_clean_lower.contains("`base64`")
+            || s_clean_lower.contains("'base64url'")
+            || s_clean_lower.contains("\"base64url\"")
+            || s_clean_lower.contains("`base64url`")))
+        || s_clean_lower.contains("atob(")
+        || s_clean_lower.contains("btoa(")
+}
+
+#[cfg(test)]
 fn is_base64_decode(s: &str) -> bool {
     let unescaped = unescape_js(s);
-    let s_clean = strip_comments_and_whitespace(&unescaped).to_ascii_lowercase();
-    (s_clean.contains("buffer.from(")
-        && (s_clean.contains("'base64'")
-            || s_clean.contains("\"base64\"")
-            || s_clean.contains("`base64`")
-            || s_clean.contains("'base64url'")
-            || s_clean.contains("\"base64url\"")
-            || s_clean.contains("`base64url`")))
-        || s_clean.contains("atob(")
-        || s_clean.contains("btoa(")
+    let s_clean_lower = strip_comments_and_whitespace(&unescaped).to_ascii_lowercase();
+    has_base64_decode(&s_clean_lower)
 }
 
 fn is_suspicious_high_entropy(line: &str) -> bool {
@@ -1357,5 +1344,17 @@ mod tests {
                 .iter()
                 .any(|f| f.rule_id == "P02_LIFECYCLE_SCRIPT_ALLOWED")
         );
+    }
+
+    #[test]
+    fn detects_indirect_eval_and_optional_chaining() {
+        assert!(is_eval_invocation("(0, eval)('malicious')"));
+        assert!(is_eval_invocation("(eval)('malicious')"));
+        assert!(is_eval_invocation("eval?.('malicious')"));
+        assert!(is_eval_invocation("window?.eval?.('malicious')"));
+        assert!(is_eval_invocation("eval.call(null, 'malicious')"));
+        assert!(is_vm_invocation("vm.compileFunction('code')"));
+        assert!(is_base64_decode("atob?.('payload')"));
+        assert!(is_child_proc_invocation("cp?.spawn('sh')"));
     }
 }

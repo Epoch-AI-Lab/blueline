@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -82,22 +82,81 @@ pub fn compute_delta(
         let base_base = find_package_prefix(base_root);
         let base_files = scan_tree(&base_base)?;
 
-        let all_paths: BTreeSet<String> = base_files
-            .keys()
-            .chain(target_files.keys())
-            .cloned()
-            .collect();
+        let mut base_iter = base_files.iter().peekable();
+        let mut target_iter = target_files.iter().peekable();
 
-        for rel_path in all_paths {
-            let in_base = base_files.get(&rel_path);
-            let in_target = target_files.get(&rel_path);
+        loop {
+            match (base_iter.peek(), target_iter.peek()) {
+                (Some(&(b_path, _)), Some(&(t_path, _))) => match b_path.cmp(t_path) {
+                    std::cmp::Ordering::Less => {
+                        let (rel_path, base_meta) = base_iter.next().unwrap();
+                        let base_full = base_base.join(rel_path);
+                        let change = diff_single_file(Some(&base_full), None, rel_path, base_meta)?;
+                        total_lines_deleted += change.lines_deleted;
+                        files_removed.push(change);
+                    }
+                    std::cmp::Ordering::Greater => {
+                        let (rel_path, target_meta) = target_iter.next().unwrap();
+                        let target_full = target_base.join(rel_path);
+                        let change =
+                            diff_single_file(None, Some(&target_full), rel_path, target_meta)?;
+                        if change.is_executable || is_executable_extension(rel_path) {
+                            new_executables.push(rel_path.clone());
+                        }
+                        if change.kind == FileKind::Binary
+                            || change.kind == FileKind::OpaqueTooLarge
+                        {
+                            new_binaries.push(rel_path.clone());
+                        }
+                        total_lines_added += change.lines_added;
+                        files_added.push(change);
+                    }
+                    std::cmp::Ordering::Equal => {
+                        let (rel_path, base_meta) = base_iter.next().unwrap();
+                        let (_, target_meta) = target_iter.next().unwrap();
 
-            match (in_base, in_target) {
-                (None, Some(target_meta)) => {
-                    let target_full = target_base.join(&rel_path);
-                    let change =
-                        diff_single_file(None, Some(&target_full), &rel_path, target_meta)?;
-                    if change.is_executable || is_executable_extension(&rel_path) {
+                        if base_meta.hash != target_meta.hash {
+                            let base_full = base_base.join(rel_path);
+                            let target_full = target_base.join(rel_path);
+                            let change = diff_single_file(
+                                Some(&base_full),
+                                Some(&target_full),
+                                rel_path,
+                                target_meta,
+                            )?;
+                            if !base_meta.is_executable && target_meta.is_executable {
+                                new_executables.push(rel_path.clone());
+                            }
+                            if base_meta.kind == FileKind::Binary
+                                && target_meta.kind == FileKind::Binary
+                            {
+                                modified_binaries.push(rel_path.clone());
+                            }
+                            if (base_meta.kind != FileKind::Binary
+                                && target_meta.kind == FileKind::Binary)
+                                || (base_meta.kind != FileKind::OpaqueTooLarge
+                                    && target_meta.kind == FileKind::OpaqueTooLarge)
+                            {
+                                new_binaries.push(rel_path.clone());
+                            }
+                            total_lines_added += change.lines_added;
+                            total_lines_deleted += change.lines_deleted;
+                            files_modified.push(change);
+                        }
+                    }
+                },
+                (Some(_), None) => {
+                    let (rel_path, base_meta) = base_iter.next().unwrap();
+                    let base_full = base_base.join(rel_path);
+                    let change = diff_single_file(Some(&base_full), None, rel_path, base_meta)?;
+                    total_lines_deleted += change.lines_deleted;
+                    files_removed.push(change);
+                }
+                (None, Some(_)) => {
+                    let (rel_path, target_meta) = target_iter.next().unwrap();
+                    let target_full = target_base.join(rel_path);
+                    let change = diff_single_file(None, Some(&target_full), rel_path, target_meta)?;
+                    if change.is_executable || is_executable_extension(rel_path) {
                         new_executables.push(rel_path.clone());
                     }
                     if change.kind == FileKind::Binary || change.kind == FileKind::OpaqueTooLarge {
@@ -106,44 +165,7 @@ pub fn compute_delta(
                     total_lines_added += change.lines_added;
                     files_added.push(change);
                 }
-                (Some(base_meta), None) => {
-                    let base_full = base_base.join(&rel_path);
-                    let change = diff_single_file(Some(&base_full), None, &rel_path, base_meta)?;
-                    total_lines_deleted += change.lines_deleted;
-                    files_removed.push(change);
-                }
-                (Some(base_meta), Some(target_meta)) => {
-                    let base_full = base_base.join(&rel_path);
-                    let target_full = target_base.join(&rel_path);
-
-                    if base_meta.hash != target_meta.hash {
-                        let change = diff_single_file(
-                            Some(&base_full),
-                            Some(&target_full),
-                            &rel_path,
-                            target_meta,
-                        )?;
-                        if !base_meta.is_executable && target_meta.is_executable {
-                            new_executables.push(rel_path.clone());
-                        }
-                        if base_meta.kind == FileKind::Binary
-                            && target_meta.kind == FileKind::Binary
-                        {
-                            modified_binaries.push(rel_path.clone());
-                        }
-                        if (base_meta.kind != FileKind::Binary
-                            && target_meta.kind == FileKind::Binary)
-                            || (base_meta.kind != FileKind::OpaqueTooLarge
-                                && target_meta.kind == FileKind::OpaqueTooLarge)
-                        {
-                            new_binaries.push(rel_path.clone());
-                        }
-                        total_lines_added += change.lines_added;
-                        total_lines_deleted += change.lines_deleted;
-                        files_modified.push(change);
-                    }
-                }
-                (None, None) => unreachable!(),
+                (None, None) => break,
             }
         }
     } else {

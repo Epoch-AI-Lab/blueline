@@ -37,6 +37,13 @@ impl BaselineStore {
         if let Some(parent) = path.parent() {
             #[cfg(unix)]
             {
+                if let Ok(meta) = fs::symlink_metadata(parent)
+                    && meta.file_type().is_symlink()
+                {
+                    return Err(BluelineError::Store(
+                        "data directory cannot be a symbolic link".into(),
+                    ));
+                }
                 use std::os::unix::fs::DirBuilderExt;
                 let mut builder = fs::DirBuilder::new();
                 builder.recursive(true);
@@ -66,6 +73,13 @@ impl BaselineStore {
 
         #[cfg(unix)]
         {
+            if let Ok(meta) = fs::symlink_metadata(path)
+                && meta.file_type().is_symlink()
+            {
+                return Err(BluelineError::Store(
+                    "database path cannot be a symbolic link".into(),
+                ));
+            }
             use std::os::unix::fs::OpenOptionsExt;
             let _ = fs::OpenOptions::new()
                 .write(true)

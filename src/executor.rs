@@ -1,10 +1,14 @@
 use std::process::{Command, Stdio};
 
-/// Executes `npm install --ignore-scripts <pkg> [extra_args...]`.
+/// Executes `npm install --ignore-scripts --registry <registry> -- <pkg> [extra_args...]`.
 ///
 /// Delegates to `$npm_execpath` if set (e.g. when invoked through `npm` or `npx`),
 /// otherwise defaults to `npm` on PATH.
-pub fn install_with_ignore_scripts(pkg: &str, extra_args: &[String]) -> anyhow::Result<()> {
+pub fn install_with_ignore_scripts(
+    pkg: &str,
+    registry_base: &str,
+    extra_args: &[String],
+) -> anyhow::Result<()> {
     validate_extra_args(extra_args)?;
 
     let mut cmd = match std::env::var("npm_execpath") {
@@ -51,6 +55,9 @@ pub fn install_with_ignore_scripts(pkg: &str, extra_args: &[String]) -> anyhow::
 
     cmd.arg("install")
         .arg("--ignore-scripts")
+        .arg("--registry")
+        .arg(registry_base)
+        .arg("--")
         .arg(pkg.trim())
         .args(extra_args)
         .stdin(Stdio::inherit())
@@ -84,16 +91,16 @@ pub fn install_with_ignore_scripts(pkg: &str, extra_args: &[String]) -> anyhow::
 }
 
 fn normalize_key(arg: &str) -> String {
-    arg.trim_start_matches('-')
-        .chars()
-        .map(|c| {
-            if c == '_' {
-                '-'
-            } else {
-                c.to_ascii_lowercase()
-            }
-        })
-        .collect()
+    let stripped = arg.trim_start_matches('-');
+    let mut out = String::with_capacity(stripped.len());
+    for c in stripped.chars() {
+        if c == '_' {
+            out.push('-');
+        } else {
+            out.push(c.to_ascii_lowercase());
+        }
+    }
+    out
 }
 
 fn is_falsy_value(val: &str) -> bool {
@@ -106,7 +113,9 @@ pub fn validate_extra_args(extra_args: &[String]) -> anyhow::Result<()> {
     while let Some(arg) = iter.next() {
         let trimmed = arg.trim();
         if !trimmed.starts_with('-') {
-            continue;
+            anyhow::bail!(
+                "forbidden positional argument `{trimmed}`: extra arguments can only be npm CLI flags"
+            );
         }
 
         let (raw_key, val_opt) = if let Some((k, v)) = trimmed.split_once('=') {
@@ -117,7 +126,7 @@ pub fn validate_extra_args(extra_args: &[String]) -> anyhow::Result<()> {
 
         let key = normalize_key(raw_key);
 
-        // Disallow configuration and shell injection flags
+        // Disallow configuration, proxy, TLS and shell injection flags
         if matches!(
             key.as_str(),
             "userconfig"
@@ -132,9 +141,23 @@ pub fn validate_extra_args(extra_args: &[String]) -> anyhow::Result<()> {
                 | "onload-script"
                 | "onloadscript"
                 | "scripts-prepend-node-path"
+                | "registry"
+                | "proxy"
+                | "https-proxy"
+                | "httpsproxy"
+                | "http-proxy"
+                | "httpproxy"
+                | "strict-ssl"
+                | "no-strict-ssl"
+                | "nostrictssl"
+                | "strictssl"
+                | "ca"
+                | "cafile"
+                | "cert"
+                | "key"
         ) {
             anyhow::bail!(
-                "forbidden flag `{trimmed}`: cannot override configuration or process options"
+                "forbidden flag `{trimmed}`: cannot override network, security or configuration options"
             );
         }
 
@@ -258,6 +281,46 @@ mod tests {
             vec!["--script-shell=/bin/sh"],
             vec!["--script_shell=/bin/sh"],
             vec!["--shell=/bin/sh"],
+        ];
+        for args in variations {
+            let string_args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            assert!(
+                validate_extra_args(&string_args).is_err(),
+                "should reject {:?}",
+                args
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_positional_arguments() {
+        let bad_args = [
+            vec!["express@4.21.2".to_string()],
+            vec!["--save-dev".to_string(), "malicious-pkg".to_string()],
+            vec!["http://evil.com/payload.tgz".to_string()],
+        ];
+        for args in bad_args {
+            assert!(
+                validate_extra_args(&args).is_err(),
+                "should reject positional package args: {:?}",
+                args
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_network_and_ssl_override_flags() {
+        let variations = [
+            vec!["--proxy=http://10.0.0.1:8080"],
+            vec!["--https-proxy=http://10.0.0.1:8080"],
+            vec!["--http-proxy=http://10.0.0.1:8080"],
+            vec!["--strict-ssl=false"],
+            vec!["--no-strict-ssl"],
+            vec!["--ca=/tmp/bad.crt"],
+            vec!["--cafile=/tmp/bad.crt"],
+            vec!["--cert=/tmp/bad.crt"],
+            vec!["--key=/tmp/bad.key"],
+            vec!["--registry=https://evil-registry.org"],
         ];
         for args in variations {
             let string_args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
