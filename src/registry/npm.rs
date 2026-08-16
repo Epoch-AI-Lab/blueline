@@ -415,21 +415,19 @@ fn is_private_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
-fn is_private_or_local_host(host: &str) -> bool {
-    if host == "localhost"
+fn is_special_local_domain(host: &str) -> bool {
+    host == "localhost"
         || host.ends_with(".localhost")
         || host == "metadata.google.internal"
         || host == "instance-data"
-    {
-        return true;
-    }
+}
 
-    // Reject hex/octal/integer/short IP representations (e.g. 0x7f000001, 2130706433, 0177.0.0.1, 127.1)
+fn is_non_canonical_ip(host: &str) -> bool {
     let lower = host.to_ascii_lowercase();
     if lower.starts_with("0x") || lower.contains(".0x") {
         return true;
     }
-    if host.chars().all(|c| c.is_ascii_digit()) {
+    if !host.is_empty() && host.chars().all(|c| c.is_ascii_digit()) {
         return true;
     }
     let parts: Vec<&str> = host.split('.').collect();
@@ -438,6 +436,13 @@ fn is_private_or_local_host(host: &str) -> bool {
         .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
         && (parts.len() != 4 || parts.iter().any(|p| p.len() > 1 && p.starts_with('0')))
     {
+        return true;
+    }
+    false
+}
+
+fn is_private_or_local_host(host: &str) -> bool {
+    if is_special_local_domain(host) || is_non_canonical_ip(host) {
         return true;
     }
 
@@ -673,6 +678,30 @@ mod tests {
         assert!(!is_private_or_local_host("100.63.255.255"));
         assert!(!is_private_or_local_host("100.128.0.1"));
         assert!(!is_private_or_local_host("2607:f8b0:4005:805::200e"));
+    }
+
+    #[test]
+    fn special_local_domain_and_non_canonical_ip_tests() {
+        assert!(is_special_local_domain("localhost"));
+        assert!(is_special_local_domain("sub.localhost"));
+        assert!(is_special_local_domain("metadata.google.internal"));
+        assert!(is_special_local_domain("instance-data"));
+        assert!(!is_special_local_domain("registry.npmjs.org"));
+        assert!(!is_special_local_domain("notlocalhost"));
+
+        assert!(is_non_canonical_ip("0x7f000001"));
+        assert!(is_non_canonical_ip("0X7F000001"));
+        assert!(is_non_canonical_ip("127.0x0.0.1"));
+        assert!(is_non_canonical_ip("127.0X0.0.1"));
+        assert!(is_non_canonical_ip("2130706433"));
+        assert!(is_non_canonical_ip("127.1"));
+        assert!(is_non_canonical_ip("0177.0.0.1"));
+
+        assert!(!is_non_canonical_ip(""));
+        assert!(!is_non_canonical_ip("127.0.0.1"));
+        assert!(!is_non_canonical_ip("8.8.8.8"));
+        assert!(!is_non_canonical_ip("127.0..1"));
+        assert!(!is_non_canonical_ip("registry.npmjs.org"));
     }
 
     #[test]
