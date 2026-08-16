@@ -262,7 +262,7 @@ pub fn install(
 
     if approved {
         let install_spec = format!("{name}@{version_str}");
-        crate::executor::install_with_ignore_scripts(&install_spec, npm_args)?;
+        crate::executor::install_with_ignore_scripts(&install_spec, registry_base, npm_args)?;
         Ok(())
     } else {
         eprintln!(

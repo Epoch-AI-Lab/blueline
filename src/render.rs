@@ -74,15 +74,61 @@ pub fn sanitize_for_terminal(s: &str) -> String {
 }
 
 pub fn sanitize_single_line(s: &str) -> String {
-    sanitize_for_terminal(s)
-        .chars()
-        .map(|c| match c {
-            '\n' | '\r' | '\t' | '\u{000B}' | '\u{000C}' | '\u{0085}' | '\u{2028}' | '\u{2029}' => {
-                ' '
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if let Some(&next) = chars.peek() {
+                if next == '[' {
+                    // CSI sequence: consume until 0x40..=0x7E with 64-char bound
+                    chars.next();
+                    let mut count = 0;
+                    for csi in chars.by_ref() {
+                        count += 1;
+                        if (0x40..=0x7E).contains(&(csi as u32)) || count > 64 {
+                            break;
+                        }
+                    }
+                    continue;
+                } else if next == ']' || next == 'P' || next == '_' || next == '^' || next == 'X' {
+                    // OSC / DCS / APC / PM / SOS: consume until \x07 (BEL) or \x1b\ (ST) with 64-char bound
+                    chars.next();
+                    let mut prev = '\0';
+                    let mut count = 0;
+                    for osc in chars.by_ref() {
+                        count += 1;
+                        if osc == '\x07' || (prev == '\x1b' && osc == '\\') || count > 64 {
+                            break;
+                        }
+                        prev = osc;
+                    }
+                    continue;
+                } else {
+                    // 2-byte escape sequence (e.g. \x1bN, \x1bO)
+                    chars.next();
+                    continue;
+                }
             }
-            _ => c,
-        })
-        .collect()
+            continue;
+        }
+
+        if is_dangerous_unicode(c) {
+            continue;
+        }
+
+        match c {
+            '\n' | '\r' | '\t' | '\u{000B}' | '\u{000C}' | '\u{0085}' | '\u{2028}' | '\u{2029}' => {
+                out.push(' ');
+            }
+            _ => {
+                let code = c as u32;
+                if code >= 0x20 && code != 0x7f && !(0x80..=0x9f).contains(&code) {
+                    out.push(c);
+                }
+            }
+        }
+    }
+    out
 }
 
 pub fn sanitize_terminal(input: &str) -> String {

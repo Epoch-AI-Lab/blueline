@@ -505,8 +505,12 @@ fn install_delegates_to_npm_with_ignore_scripts() {
 
     let logged_args = std::fs::read_to_string(&log_file).unwrap();
     assert!(
-        logged_args.contains("install --ignore-scripts safe-pkg@1.0.0 --save-dev"),
-        "npm must receive install --ignore-scripts and extra args, got: {logged_args}"
+        logged_args.contains("install --ignore-scripts")
+            && logged_args.contains("--registry")
+            && logged_args.contains(&fixture.base)
+            && logged_args.contains("safe-pkg@1.0.0")
+            && logged_args.contains("--save-dev"),
+        "npm must receive install --ignore-scripts, registry, and extra args, got: {logged_args}"
     );
 }
 

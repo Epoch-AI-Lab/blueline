@@ -148,13 +148,14 @@ fn validate_entry_path(path: &Path) -> Result<(), String> {
     if path.is_absolute() {
         return Err(format!("absolute entry path `{}` rejected", path.display()));
     }
-    if path.to_string_lossy().contains('\\') {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    if bytes.contains(&b'\\') {
         return Err(format!(
             "entry path `{}` containing backslash rejected",
             path.display()
         ));
     }
-    if path.to_string_lossy().contains(':') {
+    if bytes.contains(&b':') {
         return Err(format!(
             "entry path `{}` containing colon rejected",
             path.display()

@@ -400,6 +400,25 @@ fn is_private_v4(v4: std::net::Ipv4Addr) -> bool {
         || (octets[0] == 100 && (octets[1] & 0xc0) == 64)
 }
 
+fn is_private_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => is_private_v4(v4),
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+            {
+                return true;
+            }
+            if let Some(v4) = v6.to_ipv4() {
+                return is_private_v4(v4);
+            }
+            false
+        }
+    }
+}
+
 fn is_private_or_local_host(host: &str) -> bool {
     if host == "localhost"
         || host.ends_with(".localhost")
@@ -427,21 +446,20 @@ fn is_private_or_local_host(host: &str) -> bool {
     }
 
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        match ip {
-            std::net::IpAddr::V4(v4) => is_private_v4(v4),
-            std::net::IpAddr::V6(v6) => {
-                if (v6.segments()[0] & 0xffc0) == 0xfe80 || (v6.segments()[0] & 0xfe00) == 0xfc00 {
-                    return true;
-                }
-                if let Some(v4) = v6.to_ipv4() {
-                    return is_private_v4(v4);
-                }
-                false
+        return is_private_ip(ip);
+    }
+
+    // Resolve hostname to IP to prevent DNS rebinding or hostname-based SSRF
+    use std::net::ToSocketAddrs;
+    if let Ok(addrs) = (host, 443).to_socket_addrs() {
+        for socket_addr in addrs {
+            if is_private_ip(socket_addr.ip()) {
+                return true;
             }
         }
-    } else {
-        false
     }
+
+    false
 }
 
 fn summarize_versions(packument: &Packument) -> String {
