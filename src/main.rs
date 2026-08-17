@@ -14,11 +14,11 @@ fn main() {
 fn run() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
     match cli.command {
-        cli::Command::Review { pkg, output } => {
-            review::run(&pkg, &cli.registry, output, cli.policy.as_deref())
+        cli::Command::Review { pkg, output, yes } => {
+            review::run(&pkg, &cli.registry, output, cli.policy.as_deref(), yes)
         }
-        cli::Command::Install { pkg, npm_args } => {
-            review::install(&pkg, &cli.registry, &npm_args, cli.policy.as_deref())
+        cli::Command::Install { pkg, npm_args, yes } => {
+            review::install(&pkg, &cli.registry, &npm_args, cli.policy.as_deref(), yes)
         }
         cli::Command::Ci {
             base,

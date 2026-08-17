@@ -53,8 +53,8 @@ If a release exceeds risk thresholds, Blueline blocks the install and halts the 
 - [x] CLI review command (`blueline review <pkg@ver>`)
 - [x] Line-level diff engine
 - [x] npm and npx wrapper shim (`@blueline/cli`)
-- [ ] GitHub Action PR check
-- [ ] Agent hook via Model Context Protocol (MCP)
+- [x] GitHub Action PR check
+- [x] Agent hook via Model Context Protocol (MCP)
 - [ ] Revocation index and recall API
 
 ## Quickstart

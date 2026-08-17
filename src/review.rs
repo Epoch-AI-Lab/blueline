@@ -146,9 +146,11 @@ pub fn run(
     registry_base: &str,
     output: Output,
     policy_path: Option<&std::path::Path>,
+    yes: bool,
 ) -> anyhow::Result<()> {
     let policy = Policy::load_or_default(policy_path)?;
-    let (name, version_str) = parse_spec(pkg_spec)?;
+    let registry = NpmRegistry::new(registry_base);
+    let (name, version_str) = parse_spec_flexible(pkg_spec, &registry)?;
     let store = BaselineStore::open().map_err(|e| anyhow::anyhow!("baseline store: {e}"))?;
 
     let (verdict, delta, integrity) =
@@ -161,6 +163,33 @@ pub fn run(
         }
         OutputFormat::Text => {
             render_text(&verdict, &delta);
+        }
+    }
+
+    if yes {
+        if verdict.band == crate::verdict::VerdictBand::Low {
+            store.mark_clean(&name, &version_str, &integrity)?;
+            let _ = store.record_audit_log(
+                &name,
+                &version_str,
+                &integrity,
+                "approve_auto_yes",
+                0,
+                "auto_approved_low_risk",
+                "user",
+                None,
+            );
+            println!(
+                "Approved {}@{} and marked clean in baseline store (--yes).",
+                name, version_str
+            );
+            return Ok(());
+        } else {
+            eprintln!(
+                "Cannot auto-approve {}@{}: risk verdict is {} (score: {}). Refusing to proceed (--yes).",
+                name, version_str, verdict.band, verdict.risk_score
+            );
+            std::process::exit(2);
         }
     }
 
@@ -181,6 +210,7 @@ pub fn install(
     registry_base: &str,
     npm_args: &[String],
     policy_path: Option<&std::path::Path>,
+    yes: bool,
 ) -> anyhow::Result<()> {
     crate::executor::validate_extra_args(npm_args)?;
     let policy = Policy::load_or_default(policy_path)?;
@@ -193,7 +223,32 @@ pub fn install(
     render_text(&verdict, &delta);
 
     let is_interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    let approved = if is_interactive {
+    let approved = if yes {
+        if verdict.band == crate::verdict::VerdictBand::Low {
+            store.mark_clean(&name, &version_str, &integrity)?;
+            let _ = store.record_audit_log(
+                &name,
+                &version_str,
+                &integrity,
+                "approve_auto_yes",
+                0,
+                "auto_approved_low_risk",
+                "user",
+                None,
+            );
+            println!(
+                "Approved {}@{} and marked clean in baseline store (--yes).",
+                name, version_str
+            );
+            true
+        } else {
+            eprintln!(
+                "Cannot auto-approve {}@{}: risk verdict is {} (score: {}). Refusing to install (--yes).",
+                name, version_str, verdict.band, verdict.risk_score
+            );
+            false
+        }
+    } else if is_interactive {
         interactive_prompt(&store, &name, &version_str, &integrity, &delta)?
     } else {
         verdict.band == crate::verdict::VerdictBand::Low
