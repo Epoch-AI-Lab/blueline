@@ -39,13 +39,17 @@ pub struct Cli {
 pub enum Command {
     /// Fetch, verify, and baseline a package release
     Review {
-        /// `<name>@<version>` to review, e.g. `express@4.21.2`
+        /// `<name>` or `<name>@<version>` to review, e.g. `express` or `express@4.21.2`
         #[arg(value_parser = trim_pkg)]
         pkg: String,
 
         /// Output format: auto (text on a TTY, JSON otherwise), text, or json
         #[arg(long, value_enum, default_value_t = Output::Auto)]
         output: Output,
+
+        /// Auto-approve releases with LOW risk without prompting (fails closed on higher risk)
+        #[arg(short = 'y', long = "yes", alias = "non-interactive")]
+        yes: bool,
     },
 
     /// Review and install a package with `--ignore-scripts` upon approval
@@ -53,6 +57,10 @@ pub enum Command {
         /// `<name>` or `<name>@<version>` to review and install
         #[arg(value_parser = trim_pkg)]
         pkg: String,
+
+        /// Auto-approve releases with LOW risk without prompting (fails closed on higher risk)
+        #[arg(short = 'y', long = "yes", alias = "non-interactive")]
+        yes: bool,
 
         /// Additional arguments forwarded to npm install
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]

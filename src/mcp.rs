@@ -27,12 +27,46 @@ struct JsonRpcResponse {
     error: Option<JsonRpcError>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct JsonRpcError {
     code: i64,
     message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<serde_json::Value>,
+}
+
+impl JsonRpcError {
+    fn parse_error(msg: impl std::fmt::Display) -> Self {
+        Self {
+            code: -32700,
+            message: msg.to_string(),
+            data: None,
+        }
+    }
+
+    fn method_not_found(method: &str) -> Self {
+        Self {
+            code: -32601,
+            message: format!("Method not found: {method}"),
+            data: None,
+        }
+    }
+
+    fn invalid_params(msg: impl std::fmt::Display) -> Self {
+        Self {
+            code: -32602,
+            message: msg.to_string(),
+            data: None,
+        }
+    }
+
+    fn internal_error(msg: impl std::fmt::Display) -> Self {
+        Self {
+            code: -32603,
+            message: msg.to_string(),
+            data: None,
+        }
+    }
 }
 
 pub fn run_stdio(registry_base: &str, policy_path: Option<&Path>) -> anyhow::Result<()> {
@@ -67,11 +101,7 @@ pub fn run_stdio(registry_base: &str, policy_path: Option<&Path>) -> anyhow::Res
                     jsonrpc: "2.0",
                     id: serde_json::Value::Null,
                     result: None,
-                    error: Some(JsonRpcError {
-                        code: -32700, // Parse error
-                        message: format!("Parse error: {e}"),
-                        data: None,
-                    }),
+                    error: Some(JsonRpcError::parse_error(format!("Parse error: {e}"))),
                 };
                 let resp_str = serde_json::to_string(&err_resp)?;
                 writeln!(stdout, "{resp_str}")?;
@@ -102,15 +132,11 @@ pub fn run_stdio(registry_base: &str, policy_path: Option<&Path>) -> anyhow::Res
                 result: Some(result),
                 error: None,
             },
-            Err(err_msg) => JsonRpcResponse {
+            Err(err) => JsonRpcResponse {
                 jsonrpc: "2.0",
                 id,
                 result: None,
-                error: Some(JsonRpcError {
-                    code: -32603, // Internal error
-                    message: err_msg,
-                    data: None,
-                }),
+                error: Some(err),
             },
         };
 
@@ -129,7 +155,7 @@ fn handle_request(
     registry_base: &str,
     store: &BaselineStore,
     policy: &Policy,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, JsonRpcError> {
     match method {
         "initialize" => Ok(json!({
             "protocolVersion": "2024-11-05",
@@ -194,17 +220,18 @@ fn handle_request(
         })),
 
         "tools/call" => {
-            let params = params.ok_or_else(|| "missing params in tools/call".to_string())?;
+            let params = params
+                .ok_or_else(|| JsonRpcError::invalid_params("missing params in tools/call"))?;
             let tool_name = params
                 .get("name")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| "missing tool name in tools/call".to_string())?;
+                .ok_or_else(|| JsonRpcError::invalid_params("missing tool name in tools/call"))?;
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
             execute_tool(tool_name, &args, registry_base, store, policy)
         }
 
-        other => Err(format!("unsupported method: {other}")),
+        other => Err(JsonRpcError::method_not_found(other)),
     }
 }
 
@@ -214,20 +241,26 @@ fn execute_tool(
     registry_base: &str,
     store: &BaselineStore,
     policy: &Policy,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, JsonRpcError> {
     match name {
         "review_install" => {
             let pkg_spec = args
                 .get("package")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| "missing `package` argument".to_string())?;
+                .ok_or_else(|| JsonRpcError::invalid_params("missing `package` argument"))?;
 
-            let (pkg_name, version) = parse_spec(pkg_spec)
-                .map_err(|e| format!("invalid package spec `{pkg_spec}`: {e}"))?;
+            let (pkg_name, version) = parse_spec(pkg_spec).map_err(|e| {
+                JsonRpcError::invalid_params(format!("invalid package spec `{pkg_spec}`: {e}"))
+            })?;
 
             let (verdict, _delta, _) =
-                evaluate_package(&pkg_name, &version, registry_base, store, policy)
-                    .map_err(|e| format!("review error for `{pkg_spec}`: {e:#}"))?;
+                evaluate_package(&pkg_name, &version, registry_base, store, policy).map_err(
+                    |e| {
+                        JsonRpcError::internal_error(format!(
+                            "review error for `{pkg_spec}`: {e:#}"
+                        ))
+                    },
+                )?;
 
             let recommendation = match verdict.band {
                 crate::verdict::VerdictBand::Low => "APPROVE — Safe to install",
@@ -275,15 +308,15 @@ fn execute_tool(
             let pkg_name = args
                 .get("name")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| "missing `name` argument".to_string())?;
+                .ok_or_else(|| JsonRpcError::invalid_params("missing `name` argument"))?;
             let version = args
                 .get("version")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| "missing `version` argument".to_string())?;
+                .ok_or_else(|| JsonRpcError::invalid_params("missing `version` argument"))?;
 
             let clean_versions = store
                 .list_clean_versions(pkg_name)
-                .map_err(|e| format!("baseline store error: {e}"))?;
+                .map_err(|e| JsonRpcError::internal_error(format!("baseline store error: {e}")))?;
 
             let is_clean = clean_versions.iter().any(|(v, _)| v.to_string() == version);
             let clean_version_strings: Vec<String> =
@@ -310,14 +343,20 @@ fn execute_tool(
             let pkg_spec = args
                 .get("package")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| "missing `package` argument".to_string())?;
+                .ok_or_else(|| JsonRpcError::invalid_params("missing `package` argument"))?;
 
-            let (pkg_name, version) = parse_spec(pkg_spec)
-                .map_err(|e| format!("invalid package spec `{pkg_spec}`: {e}"))?;
+            let (pkg_name, version) = parse_spec(pkg_spec).map_err(|e| {
+                JsonRpcError::invalid_params(format!("invalid package spec `{pkg_spec}`: {e}"))
+            })?;
 
             let (_verdict, delta, _) =
-                evaluate_package(&pkg_name, &version, registry_base, store, policy)
-                    .map_err(|e| format!("review error for `{pkg_spec}`: {e:#}"))?;
+                evaluate_package(&pkg_name, &version, registry_base, store, policy).map_err(
+                    |e| {
+                        JsonRpcError::internal_error(format!(
+                            "review error for `{pkg_spec}`: {e:#}"
+                        ))
+                    },
+                )?;
 
             let mut diff_text = format!("Diff summary for {}@{}:\n", pkg_name, version);
             diff_text.push_str(&format!(
@@ -343,7 +382,9 @@ fn execute_tool(
             }))
         }
 
-        unknown => Err(format!("unknown tool: {unknown}")),
+        unknown => Err(JsonRpcError::invalid_params(format!(
+            "unknown tool: {unknown}"
+        ))),
     }
 }
 
@@ -398,5 +439,39 @@ mod tests {
                 .iter()
                 .any(|t| t.get("name").unwrap() == "inspect_diff")
         );
+    }
+
+    #[test]
+    fn returns_method_not_found_for_unknown_method() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&temp.path().join("store.db")).unwrap();
+        let policy = Policy::default();
+        let err = handle_request(
+            "nonexistent_method",
+            None,
+            "https://registry.npmjs.org",
+            &store,
+            &policy,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, -32601);
+        assert!(err.message.contains("Method not found"));
+    }
+
+    #[test]
+    fn returns_invalid_params_for_missing_tool_call_args() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&temp.path().join("store.db")).unwrap();
+        let policy = Policy::default();
+        let err = handle_request(
+            "tools/call",
+            Some(json!({"name": "check_known_clean", "arguments": {}})),
+            "https://registry.npmjs.org",
+            &store,
+            &policy,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, -32602);
+        assert!(err.message.contains("missing `name` argument"));
     }
 }

@@ -146,12 +146,29 @@ fn help_lists_review_and_install_subcommands() {
 }
 
 #[test]
-fn review_requires_version() {
+fn review_resolves_bare_package_name_to_latest() {
+    let tarball = make_tarball();
+    let integrity = sha512_b64(&tarball);
+    let pack_integrity = integrity.clone();
+    let fixture = spawn_fixture(
+        move |base| packument(base, "4.21.2", &pack_integrity),
+        tarball,
+    );
+
+    let data_dir = tempfile::tempdir().unwrap();
     blueline()
-        .args(["review", "express"])
+        .args([
+            "review",
+            "express",
+            "--registry",
+            &fixture.base,
+            "--output",
+            "json",
+        ])
+        .env("BLUELINE_DATA_DIR", data_dir.path())
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("expected `<name>@<version>`"));
+        .code(2)
+        .stdout(predicate::str::contains("\"target_version\":\"4.21.2\""));
 }
 
 #[test]
@@ -1225,4 +1242,92 @@ fn mcp_stdio_handles_initialize_and_tools_list() {
 
     drop(stdin);
     let _ = child.wait();
+}
+
+#[test]
+fn review_yes_auto_approves_low_risk_and_fails_closed_on_high_risk() {
+    let safe_tarball = make_tarball_with(b"module.exports = {};");
+    let safe_integrity = sha512_b64(&safe_tarball);
+    let fixture_safe = spawn_fixture(
+        move |base| {
+            serde_json::json!({
+                "name": "safe-yes-pkg",
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "0.9.0": {
+                        "name": "safe-yes-pkg",
+                        "version": "0.9.0",
+                        "dist": {
+                            "tarball": format!("{base}/safe-yes-pkg/-/safe-yes-pkg-1.0.0.tgz"),
+                            "integrity": safe_integrity,
+                            "shasum": "0".repeat(40)
+                        }
+                    },
+                    "1.0.0": {
+                        "name": "safe-yes-pkg",
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": format!("{base}/safe-yes-pkg/-/safe-yes-pkg-1.0.0.tgz"),
+                            "integrity": safe_integrity,
+                            "shasum": "0".repeat(40)
+                        }
+                    }
+                }
+            })
+            .to_string()
+        },
+        safe_tarball,
+    );
+
+    let data_dir = tempfile::tempdir().unwrap();
+    // 1. Initial review of 0.9.0 without approved predecessor is MEDIUM risk -> --yes must fail closed (exit code 2)
+    blueline()
+        .args([
+            "review",
+            "safe-yes-pkg@0.9.0",
+            "--registry",
+            &fixture_safe.base,
+            "--yes",
+        ])
+        .env("BLUELINE_DATA_DIR", data_dir.path())
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("Cannot auto-approve"));
+
+    // 2. Mark 0.9.0 clean in baseline store so 1.0.0 has a verified baseline
+    let db_path = data_dir.path().join("baseline.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "UPDATE known_clean SET clean = 1 WHERE name = 'safe-yes-pkg' AND version = '0.9.0'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    // 3. Review 1.0.0 with approved baseline has LOW risk -> --yes auto-approves with exit code 0
+    blueline()
+        .args([
+            "review",
+            "safe-yes-pkg@1.0.0",
+            "--registry",
+            &fixture_safe.base,
+            "-y",
+        ])
+        .env("BLUELINE_DATA_DIR", data_dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Approved safe-yes-pkg@1.0.0 and marked clean in baseline store (--yes)",
+        ));
+
+    // Verify baseline store recorded clean = 1
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let clean: i64 = conn
+        .query_row(
+            "SELECT clean FROM known_clean WHERE name = 'safe-yes-pkg' AND version = '1.0.0'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(clean, 1);
 }

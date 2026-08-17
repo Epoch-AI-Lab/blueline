@@ -61,10 +61,17 @@ pub fn run(
         BaselineStore::open().map_err(|e| anyhow::anyhow!("opening baseline store: {e}"))?;
 
     let head_content = fs::read_to_string(lockfile_path).map_err(|e| {
-        anyhow::anyhow!(
-            "failed to read head lockfile at `{}`: {e}",
-            lockfile_path.display()
-        )
+        if e.kind() == std::io::ErrorKind::NotFound {
+            anyhow::anyhow!(
+                "failed to read head lockfile at `{}`: {e} (use `--lockfile <path>` to specify a different path)",
+                lockfile_path.display()
+            )
+        } else {
+            anyhow::anyhow!(
+                "failed to read head lockfile at `{}`: {e}",
+                lockfile_path.display()
+            )
+        }
     })?;
 
     let base_content = extract_base_lockfile(base_ref, lockfile_path)?;
