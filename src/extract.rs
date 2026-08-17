@@ -139,7 +139,7 @@ pub fn safe_extract(
 const WINDOWS_RESERVED_NAMES: &[&str] = &[
     "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
     "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "CONIN$",
-    "CONOUT$",
+    "CONOUT$", "CLOCK$",
 ];
 
 fn validate_entry_path(path: &Path) -> Result<(), String> {
@@ -363,6 +363,11 @@ mod tests {
         let tarball_conout = make_tarball(&[("dir/conout$.dat", b"")]);
         let err =
             safe_extract(&tarball_conout, dir.path(), &ExtractionLimits::default()).unwrap_err();
+        assert!(err.to_string().contains("reserved device name"));
+
+        let tarball_clock = make_tarball(&[("clock$.txt", b"")]);
+        let err =
+            safe_extract(&tarball_clock, dir.path(), &ExtractionLimits::default()).unwrap_err();
         assert!(err.to_string().contains("reserved device name"));
     }
 

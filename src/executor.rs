@@ -1,6 +1,6 @@
 use std::process::{Command, Stdio};
 
-/// Executes `npm install --ignore-scripts --registry <registry> -- <pkg> [extra_args...]`.
+/// Executes `npm install --ignore-scripts --registry <registry> [extra_args...] -- <pkg>`.
 ///
 /// Delegates to `$npm_execpath` if set (e.g. when invoked through `npm` or `npx`),
 /// otherwise defaults to `npm` on PATH.
