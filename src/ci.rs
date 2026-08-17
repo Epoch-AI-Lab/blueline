@@ -219,7 +219,12 @@ pub fn evaluate_lockfile_diff(
 }
 
 fn extract_base_lockfile(base_ref: &str, lockfile_path: &Path) -> anyhow::Result<String> {
-    let spec = format!("{}:{}", base_ref, lockfile_path.display());
+    let trimmed_ref = base_ref.trim();
+    if trimmed_ref.starts_with('-') || trimmed_ref.is_empty() {
+        anyhow::bail!("invalid git base ref `{base_ref}`: cannot start with '-' or be empty");
+    }
+
+    let spec = format!("{trimmed_ref}:{}", lockfile_path.display());
     let output = Command::new("git")
         .args(["show", &spec])
         .output()
@@ -248,12 +253,19 @@ fn parse_band_str(s: &str) -> Option<VerdictBand> {
     }
 }
 
+fn escape_markdown_cell(s: &str) -> String {
+    let sanitized = sanitize_terminal(s);
+    sanitized.replace('|', "\\|").replace('\n', "<br/>")
+}
+
 pub fn render_markdown_summary(report: &CiReport) -> String {
     let mut out = String::new();
     out.push_str("## 🛡️ Blueline CI Security Review\n\n");
     out.push_str(&format!(
         "**Base Ref:** `{}` · **Evaluated Packages:** {} · **Unchanged:** {}\n\n",
-        report.base_ref, report.total_evaluated, report.unchanged_count
+        escape_markdown_cell(&report.base_ref),
+        report.total_evaluated,
+        report.unchanged_count
     ));
 
     if report.items.is_empty() {
@@ -283,16 +295,22 @@ pub fn render_markdown_summary(report: &CiReport) -> String {
             item.verdict
                 .findings
                 .iter()
-                .map(|f| format!("`{}`: {}", f.rule_id, sanitize_terminal(&f.title)))
+                .map(|f| {
+                    format!(
+                        "`{}`: {}",
+                        escape_markdown_cell(&f.rule_id),
+                        escape_markdown_cell(&f.title)
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("<br/>")
         };
 
         out.push_str(&format!(
             "| **{}** | `{}` | `{}` | {} | `{}` | {} |\n",
-            sanitize_terminal(&item.name),
-            old_v,
-            item.new_version,
+            escape_markdown_cell(&item.name),
+            escape_markdown_cell(old_v),
+            escape_markdown_cell(&item.new_version),
             item.verdict.risk_score,
             item.verdict.band,
             findings_summary
@@ -344,6 +362,61 @@ mod tests {
         assert_eq!(parse_band_str("high"), Some(VerdictBand::High));
         assert_eq!(parse_band_str("block"), Some(VerdictBand::Block));
         assert_eq!(parse_band_str("unknown"), None);
+    }
+
+    #[test]
+    fn rejects_flag_like_base_refs() {
+        let err =
+            extract_base_lockfile("--output=/tmp/pwn", Path::new("package-lock.json")).unwrap_err();
+        assert!(err.to_string().contains("cannot start with '-'"));
+
+        let err_empty = extract_base_lockfile("  ", Path::new("package-lock.json")).unwrap_err();
+        assert!(err_empty.to_string().contains("or be empty"));
+    }
+
+    #[test]
+    fn escapes_markdown_cells() {
+        let report = CiReport {
+            base_ref: "origin/main".to_string(),
+            lockfile_path: "package-lock.json".to_string(),
+            total_evaluated: 1,
+            unchanged_count: 5,
+            max_band: VerdictBand::Block,
+            passed: false,
+            items: vec![CiReviewItem {
+                name: "malicious|pkg".to_string(),
+                old_version: None,
+                new_version: "1.0.0".to_string(),
+                is_dev: false,
+                verdict: Verdict {
+                    name: "malicious|pkg".to_string(),
+                    target_version: "1.0.0".to_string(),
+                    baseline_version: None,
+                    integrity: "sha512-test".to_string(),
+                    band: VerdictBand::Block,
+                    risk_score: 95,
+                    findings: vec![crate::verdict::Finding {
+                        rule_id: "EVAL|NETWORK".to_string(),
+                        severity: VerdictBand::Block,
+                        title: "eval | payload\nmultiline".to_string(),
+                        description: "desc".to_string(),
+                    }],
+                    diff_summary: crate::verdict::DiffSummary {
+                        files_added: 1,
+                        files_removed: 0,
+                        files_modified: 0,
+                        lines_added: 10,
+                        lines_deleted: 0,
+                    },
+                    trust_sources: None,
+                },
+            }],
+        };
+
+        let md = render_markdown_summary(&report);
+        assert!(md.contains(r"malicious\|pkg"));
+        assert!(md.contains(r"EVAL\|NETWORK"));
+        assert!(md.contains(r"eval \| payload<br/>multiline"));
     }
 
     #[test]

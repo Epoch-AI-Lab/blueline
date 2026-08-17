@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use blueline::{ci, cli, mcp, review};
 
 use clap::Parser;

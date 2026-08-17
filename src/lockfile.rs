@@ -120,7 +120,7 @@ pub fn parse_lockfile_packages(
         }
     } else if let Some(raw_dependencies) = raw.dependencies {
         // v1 format
-        walk_v1_dependencies("", &raw_dependencies, &mut packages);
+        walk_v1_dependencies("", &raw_dependencies, &mut packages, 0);
     } else {
         // Lockfile with neither packages nor dependencies (empty or invalid)
         if raw.lockfile_version.is_none() {
@@ -131,11 +131,18 @@ pub fn parse_lockfile_packages(
     Ok(packages)
 }
 
+const MAX_LOCKFILE_RECURSION_DEPTH: usize = 32;
+
 fn walk_v1_dependencies(
     prefix: &str,
     deps: &BTreeMap<String, RawDependencyV1>,
     out: &mut BTreeMap<String, PackageEntry>,
+    depth: usize,
 ) {
+    if depth > MAX_LOCKFILE_RECURSION_DEPTH {
+        return;
+    }
+
     for (name, dep) in deps {
         let Some(version) = &dep.version else {
             continue;
@@ -158,7 +165,7 @@ fn walk_v1_dependencies(
         out.insert(path_key.clone(), entry);
 
         if let Some(nested) = &dep.dependencies {
-            walk_v1_dependencies(&path_key, nested, out);
+            walk_v1_dependencies(&path_key, nested, out, depth + 1);
         }
     }
 }
@@ -348,5 +355,34 @@ mod tests {
         assert_eq!(delta.removed.len(), 1);
         assert_eq!(delta.removed[0].name, "removed");
         assert_eq!(delta.total_changed(), 3);
+    }
+
+    #[test]
+    fn v1_recursion_depth_limit_enforced() {
+        // Build a deeply nested structure exceeding MAX_LOCKFILE_RECURSION_DEPTH (32)
+        let mut curr = serde_json::json!({
+            "version": "1.0.0"
+        });
+
+        for i in 0..35 {
+            curr = serde_json::json!({
+                "version": "1.0.0",
+                "dependencies": {
+                    format!("dep-{}", i): curr
+                }
+            });
+        }
+
+        let root = serde_json::json!({
+            "lockfileVersion": 1,
+            "dependencies": {
+                "dep-root": curr
+            }
+        });
+
+        let json = serde_json::to_string(&root).unwrap();
+        let pkgs = parse_lockfile_packages(&json).unwrap();
+        // Should parse up to the limit (33 levels including root: depth 0 to 32)
+        assert_eq!(pkgs.len(), MAX_LOCKFILE_RECURSION_DEPTH + 1);
     }
 }
