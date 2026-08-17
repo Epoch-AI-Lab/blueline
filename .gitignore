@@ -8,3 +8,4 @@ mutants.out
 .env*
 pr.diff
 node_modules/
+.useit/
