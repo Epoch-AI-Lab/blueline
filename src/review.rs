@@ -148,11 +148,10 @@ pub fn run(
         }
     }
 
-    if format == OutputFormat::Json {
-        if verdict.band != crate::verdict::VerdictBand::Low {
-            std::process::exit(2);
-        }
-    } else if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+    if format != OutputFormat::Json
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+    {
         interactive_prompt(
             &store,
             &target_pkg.name,

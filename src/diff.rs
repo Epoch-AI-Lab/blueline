@@ -396,26 +396,12 @@ fn diff_single_file(
 }
 
 pub(crate) fn find_package_prefix(root: &Path) -> PathBuf {
-    let nested = root.join("package");
-    if nested.is_dir() {
-        let has_siblings = fs::read_dir(root)
-            .map(|r| {
-                r.filter_map(|e| e.ok())
-                    .any(|entry| entry.file_name() != "package")
-            })
-            .unwrap_or(false);
-        if !has_siblings {
-            return nested;
-        }
-    }
-
-    if let Ok(entries) = fs::read_dir(root) {
-        let entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-        if entries.len() == 1 {
-            let entry = &entries[0];
-            if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                return entry.path();
-            }
+    if let Ok(entries) = fs::read_dir(root).and_then(|r| r.collect::<Result<Vec<_>, _>>())
+        && entries.len() == 1
+    {
+        let entry = &entries[0];
+        if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+            return entry.path();
         }
     }
 
