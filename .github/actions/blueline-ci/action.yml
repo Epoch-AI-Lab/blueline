@@ -1,0 +1,38 @@
+name: 'Blueline CI Release Review'
+description: 'Audits lockfile diffs against Git base refs for zero-days, lifecycle scripts, advisories, and provenance.'
+author: 'Epoch AI Lab'
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  base-ref:
+    description: 'Git base ref to diff against (e.g. origin/main or ${{ github.base_ref }})'
+    required: false
+    default: 'origin/main'
+  lockfile-path:
+    description: 'Path to package-lock.json'
+    required: false
+    default: 'package-lock.json'
+  fail-on:
+    description: 'Minimum verdict risk band that fails the action (low, medium, high, block)'
+    required: false
+    default: 'high'
+  policy-path:
+    description: 'Optional path to blueline.toml policy file'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Run Blueline CI Scan
+      shell: bash
+      run: |
+        ARGS=(ci --base "${{ inputs.base-ref }}" --lockfile "${{ inputs.lockfile-path }}" --fail-on "${{ inputs.fail-on }}")
+        if [ -n "${{ inputs.policy-path }}" ]; then
+          ARGS+=(--policy "${{ inputs.policy-path }}")
+        fi
+
+        echo "Executing: blueline ${ARGS[*]}"
+        cargo run --locked --release -- "${ARGS[@]}"

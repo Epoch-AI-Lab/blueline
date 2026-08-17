@@ -1,21 +1,6 @@
 #![forbid(unsafe_code)]
 
-mod advisory;
-mod baseline;
-mod cli;
-mod diff;
-mod error;
-mod executor;
-mod extract;
-mod heuristic;
-mod manifest;
-mod policy;
-mod provenance;
-mod registry;
-mod render;
-mod review;
-mod store;
-mod verdict;
+use blueline::{ci, cli, mcp, review};
 
 use clap::Parser;
 
@@ -35,5 +20,19 @@ fn run() -> anyhow::Result<()> {
         cli::Command::Install { pkg, npm_args } => {
             review::install(&pkg, &cli.registry, &npm_args, cli.policy.as_deref())
         }
+        cli::Command::Ci {
+            base,
+            lockfile,
+            format,
+            fail_on,
+        } => ci::run(
+            &base,
+            &lockfile,
+            &cli.registry,
+            cli.policy.as_deref(),
+            format.to_ci_format(),
+            fail_on,
+        ),
+        cli::Command::Mcp => mcp::run_stdio(&cli.registry, cli.policy.as_deref()),
     }
 }

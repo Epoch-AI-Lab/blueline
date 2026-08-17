@@ -1,5 +1,5 @@
 /target
-mutants.out
+mutants.out*
 *.db
 *.sqlite
 *.sqlite3
@@ -9,3 +9,5 @@ mutants.out
 pr.diff
 node_modules/
 .useit/
+.agents/
+

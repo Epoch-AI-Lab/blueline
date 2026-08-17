@@ -1164,3 +1164,65 @@ fn regression_json_output_emits_valid_json_without_prompt() {
     assert_eq!(json_val["name"], "express");
     assert_eq!(json_val["target_version"], "4.21.2");
 }
+
+#[test]
+fn ci_and_mcp_subcommands_appear_in_help() {
+    blueline()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("ci"))
+        .stdout(predicates::str::contains("mcp"));
+}
+
+#[test]
+fn mcp_stdio_handles_initialize_and_tools_list() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let bin_path = assert_cmd::cargo::cargo_bin("blueline");
+    let mut child = Command::new(bin_path)
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+
+    // 1. Send initialize
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{}}}}"#
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut reader, &mut line).unwrap();
+
+    let init_resp: serde_json::Value = serde_json::from_str(&line).expect("valid JSON response");
+    assert_eq!(init_resp["id"], 1);
+    assert_eq!(init_resp["result"]["serverInfo"]["name"], "blueline");
+
+    // 2. Send tools/list
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{{}}}}"#
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+
+    line.clear();
+    std::io::BufRead::read_line(&mut reader, &mut line).unwrap();
+    let tools_resp: serde_json::Value = serde_json::from_str(&line).expect("valid JSON response");
+    assert_eq!(tools_resp["id"], 2);
+    let tools = tools_resp["result"]["tools"].as_array().unwrap();
+    assert!(tools.iter().any(|t| t["name"] == "review_install"));
+
+    drop(stdin);
+    let _ = child.wait();
+}

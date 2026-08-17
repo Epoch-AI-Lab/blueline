@@ -26,9 +26,11 @@ decisions behind each phase.
 - [x] `blueline.toml` policy-as-code (advisories, provenance enforcement, allow/blocklists) (`src/policy.rs`)
 - [x] SQLite schema v2 (`advisory_cache`, `provenance_cache`, `audit_log`) (`src/store.rs`)
 
-## Phase 3 — CI & Agents
-- GitHub composite Action: `blueline ci` scans lockfile / `package.json` PR diffs → comment + status check
-- MCP server: `review_install` tool + optional guardrail (PATH shim) mode
+## Phase 3 — CI & Agents ✅
+- [x] GitHub composite Action (`.github/actions/blueline-ci/action.yml`)
+- [x] `blueline ci` lockfile diff scanner & PR reporting (`src/ci.rs`, `src/lockfile.rs`)
+- [x] Model Context Protocol (MCP) server & agent tools (`src/mcp.rs`, `blueline mcp`)
+- [x] Top-tier CI hardening with `cargo-deny` (`deny.toml`) and `cargo-fuzz` (`fuzz/`)
 
 ## Phase 4 — Hosted Service (paid, opt-in token)
 - Recall index API (curated, faster than OSV; e.g. TanStack/router worm)
@@ -46,6 +48,6 @@ decisions behind each phase.
 ## Status (from README)
 - [x] Diff rendering engine (Rust)
 - [x] npm/npx CLI wrapper
-- [ ] GitHub Action + CI check
-- [ ] MCP tool (agent hook)
+- [x] GitHub Action + CI check
+- [x] MCP tool (agent hook)
 - [ ] Revocation index + recall API
