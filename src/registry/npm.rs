@@ -404,7 +404,14 @@ fn is_private_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => is_private_v4(v4),
         std::net::IpAddr::V6(v6) => {
-            if (v6.segments()[0] & 0xffc0) == 0xfe80 || (v6.segments()[0] & 0xfe00) == 0xfc00 {
+            let seg0 = v6.segments()[0];
+            if (seg0 & 0xff00) == 0xff00 // Multicast (ff00::/8)
+                || (seg0 & 0xffc0) == 0xfe80 // Link-local (fe80::/10)
+                || (seg0 & 0xfe00) == 0xfc00 // Unique local (fc00::/7)
+                || seg0 == 0x0100 // Discard prefix (100::/64)
+                || (seg0 == 0x2001 && v6.segments()[1] == 0x0db8)
+            // Documentation (2001:db8::/32)
+            {
                 return true;
             }
             if let Some(v4) = v6.to_ipv4() {
@@ -671,6 +678,10 @@ mod tests {
         assert!(is_private_or_local_host("::ffff:10.0.0.1"));
         assert!(is_private_or_local_host("100.64.0.1"));
         assert!(is_private_or_local_host("100.127.255.254"));
+        assert!(is_private_or_local_host("ff02::1"));
+        assert!(is_private_or_local_host("ff02::2"));
+        assert!(is_private_or_local_host("2001:db8::1"));
+        assert!(is_private_or_local_host("100::1"));
 
         assert!(!is_private_or_local_host("registry.npmjs.org"));
         assert!(!is_private_or_local_host("8.8.8.8"));
@@ -678,6 +689,14 @@ mod tests {
         assert!(!is_private_or_local_host("100.63.255.255"));
         assert!(!is_private_or_local_host("100.128.0.1"));
         assert!(!is_private_or_local_host("2607:f8b0:4005:805::200e"));
+        assert!(!is_private_or_local_host("2001:cafe::1"));
+        assert!(!is_private_or_local_host("2002:db8::1"));
+
+        // Direct is_private_ip invariant checks
+        assert!(is_private_ip("::1".parse().unwrap()));
+        assert!(is_private_ip("::".parse().unwrap()));
+        assert!(!is_private_ip("2001:cafe::1".parse().unwrap()));
+        assert!(!is_private_ip("2002:db8::1".parse().unwrap()));
     }
 
     #[test]

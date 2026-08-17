@@ -818,6 +818,12 @@ fn has_eval_invocation(s_clean: &str) -> bool {
         || s_clean.contains("newFunction`")
         || s_clean.contains("Function(")
         || s_clean.contains("Function`")
+        || s_clean.contains(".constructor(")
+        || s_clean.contains("['constructor'](")
+        || s_clean.contains("[\"constructor\"](")
+        || s_clean.contains("[`constructor`]")
+        || s_clean.contains("Reflect.construct(")
+        || s_clean.contains("Reflect.apply(")
         || s_clean.contains("globalThis.eval")
         || s_clean.contains("window.eval")
         || s_clean.contains("global.eval")
@@ -871,6 +877,7 @@ fn has_child_proc_invocation(s_clean: &str) -> bool {
         || s_clean.contains("process.binding('spawn_sync')")
         || s_clean.contains("process.binding(\"spawn_sync\")")
         || s_clean.contains("process._linkedBinding")
+        || s_clean.contains("process.getBuiltinModule")
 }
 
 #[cfg(test)]
@@ -887,7 +894,10 @@ fn has_base64_decode(s_clean_lower: &str) -> bool {
             || s_clean_lower.contains("`base64`")
             || s_clean_lower.contains("'base64url'")
             || s_clean_lower.contains("\"base64url\"")
-            || s_clean_lower.contains("`base64url`")))
+            || s_clean_lower.contains("`base64url`")
+            || s_clean_lower.contains("'hex'")
+            || s_clean_lower.contains("\"hex\"")
+            || s_clean_lower.contains("`hex`")))
         || s_clean_lower.contains("atob(")
         || s_clean_lower.contains("btoa(")
 }
@@ -1142,6 +1152,10 @@ mod tests {
         assert!(is_eval_invocation(r#"\u0065val(payload)"#));
         assert!(is_eval_invocation("eval\n(payload)"));
         assert!(is_eval_invocation("window['\\x65val'](x)"));
+        assert!(is_eval_invocation("(() => {}).constructor('return 1')()"));
+        assert!(is_eval_invocation(
+            "Reflect.construct(Function, ['code'])()"
+        ));
     }
 
     #[test]
@@ -1150,6 +1164,9 @@ mod tests {
         assert!(is_child_proc_invocation("spawnSync('ls')"));
         assert!(is_child_proc_invocation("execFileSync('sh')"));
         assert!(is_child_proc_invocation("child_process\n.execSync(cmd)"));
+        assert!(is_child_proc_invocation(
+            "process.getBuiltinModule('child_process')"
+        ));
     }
 
     #[test]
@@ -1360,6 +1377,7 @@ mod tests {
     fn detects_base64_variants_and_child_proc_bindings() {
         assert!(is_base64_decode("Buffer.from(x, 'base64url')"));
         assert!(is_base64_decode("Buffer.from(x, \"BASE64\")"));
+        assert!(is_base64_decode("Buffer.from(x, 'hex')"));
         assert!(is_child_proc_invocation("process.binding('spawn_sync')"));
         assert!(is_child_proc_invocation(
             "process._linkedBinding('spawn_sync')"
