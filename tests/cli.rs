@@ -1077,3 +1077,90 @@ packages = ["express"]
         .stdout(predicates::str::contains(r#""band":"BLOCK""#))
         .stdout(predicates::str::contains("P01_PACKAGE_BLOCKED"));
 }
+
+fn make_custom_layout_tarball(prefix: &str) -> Vec<u8> {
+    let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut builder = tar::Builder::new(encoder);
+    let pkg_json = br#"{
+        "name": "express",
+        "version": "4.21.2"
+    }"#;
+    let mut h = tar::Header::new_gnu();
+    h.set_size(pkg_json.len() as u64);
+    h.set_mode(0o644);
+    h.set_cksum();
+    builder
+        .append_data(&mut h, format!("{prefix}/package.json"), &pkg_json[..])
+        .unwrap();
+
+    let code = b"module.exports = {};";
+    let mut h2 = tar::Header::new_gnu();
+    h2.set_size(code.len() as u64);
+    h2.set_mode(0o644);
+    h2.set_cksum();
+    builder
+        .append_data(&mut h2, format!("{prefix}/index.js"), &code[..])
+        .unwrap();
+    builder.into_inner().unwrap().finish().unwrap()
+}
+
+#[test]
+fn regression_single_directory_package_layout() {
+    let tarball = make_custom_layout_tarball("lodash");
+    let integrity = sha512_b64(&tarball);
+    let pack_integrity = integrity.clone();
+    let fix = spawn_fixture(
+        move |base| packument(base, "4.21.2", &pack_integrity),
+        tarball,
+    );
+
+    let data_dir = tempfile::tempdir().unwrap();
+    blueline()
+        .args([
+            "review",
+            "express@4.21.2",
+            "--registry",
+            &fix.base,
+            "--output",
+            "json",
+        ])
+        .env("BLUELINE_DATA_DIR", data_dir.path())
+        .assert()
+        .code(2)
+        .stdout(predicates::str::contains(r#""name":"express""#))
+        .stdout(predicates::str::contains(r#""files_added":2"#));
+}
+
+#[test]
+fn regression_json_output_emits_valid_json_without_prompt() {
+    let tarball = make_tarball();
+    let integrity = sha512_b64(&tarball);
+    let pack_integrity = integrity.clone();
+    let fix = spawn_fixture(
+        move |base| packument(base, "4.21.2", &pack_integrity),
+        tarball,
+    );
+
+    let data_dir = tempfile::tempdir().unwrap();
+    let output = blueline()
+        .args([
+            "review",
+            "express@4.21.2",
+            "--registry",
+            &fix.base,
+            "--output",
+            "json",
+        ])
+        .env("BLUELINE_DATA_DIR", data_dir.path())
+        .assert()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout_str = String::from_utf8(output).unwrap();
+    assert!(!stdout_str.contains("[a]pprove · [h]old · [d]iff"));
+    let json_val: serde_json::Value =
+        serde_json::from_str(&stdout_str).expect("stdout should be valid JSON");
+    assert_eq!(json_val["name"], "express");
+    assert_eq!(json_val["target_version"], "4.21.2");
+}

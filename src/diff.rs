@@ -395,21 +395,30 @@ fn diff_single_file(
     })
 }
 
-fn find_package_prefix(root: &Path) -> PathBuf {
+pub(crate) fn find_package_prefix(root: &Path) -> PathBuf {
     let nested = root.join("package");
     if nested.is_dir() {
         let has_siblings = fs::read_dir(root)
-            .map(|mut r| {
-                r.any(|e| {
-                    e.map(|entry| entry.file_name() != "package")
-                        .unwrap_or(false)
-                })
+            .map(|r| {
+                r.filter_map(|e| e.ok())
+                    .any(|entry| entry.file_name() != "package")
             })
             .unwrap_or(false);
         if !has_siblings {
             return nested;
         }
     }
+
+    if let Ok(entries) = fs::read_dir(root) {
+        let entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+        if entries.len() == 1 {
+            let entry = &entries[0];
+            if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                return entry.path();
+            }
+        }
+    }
+
     root.to_path_buf()
 }
 
@@ -619,5 +628,18 @@ mod tests {
 
         let delta = compute_delta(None, None, None, new_dir.path(), &target_m, "1.0.0").unwrap();
         assert!(delta.binding_gyp_added);
+    }
+
+    #[test]
+    fn find_package_prefix_handles_custom_single_directory_and_flat_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(find_package_prefix(dir.path()), dir.path());
+
+        let custom_dir = dir.path().join("lodash");
+        fs::create_dir(&custom_dir).unwrap();
+        assert_eq!(find_package_prefix(dir.path()), custom_dir);
+
+        fs::write(dir.path().join("extra.txt"), "hello").unwrap();
+        assert_eq!(find_package_prefix(dir.path()), dir.path());
     }
 }

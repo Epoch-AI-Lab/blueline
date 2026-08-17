@@ -138,7 +138,8 @@ pub fn run(
         Some(&provenance),
     );
 
-    match output.resolve(std::io::stdout().is_terminal()) {
+    let format = output.resolve(std::io::stdout().is_terminal());
+    match format {
         OutputFormat::Json => {
             render_json(&verdict)?;
         }
@@ -147,7 +148,11 @@ pub fn run(
         }
     }
 
-    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+    if format == OutputFormat::Json {
+        if verdict.band != crate::verdict::VerdictBand::Low {
+            std::process::exit(2);
+        }
+    } else if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
         interactive_prompt(
             &store,
             &target_pkg.name,
@@ -421,11 +426,13 @@ fn parse_spec_flexible(spec: &str, registry: &dyn Registry) -> anyhow::Result<(S
     }
 }
 
-/// npm tarballs nest every file under a `package/` prefix.
+/// Resolves the package.json path inside an extracted package tarball.
+/// Supports standard `package/`, single-directory roots (e.g. `@types/*`), and flat roots.
 fn package_json_path(root: &std::path::Path) -> std::path::PathBuf {
-    let nested = root.join("package/package.json");
-    if nested.exists() {
-        nested
+    let prefix = crate::diff::find_package_prefix(root);
+    let candidate = prefix.join("package.json");
+    if candidate.exists() {
+        candidate
     } else {
         root.join("package.json")
     }
