@@ -85,12 +85,22 @@ jobs:
           name: mutants-pr.out
           path: mutants.out
 
+  # Sharded across 4 parallel runners instead of one. A single runner serializes
+  # every mutant (~233 on a full run = ~14 min); `--jobs 4` on one runner does
+  # NOT help because the worker copies cold-build simultaneously and thrash the
+  # shared cores, and the incremental cache is keyed on absolute source paths so
+  # copies recompile the whole crate per mutant. Separate runners each get their
+  # own warm in-place cache, so shards run at full single-thread speed (~3 min).
   mutants:
-    name: Mutation testing (all)
+    name: Mutation testing (all, shard ${{ matrix.shard }}/4)
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [test]
-    timeout-minutes: 60
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     env:
       CARGO_TERM_COLOR: always
       RUSTFLAGS: ""
@@ -101,9 +111,9 @@ jobs:
         with:
           tool: cargo-mutants
       - name: Mutate the trust boundary
-        run: cargo mutants --file src/extract.rs --file src/manifest.rs --file src/registry/npm.rs --file src/store.rs --in-place --baseline=skip --timeout 300
+        run: cargo mutants --shard ${{ matrix.shard }}/4 --file src/extract.rs --file src/manifest.rs --file src/registry/npm.rs --file src/store.rs --in-place --baseline=skip --timeout 300
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: mutants.out
+          name: mutants-${{ matrix.shard }}.out
           path: mutants.out
