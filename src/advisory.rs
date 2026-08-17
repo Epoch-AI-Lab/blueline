@@ -224,7 +224,7 @@ fn fallback_or_fail(
     Ok(AdvisoryReport::unverified(err_msg))
 }
 
-pub fn parse_osv_response(resp: OsvQueryResponse, policy: &Policy) -> AdvisoryReport {
+pub(crate) fn parse_osv_response(resp: OsvQueryResponse, policy: &Policy) -> AdvisoryReport {
     if resp.vulns.is_empty() {
         return AdvisoryReport::clean("osv.dev");
     }

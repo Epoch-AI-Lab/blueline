@@ -20,6 +20,7 @@ pub struct Policy {
     pub provenance: ProvenancePolicyConfig,
     pub allowlist: AllowlistConfig,
     pub blocklist: BlocklistConfig,
+    pub ci: CiPolicyConfig,
 }
 
 impl Policy {
@@ -253,6 +254,28 @@ pub struct ProvenancePolicyConfig {
     pub require_signatures: bool,
     pub allowed_builders: Vec<String>,
     pub allowed_repositories: Vec<String>,
+}
+
+/// CI policy configuration for pull requests and lockfile scanning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CiPolicyConfig {
+    /// Minimum verdict band that triggers a non-zero exit code (default: "high").
+    pub fail_on: String,
+    /// Maximum number of packages to evaluate before failing closed (default: 100).
+    pub max_evaluations: usize,
+    /// Whether to evaluate devDependencies (default: true).
+    pub include_dev: bool,
+}
+
+impl Default for CiPolicyConfig {
+    fn default() -> Self {
+        Self {
+            fail_on: "high".to_string(),
+            max_evaluations: 100,
+            include_dev: true,
+        }
+    }
 }
 
 /// Allowlist configuration for verified packages and lifecycle scripts.

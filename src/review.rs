@@ -12,19 +12,20 @@ use crate::registry::npm::NpmRegistry;
 use crate::render::{render_json, render_text};
 use crate::store::BaselineStore;
 
-pub fn run(
-    pkg_spec: &str,
+/// Evaluates a package specification against its baseline, computing delta,
+/// OSV advisories, and Sigstore provenance to produce a final Verdict and Delta.
+pub fn evaluate_package(
+    name: &str,
+    version_str: &str,
     registry_base: &str,
-    output: Output,
-    policy_path: Option<&std::path::Path>,
-) -> anyhow::Result<()> {
-    let policy = Policy::load_or_default(policy_path)?;
-    let (name, version_str) = parse_spec(pkg_spec)?;
-    let target_semver = semver::Version::parse(&version_str)
+    store: &BaselineStore,
+    policy: &Policy,
+) -> anyhow::Result<(crate::verdict::Verdict, crate::diff::Delta, String)> {
+    let target_semver = semver::Version::parse(version_str)
         .map_err(|e| anyhow::anyhow!("invalid semver for `{version_str}`: {e}"))?;
 
     let registry = NpmRegistry::new(registry_base);
-    let target_pkg = registry.resolve(&name, &version_str)?;
+    let target_pkg = registry.resolve(name, version_str)?;
 
     // fetch_tarball verifies sha512 against dist.integrity and fails closed
     // on any mismatch, so the bytes below are integrity-verified.
@@ -53,13 +54,12 @@ pub fn run(
         )
     })?;
 
-    let store = BaselineStore::open().map_err(|e| anyhow::anyhow!("baseline store: {e}"))?;
     let integrity = target_pkg.integrity.clone().unwrap_or_default();
     store
         .record_verified(&target_pkg.name, &target_pkg.version, &integrity)
         .map_err(|e| anyhow::anyhow!("baseline store: {e}"))?;
 
-    let baseline_res = resolve_baseline(&name, &target_semver, &registry, &store)
+    let baseline_res = resolve_baseline(name, &target_semver, &registry, store)
         .map_err(|e| anyhow::anyhow!("baseline resolution: {e}"))?;
 
     let delta = if let Some(base_pkg) = baseline_res.package() {
@@ -114,8 +114,8 @@ pub fn run(
     let advisories = crate::advisory::fetch_advisories(
         &target_pkg.name,
         &target_pkg.version,
-        Some(&store),
-        &policy,
+        Some(store),
+        policy,
     )
     .unwrap_or_else(|e| crate::advisory::AdvisoryReport::unverified(&e.to_string()));
 
@@ -124,8 +124,8 @@ pub fn run(
         &target_pkg.version,
         &integrity,
         None,
-        Some(&store),
-        &policy,
+        Some(store),
+        policy,
     );
 
     let verdict = evaluate_with_trust(
@@ -133,10 +133,26 @@ pub fn run(
         "verified (sha512)",
         &delta,
         is_unreviewed,
-        &policy,
+        policy,
         Some(&advisories),
         Some(&provenance),
     );
+
+    Ok((verdict, delta, integrity))
+}
+
+pub fn run(
+    pkg_spec: &str,
+    registry_base: &str,
+    output: Output,
+    policy_path: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    let policy = Policy::load_or_default(policy_path)?;
+    let (name, version_str) = parse_spec(pkg_spec)?;
+    let store = BaselineStore::open().map_err(|e| anyhow::anyhow!("baseline store: {e}"))?;
+
+    let (verdict, delta, integrity) =
+        evaluate_package(&name, &version_str, registry_base, &store, &policy)?;
 
     let format = output.resolve(std::io::stdout().is_terminal());
     match format {
@@ -152,13 +168,7 @@ pub fn run(
         && std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal()
     {
-        interactive_prompt(
-            &store,
-            &target_pkg.name,
-            &target_pkg.version,
-            &integrity,
-            &delta,
-        )?;
+        interactive_prompt(&store, &name, &version_str, &integrity, &delta)?;
     } else if verdict.band != crate::verdict::VerdictBand::Low {
         std::process::exit(2);
     }
@@ -176,130 +186,15 @@ pub fn install(
     let policy = Policy::load_or_default(policy_path)?;
     let registry = NpmRegistry::new(registry_base);
     let (name, version_str) = parse_spec_flexible(pkg_spec, &registry)?;
-    let target_semver = semver::Version::parse(&version_str)
-        .map_err(|e| anyhow::anyhow!("invalid semver for `{version_str}`: {e}"))?;
-
-    let target_pkg = registry.resolve(&name, &version_str)?;
-    let target_tarball = registry.fetch_tarball(&target_pkg)?;
-
-    let target_temp = tempfile::tempdir().map_err(|e| anyhow::anyhow!("creating temp dir: {e}"))?;
-    safe_extract(
-        &target_tarball,
-        target_temp.path(),
-        &ExtractionLimits::default(),
-    )
-    .map_err(|e| {
-        anyhow::anyhow!(
-            "failed to extract {}@{}: {e}",
-            target_pkg.name,
-            target_pkg.version
-        )
-    })?;
-
-    let target_manifest_path = package_json_path(target_temp.path());
-    let target_manifest = read_package_json(&target_manifest_path).map_err(|e| {
-        anyhow::anyhow!(
-            "failed to parse package.json for {}@{}: {e}",
-            target_pkg.name,
-            target_pkg.version
-        )
-    })?;
-
     let store = BaselineStore::open().map_err(|e| anyhow::anyhow!("baseline store: {e}"))?;
-    let integrity = target_pkg.integrity.clone().unwrap_or_default();
-    store
-        .record_verified(&target_pkg.name, &target_pkg.version, &integrity)
-        .map_err(|e| anyhow::anyhow!("baseline store: {e}"))?;
 
-    let baseline_res = resolve_baseline(&name, &target_semver, &registry, &store)
-        .map_err(|e| anyhow::anyhow!("baseline resolution: {e}"))?;
-
-    let delta = if let Some(base_pkg) = baseline_res.package() {
-        let base_tarball = registry.fetch_tarball(base_pkg)?;
-        let base_temp =
-            tempfile::tempdir().map_err(|e| anyhow::anyhow!("creating temp dir: {e}"))?;
-        safe_extract(
-            &base_tarball,
-            base_temp.path(),
-            &ExtractionLimits::default(),
-        )
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "failed to extract baseline {}@{}: {e}",
-                base_pkg.name,
-                base_pkg.version
-            )
-        })?;
-        let base_manifest_path = package_json_path(base_temp.path());
-        let base_manifest = read_package_json(&base_manifest_path).map_err(|e| {
-            anyhow::anyhow!(
-                "failed to parse package.json for baseline {}@{}: {e}",
-                base_pkg.name,
-                base_pkg.version
-            )
-        })?;
-
-        compute_delta(
-            Some(base_temp.path()),
-            Some(&base_manifest),
-            Some(&base_pkg.version),
-            target_temp.path(),
-            &target_manifest,
-            &target_pkg.version,
-        )?
-    } else {
-        compute_delta(
-            None,
-            None,
-            None,
-            target_temp.path(),
-            &target_manifest,
-            &target_pkg.version,
-        )?
-    };
-
-    let is_unreviewed = matches!(
-        baseline_res,
-        crate::baseline::BaselineResolution::RegistryPredecessor(_)
-    );
-
-    let advisories = crate::advisory::fetch_advisories(
-        &target_pkg.name,
-        &target_pkg.version,
-        Some(&store),
-        &policy,
-    )
-    .unwrap_or_else(|e| crate::advisory::AdvisoryReport::unverified(&e.to_string()));
-
-    let provenance = crate::provenance::inspect_provenance(
-        &target_pkg.name,
-        &target_pkg.version,
-        &integrity,
-        None,
-        Some(&store),
-        &policy,
-    );
-
-    let verdict = evaluate_with_trust(
-        &target_pkg.name,
-        "verified (sha512)",
-        &delta,
-        is_unreviewed,
-        &policy,
-        Some(&advisories),
-        Some(&provenance),
-    );
+    let (verdict, delta, integrity) =
+        evaluate_package(&name, &version_str, registry_base, &store, &policy)?;
     render_text(&verdict, &delta);
 
     let is_interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let approved = if is_interactive {
-        interactive_prompt(
-            &store,
-            &target_pkg.name,
-            &target_pkg.version,
-            &integrity,
-            &delta,
-        )?
+        interactive_prompt(&store, &name, &version_str, &integrity, &delta)?
     } else {
         verdict.band == crate::verdict::VerdictBand::Low
     };
@@ -309,10 +204,7 @@ pub fn install(
         crate::executor::install_with_ignore_scripts(&install_spec, registry_base, npm_args)?;
         Ok(())
     } else {
-        eprintln!(
-            "Held {}@{}; installation blocked.",
-            target_pkg.name, target_pkg.version
-        );
+        eprintln!("Held {}@{}; installation blocked.", name, version_str);
         std::process::exit(2);
     }
 }
@@ -383,7 +275,7 @@ fn interactive_prompt(
 
 /// `<name>@<version>` → (name, version). Scoped names (`@scope/pkg@1.0.0`)
 /// split from the right so the scope's leading `@` stays with the name.
-fn parse_spec(spec: &str) -> anyhow::Result<(String, String)> {
+pub fn parse_spec(spec: &str) -> anyhow::Result<(String, String)> {
     let mut parts = spec.rsplitn(2, '@');
     let version = parts.next().unwrap_or("");
     let name = parts.next().unwrap_or("");

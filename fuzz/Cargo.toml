@@ -1,0 +1,27 @@
+[package]
+name = "blueline-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tempfile = "3"
+
+[dependencies.blueline]
+path = ".."
+
+[[bin]]
+name = "safe_extract"
+path = "fuzz_targets/safe_extract.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "read_package_json"
+path = "fuzz_targets/read_package_json.rs"
+test = false
+doc = false

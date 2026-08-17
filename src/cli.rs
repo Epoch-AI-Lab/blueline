@@ -58,6 +58,47 @@ pub enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         npm_args: Vec<String>,
     },
+
+    /// Scan lockfile diffs across Git base ref for CI pull request review
+    Ci {
+        /// Git base ref to diff against (e.g. origin/main, HEAD~1)
+        #[arg(long, default_value = "origin/main")]
+        base: String,
+
+        /// Path to package-lock.json to inspect
+        #[arg(long, default_value = "package-lock.json")]
+        lockfile: std::path::PathBuf,
+
+        /// Output format: auto, text, markdown, or json
+        #[arg(long, value_enum, default_value_t = CiOutput::Auto)]
+        format: CiOutput,
+
+        /// Minimum verdict band that triggers failure exit code (low, medium, high, block)
+        #[arg(long)]
+        fail_on: Option<crate::verdict::VerdictBand>,
+    },
+
+    /// Start Model Context Protocol (MCP) JSON-RPC 2.0 stdio server
+    Mcp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum CiOutput {
+    Auto,
+    Text,
+    Markdown,
+    Json,
+}
+
+impl CiOutput {
+    pub fn to_ci_format(self) -> crate::ci::CiOutputFormat {
+        match self {
+            CiOutput::Auto => crate::ci::CiOutputFormat::Auto,
+            CiOutput::Text => crate::ci::CiOutputFormat::Text,
+            CiOutput::Markdown => crate::ci::CiOutputFormat::Markdown,
+            CiOutput::Json => crate::ci::CiOutputFormat::Json,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
