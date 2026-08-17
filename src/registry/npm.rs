@@ -417,7 +417,7 @@ fn is_private_ip(ip: std::net::IpAddr) -> bool {
             if let Some(v4) = v6.to_ipv4() {
                 return is_private_v4(v4);
             }
-            v6.is_loopback() || v6.is_unspecified()
+            false
         }
     }
 }
@@ -689,6 +689,14 @@ mod tests {
         assert!(!is_private_or_local_host("100.63.255.255"));
         assert!(!is_private_or_local_host("100.128.0.1"));
         assert!(!is_private_or_local_host("2607:f8b0:4005:805::200e"));
+        assert!(!is_private_or_local_host("2001:cafe::1"));
+        assert!(!is_private_or_local_host("2002:db8::1"));
+
+        // Direct is_private_ip invariant checks
+        assert!(is_private_ip("::1".parse().unwrap()));
+        assert!(is_private_ip("::".parse().unwrap()));
+        assert!(!is_private_ip("2001:cafe::1".parse().unwrap()));
+        assert!(!is_private_ip("2002:db8::1".parse().unwrap()));
     }
 
     #[test]
