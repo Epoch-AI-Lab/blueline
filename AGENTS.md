@@ -25,6 +25,8 @@ passes locally it passes CI. The toolchain is pinned in `rust-toolchain.toml`
 - Commit `Cargo.lock` changes together with the dependency change that caused
   them.
 - Read `ARCHITECTURE.md` before touching module boundaries.
+- After each merged PR, add an entry to `CHANGELOG.md` under `[Unreleased]`
+  in the same branch.
 
 **Ask first**
 - Adding a dependency — propose it and wait for a decision.
