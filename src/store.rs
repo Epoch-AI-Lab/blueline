@@ -176,9 +176,18 @@ impl BaselineStore {
             .map_err(|e| BluelineError::Store(format!("enabling WAL: {e}")))?;
 
         let migrations = Migrations::new(MIGRATIONS.iter().map(|sql| M::up(sql)).collect());
-        migrations
-            .to_latest(&mut conn)
-            .map_err(|e| BluelineError::Store(format!("applying migrations: {e}")))?;
+        let mut migration_res = migrations.to_latest(&mut conn);
+        if let Err(e) = &migration_res {
+            let err_str = e.to_string();
+            if err_str.contains("already exists")
+                || err_str.contains("busy")
+                || err_str.contains("locked")
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                migration_res = migrations.to_latest(&mut conn);
+            }
+        }
+        migration_res.map_err(|e| BluelineError::Store(format!("applying migrations: {e}")))?;
 
         Ok(Self { conn })
     }

