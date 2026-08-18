@@ -84,6 +84,10 @@ pub enum Command {
         /// Minimum verdict band that triggers failure exit code (low, medium, high, block)
         #[arg(long)]
         fail_on: Option<crate::verdict::VerdictBand>,
+
+        /// Optional path to write the formatted CI report to
+        #[arg(long)]
+        output_file: Option<std::path::PathBuf>,
     },
 
     /// Start Model Context Protocol (MCP) JSON-RPC 2.0 stdio server

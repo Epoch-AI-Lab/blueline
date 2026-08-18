@@ -55,6 +55,7 @@ pub fn run(
     policy_path: Option<&Path>,
     format: CiOutputFormat,
     fail_on_override: Option<VerdictBand>,
+    output_file: Option<&Path>,
 ) -> anyhow::Result<()> {
     let policy = Policy::load_or_default(policy_path)?;
     let store =
@@ -87,18 +88,18 @@ pub fn run(
     let report = evaluate_lockfile_diff(&base_content, &head_content, &ctx, &store, &policy)?;
 
     // Render output
-    match format {
-        CiOutputFormat::Json => {
-            let json = serde_json::to_string_pretty(&report)?;
-            println!("{json}");
-        }
-        CiOutputFormat::Markdown => {
-            let md = render_markdown_summary(&report);
-            println!("{md}");
-        }
-        CiOutputFormat::Text | CiOutputFormat::Auto => {
-            render_text_summary(&report);
-        }
+    let output_str = match format {
+        CiOutputFormat::Json => serde_json::to_string_pretty(&report)?,
+        CiOutputFormat::Markdown => render_markdown_summary(&report),
+        CiOutputFormat::Text | CiOutputFormat::Auto => render_text_summary_to_string(&report),
+    };
+
+    println!("{output_str}");
+
+    if let Some(out_path) = output_file {
+        fs::write(out_path, &output_str).map_err(|e| {
+            anyhow::anyhow!("failed to write CI report to `{}`: {e}", out_path.display())
+        })?;
     }
 
     // Emit to $GITHUB_STEP_SUMMARY if present
@@ -240,7 +241,11 @@ fn extract_base_lockfile(base_ref: &str, lockfile_path: &Path) -> anyhow::Result
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         // If file did not exist in base ref (e.g. initial commit of lockfile), return empty v3 template
-        if stderr.contains("does not exist") || stderr.contains("path not in") {
+        if stderr.contains("does not exist")
+            || stderr.contains("path not in")
+            || stderr.contains("exists on disk, but not in")
+            || stderr.contains("does not exist in")
+        {
             return Ok(r#"{"lockfileVersion": 3, "packages": {}}"#.to_string());
         }
         anyhow::bail!("git show `{spec}` failed: {stderr}");
@@ -327,35 +332,45 @@ pub fn render_markdown_summary(report: &CiReport) -> String {
     out
 }
 
-pub fn render_text_summary(report: &CiReport) {
-    println!("\n=======================================================");
-    println!("             BLUELINE CI REVIEW SUMMARY                ");
-    println!("=======================================================");
-    println!("Base Ref:          {}", report.base_ref);
-    println!("Evaluated:         {}", report.total_evaluated);
-    println!("Unchanged:         {}", report.unchanged_count);
-    println!("Max Risk Band:     {}", report.max_band);
-    println!(
-        "Status:            {}",
+pub fn render_text_summary_to_string(report: &CiReport) -> String {
+    let mut out = String::new();
+    out.push_str("\n=======================================================\n");
+    out.push_str("             BLUELINE CI REVIEW SUMMARY                \n");
+    out.push_str("=======================================================\n");
+    out.push_str(&format!("Base Ref:          {}\n", report.base_ref));
+    out.push_str(&format!("Evaluated:         {}\n", report.total_evaluated));
+    out.push_str(&format!("Unchanged:         {}\n", report.unchanged_count));
+    out.push_str(&format!("Max Risk Band:     {}\n", report.max_band));
+    out.push_str(&format!(
+        "Status:            {}\n",
         if report.passed { "PASSED" } else { "FAILED" }
-    );
-    println!("-------------------------------------------------------");
+    ));
+    out.push_str("-------------------------------------------------------\n");
 
     for item in &report.items {
         let old_v = item.old_version.as_deref().unwrap_or("new");
-        println!(
-            "{:<30} {:<10} -> {:<10} | Score: {:<3} | Band: {:<6}",
+        out.push_str(&format!(
+            "{:<30} {:<10} -> {:<10} | Score: {:<3} | Band: {:<6}\n",
             sanitize_terminal(&item.name),
             old_v,
             item.new_version,
             item.verdict.risk_score,
             item.verdict.band
-        );
+        ));
         for f in &item.verdict.findings {
-            println!("  ! [{}] {}", f.rule_id, sanitize_terminal(&f.title));
+            out.push_str(&format!(
+                "  ! [{}] {}\n",
+                f.rule_id,
+                sanitize_terminal(&f.title)
+            ));
         }
     }
-    println!("=======================================================\n");
+    out.push_str("=======================================================\n");
+    out
+}
+
+pub fn render_text_summary(report: &CiReport) {
+    print!("{}", render_text_summary_to_string(report));
 }
 
 #[cfg(test)]
@@ -464,5 +479,22 @@ mod tests {
         assert!(md.contains("lodash"));
         assert!(md.contains("4.17.21"));
         assert!(md.contains("PASSED"));
+    }
+
+    #[test]
+    fn renders_text_summary_to_string() {
+        let report = CiReport {
+            base_ref: "origin/main".to_string(),
+            lockfile_path: "package-lock.json".to_string(),
+            total_evaluated: 1,
+            unchanged_count: 3,
+            max_band: VerdictBand::Low,
+            passed: true,
+            items: vec![],
+        };
+        let text = render_text_summary_to_string(&report);
+        assert!(text.contains("BLUELINE CI REVIEW SUMMARY"));
+        assert!(text.contains("Base Ref:          origin/main"));
+        assert!(text.contains("Status:            PASSED"));
     }
 }
