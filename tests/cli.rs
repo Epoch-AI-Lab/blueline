@@ -1311,6 +1311,8 @@ fn review_yes_auto_approves_low_risk_and_fails_closed_on_high_risk() {
             "safe-yes-pkg@1.0.0",
             "--registry",
             &fixture_safe.base,
+            "--output",
+            "text",
             "-y",
         ])
         .env("BLUELINE_DATA_DIR", data_dir.path())
@@ -1330,4 +1332,164 @@ fn review_yes_auto_approves_low_risk_and_fails_closed_on_high_risk() {
         )
         .unwrap();
     assert_eq!(clean, 1);
+}
+
+#[test]
+fn regression_pure_json_output_with_yes_and_clean_exit() {
+    let safe_tarball = make_tarball_with(b"module.exports = {};");
+    let safe_integrity = sha512_b64(&safe_tarball);
+    let fixture_integrity = safe_integrity.clone();
+
+    let fixture = spawn_fixture(
+        move |base| {
+            serde_json::json!({
+                "name": "pure-json-pkg",
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "0.9.0": {
+                        "name": "pure-json-pkg",
+                        "version": "0.9.0",
+                        "dist": {
+                            "tarball": format!("{base}/pure-json-pkg/-/pure-json-pkg-1.0.0.tgz"),
+                            "integrity": fixture_integrity,
+                            "shasum": "0".repeat(40)
+                        }
+                    },
+                    "1.0.0": {
+                        "name": "pure-json-pkg",
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": format!("{base}/pure-json-pkg/-/pure-json-pkg-1.0.0.tgz"),
+                            "integrity": fixture_integrity,
+                            "shasum": "0".repeat(40)
+                        }
+                    }
+                }
+            })
+            .to_string()
+        },
+        safe_tarball,
+    );
+
+    let data_dir = tempfile::tempdir().unwrap();
+    let db_path = data_dir.path().join("baseline.db");
+    let store = blueline::store::BaselineStore::open_at(&db_path).unwrap();
+    store
+        .record_verified("pure-json-pkg", "0.9.0", &safe_integrity)
+        .unwrap();
+    store
+        .mark_clean("pure-json-pkg", "0.9.0", &safe_integrity)
+        .unwrap();
+    drop(store);
+
+    let assert = blueline()
+        .args([
+            "review",
+            "pure-json-pkg@1.0.0",
+            "--registry",
+            &fixture.base,
+            "--output",
+            "json",
+            "-y",
+        ])
+        .env("BLUELINE_DATA_DIR", data_dir.path())
+        .assert()
+        .success();
+
+    let stdout_bytes = assert.get_output().stdout.clone();
+    let stdout_str = String::from_utf8(stdout_bytes).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(stdout_str.trim()).unwrap();
+    assert_eq!(parsed["name"], "pure-json-pkg");
+    assert_eq!(parsed["band"], "LOW");
+}
+
+#[test]
+fn regression_non_interactive_emits_diagnostic_stderr_on_exit() {
+    let safe_tarball = make_tarball_with(b"module.exports = {};");
+    let safe_integrity = sha512_b64(&safe_tarball);
+
+    let fixture = spawn_fixture(
+        move |base| {
+            serde_json::json!({
+                "name": "unapproved-pkg",
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "0.9.0": {
+                        "name": "unapproved-pkg",
+                        "version": "0.9.0",
+                        "dist": {
+                            "tarball": format!("{base}/unapproved-pkg/-/unapproved-pkg-1.0.0.tgz"),
+                            "integrity": safe_integrity,
+                            "shasum": "0".repeat(40)
+                        }
+                    },
+                    "1.0.0": {
+                        "name": "unapproved-pkg",
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": format!("{base}/unapproved-pkg/-/unapproved-pkg-1.0.0.tgz"),
+                            "integrity": safe_integrity,
+                            "shasum": "0".repeat(40)
+                        }
+                    }
+                }
+            })
+            .to_string()
+        },
+        safe_tarball,
+    );
+
+    let data_dir = tempfile::tempdir().unwrap();
+    blueline()
+        .args([
+            "review",
+            "unapproved-pkg@1.0.0",
+            "--registry",
+            &fixture.base,
+            "--output",
+            "text",
+        ])
+        .env("BLUELINE_DATA_DIR", data_dir.path())
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "Non-interactive terminal detected without `--yes`",
+        ));
+}
+
+#[test]
+fn ci_writes_report_to_output_file() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let lockfile_path = temp_dir.path().join("package-lock.json");
+    let out_report_path = temp_dir.path().join("ci-summary.md");
+
+    std::fs::write(
+        &lockfile_path,
+        r#"{
+  "name": "ci-test-app",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {}
+}"#,
+    )
+    .unwrap();
+
+    blueline()
+        .args([
+            "ci",
+            "--base",
+            "HEAD",
+            "--lockfile",
+            lockfile_path.to_str().unwrap(),
+            "--format",
+            "markdown",
+            "--output-file",
+            out_report_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert!(out_report_path.exists());
+    let content = std::fs::read_to_string(&out_report_path).unwrap();
+    assert!(content.contains("Blueline CI Security Review"));
 }

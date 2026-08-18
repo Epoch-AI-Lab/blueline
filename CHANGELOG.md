@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   override, and a fail-closed `--yes` flag.
 - `blueline install` command with sandboxed extraction and fail-closed script
   execution.
+- `blueline ci --output-file <path>` parameter to save formatted CI review
+  reports directly to disk.
 - npm registry client with SHA-512 integrity verification before extraction.
 - Line-level diff engine against the last known-clean release.
 - Heuristic verdict engine with an ASCII review card and stable JSON verdict
@@ -37,11 +39,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   redirects.
 - Validated package name grammar, scoped URLs, and terminal escape sequences.
 - Optimized diff scanning performance.
+- Clarified diagnostic stderr explanations when non-interactive input is piped
+  without `--yes`.
 
 ### Fixed
 
 - IPv6 mutation testing by eliminating redundant address checks.
 - Redirect handling and false-equivalent bounds in registry metadata.
+- JSON output purity by suppressing trailing human messages under `--output json --yes`.
 
 ### Security
 

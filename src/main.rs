@@ -25,6 +25,7 @@ fn run() -> anyhow::Result<()> {
             lockfile,
             format,
             fail_on,
+            output_file,
         } => ci::run(
             &base,
             &lockfile,
@@ -32,6 +33,7 @@ fn run() -> anyhow::Result<()> {
             cli.policy.as_deref(),
             format.to_ci_format(),
             fail_on,
+            output_file.as_deref(),
         ),
         cli::Command::Mcp => mcp::run_stdio(&cli.registry, cli.policy.as_deref()),
     }

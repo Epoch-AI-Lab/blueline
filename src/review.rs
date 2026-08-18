@@ -179,10 +179,12 @@ pub fn run(
                 "user",
                 None,
             );
-            println!(
-                "Approved {}@{} and marked clean in baseline store (--yes).",
-                name, version_str
-            );
+            if format != OutputFormat::Json {
+                println!(
+                    "Approved {}@{} and marked clean in baseline store (--yes).",
+                    name, version_str
+                );
+            }
             return Ok(());
         } else {
             eprintln!(
@@ -199,6 +201,12 @@ pub fn run(
     {
         interactive_prompt(&store, &name, &version_str, &integrity, &delta)?;
     } else if verdict.band != crate::verdict::VerdictBand::Low {
+        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+            eprintln!(
+                "Non-interactive terminal detected without `--yes`. Risk verdict is {} (score: {}). Refusing to proceed.",
+                verdict.band, verdict.risk_score
+            );
+        }
         std::process::exit(2);
     }
 
@@ -251,6 +259,12 @@ pub fn install(
     } else if is_interactive {
         interactive_prompt(&store, &name, &version_str, &integrity, &delta)?
     } else {
+        if verdict.band != crate::verdict::VerdictBand::Low {
+            eprintln!(
+                "Non-interactive terminal detected without `--yes`. Risk verdict is {} (score: {}). Refusing to install.",
+                verdict.band, verdict.risk_score
+            );
+        }
         verdict.band == crate::verdict::VerdictBand::Low
     };
 
