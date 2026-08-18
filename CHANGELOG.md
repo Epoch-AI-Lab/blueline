@@ -51,4 +51,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Security
 
 - Fail-closed on every parse, extract, and verify boundary.
+- Hardened static heuristic scanner against inline module requires, paren-wrapped constructors, http2/dns primitives, and indirect eval aliases.
 - Mutation testing and supply-chain audits run on every PR (CI gate).
