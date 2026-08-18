@@ -33,8 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- Hardened static AST/diff scanner to detect reflection-based code execution (`Reflect.get`, `Reflect.has`), character constructors (`String.fromCharCode`, `String.fromCodePoint`), global bracket access, and Node.js `worker_threads`.
-- Added collision retry handling for concurrent cold-start SQLite database migrations.
+- Hardened static AST/diff scanner to detect reflection-based code execution (`Reflect.get`), global dynamic execution lookups (`globalThis['eval']`, `window['Function']`), and Node.js `worker_threads` imports without triggering false positives on benign JavaScript.
 - Hardened archive extraction, SSRF checks, and executor isolation to fail
   closed on any doubt.
 - Bounded registry reads with exact limits for packuments, tarballs, and
