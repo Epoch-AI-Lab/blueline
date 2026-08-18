@@ -960,6 +960,27 @@ fn has_eval_invocation(s_clean: &str) -> bool {
         || s_clean.contains("[`constructor`]")
         || s_clean.contains("Reflect.construct(")
         || s_clean.contains("Reflect.apply(")
+        || s_clean.contains("Reflect.get(globalThis,\"eval\")")
+        || s_clean.contains("Reflect.get(globalThis,'eval')")
+        || s_clean.contains("Reflect.get(globalThis,`eval`)")
+        || s_clean.contains("Reflect.get(window,\"eval\")")
+        || s_clean.contains("Reflect.get(window,'eval')")
+        || s_clean.contains("Reflect.get(window,`eval`)")
+        || s_clean.contains("Reflect.get(global,\"eval\")")
+        || s_clean.contains("Reflect.get(global,'eval')")
+        || s_clean.contains("Reflect.get(global,`eval`)")
+        || s_clean.contains("Reflect.get(this,\"eval\")")
+        || s_clean.contains("Reflect.get(this,'eval')")
+        || s_clean.contains("Reflect.get(this,`eval`)")
+        || s_clean.contains("Reflect.get(globalThis,\"Function\")")
+        || s_clean.contains("Reflect.get(globalThis,'Function')")
+        || s_clean.contains("Reflect.get(globalThis,`Function`)")
+        || s_clean.contains("Reflect.get(window,\"Function\")")
+        || s_clean.contains("Reflect.get(window,'Function')")
+        || s_clean.contains("Reflect.get(window,`Function`)")
+        || s_clean.contains("Reflect.get(global,\"Function\")")
+        || s_clean.contains("Reflect.get(global,'Function')")
+        || s_clean.contains("Reflect.get(global,`Function`)")
         || s_clean.contains("globalThis.eval")
         || s_clean.contains("window.eval")
         || s_clean.contains("global.eval")
@@ -975,6 +996,18 @@ fn has_eval_invocation(s_clean: &str) -> bool {
         || s_clean.contains("this[\"eval\"]")
         || s_clean.contains("this['eval']")
         || s_clean.contains("this[`eval`]")
+        || s_clean.contains("globalThis[\"Function\"]")
+        || s_clean.contains("globalThis['Function']")
+        || s_clean.contains("globalThis[`Function`]")
+        || s_clean.contains("window[\"Function\"]")
+        || s_clean.contains("window['Function']")
+        || s_clean.contains("window[`Function`]")
+        || s_clean.contains("global[\"Function\"]")
+        || s_clean.contains("global['Function']")
+        || s_clean.contains("global[`Function`]")
+        || s_clean.contains("this[\"Function\"]")
+        || s_clean.contains("this['Function']")
+        || s_clean.contains("this[`Function`]")
         || s_clean.contains("import(\"data:")
         || s_clean.contains("import('data:")
         || s_clean.contains("import(`data:")
@@ -996,6 +1029,8 @@ fn is_eval_invocation(s: &str) -> bool {
 fn has_child_proc_invocation(s_clean: &str) -> bool {
     s_clean.contains("child_process")
         || s_clean.contains("node:child_process")
+        || s_clean.contains("worker_threads")
+        || s_clean.contains("node:worker_threads")
         || contains_call(s_clean, "execSync(")
         || contains_call(s_clean, "spawnSync(")
         || contains_call(s_clean, "execFileSync(")
@@ -1953,6 +1988,20 @@ mod tests {
         assert!(is_eval_invocation(
             "import('data:text/javascript,console.log(1)')"
         ));
+        assert!(is_eval_invocation(
+            "const fn = Reflect.get(globalThis, 'eval');"
+        ));
+        assert!(is_eval_invocation(
+            "const fn = Reflect.get(window, 'Function');"
+        ));
+        assert!(is_eval_invocation("const fn = window['eval'];"));
+        assert!(is_eval_invocation("const fn = globalThis['Function'];"));
+        assert!(is_child_proc_invocation(
+            "const { Worker } = require('worker_threads');"
+        ));
+        assert!(is_child_proc_invocation(
+            "import { Worker } from 'node:worker_threads';"
+        ));
     }
 
     #[test]
@@ -1960,8 +2009,16 @@ mod tests {
         assert!(!is_eval_invocation("const isFunc = isFunction(x);"));
         assert!(!is_eval_invocation("const val = timeval(s);"));
         assert!(!is_eval_invocation("const r = retrieval(key);"));
+        assert!(!is_eval_invocation("const ch = String.fromCharCode(65);"));
+        assert!(!is_eval_invocation(
+            "const val = Reflect.get(target, prop);"
+        ));
+        assert!(!is_eval_invocation("const obj = window['localStorage'];"));
         assert!(!is_network_invocation("router.prefetch('/page');"));
         assert!(!is_network_invocation("query.refetch();"));
         assert!(!is_child_proc_invocation("const match = /test/.exec(str);"));
+        assert!(!is_child_proc_invocation(
+            "const w = new Worker('./worker.js');"
+        ));
     }
 }
