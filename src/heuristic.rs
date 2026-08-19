@@ -522,9 +522,10 @@ fn scan_diff_for_suspicious_patterns(path: &str, diff: &str, findings: &mut Vec<
     let combined_added = added_lines.join("\n");
     let unescaped = unescape_js(&combined_added);
     let s_clean = strip_comments_and_whitespace(&unescaped);
-    let s_clean_lower = s_clean.to_ascii_lowercase();
+    let s_folded = fold_adjacent_string_literals(&s_clean);
+    let s_clean_lower = s_folded.to_ascii_lowercase();
 
-    if has_eval_invocation(&s_clean) {
+    if has_eval_invocation(&s_folded) {
         findings.push(Finding {
             rule_id: "R03_EVAL_USAGE".into(),
             severity: VerdictBand::High,
@@ -533,7 +534,7 @@ fn scan_diff_for_suspicious_patterns(path: &str, diff: &str, findings: &mut Vec<
         });
     }
 
-    if has_child_proc_invocation(&s_clean) {
+    if has_child_proc_invocation(&s_folded) {
         findings.push(Finding {
             rule_id: "R03_CHILD_PROCESS".into(),
             severity: VerdictBand::High,
@@ -542,7 +543,7 @@ fn scan_diff_for_suspicious_patterns(path: &str, diff: &str, findings: &mut Vec<
         });
     }
 
-    if has_vm_invocation(&s_clean) {
+    if has_vm_invocation(&s_folded) {
         findings.push(Finding {
             rule_id: "R03_VM_EXECUTION".into(),
             severity: VerdictBand::High,
@@ -551,7 +552,7 @@ fn scan_diff_for_suspicious_patterns(path: &str, diff: &str, findings: &mut Vec<
         });
     }
 
-    if has_network_invocation(&s_clean) {
+    if has_network_invocation(&s_folded) {
         findings.push(Finding {
             rule_id: "R03_NETWORK_PRIMITIVE".into(),
             severity: VerdictBand::Medium,
@@ -763,6 +764,89 @@ fn strip_comments_and_whitespace(s: &str) -> String {
     out
 }
 
+fn fold_adjacent_string_literals(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '"' || c == '\'' || c == '`' {
+            let quote = c;
+            let mut current_literal = String::new();
+            let mut terminated = false;
+
+            while let Some(ch) = chars.next() {
+                if ch == '\\' {
+                    current_literal.push(ch);
+                    if let Some(escaped) = chars.next() {
+                        current_literal.push(escaped);
+                    }
+                    continue;
+                }
+                if ch == quote {
+                    terminated = true;
+                    break;
+                }
+                current_literal.push(ch);
+            }
+
+            if terminated {
+                while chars.peek() == Some(&'+') {
+                    let mut lookahead = chars.clone();
+                    lookahead.next();
+                    if let Some(&next_q) = lookahead.peek()
+                        && (next_q == '"' || next_q == '\'' || next_q == '`')
+                    {
+                        chars.next();
+                        chars.next();
+                        let mut next_literal = String::new();
+                        let mut next_terminated = false;
+                        while let Some(ch) = chars.next() {
+                            if ch == '\\' {
+                                next_literal.push(ch);
+                                if let Some(escaped) = chars.next() {
+                                    next_literal.push(escaped);
+                                }
+                                continue;
+                            }
+                            if ch == next_q {
+                                next_terminated = true;
+                                break;
+                            }
+                            next_literal.push(ch);
+                        }
+                        if next_terminated {
+                            current_literal.push_str(&next_literal);
+                        } else {
+                            out.push(quote);
+                            out.push_str(&current_literal);
+                            out.push(quote);
+                            out.push('+');
+                            out.push(next_q);
+                            out.push_str(&next_literal);
+                            current_literal.clear();
+                            terminated = false;
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                if (!current_literal.is_empty() || terminated) && terminated {
+                    out.push(quote);
+                    out.push_str(&current_literal);
+                    out.push(quote);
+                }
+            } else {
+                out.push(quote);
+                out.push_str(&current_literal);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn has_vm_invocation(s_clean: &str) -> bool {
     s_clean.contains("vm.runInThisContext")
         || s_clean.contains("vm.runInNewContext")
@@ -779,7 +863,8 @@ fn has_vm_invocation(s_clean: &str) -> bool {
 fn is_vm_invocation(s: &str) -> bool {
     let unescaped = unescape_js(s);
     let s_clean = strip_comments_and_whitespace(&unescaped);
-    has_vm_invocation(&s_clean)
+    let s_folded = fold_adjacent_string_literals(&s_clean);
+    has_vm_invocation(&s_folded)
 }
 
 fn contains_call(s: &str, target: &str) -> bool {
@@ -924,11 +1009,78 @@ fn has_network_invocation(s_clean: &str) -> bool {
 fn is_network_invocation(s: &str) -> bool {
     let unescaped = unescape_js(s);
     let s_clean = strip_comments_and_whitespace(&unescaped);
-    has_network_invocation(&s_clean)
+    let s_folded = fold_adjacent_string_literals(&s_clean);
+    has_network_invocation(&s_folded)
+}
+
+fn has_dynamic_global_invocation(s_clean: &str) -> bool {
+    for prefix in &["globalThis[", "window[", "global["] {
+        let mut search_idx = 0;
+        while let Some(pos) = s_clean[search_idx..].find(prefix) {
+            let actual_idx = search_idx + pos;
+            let is_start = actual_idx == 0;
+            let prev_is_ident = if is_start {
+                false
+            } else {
+                let prev_char = s_clean[..actual_idx].chars().next_back().unwrap_or(' ');
+                prev_char.is_ascii_alphanumeric() || prev_char == '_' || prev_char == '$'
+            };
+
+            let start = actual_idx + prefix.len();
+            search_idx = start;
+
+            if prev_is_ident {
+                continue;
+            }
+
+            let mut depth = 1usize;
+            let mut end_idx = None;
+            let mut in_q: Option<char> = None;
+            let mut chars_iter = s_clean[start..].char_indices();
+
+            while let Some((idx, ch)) = chars_iter.next() {
+                if let Some(q) = in_q {
+                    if ch == '\\' {
+                        chars_iter.next();
+                        continue;
+                    }
+                    if ch == q {
+                        in_q = None;
+                    }
+                    continue;
+                }
+                if ch == '"' || ch == '\'' || ch == '`' {
+                    in_q = Some(ch);
+                    continue;
+                }
+                if ch == '[' {
+                    depth += 1;
+                } else if ch == ']' {
+                    depth -= 1;
+                    if depth == 0 {
+                        end_idx = Some(start + idx);
+                        break;
+                    }
+                }
+            }
+
+            if let Some(bracket_end) = end_idx {
+                let after_bracket = bracket_end + 1;
+                if after_bracket < s_clean.len() {
+                    let next_ch = s_clean[after_bracket..].chars().next().unwrap_or(' ');
+                    if next_ch == '(' || next_ch == '`' {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 fn has_eval_invocation(s_clean: &str) -> bool {
-    contains_call(s_clean, "eval(")
+    has_dynamic_global_invocation(s_clean)
+        || contains_call(s_clean, "eval(")
         || contains_call(s_clean, "eval`")
         || s_clean.contains("(eval)(")
         || s_clean.contains(",eval)")
@@ -954,10 +1106,31 @@ fn has_eval_invocation(s_clean: &str) -> bool {
         || contains_call(s_clean, "GeneratorFunction`")
         || contains_call(s_clean, "AsyncGeneratorFunction(")
         || contains_call(s_clean, "AsyncGeneratorFunction`")
-        || s_clean.contains(".constructor(")
-        || s_clean.contains("['constructor'](")
-        || s_clean.contains("[\"constructor\"](")
+        || s_clean.contains(".constructor")
+        || s_clean.contains("['constructor']")
+        || s_clean.contains("[\"constructor\"]")
         || s_clean.contains("[`constructor`]")
+        || s_clean.contains("Function.prototype")
+        || s_clean.contains("Object.getPrototypeOf")
+        || s_clean.contains("Reflect.getPrototypeOf")
+        || s_clean.contains("globalThis[String.fromCharCode")
+        || s_clean.contains("window[String.fromCharCode")
+        || s_clean.contains("global[String.fromCharCode")
+        || s_clean.contains("this[String.fromCharCode")
+        || s_clean.contains("globalThis[fromCharCode")
+        || s_clean.contains("window[fromCharCode")
+        || s_clean.contains("global[fromCharCode")
+        || s_clean.contains("this[fromCharCode")
+        || s_clean.contains("globalThis[String.fromCodePoint")
+        || s_clean.contains("window[String.fromCodePoint")
+        || s_clean.contains("global[String.fromCodePoint")
+        || s_clean.contains("this[String.fromCodePoint")
+        || s_clean.contains("Reflect.get(globalThis,String.fromCharCode")
+        || s_clean.contains("Reflect.get(window,String.fromCharCode")
+        || s_clean.contains("Reflect.get(global,String.fromCharCode")
+        || s_clean.contains("Reflect.get(this,String.fromCharCode")
+        || s_clean.contains("Reflect.get(globalThis,fromCharCode")
+        || s_clean.contains("Reflect.get(window,fromCharCode")
         || s_clean.contains("Reflect.construct(")
         || s_clean.contains("Reflect.apply(")
         || s_clean.contains("Reflect.get(globalThis,\"eval\")")
@@ -1023,7 +1196,8 @@ fn has_eval_invocation(s_clean: &str) -> bool {
 fn is_eval_invocation(s: &str) -> bool {
     let unescaped = unescape_js(s);
     let s_clean = strip_comments_and_whitespace(&unescaped);
-    has_eval_invocation(&s_clean)
+    let s_folded = fold_adjacent_string_literals(&s_clean);
+    has_eval_invocation(&s_folded)
 }
 
 fn has_child_proc_invocation(s_clean: &str) -> bool {
@@ -1047,7 +1221,8 @@ fn has_child_proc_invocation(s_clean: &str) -> bool {
 fn is_child_proc_invocation(s: &str) -> bool {
     let unescaped = unescape_js(s);
     let s_clean = strip_comments_and_whitespace(&unescaped);
-    has_child_proc_invocation(&s_clean)
+    let s_folded = fold_adjacent_string_literals(&s_clean);
+    has_child_proc_invocation(&s_folded)
 }
 
 fn has_base64_decode(s_clean_lower: &str) -> bool {
@@ -1068,7 +1243,9 @@ fn has_base64_decode(s_clean_lower: &str) -> bool {
 #[cfg(test)]
 fn is_base64_decode(s: &str) -> bool {
     let unescaped = unescape_js(s);
-    let s_clean_lower = strip_comments_and_whitespace(&unescaped).to_ascii_lowercase();
+    let s_clean = strip_comments_and_whitespace(&unescaped);
+    let s_folded = fold_adjacent_string_literals(&s_clean);
+    let s_clean_lower = s_folded.to_ascii_lowercase();
     has_base64_decode(&s_clean_lower)
 }
 
@@ -2020,5 +2197,50 @@ mod tests {
         assert!(!is_child_proc_invocation(
             "const w = new Worker('./worker.js');"
         ));
+        assert!(!is_eval_invocation("class Foo { constructor() {} }"));
+        assert!(!is_eval_invocation("this[handler](event);"));
+        assert!(!is_eval_invocation("not_this[i]();"));
+        assert!(!is_eval_invocation("my_global[fn]();"));
+    }
+
+    #[test]
+    fn detects_string_concatenation_evasion() {
+        assert!(is_eval_invocation("globalThis['e' + 'val']('evil()');"));
+        assert!(is_eval_invocation("window[\"ev\" + \"al\"]('evil()');"));
+        assert!(is_eval_invocation(
+            "Reflect.get(globalThis, 'Func' + 'tion');"
+        ));
+        assert!(is_child_proc_invocation("require('child_' + 'process')"));
+        assert!(is_child_proc_invocation(
+            "require('node:' + 'child_process')"
+        ));
+        assert!(is_network_invocation("require('ht' + 'tp')"));
+        assert!(is_base64_decode(
+            "Buffer.from('payload', 'base' + '64').toString()"
+        ));
+    }
+
+    #[test]
+    fn detects_indirect_constructor_and_charcode_indexing() {
+        assert!(is_eval_invocation(
+            "const AsyncFunc = (async () => {}).constructor; AsyncFunc('return process')();"
+        ));
+        assert!(is_eval_invocation(
+            "const f = [].constructor.constructor; f('return process')();"
+        ));
+        assert!(is_eval_invocation(
+            "globalThis[String.fromCharCode(101,118,97,108)]('evil()')"
+        ));
+        assert!(is_eval_invocation(
+            "window[String.fromCodePoint(101,118,97,108)]('evil()')"
+        ));
+        assert!(is_eval_invocation(
+            "const e = 'e' + 'val'; globalThis[e]('evil()');"
+        ));
+        assert!(is_eval_invocation(
+            "const k = String.fromCharCode(101,118,97,108); globalThis[k]('evil()');"
+        ));
+        assert!(is_eval_invocation("window[dynamicFunc]('payload');"));
+        assert!(is_eval_invocation("globalThis[arr[0]]('payload');"));
     }
 }
