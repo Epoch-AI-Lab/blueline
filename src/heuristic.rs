@@ -824,13 +824,14 @@ fn fold_adjacent_string_literals(s: &str) -> String {
                             out.push(next_q);
                             out.push_str(&next_literal);
                             current_literal.clear();
+                            terminated = false;
                             break;
                         }
                     } else {
                         break;
                     }
                 }
-                if !current_literal.is_empty() || terminated {
+                if (!current_literal.is_empty() || terminated) && terminated {
                     out.push(quote);
                     out.push_str(&current_literal);
                     out.push(quote);
@@ -1013,12 +1014,58 @@ fn is_network_invocation(s: &str) -> bool {
 }
 
 fn has_dynamic_global_invocation(s_clean: &str) -> bool {
-    for prefix in &["globalThis[", "window[", "global[", "this["] {
+    for prefix in &["globalThis[", "window[", "global["] {
         let mut search_idx = 0;
         while let Some(pos) = s_clean[search_idx..].find(prefix) {
-            let start = search_idx + pos + prefix.len();
-            if let Some(bracket_end) = s_clean[start..].find(']') {
-                let after_bracket = start + bracket_end + 1;
+            let actual_idx = search_idx + pos;
+            let is_start = actual_idx == 0;
+            let prev_is_ident = if is_start {
+                false
+            } else {
+                let prev_char = s_clean[..actual_idx].chars().next_back().unwrap_or(' ');
+                prev_char.is_ascii_alphanumeric() || prev_char == '_' || prev_char == '$'
+            };
+
+            let start = actual_idx + prefix.len();
+            search_idx = start;
+
+            if prev_is_ident {
+                continue;
+            }
+
+            let mut depth = 1usize;
+            let mut end_idx = None;
+            let mut in_q: Option<char> = None;
+            let mut chars_iter = s_clean[start..].char_indices();
+
+            while let Some((idx, ch)) = chars_iter.next() {
+                if let Some(q) = in_q {
+                    if ch == '\\' {
+                        chars_iter.next();
+                        continue;
+                    }
+                    if ch == q {
+                        in_q = None;
+                    }
+                    continue;
+                }
+                if ch == '"' || ch == '\'' || ch == '`' {
+                    in_q = Some(ch);
+                    continue;
+                }
+                if ch == '[' {
+                    depth += 1;
+                } else if ch == ']' {
+                    depth -= 1;
+                    if depth == 0 {
+                        end_idx = Some(start + idx);
+                        break;
+                    }
+                }
+            }
+
+            if let Some(bracket_end) = end_idx {
+                let after_bracket = bracket_end + 1;
                 if after_bracket < s_clean.len() {
                     let next_ch = s_clean[after_bracket..].chars().next().unwrap_or(' ');
                     if next_ch == '(' || next_ch == '`' {
@@ -1026,7 +1073,6 @@ fn has_dynamic_global_invocation(s_clean: &str) -> bool {
                     }
                 }
             }
-            search_idx = start;
         }
     }
     false
@@ -2152,6 +2198,9 @@ mod tests {
             "const w = new Worker('./worker.js');"
         ));
         assert!(!is_eval_invocation("class Foo { constructor() {} }"));
+        assert!(!is_eval_invocation("this[handler](event);"));
+        assert!(!is_eval_invocation("not_this[i]();"));
+        assert!(!is_eval_invocation("my_global[fn]();"));
     }
 
     #[test]
@@ -2192,5 +2241,6 @@ mod tests {
             "const k = String.fromCharCode(101,118,97,108); globalThis[k]('evil()');"
         ));
         assert!(is_eval_invocation("window[dynamicFunc]('payload');"));
+        assert!(is_eval_invocation("globalThis[arr[0]]('payload');"));
     }
 }
