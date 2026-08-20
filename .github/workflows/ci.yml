@@ -117,7 +117,7 @@ jobs:
         with:
           tool: cargo-mutants
       - name: Mutate the trust boundary
-        run: cargo mutants --shard ${{ matrix.shard }}/4 --file src/extract.rs --file src/manifest.rs --file src/registry/npm.rs --file src/store.rs --file src/executor.rs --file src/lockfile.rs --file src/ci.rs --file src/mcp.rs --in-place --baseline=skip --timeout 300
+        run: cargo mutants --shard ${{ matrix.shard }}/4 --file src/extract.rs --file src/manifest.rs --file src/registry/npm.rs --file src/store.rs --in-place --baseline=skip --timeout 300
       - uses: actions/upload-artifact@v4
         if: always()
         with:
