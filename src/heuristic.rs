@@ -495,17 +495,25 @@ pub fn evaluate_with_trust(
 }
 
 fn is_non_semver_url(v: &str) -> bool {
-    let lower = v.to_lowercase();
-    lower.starts_with("git")
-        || lower.starts_with("http://")
-        || lower.starts_with("https://")
-        || lower.starts_with("github:")
-        || lower.starts_with("gitlab:")
-        || lower.starts_with("bitbucket:")
-        || lower.starts_with("ssh://")
-        || lower.starts_with("file:")
-        || lower.starts_with("link:")
-        || lower.starts_with("npm:")
+    const PREFIXES: [&str; 10] = [
+        "git",
+        "http://",
+        "https://",
+        "github:",
+        "gitlab:",
+        "bitbucket:",
+        "ssh://",
+        "file:",
+        "link:",
+        "npm:",
+    ];
+    PREFIXES.iter().any(|&p| {
+        if v.len() >= p.len() {
+            v[..p.len()].eq_ignore_ascii_case(p)
+        } else {
+            false
+        }
+    })
 }
 
 fn scan_diff_for_suspicious_patterns(path: &str, diff: &str, findings: &mut Vec<Finding>) {
@@ -595,98 +603,124 @@ fn unescape_js(s: &str) -> String {
             match chars.peek() {
                 Some('x') => {
                     chars.next();
-                    let mut hex = String::new();
-                    for _ in 0..2 {
+                    let mut val = 0u8;
+                    let mut count = 0;
+                    let mut buf = [0u8; 2];
+                    for slot in &mut buf {
                         if let Some(&h) = chars.peek()
                             && h.is_ascii_hexdigit()
                             && let Some(ch) = chars.next()
                         {
-                            hex.push(ch);
+                            *slot = ch as u8;
+                            val = (val << 4) | (ch.to_digit(16).unwrap_or(0) as u8);
+                            count += 1;
+                        } else {
+                            break;
                         }
                     }
-                    if hex.len() == 2
-                        && let Ok(val) = u8::from_str_radix(&hex, 16)
-                    {
+                    if count == 2 {
                         out.push(val as char);
                     } else {
                         out.push('\\');
                         out.push('x');
-                        out.push_str(&hex);
+                        for &b in &buf[..count] {
+                            out.push(b as char);
+                        }
                     }
                 }
                 Some('u') => {
                     chars.next();
                     if chars.peek() == Some(&'{') {
                         chars.next();
-                        let mut hex = String::new();
+                        let mut val = 0u32;
+                        let mut count = 0;
+                        let mut buf = [0u8; 8];
+                        let mut closed = false;
                         while let Some(&h) = chars.peek() {
                             if h == '}' {
                                 chars.next();
+                                closed = true;
                                 break;
                             }
                             if h.is_ascii_hexdigit()
+                                && count < 8
                                 && let Some(ch) = chars.next()
                             {
-                                hex.push(ch);
+                                buf[count] = ch as u8;
+                                val = (val << 4) | ch.to_digit(16).unwrap_or(0);
+                                count += 1;
                             } else {
                                 break;
                             }
                         }
-                        if let Ok(code) = u32::from_str_radix(&hex, 16)
-                            && let Some(ch) = char::from_u32(code)
+                        if closed
+                            && count > 0
+                            && let Some(ch) = char::from_u32(val)
                         {
                             out.push(ch);
                         } else {
                             out.push('\\');
                             out.push('u');
                             out.push('{');
-                            out.push_str(&hex);
-                            out.push('}');
+                            for &b in &buf[..count] {
+                                out.push(b as char);
+                            }
+                            if closed {
+                                out.push('}');
+                            }
                         }
                     } else {
-                        let mut hex = String::new();
-                        for _ in 0..4 {
+                        let mut val = 0u32;
+                        let mut count = 0;
+                        let mut buf = [0u8; 4];
+                        for slot in &mut buf {
                             if let Some(&h) = chars.peek()
                                 && h.is_ascii_hexdigit()
                                 && let Some(ch) = chars.next()
                             {
-                                hex.push(ch);
+                                *slot = ch as u8;
+                                val = (val << 4) | ch.to_digit(16).unwrap_or(0);
+                                count += 1;
+                            } else {
+                                break;
                             }
                         }
-                        if hex.len() == 4
-                            && let Ok(code) = u32::from_str_radix(&hex, 16)
-                            && let Some(ch) = char::from_u32(code)
+                        if count == 4
+                            && let Some(ch) = char::from_u32(val)
                         {
                             out.push(ch);
                         } else {
                             out.push('\\');
                             out.push('u');
-                            out.push_str(&hex);
+                            for &b in &buf[..count] {
+                                out.push(b as char);
+                            }
                         }
                     }
                 }
                 Some(&d) if ('0'..='7').contains(&d) => {
                     // Octal escape sequence (e.g. \145 \166 \141 \154)
-                    let mut oct = String::new();
+                    let mut val = 0u8;
+                    let mut count = 0;
+                    let mut buf = [0u8; 3];
                     if let Some(first) = chars.next() {
-                        oct.push(first);
+                        buf[count] = first as u8;
+                        val = first.to_digit(8).unwrap_or(0) as u8;
+                        count += 1;
                     }
                     for _ in 0..2 {
                         if let Some(&o) = chars.peek()
                             && ('0'..='7').contains(&o)
                             && let Some(ch) = chars.next()
                         {
-                            oct.push(ch);
+                            buf[count] = ch as u8;
+                            val = (val << 3) | (ch.to_digit(8).unwrap_or(0) as u8);
+                            count += 1;
                         } else {
                             break;
                         }
                     }
-                    if let Ok(val) = u8::from_str_radix(&oct, 8) {
-                        out.push(val as char);
-                    } else {
-                        out.push('\\');
-                        out.push_str(&oct);
-                    }
+                    out.push(val as char);
                 }
                 _ => {
                     out.push(c);
@@ -870,11 +904,26 @@ fn fold_adjacent_string_literals(s: &str) -> String {
 }
 
 fn contains_module_import(s: &str, module: &str) -> bool {
-    ['\'', '"', '`'].iter().any(|&q| {
-        s.contains(&format!("require({q}{module}{q})"))
-            || s.contains(&format!("import({q}{module}{q})"))
-            || s.contains(&format!("from{q}{module}{q}"))
-    })
+    const PREFIXES: [&str; 3] = ["require(", "import(", "from"];
+    const QUOTES: [char; 3] = ['\'', '"', '`'];
+
+    for prefix in PREFIXES {
+        let mut search_idx = 0;
+        while let Some(pos) = s[search_idx..].find(prefix) {
+            let start = search_idx + pos + prefix.len();
+            let remainder = &s[start..];
+            for q in QUOTES {
+                if let Some(rest) = remainder.strip_prefix(q)
+                    && let Some(after_mod) = rest.strip_prefix(module)
+                    && after_mod.starts_with(q)
+                {
+                    return true;
+                }
+            }
+            search_idx = start;
+        }
+    }
+    false
 }
 
 fn has_vm_invocation(s_clean: &str) -> bool {
@@ -1092,24 +1141,61 @@ fn contains_scoped_eval(s: &str) -> bool {
     const TARGETS: [&str; 2] = ["eval", "Function"];
 
     for scope in SCOPES {
-        if s.contains(&format!("{scope}.eval")) {
-            return true;
-        }
-        for pat in CHAR_CODE_PATTERNS {
-            if s.contains(&format!("{scope}[{pat}"))
-                || s.contains(&format!("Reflect.get({scope},{pat}"))
-            {
+        let mut search_idx = 0;
+        while let Some(pos) = s[search_idx..].find(scope) {
+            let start = search_idx + pos + scope.len();
+            let rest = &s[start..];
+            if rest.starts_with(".eval") {
                 return true;
             }
-        }
-        for target in TARGETS {
-            for q in QUOTES {
-                if s.contains(&format!("{scope}[{q}{target}{q}]"))
-                    || s.contains(&format!("Reflect.get({scope},{q}{target}{q})"))
+            for pat in CHAR_CODE_PATTERNS {
+                if let Some(after_bracket) = rest.strip_prefix('[')
+                    && after_bracket.starts_with(pat)
                 {
                     return true;
                 }
             }
+            for target in TARGETS {
+                for q in QUOTES {
+                    if let Some(after_bracket) = rest.strip_prefix('[')
+                        && let Some(after_q) = after_bracket.strip_prefix(q)
+                        && let Some(after_target) = after_q.strip_prefix(target)
+                        && let Some(after_close_q) = after_target.strip_prefix(q)
+                        && after_close_q.starts_with(']')
+                    {
+                        return true;
+                    }
+                }
+            }
+            search_idx = start;
+        }
+
+        let reflect_prefix = "Reflect.get(";
+        let mut ref_idx = 0;
+        while let Some(pos) = s[ref_idx..].find(reflect_prefix) {
+            let start = ref_idx + pos + reflect_prefix.len();
+            let rest = &s[start..];
+            if let Some(after_scope) = rest.strip_prefix(scope)
+                && let Some(after_comma) = after_scope.strip_prefix(',')
+            {
+                for pat in CHAR_CODE_PATTERNS {
+                    if after_comma.starts_with(pat) {
+                        return true;
+                    }
+                }
+                for target in TARGETS {
+                    for q in QUOTES {
+                        if let Some(after_q) = after_comma.strip_prefix(q)
+                            && let Some(after_target) = after_q.strip_prefix(target)
+                            && let Some(after_close_q) = after_target.strip_prefix(q)
+                            && after_close_q.starts_with(')')
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+            ref_idx = start;
         }
     }
     false
@@ -1154,11 +1240,28 @@ fn has_eval_invocation(s_clean: &str) -> bool {
         || s_clean.contains("Reflect.getPrototypeOf")
         || s_clean.contains("Reflect.construct(")
         || s_clean.contains("Reflect.apply(")
-        || ['\'', '"', '`'].iter().any(|&q| {
-            s_clean.contains(&format!("import({q}data:"))
-                || s_clean.contains(&format!("import({q}http://"))
-                || s_clean.contains(&format!("import({q}https://"))
-        })
+        || {
+            const SCHEMES: [&str; 3] = ["data:", "http://", "https://"];
+            let mut search_idx = 0;
+            let mut found = false;
+            while let Some(pos) = s_clean[search_idx..].find("import(") {
+                let start = search_idx + pos + "import(".len();
+                let rest = &s_clean[start..];
+                for q in ['\'', '"', '`'] {
+                    if let Some(after_q) = rest.strip_prefix(q)
+                        && SCHEMES.iter().any(|&scheme| after_q.starts_with(scheme))
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+                if found {
+                    break;
+                }
+                search_idx = start;
+            }
+            found
+        }
         || s_clean.contains("import.meta")
         || s_clean.contains("WebAssembly.compile")
         || s_clean.contains("WebAssembly.instantiate")
@@ -1198,15 +1301,78 @@ fn has_child_proc_invocation(s_clean: &str) -> bool {
         || s_clean.contains("module.require(")
         || MODULES.iter().any(|m| s_clean.contains(m))
         || CALLS.iter().any(|c| contains_call(s_clean, c))
-        || BINDINGS.iter().any(|b| {
-            QUOTES
-                .iter()
-                .any(|q| s_clean.contains(&format!("process.binding({q}{b}{q})")))
-        })
-        || QUOTES.iter().any(|q| {
-            s_clean.contains(&format!("process[{q}mainModule{q}]"))
-                || s_clean.contains(&format!("module[{q}require{q}]("))
-        })
+        || {
+            let mut search_idx = 0;
+            let mut found = false;
+            while let Some(pos) = s_clean[search_idx..].find("process.binding(") {
+                let start = search_idx + pos + "process.binding(".len();
+                let rest = &s_clean[start..];
+                for q in QUOTES {
+                    for b in BINDINGS {
+                        if let Some(after_q) = rest.strip_prefix(q)
+                            && let Some(after_b) = after_q.strip_prefix(b)
+                            && let Some(after_close_q) = after_b.strip_prefix(q)
+                            && after_close_q.starts_with(')')
+                        {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if found {
+                    break;
+                }
+                search_idx = start;
+            }
+            found
+        }
+        || {
+            let mut search_idx = 0;
+            let mut found = false;
+            while let Some(pos) = s_clean[search_idx..].find("process[") {
+                let start = search_idx + pos + "process[".len();
+                let rest = &s_clean[start..];
+                for q in QUOTES {
+                    if let Some(after_q) = rest.strip_prefix(q)
+                        && let Some(after_mod) = after_q.strip_prefix("mainModule")
+                        && let Some(after_close_q) = after_mod.strip_prefix(q)
+                        && after_close_q.starts_with(']')
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+                if found {
+                    break;
+                }
+                search_idx = start;
+            }
+            found
+        }
+        || {
+            let mut search_idx = 0;
+            let mut found = false;
+            while let Some(pos) = s_clean[search_idx..].find("module[") {
+                let start = search_idx + pos + "module[".len();
+                let rest = &s_clean[start..];
+                for q in QUOTES {
+                    if let Some(after_q) = rest.strip_prefix(q)
+                        && let Some(after_req) = after_q.strip_prefix("require")
+                        && let Some(after_close_q) = after_req.strip_prefix(q)
+                        && let Some(after_bracket) = after_close_q.strip_prefix(']')
+                        && after_bracket.starts_with('(')
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+                if found {
+                    break;
+                }
+                search_idx = start;
+            }
+            found
+        }
 }
 
 #[cfg(test)]

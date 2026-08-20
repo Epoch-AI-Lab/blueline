@@ -187,19 +187,24 @@ pub fn render_text(verdict: &Verdict, delta: &Delta) {
     ]);
 
     // Lifecycle scripts
-    let scripts_str =
-        if delta.new_lifecycle_scripts.is_empty() && delta.modified_lifecycle_scripts.is_empty() {
-            "none".to_string()
-        } else {
-            let mut parts = Vec::new();
-            for s in &delta.new_lifecycle_scripts {
-                parts.push(format!("+{}", sanitize_single_line(s)));
-            }
-            for s in &delta.modified_lifecycle_scripts {
-                parts.push(format!("~{}", sanitize_single_line(s)));
-            }
-            parts.join(", ")
-        };
+    let mut scripts_str = String::new();
+    for s in &delta.new_lifecycle_scripts {
+        if !scripts_str.is_empty() {
+            scripts_str.push_str(", ");
+        }
+        scripts_str.push('+');
+        scripts_str.push_str(&sanitize_single_line(s));
+    }
+    for s in &delta.modified_lifecycle_scripts {
+        if !scripts_str.is_empty() {
+            scripts_str.push_str(", ");
+        }
+        scripts_str.push('~');
+        scripts_str.push_str(&sanitize_single_line(s));
+    }
+    if scripts_str.is_empty() {
+        scripts_str = "none".to_string();
+    }
     let script_color = if scripts_str == "none" {
         Color::Green
     } else {
@@ -391,6 +396,53 @@ mod tests {
         assert!(!single.contains('\u{2028}'));
         assert!(!single.contains('\u{2029}'));
         assert_eq!(single, "Header [ BLOCK ] fake line line2 line3");
+    }
+
+    #[test]
+    fn render_text_and_json_with_lifecycle_scripts_and_findings() {
+        let delta = crate::diff::Delta {
+            baseline_version: Some("1.0.0".into()),
+            target_version: "1.1.0".into(),
+            files_added: vec![],
+            files_removed: vec![],
+            files_modified: vec![],
+            total_lines_added: 10,
+            total_lines_deleted: 2,
+            new_executables: vec![],
+            new_binaries: vec![],
+            modified_binaries: vec![],
+            new_lifecycle_scripts: vec!["postinstall".into()],
+            modified_lifecycle_scripts: vec!["preinstall".into()],
+            new_dependencies: vec![],
+            modified_dependencies: vec![],
+            removed_dependencies: vec![],
+            binding_gyp_added: false,
+        };
+        let verdict = crate::verdict::Verdict {
+            name: "my-pkg".into(),
+            target_version: "1.1.0".into(),
+            baseline_version: Some("1.0.0".into()),
+            integrity: "sha512-test".into(),
+            band: crate::verdict::VerdictBand::Block,
+            risk_score: 75,
+            findings: vec![crate::verdict::Finding {
+                rule_id: "R02_NEW_INSTALL_SCRIPT".into(),
+                severity: crate::verdict::VerdictBand::Block,
+                title: "New install-time lifecycle script: `postinstall`".into(),
+                description: "Package added a postinstall script".into(),
+            }],
+            diff_summary: crate::verdict::DiffSummary {
+                files_added: 1,
+                files_removed: 0,
+                files_modified: 0,
+                lines_added: 10,
+                lines_deleted: 2,
+            },
+            trust_sources: None,
+        };
+
+        render_text(&verdict, &delta);
+        assert!(render_json(&verdict).is_ok());
     }
 
     mod proptest_invariants {

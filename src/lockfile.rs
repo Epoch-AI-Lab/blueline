@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -171,16 +171,8 @@ fn walk_v1_dependencies(
 }
 
 fn extract_package_name_from_path(path: &str) -> String {
-    let parts: Vec<&str> = path
-        .split("node_modules/")
-        .filter(|s| !s.is_empty())
-        .collect();
-    if let Some(last) = parts.last() {
-        // Strip trailing slash if present
-        last.trim_end_matches('/').to_string()
-    } else {
-        path.to_string()
-    }
+    let name_part = path.rsplit("node_modules/").next().unwrap_or(path);
+    name_part.trim_end_matches('/').to_string()
 }
 
 fn normalize_node_modules_path(path: &str) -> String {
@@ -201,34 +193,47 @@ pub fn compute_lockfile_delta(
     let mut removed = Vec::new();
     let mut unchanged_count = 0;
 
-    let all_keys: BTreeSet<&String> = base_pkgs.keys().chain(head_pkgs.keys()).collect();
+    let mut base_iter = base_pkgs.iter().peekable();
+    let mut head_iter = head_pkgs.iter().peekable();
 
-    for key in all_keys {
-        match (base_pkgs.get(key), head_pkgs.get(key)) {
-            (None, Some(new_entry)) => {
-                added.push(new_entry.clone());
-            }
-            (Some(old_entry), None) => {
-                removed.push(old_entry.clone());
-            }
-            (Some(old_entry), Some(new_entry)) => {
-                if old_entry.version != new_entry.version
-                    || old_entry.integrity != new_entry.integrity
-                {
-                    upgraded.push(PackageUpgrade {
-                        name: new_entry.name.clone(),
-                        old_version: old_entry.version.clone(),
-                        new_version: new_entry.version.clone(),
-                        old_integrity: old_entry.integrity.clone(),
-                        new_integrity: new_entry.integrity.clone(),
-                        resolved: new_entry.resolved.clone(),
-                        is_dev: new_entry.is_dev,
-                    });
-                } else {
-                    unchanged_count += 1;
+    loop {
+        match (base_iter.peek(), head_iter.peek()) {
+            (Some(&(b_key, b_val)), Some(&(h_key, h_val))) => match b_key.cmp(h_key) {
+                std::cmp::Ordering::Less => {
+                    removed.push(b_val.clone());
+                    base_iter.next();
                 }
+                std::cmp::Ordering::Greater => {
+                    added.push(h_val.clone());
+                    head_iter.next();
+                }
+                std::cmp::Ordering::Equal => {
+                    if b_val.version != h_val.version || b_val.integrity != h_val.integrity {
+                        upgraded.push(PackageUpgrade {
+                            name: h_val.name.clone(),
+                            old_version: b_val.version.clone(),
+                            new_version: h_val.version.clone(),
+                            old_integrity: b_val.integrity.clone(),
+                            new_integrity: h_val.integrity.clone(),
+                            resolved: h_val.resolved.clone(),
+                            is_dev: h_val.is_dev,
+                        });
+                    } else {
+                        unchanged_count += 1;
+                    }
+                    base_iter.next();
+                    head_iter.next();
+                }
+            },
+            (Some(&(_, b_val)), None) => {
+                removed.push(b_val.clone());
+                base_iter.next();
             }
-            (None, None) => unreachable!(),
+            (None, Some(&(_, h_val))) => {
+                added.push(h_val.clone());
+                head_iter.next();
+            }
+            (None, None) => break,
         }
     }
 
@@ -384,5 +389,72 @@ mod tests {
         let pkgs = parse_lockfile_packages(&json).unwrap();
         // Should parse up to the limit (33 levels including root: depth 0 to 32)
         assert_eq!(pkgs.len(), MAX_LOCKFILE_RECURSION_DEPTH + 1);
+    }
+
+    #[test]
+    fn delta_is_empty_and_integrity_only_upgrade() {
+        let empty_delta = LockfileDelta {
+            added: Vec::new(),
+            upgraded: Vec::new(),
+            removed: Vec::new(),
+            unchanged_count: 5,
+        };
+        assert!(empty_delta.is_empty());
+
+        let mut delta_with_add = empty_delta.clone();
+        delta_with_add.added.push(PackageEntry {
+            name: "pkg".into(),
+            version: "1.0.0".into(),
+            integrity: None,
+            resolved: None,
+            is_dev: false,
+        });
+        assert!(!delta_with_add.is_empty());
+
+        let mut delta_with_up = empty_delta.clone();
+        delta_with_up.upgraded.push(PackageUpgrade {
+            name: "pkg".into(),
+            old_version: "1.0.0".into(),
+            new_version: "1.0.0".into(),
+            old_integrity: Some("sha512-old".into()),
+            new_integrity: Some("sha512-new".into()),
+            resolved: None,
+            is_dev: false,
+        });
+        assert!(!delta_with_up.is_empty());
+
+        let mut delta_with_rem = empty_delta.clone();
+        delta_with_rem.removed.push(PackageEntry {
+            name: "pkg".into(),
+            version: "1.0.0".into(),
+            integrity: None,
+            resolved: None,
+            is_dev: false,
+        });
+        assert!(!delta_with_rem.is_empty());
+
+        let base_json = r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "node_modules/tampered": { "version": "1.0.0", "integrity": "sha512-old" }
+            }
+        }"#;
+        let head_json = r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "node_modules/tampered": { "version": "1.0.0", "integrity": "sha512-new" }
+            }
+        }"#;
+        let delta = compute_lockfile_delta(base_json, head_json).unwrap();
+        assert_eq!(delta.upgraded.len(), 1);
+        assert_eq!(delta.upgraded[0].name, "tampered");
+        assert_eq!(
+            delta.upgraded[0].old_integrity.as_deref(),
+            Some("sha512-old")
+        );
+        assert_eq!(
+            delta.upgraded[0].new_integrity.as_deref(),
+            Some("sha512-new")
+        );
     }
 }

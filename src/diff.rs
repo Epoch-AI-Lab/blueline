@@ -375,11 +375,20 @@ fn diff_single_file(
         }
     }
 
-    let unified = diff
-        .unified_diff()
-        .context_radius(3)
-        .header(&format!("a/{rel_path}"), &format!("b/{rel_path}"))
-        .to_string();
+    let unified_diff = if lines_added == 0 && lines_deleted == 0 {
+        None
+    } else {
+        let unified = diff
+            .unified_diff()
+            .context_radius(3)
+            .header(&format!("a/{rel_path}"), &format!("b/{rel_path}"))
+            .to_string();
+        if unified.trim().is_empty() {
+            None
+        } else {
+            Some(unified)
+        }
+    };
 
     Ok(FileChange {
         relative_path: rel_path.to_string(),
@@ -387,11 +396,7 @@ fn diff_single_file(
         lines_added,
         lines_deleted,
         is_executable: target_meta.is_executable,
-        unified_diff: if unified.trim().is_empty() {
-            None
-        } else {
-            Some(unified)
-        },
+        unified_diff,
     })
 }
 

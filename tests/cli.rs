@@ -1463,6 +1463,19 @@ fn ci_writes_report_to_output_file() {
     let lockfile_path = temp_dir.path().join("package-lock.json");
     let out_report_path = temp_dir.path().join("ci-summary.md");
 
+    let _ = std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(temp_dir.path())
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["config", "user.name", "CI Test"])
+        .current_dir(temp_dir.path())
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["config", "user.email", "ci@test.local"])
+        .current_dir(temp_dir.path())
+        .output();
+
     std::fs::write(
         &lockfile_path,
         r#"{
@@ -1474,13 +1487,23 @@ fn ci_writes_report_to_output_file() {
     )
     .unwrap();
 
+    let _ = std::process::Command::new("git")
+        .args(["add", "package-lock.json"])
+        .current_dir(temp_dir.path())
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["commit", "-m", "initial commit"])
+        .current_dir(temp_dir.path())
+        .output();
+
     blueline()
+        .current_dir(temp_dir.path())
         .args([
             "ci",
             "--base",
             "HEAD",
             "--lockfile",
-            lockfile_path.to_str().unwrap(),
+            "package-lock.json",
             "--format",
             "markdown",
             "--output-file",
