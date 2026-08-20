@@ -55,11 +55,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Timer string dynamic code evaluation (`setTimeout`, `setInterval`, `setImmediate`) in diff scanner heuristics.
 - Zero-width and bidirectional unicode formatting character evasion in JavaScript token stripping.
 - In-toto attestation empty subject bypass in SLSA provenance verification by enforcing matching subject digest.
-- Executor flag normalization bypass allowing `--user-config`, `--global-config`, and `--ca-file` overrides.
+- MCP standard heartbeat `ping` method handling returning empty JSON object.
+- Case-insensitive parsing and uppercase aliases for `--fail-on` verdict risk bands.
+- GitHub Actions composite step hardening mapping action inputs into environment variables to prevent shell injection.
 - MCP tool output terminal escape and BiDi control character sanitization.
 
 ### Security
 
 - Fail-closed on every parse, extract, and verify boundary.
+- Integrated `cargo-deny` in CI to enforce licenses, bans, sources, and security advisories using `deny.toml`.
+- Expanded PR diff and matrix mutation testing to guard `executor.rs`, `lockfile.rs`, `ci.rs`, and `mcp.rs` boundaries against regressions.
 - Hardened static heuristic scanner against inline module requires, paren-wrapped constructors, http2/dns primitives, timer string eval, zero-width unicode obfuscation, indirect eval aliases, dynamic `this[...]` evaluation, `process.dlopen`, `cluster`, `WebAssembly` compilation, and external HTTP client libraries.
 - Mutation testing and supply-chain audits run on every PR (CI gate).

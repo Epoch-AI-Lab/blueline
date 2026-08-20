@@ -4,10 +4,15 @@ use serde::{Deserialize, Serialize};
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, clap::ValueEnum,
 )]
 #[serde(rename_all = "UPPERCASE")]
+#[clap(rename_all = "lower")]
 pub enum VerdictBand {
+    #[value(alias = "LOW", alias = "Low")]
     Low,
+    #[value(alias = "MEDIUM", alias = "Medium")]
     Medium,
+    #[value(alias = "HIGH", alias = "High")]
     High,
+    #[value(alias = "BLOCK", alias = "Block")]
     Block,
 }
 

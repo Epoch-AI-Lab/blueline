@@ -49,9 +49,15 @@ jobs:
       security-events: write
     steps:
       - uses: actions/checkout@v4
+      - uses: swatinem/rust-cache@v2
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: Check advisories, licenses, bans and sources
+        run: cargo deny check
 
   # Mutation testing guards the trust boundary: it proves the test suite would
   # catch a regression like the poisoned-baseline bug, so audits don't have to.
@@ -78,7 +84,7 @@ jobs:
           BASE_REF: ${{ github.base_ref }}
         run: git diff "origin/${BASE_REF}" -- > pr.diff
       - name: Mutate the changed lines
-        run: cargo mutants --in-diff pr.diff --file src/extract.rs --file src/manifest.rs --file src/registry/npm.rs --file src/store.rs --in-place --no-shuffle --timeout 300
+        run: cargo mutants --in-diff pr.diff --file src/extract.rs --file src/manifest.rs --file src/registry/npm.rs --file src/store.rs --file src/executor.rs --file src/lockfile.rs --file src/ci.rs --file src/mcp.rs --in-place --no-shuffle --timeout 300
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -111,7 +117,7 @@ jobs:
         with:
           tool: cargo-mutants
       - name: Mutate the trust boundary
-        run: cargo mutants --shard ${{ matrix.shard }}/4 --file src/extract.rs --file src/manifest.rs --file src/registry/npm.rs --file src/store.rs --in-place --baseline=skip --timeout 300
+        run: cargo mutants --shard ${{ matrix.shard }}/4 --file src/extract.rs --file src/manifest.rs --file src/registry/npm.rs --file src/store.rs --file src/executor.rs --file src/lockfile.rs --file src/ci.rs --file src/mcp.rs --in-place --baseline=skip --timeout 300
       - uses: actions/upload-artifact@v4
         if: always()
         with:
