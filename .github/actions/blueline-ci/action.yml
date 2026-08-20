@@ -28,10 +28,15 @@ runs:
   steps:
     - name: Run Blueline CI Scan
       shell: bash
+      env:
+        INPUT_BASE_REF: ${{ inputs.base-ref }}
+        INPUT_LOCKFILE_PATH: ${{ inputs.lockfile-path }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_POLICY_PATH: ${{ inputs.policy-path }}
       run: |
-        ARGS=(ci --base "${{ inputs.base-ref }}" --lockfile "${{ inputs.lockfile-path }}" --fail-on "${{ inputs.fail-on }}")
-        if [ -n "${{ inputs.policy-path }}" ]; then
-          ARGS+=(--policy "${{ inputs.policy-path }}")
+        ARGS=(ci --base "$INPUT_BASE_REF" --lockfile "$INPUT_LOCKFILE_PATH" --fail-on "$INPUT_FAIL_ON")
+        if [ -n "$INPUT_POLICY_PATH" ]; then
+          ARGS+=(--policy "$INPUT_POLICY_PATH")
         fi
 
         echo "Executing: blueline ${ARGS[*]}"

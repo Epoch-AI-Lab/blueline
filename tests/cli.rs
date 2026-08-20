@@ -1516,3 +1516,98 @@ fn ci_writes_report_to_output_file() {
     let content = std::fs::read_to_string(&out_report_path).unwrap();
     assert!(content.contains("Blueline CI Security Review"));
 }
+
+#[test]
+fn mcp_ping_heartbeat() {
+    let input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n";
+    blueline()
+        .args(["mcp"])
+        .write_stdin(input)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"result\":{}"));
+}
+
+#[test]
+fn ci_fail_on_case_insensitive() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let lockfile_path = temp_dir.path().join("package-lock.json");
+
+    let _ = std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(temp_dir.path())
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["config", "user.name", "CI Test"])
+        .current_dir(temp_dir.path())
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["config", "user.email", "ci@test.local"])
+        .current_dir(temp_dir.path())
+        .output();
+
+    std::fs::write(
+        &lockfile_path,
+        r#"{"name": "app", "version": "1.0.0", "lockfileVersion": 3, "packages": {}}"#,
+    )
+    .unwrap();
+
+    let _ = std::process::Command::new("git")
+        .args(["add", "package-lock.json"])
+        .current_dir(temp_dir.path())
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["commit", "-m", "init"])
+        .current_dir(temp_dir.path())
+        .output();
+
+    // Uppercase HIGH should be parsed successfully without clap enum error
+    blueline()
+        .current_dir(temp_dir.path())
+        .args([
+            "ci",
+            "--base",
+            "HEAD",
+            "--lockfile",
+            "package-lock.json",
+            "--fail-on",
+            "HIGH",
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn install_blocks_extra_positional_args() {
+    blueline()
+        .args([
+            "install",
+            "lodash@4.17.21",
+            "--save-dev",
+            "unreviewed-malicious-pkg",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "forbidden positional argument `unreviewed-malicious-pkg`",
+        ));
+}
+
+#[test]
+fn ci_rejects_flag_like_base_refs() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let lockfile_path = temp_dir.path().join("package-lock.json");
+    std::fs::write(&lockfile_path, r#"{"lockfileVersion": 3, "packages": {}}"#).unwrap();
+
+    blueline()
+        .current_dir(temp_dir.path())
+        .args([
+            "ci",
+            "--base=--output=/tmp/pwn",
+            "--lockfile",
+            "package-lock.json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot start with '-'"));
+}

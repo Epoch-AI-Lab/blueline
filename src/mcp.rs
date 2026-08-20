@@ -157,6 +157,8 @@ fn handle_request(
     policy: &Policy,
 ) -> Result<serde_json::Value, JsonRpcError> {
     match method {
+        "ping" => Ok(json!({})),
+
         "initialize" => Ok(json!({
             "protocolVersion": "2024-11-05",
             "capabilities": {
@@ -382,6 +384,16 @@ fn execute_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handles_ping_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&temp.path().join("store.db")).unwrap();
+        let policy = Policy::default();
+        let resp =
+            handle_request("ping", None, "https://registry.npmjs.org", &store, &policy).unwrap();
+        assert_eq!(resp, json!({}));
+    }
 
     #[test]
     fn handles_initialize_request() {
