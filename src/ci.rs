@@ -62,17 +62,15 @@ pub fn run(
         BaselineStore::open().map_err(|e| anyhow::anyhow!("opening baseline store: {e}"))?;
 
     let head_content = fs::read_to_string(lockfile_path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            anyhow::anyhow!(
-                "failed to read head lockfile at `{}`: {e} (use `--lockfile <path>` to specify a different path)",
-                lockfile_path.display()
-            )
+        let hint = if e.kind() == std::io::ErrorKind::NotFound {
+            " (use `--lockfile <path>` to specify a different path)"
         } else {
-            anyhow::anyhow!(
-                "failed to read head lockfile at `{}`: {e}",
-                lockfile_path.display()
-            )
-        }
+            ""
+        };
+        anyhow::anyhow!(
+            "failed to read head lockfile at `{}`: {e}{hint}",
+            lockfile_path.display()
+        )
     })?;
 
     let base_content = extract_base_lockfile(base_ref, lockfile_path)?;
@@ -118,11 +116,8 @@ pub fn run(
     }
 
     if !report.passed {
-        let fail_threshold = if let Some(band) = fail_on_override {
-            band
-        } else {
-            parse_band_str(&policy.ci.fail_on).unwrap_or(VerdictBand::High)
-        };
+        let fail_threshold = fail_on_override
+            .unwrap_or_else(|| parse_band_str(&policy.ci.fail_on).unwrap_or(VerdictBand::High));
         anyhow::bail!(
             "CI review failed: highest risk band `{}` reached or exceeded failure threshold `{fail_threshold}`",
             report.max_band
@@ -141,9 +136,6 @@ pub fn evaluate_lockfile_diff(
 ) -> anyhow::Result<CiReport> {
     let delta = compute_lockfile_delta(base_content, head_content)?;
 
-    let mut items = Vec::new();
-    let mut max_band = VerdictBand::Low;
-
     let total_to_eval = delta.added.len() + delta.upgraded.len();
     if total_to_eval > policy.ci.max_evaluations {
         anyhow::bail!(
@@ -153,65 +145,44 @@ pub fn evaluate_lockfile_diff(
         );
     }
 
-    // Process added packages
-    for entry in &delta.added {
-        if !policy.ci.include_dev && entry.is_dev {
+    let mut items = Vec::new();
+    let mut max_band = VerdictBand::Low;
+
+    let eval_candidates = delta
+        .added
+        .iter()
+        .map(|e| (&e.name, None, &e.version, e.is_dev))
+        .chain(delta.upgraded.iter().map(|u| {
+            (
+                &u.name,
+                Some(u.old_version.clone()),
+                &u.new_version,
+                u.is_dev,
+            )
+        }));
+
+    for (name, old_version, new_version, is_dev) in eval_candidates {
+        if !policy.ci.include_dev && is_dev {
             continue;
         }
 
-        let (verdict, _, _) = evaluate_package(
-            &entry.name,
-            &entry.version,
-            ctx.registry_base,
-            store,
-            policy,
-        )?;
+        let (verdict, _, _) =
+            evaluate_package(name, new_version, ctx.registry_base, store, policy)?;
 
-        if verdict.band > max_band {
-            max_band = verdict.band;
-        }
+        max_band = max_band.max(verdict.band);
 
         items.push(CiReviewItem {
-            name: entry.name.clone(),
-            old_version: None,
-            new_version: entry.version.clone(),
-            is_dev: entry.is_dev,
+            name: name.to_string(),
+            old_version,
+            new_version: new_version.to_string(),
+            is_dev,
             verdict,
         });
     }
 
-    // Process upgraded packages
-    for upgrade in &delta.upgraded {
-        if !policy.ci.include_dev && upgrade.is_dev {
-            continue;
-        }
-
-        let (verdict, _, _) = evaluate_package(
-            &upgrade.name,
-            &upgrade.new_version,
-            ctx.registry_base,
-            store,
-            policy,
-        )?;
-
-        if verdict.band > max_band {
-            max_band = verdict.band;
-        }
-
-        items.push(CiReviewItem {
-            name: upgrade.name.clone(),
-            old_version: Some(upgrade.old_version.clone()),
-            new_version: upgrade.new_version.clone(),
-            is_dev: upgrade.is_dev,
-            verdict,
-        });
-    }
-
-    let fail_threshold = if let Some(band) = ctx.fail_on {
-        band
-    } else {
-        parse_band_str(&policy.ci.fail_on).unwrap_or(VerdictBand::High)
-    };
+    let fail_threshold = ctx
+        .fail_on
+        .unwrap_or_else(|| parse_band_str(&policy.ci.fail_on).unwrap_or(VerdictBand::High));
 
     let passed = max_band < fail_threshold;
 
@@ -240,12 +211,13 @@ fn extract_base_lockfile(base_ref: &str, lockfile_path: &Path) -> anyhow::Result
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // If file did not exist in base ref (e.g. initial commit of lockfile), return empty v3 template
-        if stderr.contains("does not exist")
-            || stderr.contains("path not in")
-            || stderr.contains("exists on disk, but not in")
-            || stderr.contains("does not exist in")
-        {
+        const NOT_IN_BASE: [&str; 4] = [
+            "does not exist",
+            "path not in",
+            "exists on disk, but not in",
+            "does not exist in",
+        ];
+        if NOT_IN_BASE.iter().any(|pat| stderr.contains(pat)) {
             return Ok(r#"{"lockfileVersion": 3, "packages": {}}"#.to_string());
         }
         anyhow::bail!("git show `{spec}` failed: {stderr}");
@@ -496,5 +468,14 @@ mod tests {
         assert!(text.contains("BLUELINE CI REVIEW SUMMARY"));
         assert!(text.contains("Base Ref:          origin/main"));
         assert!(text.contains("Status:            PASSED"));
+    }
+
+    #[test]
+    fn invalid_git_ref_fails_closed() {
+        let res = extract_base_lockfile("-leading-hyphen", Path::new("package-lock.json"));
+        assert!(res.is_err());
+        let res_nonexistent =
+            extract_base_lockfile("nonexistent_ref_123456789", Path::new("package-lock.json"));
+        assert!(res_nonexistent.is_err());
     }
 }

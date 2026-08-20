@@ -143,34 +143,26 @@ pub fn parse_attestation_payload(
         BluelineError::Provenance(format!("failed to parse in-toto statement JSON: {e}"))
     })?;
 
-    // Verify digest binding: compare sha512 if provided
-    let mut digest_matched = false;
     let expected_hex_or_b64 = expected_integrity
         .strip_prefix("sha512-")
         .unwrap_or(expected_integrity);
 
-    for subj in &statement.subject {
-        if let Some(sha512_val) = subj.digest.get("sha512") {
-            // Check matching either base64 or hex format
-            if sha512_val == expected_hex_or_b64 || sha512_val == expected_integrity {
-                digest_matched = true;
-                break;
-            }
-            // If expected is base64 and sha512_val is hex (or vice-versa), convert and check
-            if let Ok(b64_bytes) = engine.decode(expected_hex_or_b64) {
-                let hex_str = b64_bytes
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<String>();
-                if sha512_val.eq_ignore_ascii_case(&hex_str) {
-                    digest_matched = true;
-                    break;
-                }
-            }
-        }
-    }
+    let expected_hex = engine
+        .decode(expected_hex_or_b64)
+        .ok()
+        .map(|bytes| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>());
 
-    if !statement.subject.is_empty() && !digest_matched && !expected_integrity.is_empty() {
+    let digest_matched = statement.subject.iter().any(|subj| {
+        subj.digest.get("sha512").is_some_and(|val| {
+            val == expected_hex_or_b64
+                || val == expected_integrity
+                || expected_hex
+                    .as_deref()
+                    .is_some_and(|hex| val.eq_ignore_ascii_case(hex))
+        })
+    });
+
+    if !digest_matched {
         return Ok(ProvenanceReport::failed_mismatch(
             "tarball sha512 does not match in-toto statement subject digest",
         ));
@@ -182,17 +174,15 @@ pub fn parse_attestation_payload(
     let mut workflow_path = None;
 
     if let Some(pred) = statement.predicate {
-        if let Some(builder) = pred.builder {
-            builder_id = builder.id;
-        }
+        builder_id = pred.builder.and_then(|b| b.id);
         if let Some(cfg) = pred.invocation.and_then(|invoc| invoc.config_source) {
             source_repo = cfg.uri;
             workflow_path = cfg.entry_point;
-            if let Some(sha) = cfg.digest.get("sha1") {
-                commit_sha = Some(sha.clone());
-            } else if let Some(sha) = cfg.digest.get("sha256") {
-                commit_sha = Some(sha.clone());
-            }
+            commit_sha = cfg
+                .digest
+                .get("sha1")
+                .or_else(|| cfg.digest.get("sha256"))
+                .cloned();
         }
     }
 
@@ -219,16 +209,15 @@ pub fn inspect_provenance(
     _policy: &Policy,
 ) -> ProvenanceReport {
     // 1. Check registry signature presence
-    let mut has_sig = false;
-    let mut sig_key_id = None;
-    if let Some(sigs_arr) = signatures_json.and_then(|v| v.as_array())
-        && !sigs_arr.is_empty()
-    {
-        has_sig = true;
-        if let Some(keyid) = sigs_arr[0].get("keyid").and_then(|k| k.as_str()) {
-            sig_key_id = Some(keyid.to_string());
-        }
-    }
+    let (has_sig, sig_key_id) = signatures_json
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .map_or((false, None), |sig| {
+            (
+                true,
+                sig.get("keyid").and_then(|k| k.as_str()).map(String::from),
+            )
+        });
 
     // 2. Check local provenance cache
     if let Some(store) = store
@@ -371,6 +360,25 @@ mod tests {
 
         let b64 = base64::engine::general_purpose::STANDARD.encode(intoto_json.as_bytes());
         let report = parse_attestation_payload(&b64, "sha512-expected_real_hash").unwrap();
+
+        assert_eq!(report.status, ProvenanceStatus::FailedMismatch);
+    }
+
+    #[test]
+    fn empty_subject_attestation_fails_closed() {
+        let intoto_json = r#"{
+            "_type": "https://in-toto.io/Statement/v0.1",
+            "subject": [],
+            "predicateType": "https://slsa.dev/provenance/v0.2",
+            "predicate": {
+                "builder": {
+                    "id": "https://github.com/actions/runner"
+                }
+            }
+        }"#;
+
+        let b64 = base64::engine::general_purpose::STANDARD.encode(intoto_json.as_bytes());
+        let report = parse_attestation_payload(&b64, "sha512-anything").unwrap();
 
         assert_eq!(report.status, ProvenanceStatus::FailedMismatch);
     }
