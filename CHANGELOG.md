@@ -40,11 +40,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Bounded registry reads with exact limits for packuments, tarballs, and
   redirects.
 - Validated package name grammar, scoped URLs, and terminal escape sequences.
+- Optimized static diff heuristic scanning, lockfile delta merging, SSRF IP validation, and terminal formatting with zero-allocation slice processing and O(N) two-pointer iteration.
 - Optimized diff scanning performance.
 - Clarified diagnostic stderr explanations when non-interactive input is piped
   without `--yes`.
 
 ### Fixed
+
+- Isolated temporary build environment git repository resolution in CI test suites.
 
 - IPv6 mutation testing by eliminating redundant address checks.
 - Redirect handling and false-equivalent bounds in registry metadata.

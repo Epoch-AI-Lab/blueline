@@ -430,22 +430,31 @@ fn is_special_local_domain(host: &str) -> bool {
 }
 
 fn is_non_canonical_ip(host: &str) -> bool {
-    let lower = host.to_ascii_lowercase();
-    if lower.starts_with("0x") || lower.contains(".0x") {
+    if host.eq_ignore_ascii_case("0x")
+        || host.starts_with("0x")
+        || host.starts_with("0X")
+        || host.contains(".0x")
+        || host.contains(".0X")
+    {
         return true;
     }
     if !host.is_empty() && host.chars().all(|c| c.is_ascii_digit()) {
         return true;
     }
-    let parts: Vec<&str> = host.split('.').collect();
-    if parts
-        .iter()
-        .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
-        && (parts.len() != 4 || parts.iter().any(|p| p.len() > 1 && p.starts_with('0')))
-    {
-        return true;
+    let mut part_count = 0;
+    let mut has_leading_zero = false;
+    let mut all_digits = true;
+
+    for p in host.split('.') {
+        part_count += 1;
+        if p.is_empty() || !p.chars().all(|c| c.is_ascii_digit()) {
+            all_digits = false;
+        } else if p.len() > 1 && p.starts_with('0') {
+            has_leading_zero = true;
+        }
     }
-    false
+
+    all_digits && (part_count != 4 || has_leading_zero)
 }
 
 fn is_private_or_local_host(host: &str) -> bool {
