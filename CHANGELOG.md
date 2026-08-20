@@ -49,9 +49,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - IPv6 mutation testing by eliminating redundant address checks.
 - Redirect handling and false-equivalent bounds in registry metadata.
 - JSON output purity by suppressing trailing human messages under `--output json --yes`.
+- Timer string dynamic code evaluation (`setTimeout`, `setInterval`, `setImmediate`) in diff scanner heuristics.
+- Zero-width and bidirectional unicode formatting character evasion in JavaScript token stripping.
+- In-toto attestation empty subject bypass in SLSA provenance verification by enforcing matching subject digest.
+- Executor flag normalization bypass allowing `--user-config`, `--global-config`, and `--ca-file` overrides.
+- MCP tool output terminal escape and BiDi control character sanitization.
 
 ### Security
 
 - Fail-closed on every parse, extract, and verify boundary.
-- Hardened static heuristic scanner against inline module requires, paren-wrapped constructors, http2/dns primitives, and indirect eval aliases.
+- Hardened static heuristic scanner against inline module requires, paren-wrapped constructors, http2/dns primitives, timer string eval, zero-width unicode obfuscation, indirect eval aliases, dynamic `this[...]` evaluation, `process.dlopen`, `cluster`, `WebAssembly` compilation, and external HTTP client libraries.
 - Mutation testing and supply-chain audits run on every PR (CI gate).

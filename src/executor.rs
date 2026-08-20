@@ -37,21 +37,6 @@ pub fn install_with_ignore_scripts(
             cmd.env_remove(&key);
         }
     }
-    cmd.env_remove("NODE_OPTIONS")
-        .env_remove("npm_config_script_shell")
-        .env_remove("NPM_CONFIG_SCRIPT_SHELL")
-        .env_remove("npm_config_userconfig")
-        .env_remove("NPM_CONFIG_USERCONFIG")
-        .env_remove("npm_config_globalconfig")
-        .env_remove("NPM_CONFIG_GLOBALCONFIG")
-        .env_remove("npm_config_foreground_scripts")
-        .env_remove("NPM_CONFIG_FOREGROUND_SCRIPTS")
-        .env_remove("npm_config_ignore_scripts")
-        .env_remove("NPM_CONFIG_IGNORE_SCRIPTS")
-        .env_remove("npm_config_node_options")
-        .env_remove("NPM_CONFIG_NODE_OPTIONS")
-        .env_remove("npm_config_onload_script")
-        .env_remove("NPM_CONFIG_ONLOAD_SCRIPT");
 
     cmd.arg("install")
         .arg("--ignore-scripts")
@@ -91,26 +76,15 @@ pub fn install_with_ignore_scripts(
 }
 
 fn normalize_key(arg: &str) -> String {
-    let stripped = arg.trim_start_matches('-');
-    let mut out = String::with_capacity(stripped.len());
-    for c in stripped.chars() {
-        if c == '_' {
-            out.push('-');
-        } else {
-            out.push(c.to_ascii_lowercase());
-        }
-    }
-    out
-}
-
-fn is_falsy_value(val: &str) -> bool {
-    let lower = val.trim().to_ascii_lowercase();
-    matches!(lower.as_str(), "false" | "0" | "no" | "off")
+    arg.trim_start_matches('-')
+        .chars()
+        .filter(|&c| c != '-' && c != '_')
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
 }
 
 pub fn validate_extra_args(extra_args: &[String]) -> anyhow::Result<()> {
-    let mut iter = extra_args.iter().peekable();
-    while let Some(arg) = iter.next() {
+    for arg in extra_args {
         let trimmed = arg.trim();
         if !trimmed.starts_with('-') {
             anyhow::bail!(
@@ -118,81 +92,51 @@ pub fn validate_extra_args(extra_args: &[String]) -> anyhow::Result<()> {
             );
         }
 
-        let (raw_key, val_opt) = if let Some((k, v)) = trimmed.split_once('=') {
-            (k, Some(v))
-        } else {
-            (trimmed, None)
-        };
-
+        let (raw_key, _) = trimmed.split_once('=').unwrap_or((trimmed, ""));
         let key = normalize_key(raw_key);
 
-        // Disallow configuration, proxy, TLS and shell injection flags
+        // Disallow configuration, proxy, TLS, loader, auth and shell injection flags
         if matches!(
             key.as_str(),
             "userconfig"
                 | "globalconfig"
                 | "config"
                 | "prefix"
-                | "node-options"
                 | "nodeoptions"
-                | "script-shell"
+                | "loader"
+                | "experimentalloader"
+                | "import"
                 | "scriptshell"
                 | "shell"
-                | "onload-script"
                 | "onloadscript"
-                | "scripts-prepend-node-path"
+                | "scriptsprependnodepath"
                 | "registry"
                 | "proxy"
-                | "https-proxy"
                 | "httpsproxy"
-                | "http-proxy"
                 | "httpproxy"
-                | "strict-ssl"
-                | "no-strict-ssl"
-                | "nostrictssl"
+                | "noproxy"
                 | "strictssl"
+                | "nostrictssl"
                 | "ca"
                 | "cafile"
                 | "cert"
                 | "key"
+                | "extracacerts"
+                | "extracacert"
+                | "initmodule"
+                | "auth"
+                | "authtoken"
         ) {
             anyhow::bail!(
                 "forbidden flag `{trimmed}`: cannot override network, security or configuration options"
             );
         }
 
-        // Disallow explicit no-ignore-scripts
-        if key == "no-ignore-scripts" || key == "no-ignore_scripts" || key == "noignorescripts" {
+        if matches!(
+            key.as_str(),
+            "noignorescripts" | "ignorescripts" | "foregroundscripts"
+        ) {
             anyhow::bail!("forbidden flag `{trimmed}`: cannot override script isolation");
-        }
-
-        // Disallow ignore-scripts=false/0/no/off
-        if key == "ignore-scripts" || key == "ignorescripts" {
-            if let Some(val) = val_opt {
-                if is_falsy_value(val) {
-                    anyhow::bail!("forbidden flag `{trimmed}`: cannot override script isolation");
-                }
-            } else if let Some(next) = iter.peek()
-                && is_falsy_value(next)
-            {
-                anyhow::bail!(
-                    "forbidden flag `{trimmed} {next}`: cannot override script isolation"
-                );
-            }
-        }
-
-        // Disallow foreground-scripts
-        if key == "foreground-scripts" || key == "foregroundscripts" {
-            if let Some(val) = val_opt {
-                if !is_falsy_value(val) {
-                    anyhow::bail!("forbidden flag `{trimmed}`: cannot override script isolation");
-                }
-            } else {
-                let next_is_falsy = iter.peek().is_some_and(|next| is_falsy_value(next));
-                if !next_is_falsy {
-                    anyhow::bail!("forbidden flag `{trimmed}`: cannot override script isolation");
-                }
-            }
         }
     }
     Ok(())
@@ -336,7 +280,13 @@ mod tests {
     fn rejects_config_and_node_options_injection() {
         let variations = [
             vec!["--userconfig=/tmp/bad.npmrc"],
+            vec!["--user-config=/tmp/bad.npmrc"],
+            vec!["--user_config=/tmp/bad.npmrc"],
             vec!["--globalconfig=/tmp/bad.npmrc"],
+            vec!["--global-config=/tmp/bad.npmrc"],
+            vec!["--global_config=/tmp/bad.npmrc"],
+            vec!["--ca-file=/tmp/bad.crt"],
+            vec!["--ca_file=/tmp/bad.crt"],
             vec!["--config=/tmp/bad.npmrc"],
             vec!["--prefix=/tmp/bad"],
             vec!["--node-options=--require /tmp/pwn.js"],
@@ -346,6 +296,10 @@ mod tests {
             vec!["--onload_script=/tmp/pwn.js"],
             vec!["--onloadscript", "/tmp/pwn.js"],
             vec!["--scripts-prepend-node-path"],
+            vec!["--scripts_prepend_node_path"],
+            vec!["--init-module=/tmp/pwn.js"],
+            vec!["--auth=token"],
+            vec!["--authtoken=token"],
         ];
         for args in variations {
             let string_args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
@@ -391,7 +345,7 @@ mod tests {
             #[test]
             fn rejects_all_forbidden_flag_variations(
                 dashes in "[-]{1,3}",
-                flag in "userconfig|globalconfig|config|prefix|node-options|node_options|script-shell|script_shell|foreground-scripts|foreground_scripts",
+                flag in "userconfig|globalconfig|config|prefix|node-options|node_options|loader|experimental-loader|import|script-shell|script_shell|foreground-scripts|foreground_scripts",
                 suffix in "(=[^ ]*| /[^ ]*)?"
             ) {
                 let arg = format!("{dashes}{flag}{suffix}");

@@ -271,34 +271,26 @@ fn execute_tool(
                 crate::verdict::VerdictBand::Block => "BLOCK — Security policy violation detected",
             };
 
+            let name = crate::render::sanitize_single_line(&verdict.name);
+            let ver = crate::render::sanitize_single_line(&verdict.target_version);
             let mut text = format!(
-                "## Blueline Review: {}@{}\n\n**Verdict:** `{}` (Score: {}/100)\n**Recommendation:** {}\n\n",
-                verdict.name,
-                verdict.target_version,
-                verdict.band,
-                verdict.risk_score,
-                recommendation
+                "## Blueline Review: {name}@{ver}\n\n**Verdict:** `{}` (Score: {}/100)\n**Recommendation:** {recommendation}\n\n",
+                verdict.band, verdict.risk_score
             );
 
-            if !verdict.findings.is_empty() {
+            if verdict.findings.is_empty() {
+                text.push_str("✅ No suspicious heuristics or advisories triggered.\n");
+            } else {
                 text.push_str("### Findings:\n");
                 for f in &verdict.findings {
-                    text.push_str(&format!(
-                        "- **[{}]** {}: {}\n",
-                        f.rule_id, f.title, f.description
-                    ));
+                    let title = crate::render::sanitize_single_line(&f.title);
+                    let desc = crate::render::sanitize_terminal(&f.description);
+                    text.push_str(&format!("- **[{}]** {title}: {desc}\n", f.rule_id));
                 }
-            } else {
-                text.push_str("✅ No suspicious heuristics or advisories triggered.\n");
             }
 
             Ok(json!({
-                "content": [
-                    {
-                        "type": "text",
-                        "text": text
-                    }
-                ],
+                "content": [{ "type": "text", "text": text }],
                 "isError": false,
                 "structuredVerdict": verdict
             }))
@@ -322,18 +314,19 @@ fn execute_tool(
             let clean_version_strings: Vec<String> =
                 clean_versions.iter().map(|(v, _)| v.to_string()).collect();
 
+            let name = crate::render::sanitize_single_line(pkg_name);
+            let ver = crate::render::sanitize_single_line(version);
+            let status = if is_clean {
+                "KNOWN CLEAN (approved in local store)"
+            } else {
+                "NOT recorded as clean"
+            };
+
             Ok(json!({
-                "content": [
-                    {
-                        "type": "text",
-                        "text": format!(
-                            "Package {}@{} is {}.",
-                            pkg_name,
-                            version,
-                            if is_clean { "KNOWN CLEAN (approved in local store)" } else { "NOT recorded as clean" }
-                        )
-                    }
-                ],
+                "content": [{
+                    "type": "text",
+                    "text": format!("Package {name}@{ver} is {status}.")
+                }],
                 "isClean": is_clean,
                 "cleanVersions": clean_version_strings
             }))
@@ -358,27 +351,25 @@ fn execute_tool(
                     },
                 )?;
 
-            let mut diff_text = format!("Diff summary for {}@{}:\n", pkg_name, version);
-            diff_text.push_str(&format!(
-                "Files added: {}, removed: {}, modified: {}\n\n",
+            let name = crate::render::sanitize_single_line(&pkg_name);
+            let ver = crate::render::sanitize_single_line(&version);
+            let mut diff_text = format!(
+                "Diff summary for {name}@{ver}:\nFiles added: {}, removed: {}, modified: {}\n\n",
                 delta.files_added.len(),
                 delta.files_removed.len(),
                 delta.files_modified.len()
-            ));
+            );
 
             for f in delta.files_added.iter().chain(delta.files_modified.iter()) {
                 if let Some(unified) = &f.unified_diff {
-                    diff_text.push_str(&format!("--- {}\n{}\n", f.relative_path, unified));
+                    let path = crate::render::sanitize_single_line(&f.relative_path);
+                    let diff = crate::render::sanitize_terminal(unified);
+                    diff_text.push_str(&format!("--- {path}\n{diff}\n"));
                 }
             }
 
             Ok(json!({
-                "content": [
-                    {
-                        "type": "text",
-                        "text": diff_text
-                    }
-                ]
+                "content": [{ "type": "text", "text": diff_text }]
             }))
         }
 

