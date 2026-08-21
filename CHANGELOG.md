@@ -33,6 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Hardened static diff scanner against `String.fromCharCode` /
+  `String.fromCodePoint` module-name reconstruction: charcode calls with
+  plain integer arguments are folded to string literals before heuristic
+  matching, closing a `require(child_process)` evasion.
 - Hardened static AST/diff scanner with adjacent string literal folding to prevent concatenation evasion, dynamic global bracket invocations, String.fromCharCode property indexing, and indirect constructor/prototype references.
 - Hardened static AST/diff scanner to detect reflection-based code execution (`Reflect.get`), global dynamic execution lookups (`globalThis['eval']`, `window['Function']`), and Node.js `worker_threads` imports without triggering false positives on benign JavaScript.
 - Hardened archive extraction, SSRF checks, and executor isolation to fail
