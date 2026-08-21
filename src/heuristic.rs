@@ -2630,4 +2630,24 @@ mod tests {
             "folding went superlinear: {elapsed:?}"
         );
     }
+
+    #[test]
+    fn charcode_folding_handles_interleaved_markers() {
+        assert_eq!(
+            fold_char_code_calls("fromCodePoint(99) fromCharCode(118,109)"),
+            "'c' 'vm'"
+        );
+        assert_eq!(
+            fold_char_code_calls("String.fromCharCode(99,x) String.fromCharCode(118,109)"),
+            "String.fromCharCode(99,x) 'vm'"
+        );
+        assert_eq!(
+            fold_char_code_calls("a fromCharCode(118,109) b fromCodePoint(99) c"),
+            "a 'vm' b 'c' c"
+        );
+        assert_eq!(
+            fold_char_code_calls("String.fromCharCode(118,109)tail"),
+            "'vm'tail"
+        );
+    }
 }
