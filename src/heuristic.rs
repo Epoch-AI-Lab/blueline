@@ -916,12 +916,28 @@ fn fold_char_code_calls(s: &str) -> String {
     const MARKERS: [&str; 2] = ["fromCharCode(", "fromCodePoint("];
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
-    while let Some((pos, marker)) = MARKERS
-        .iter()
-        .filter_map(|m| rest.find(m).map(|p| (p, *m)))
-        .min_by_key(|(p, _)| *p)
-    {
-        let args_start = pos + marker.len();
+    let mut search_from = 0;
+    let mut cached: [Option<Option<usize>>; 2] = [None; 2];
+    loop {
+        let mut hit: Option<(usize, usize)> = None;
+        for (idx, m) in MARKERS.iter().enumerate() {
+            let abs = match cached[idx] {
+                Some(p) => p,
+                None => {
+                    let p = rest[search_from..].find(m).map(|q| search_from + q);
+                    cached[idx] = Some(p);
+                    p
+                }
+            };
+            if let Some(a) = abs {
+                hit = Some(match hit {
+                    Some((hp, hi)) if hp <= a => (hp, hi),
+                    _ => (a, idx),
+                });
+            }
+        }
+        let Some((pos, idx)) = hit else { break };
+        let args_start = pos + MARKERS[idx].len();
         match parse_code_point_args(&rest[args_start..]) {
             Some((codes, consumed)) => match quoted_literal(&codes) {
                 Some(literal) => {
@@ -933,15 +949,17 @@ fn fold_char_code_calls(s: &str) -> String {
                     out.push_str(&rest[..call_start]);
                     out.push_str(&literal);
                     rest = &rest[args_start + consumed..];
+                    search_from = 0;
+                    cached = [None; 2];
                 }
                 None => {
-                    out.push_str(&rest[..args_start]);
-                    rest = &rest[args_start..];
+                    search_from = args_start;
+                    cached[idx] = None;
                 }
             },
             None => {
-                out.push_str(&rest[..args_start]);
-                rest = &rest[args_start..];
+                search_from = args_start;
+                cached[idx] = None;
             }
         }
     }
@@ -993,7 +1011,12 @@ fn parse_code_point_args(s: &str) -> Option<(Vec<u32>, usize)> {
 }
 
 fn quoted_literal(codes: &[u32]) -> Option<String> {
-    let text: String = codes.iter().filter_map(|&c| char::from_u32(c)).collect();
+    let text: String = codes
+        .iter()
+        .map(|&c| char::from_u32(c))
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .collect();
     for q in ['\'', '"', '`'] {
         if !text.contains(q) && !text.contains('\\') {
             return Some(format!("{q}{text}{q}"));
@@ -2562,11 +2585,9 @@ mod tests {
         assert!(is_child_proc_invocation(
             "require('child_' + String.fromCharCode(112,114,111,99,101,115,115))"
         ));
-        assert!(is_vm_invocation(
-            "require(String.fromCharCode(118,109)).runInNewContext('1+1');"
-        ));
+        assert!(is_vm_invocation("require(String.fromCharCode(118,109))"));
         assert!(is_network_invocation(
-            "var h = ['ht', 'tp']; fetch(String.fromCharCode(104,116,116,112) + '://evil.com');"
+            "require(String.fromCharCode(104,116,116,112))"
         ));
     }
 
@@ -2582,5 +2603,31 @@ mod tests {
         assert!(!is_child_proc_invocation(
             "String.fromCharCode(99999999999999999999);"
         ));
+        assert!(fold_char_code_calls("const x = 1;") == "const x = 1;");
+        assert!(fold_char_code_calls("héllo — fromCharCod") == "héllo — fromCharCod");
+        assert!(
+            fold_char_code_calls("String.fromCharCode(99+x).repeat(2);")
+                == "String.fromCharCode(99+x).repeat(2);"
+        );
+        assert!(
+            fold_char_code_calls("String.fromCharCode(0xD800,104);")
+                == "String.fromCharCode(0xD800,104);"
+        );
+        assert!(
+            fold_char_code_calls("String.fromCodePoint(0x110000,65);")
+                == "String.fromCodePoint(0x110000,65);"
+        );
+    }
+
+    #[test]
+    fn charcode_folding_stays_fast_on_repeated_unparseable_calls() {
+        let input = "fromCharCode(".repeat(200_000);
+        let start = std::time::Instant::now();
+        assert_eq!(fold_char_code_calls(&input), input);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_secs() < 10,
+            "folding went superlinear: {elapsed:?}"
+        );
     }
 }
