@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Multi-registry foundation: `Ecosystem` enum (`npm`/`cargo`/`pypi`) with a
+  `Registry::ecosystem()` accessor, a typed `Checksum { alg, value_hex }`
+  replacing raw SRI strings, and `Release { version, yanked, publish_time }`
+  with `list_releases` + `default_version` replacing `resolve_dist_tag`.
+- `VersionInfo` seam in `src/version.rs`: baseline selection and the store's
+  clean-version listing now work over any version grammar (semver today,
+  PEP 440 later).
+- Shared registry HTTP plumbing in `src/registry/http_util.rs`: URL scheme
+  validation, private/local-host SSRF guards, capped redirect following, and
+  bounded reads, reusable by future registry adapters.
+- Optional `ecosystem` field on policy allow/blocklist rules; absent means the
+  rule matches every ecosystem. Plain-string blocklist entries keep working.
+- Store schema v3: every table gains an `ecosystem` column with composite
+  primary keys `(ecosystem, name, version)`; existing rows become npm-scoped.
+
+### Changed
+
+- Advisory lookups send the resolved ecosystem to OSV.dev with exact schema
+  casing (`npm`, `CratesIO`, `PyPI`).
+- Provenance attestation endpoint is threaded from the configured registry
+  base instead of hardcoding `registry.npmjs.org`; DSSE subject digests are
+  compared against the typed checksum.
+- Baseline integrity tamper checks compare normalized digest content, so
+  legacy `sha512-<base64>` rows and new `sha512:<hex>` display forms are
+  judged alike (fail-closed behavior unchanged).
+
 ## [0.2.0] - 2026-08-22
 
 ### Added
