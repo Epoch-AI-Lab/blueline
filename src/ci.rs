@@ -165,7 +165,7 @@ pub fn evaluate_lockfile_diff(
             continue;
         }
 
-        let (verdict, _, _) =
+        let (verdict, _, _, _unreviewed_baseline) =
             evaluate_package(name, new_version, ctx.registry_base, store, policy)?;
 
         max_band = max_band.max(verdict.band);

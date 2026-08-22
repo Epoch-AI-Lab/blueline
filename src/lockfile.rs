@@ -5,13 +5,22 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum LockfileError {
     #[error("failed to parse lockfile JSON: {0}")]
-    InvalidJson(#[from] serde_json::Error),
+    InvalidJson(serde_json::Error),
 
     #[error("lockfile is missing mandatory field: {0}")]
     MissingField(&'static str),
 
     #[error("invalid lockfile data: {0}")]
     InvalidData(String),
+}
+
+// Manual From instead of #[from]: the Display already embeds the serde_json
+// detail, and thiserror's #[from] would also attach it as `source()`, which
+// makes `{e:#}` in main print the detail twice.
+impl From<serde_json::Error> for LockfileError {
+    fn from(e: serde_json::Error) -> Self {
+        LockfileError::InvalidJson(e)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
