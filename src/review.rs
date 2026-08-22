@@ -140,13 +140,15 @@ pub fn evaluate_package(
 }
 
 fn bootstrap_hint(verdict: &crate::verdict::Verdict) -> Option<String> {
-    let name = &verdict.name;
+    let name = &crate::render::sanitize_single_line(&verdict.name);
     if verdict
         .findings
         .iter()
         .any(|f| f.rule_id == "R07_UNREVIEWED_PREDECESSOR_BASELINE")
     {
-        let base = verdict.baseline_version.as_deref().unwrap_or("unknown");
+        let base = &crate::render::sanitize_single_line(
+            verdict.baseline_version.as_deref().unwrap_or("unknown"),
+        );
         Some(format!(
             "hint: baseline `{name}@{base}` was never approved locally. Run `blueline review {name}@{base}` from an interactive terminal and approve it to establish a baseline."
         ))

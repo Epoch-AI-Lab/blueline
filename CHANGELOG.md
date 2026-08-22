@@ -24,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - OSV and GitHub Advisory revocation cache and engine.
 - Sigstore / SLSA provenance and attestation surfacing.
 - Policy-as-code via `blueline.toml` (advisories, provenance, allow/blocklists).
-- `allow_unreviewed_baseline` allowlist rule for scripted onboarding of packages without an approved baseline; bootstrap findings stay visible but stop contributing risk (rendered as `[INFO]`, `"LOW"` in JSON), while content heuristics still apply in full. Note: approving via `--yes` marks the version known-clean in the baseline store, so it becomes the diff anchor for all future releases of that package.
+- `allow_unreviewed_baseline` allowlist rule for scripted onboarding of packages without an approved baseline; bootstrap findings stay visible but stop contributing risk (rendered as `[INFO]`, `"LOW"` in JSON), while content heuristics still apply in full. Note: the declared package name can reach a LOW verdict with zero interaction, so both `review --yes` and non-interactive `install` will proceed for it when nothing else is wrong; approving via `--yes` also marks the version known-clean as the diff anchor for future releases. Old binaries ignore this config key and fail closed.
 - `blueline ci` lockfile diff scanner and PR reporting.
 - Model Context Protocol (MCP) server and agent tools (`blueline mcp`).
 - npm/npx wrapper shim (`@blueline/cli`).
