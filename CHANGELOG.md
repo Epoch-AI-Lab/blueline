@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-08-22
+
 ### Added
 
 - `blueline review <pkg@ver>` command with text and JSON output, `--registry`

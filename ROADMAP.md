@@ -1,7 +1,7 @@
 # Blueline Roadmap
 
-Phased plan from greenfield to hosted service. See `ARCHITECTURE.md` for the
-decisions behind each phase.
+Phased plan from greenfield to a trustworthy release-diff review desk. See
+`ARCHITECTURE.md` for the decisions behind each phase.
 
 ## Phase 0 — Foundation ✅
 - [x] Rust crate skeleton + `clap` CLI
@@ -32,16 +32,21 @@ decisions behind each phase.
 - [x] Model Context Protocol (MCP) server & agent tools (`src/mcp.rs`, `blueline mcp`)
 - [x] Top-tier CI hardening with `cargo-deny` (`deny.toml`) and `cargo-fuzz` (`fuzz/`)
 
-## Phase 4 — Hosted Service (paid, opt-in token)
-- Recall index API (curated, faster than OSV; e.g. TanStack/router worm)
+## Phase 4 — Scale
+- Multi-registry adapters (PyPI, cargo) via the `Registry` trait
+- Advisory feed contributions back to OSV / GitHub
+
+---
+
+## Someday (deliberately unbuilt)
+
+These need users and revenue we don't have. No dates, no pending checkboxes —
+they get built only when there's demand for them.
+
+- Hosted recall index API (curated, faster than OSV; e.g. TanStack/router worm)
 - Verdict-model endpoint (ML refines local score)
 - Team policy sync · audit logs · SSO
-- Token-gated upgrade path in CLI
-
-## Phase 5 — Scale
-- Multi-registry adapters (PyPI, cargo) via the `Registry` trait
-- Enterprise SSO / SCIM
-- Advisory feed contributions back to OSV / GitHub
+- Token-gated paid upgrade path in CLI
 
 ---
 
