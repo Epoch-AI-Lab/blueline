@@ -48,7 +48,7 @@ runs:
           ARGS+=(--policy "$INPUT_POLICY_PATH")
         fi
         if [ -n "$INPUT_OUTPUT_FILE" ]; then
-          ARGS+=(--output-file "$INPUT_OUTPUT_FILE")
+          ARGS+=(--format json --output-file "$INPUT_OUTPUT_FILE")
         fi
 
         echo "Executing: blueline ${ARGS[*]}"
