@@ -405,9 +405,14 @@ pub fn evaluate_with_trust(
 
     // R06: First sighting
     if delta.baseline_version.is_none() {
+        let severity = if policy.allows_unreviewed_baseline(name) {
+            VerdictBand::Low
+        } else {
+            VerdictBand::Medium
+        };
         findings.push(Finding {
             rule_id: "R06_FIRST_SIGHTING".into(),
-            severity: VerdictBand::Medium,
+            severity,
             title: "First sighting: no known-clean baseline exists".into(),
             description: "No previous version was found to diff against; full tarball inspected."
                 .into(),
@@ -417,9 +422,14 @@ pub fn evaluate_with_trust(
     // R07: Unreviewed predecessor baseline
     if is_unreviewed_baseline {
         let base_ver = delta.baseline_version.as_deref().unwrap_or("unknown");
+        let severity = if policy.allows_unreviewed_baseline(name) {
+            VerdictBand::Low
+        } else {
+            VerdictBand::Medium
+        };
         findings.push(Finding {
             rule_id: "R07_UNREVIEWED_PREDECESSOR_BASELINE".into(),
-            severity: VerdictBand::Medium,
+            severity,
             title: format!("Unreviewed baseline version `{base_ver}`"),
             description: format!(
                 "Baseline version `{base_ver}` was selected from registry history and has not been approved locally."
@@ -1877,6 +1887,129 @@ mod tests {
     }
 
     #[test]
+    fn allow_unreviewed_baseline_downgrades_bootstrap_findings_without_hiding_them() {
+        let first_sighting = Delta {
+            baseline_version: None,
+            target_version: "1.0.0".into(),
+            files_added: vec![],
+            files_removed: vec![],
+            files_modified: vec![],
+            total_lines_added: 0,
+            total_lines_deleted: 0,
+            new_executables: vec![],
+            new_binaries: vec![],
+            modified_binaries: vec![],
+            new_lifecycle_scripts: vec![],
+            modified_lifecycle_scripts: vec![],
+            new_dependencies: vec![],
+            modified_dependencies: vec![],
+            removed_dependencies: vec![],
+            binding_gyp_added: false,
+        };
+        let unreviewed = Delta {
+            baseline_version: Some("1.0.0".into()),
+            ..first_sighting.clone()
+        };
+
+        let mut policy = Policy::default();
+        policy
+            .allowlist
+            .packages
+            .push(crate::policy::PackageAllowRule {
+                name: "test-pkg".into(),
+                allowed_scripts: vec![],
+                max_risk: None,
+                integrity: None,
+                allow_unreviewed_baseline: true,
+            });
+
+        for (name, delta, unreviewed_flag) in [
+            ("test-pkg", &first_sighting, false),
+            ("test-pkg", &unreviewed, true),
+            ("other-pkg", &first_sighting, false),
+            ("other-pkg", &unreviewed, true),
+        ] {
+            let verdict =
+                evaluate_with_policy(name, "verified (sha512)", delta, unreviewed_flag, &policy);
+            let r06 = verdict
+                .findings
+                .iter()
+                .find(|f| f.rule_id == "R06_FIRST_SIGHTING");
+            let r07 = verdict
+                .findings
+                .iter()
+                .find(|f| f.rule_id == "R07_UNREVIEWED_PREDECESSOR_BASELINE");
+            if name == "test-pkg" {
+                assert_eq!(verdict.band, VerdictBand::Low);
+                assert_eq!(verdict.risk_score, 0);
+                if delta.baseline_version.is_none() {
+                    assert_eq!(r06.unwrap().severity, VerdictBand::Low);
+                    assert!(r07.is_none());
+                } else {
+                    assert!(r06.is_none());
+                    assert_eq!(r07.unwrap().severity, VerdictBand::Low);
+                }
+            } else {
+                assert_eq!(verdict.band, VerdictBand::Medium);
+                assert!(verdict.risk_score > 0);
+            }
+        }
+    }
+
+    #[test]
+    fn allow_unreviewed_baseline_still_blocks_real_threats() {
+        use crate::diff::{FileChange, FileKind};
+
+        let delta = Delta {
+            baseline_version: Some("1.0.0".into()),
+            target_version: "1.0.1".into(),
+            files_added: vec![],
+            files_removed: vec![],
+            files_modified: vec![FileChange {
+                relative_path: "index.js".into(),
+                kind: FileKind::Text,
+                is_executable: false,
+                lines_added: 1,
+                lines_deleted: 0,
+                unified_diff: Some("+eval(process.argv[2])".into()),
+            }],
+            total_lines_added: 1,
+            total_lines_deleted: 0,
+            new_executables: vec![],
+            new_binaries: vec![],
+            modified_binaries: vec![],
+            new_lifecycle_scripts: vec![],
+            modified_lifecycle_scripts: vec![],
+            new_dependencies: vec![],
+            modified_dependencies: vec![],
+            removed_dependencies: vec![],
+            binding_gyp_added: false,
+        };
+
+        let mut policy = Policy::default();
+        policy
+            .allowlist
+            .packages
+            .push(crate::policy::PackageAllowRule {
+                name: "sneaky-pkg".into(),
+                allowed_scripts: vec![],
+                max_risk: None,
+                integrity: None,
+                allow_unreviewed_baseline: true,
+            });
+
+        let verdict =
+            evaluate_with_policy("sneaky-pkg", "verified (sha512)", &delta, true, &policy);
+        assert_eq!(verdict.band, VerdictBand::High);
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| f.severity == VerdictBand::High)
+        );
+    }
+
+    #[test]
     fn detects_octal_and_comment_obfuscations() {
         assert!(is_eval_invocation(r#"\145\166\141\154(payload)"#));
         assert!(is_eval_invocation("eval/*comment*/(payload)"));
@@ -2119,6 +2252,7 @@ mod tests {
                 allowed_scripts: vec!["postinstall".into()],
                 max_risk: None,
                 integrity: None,
+                allow_unreviewed_baseline: false,
             });
 
         let verdict = evaluate_with_policy("esbuild", "verified (sha512)", &delta, false, &policy);

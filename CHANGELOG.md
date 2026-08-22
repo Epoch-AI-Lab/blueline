@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - OSV and GitHub Advisory revocation cache and engine.
 - Sigstore / SLSA provenance and attestation surfacing.
 - Policy-as-code via `blueline.toml` (advisories, provenance, allow/blocklists).
+- `allow_unreviewed_baseline` allowlist rule for scripted onboarding of packages without an approved baseline; bootstrap findings stay visible but stop contributing risk (rendered as `[INFO]`, `"LOW"` in JSON), while content heuristics still apply in full. Note: the declared package name can reach a LOW verdict with zero interaction, so both `review --yes` and non-interactive `install` will proceed for it when nothing else is wrong; approving via `--yes` also marks the version known-clean as the diff anchor for future releases. Old binaries ignore this config key and fail closed.
 - `blueline ci` lockfile diff scanner and PR reporting.
 - Model Context Protocol (MCP) server and agent tools (`blueline mcp`).
 - npm/npx wrapper shim (`@blueline/cli`).
@@ -54,6 +55,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Isolated temporary build environment git repository resolution in CI test suites.
 
 - IPv6 mutation testing by eliminating redundant address checks.
+- Doubled `baseline store:` prefix in error messages caused by redundant error wrapping in `review`, `ci`, and `mcp` entry points.
+- Baseline refusals now print an actionable hint naming the exact command to run (which predecessor version to approve) or the policy escape hatch, instead of failing with no next step.
 - Redirect handling and false-equivalent bounds in registry metadata.
 - JSON output purity by suppressing trailing human messages under `--output json --yes`.
 - Timer string dynamic code evaluation (`setTimeout`, `setInterval`, `setImmediate`) in diff scanner heuristics.

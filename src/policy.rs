@@ -163,6 +163,16 @@ impl Policy {
         }
         false
     }
+
+    /// Check if a package is explicitly declared trusted to onboard without an
+    /// approved baseline. Exact name match (no globs), matching
+    /// `is_script_allowed`; a pattern like `@scope/*` grants nothing.
+    pub fn allows_unreviewed_baseline(&self, package_name: &str) -> bool {
+        self.allowlist
+            .packages
+            .iter()
+            .any(|r| r.allow_unreviewed_baseline && r.name == package_name)
+    }
 }
 
 /// Threshold configurations for mapping numeric risk scores to verdict bands.
@@ -295,6 +305,11 @@ pub struct PackageAllowRule {
     pub max_risk: Option<VerdictBand>,
     #[serde(default)]
     pub integrity: Option<String>,
+    /// Trust this package enough to onboard it without an approved baseline.
+    /// First-sighting and unreviewed-predecessor findings stay visible but no
+    /// longer contribute risk. Content heuristics still apply in full.
+    #[serde(default)]
+    pub allow_unreviewed_baseline: bool,
 }
 
 /// Blocklist configuration for banned packages and maintainers.
@@ -428,5 +443,22 @@ block_score = 101
         assert!(glob_match("*middle*", "some-middle-name"));
         assert!(glob_match("exact", "exact"));
         assert!(!glob_match("exact", "exact-not"));
+    }
+
+    #[test]
+    fn parses_allow_unreviewed_baseline_rule() {
+        let toml_content = r#"
+[[allowlist.packages]]
+name = "internal-tool"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "other-pkg"
+"#;
+        let policy = Policy::from_toml_str(toml_content).unwrap();
+        assert!(policy.allows_unreviewed_baseline("internal-tool"));
+        assert!(!policy.allows_unreviewed_baseline("other-pkg"));
+        assert!(!policy.allows_unreviewed_baseline("internal-tool-jr"));
+        assert!(!Policy::default().allows_unreviewed_baseline("internal-tool"));
     }
 }
