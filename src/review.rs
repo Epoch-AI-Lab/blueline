@@ -140,6 +140,7 @@ pub fn evaluate_package(
 
     let verdict = evaluate_with_trust(
         &target_pkg.name,
+        ecosystem,
         "verified (sha512)",
         &delta,
         is_unreviewed,
