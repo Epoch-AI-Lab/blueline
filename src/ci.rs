@@ -58,8 +58,7 @@ pub fn run(
     output_file: Option<&Path>,
 ) -> anyhow::Result<()> {
     let policy = Policy::load_or_default(policy_path)?;
-    let store =
-        BaselineStore::open().map_err(|e| anyhow::anyhow!("opening baseline store: {e}"))?;
+    let store = BaselineStore::open()?;
 
     let head_content = fs::read_to_string(lockfile_path).map_err(|e| {
         let hint = if e.kind() == std::io::ErrorKind::NotFound {

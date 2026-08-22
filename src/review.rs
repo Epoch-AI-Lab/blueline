@@ -55,9 +55,7 @@ pub fn evaluate_package(
     })?;
 
     let integrity = target_pkg.integrity.clone().unwrap_or_default();
-    store
-        .record_verified(&target_pkg.name, &target_pkg.version, &integrity)
-        .map_err(|e| anyhow::anyhow!("baseline store: {e}"))?;
+    store.record_verified(&target_pkg.name, &target_pkg.version, &integrity)?;
 
     let baseline_res = resolve_baseline(name, &target_semver, &registry, store)
         .map_err(|e| anyhow::anyhow!("baseline resolution: {e}"))?;
@@ -141,6 +139,30 @@ pub fn evaluate_package(
     Ok((verdict, delta, integrity))
 }
 
+fn bootstrap_hint(verdict: &crate::verdict::Verdict) -> Option<String> {
+    let name = &verdict.name;
+    if verdict
+        .findings
+        .iter()
+        .any(|f| f.rule_id == "R07_UNREVIEWED_PREDECESSOR_BASELINE")
+    {
+        let base = verdict.baseline_version.as_deref().unwrap_or("unknown");
+        Some(format!(
+            "hint: baseline `{name}@{base}` was never approved locally. Run `blueline review {name}@{base}` from an interactive terminal and approve it to establish a baseline."
+        ))
+    } else if verdict
+        .findings
+        .iter()
+        .any(|f| f.rule_id == "R06_FIRST_SIGHTING")
+    {
+        Some(format!(
+            "hint: no approved baseline exists for `{name}`. Approve it from an interactive terminal, or add an [[allowlist.packages]] rule with `name = \"{name}\"` and `allow_unreviewed_baseline = true` to blueline.toml to onboard it without one."
+        ))
+    } else {
+        None
+    }
+}
+
 pub fn run(
     pkg_spec: &str,
     registry_base: &str,
@@ -151,7 +173,7 @@ pub fn run(
     let policy = Policy::load_or_default(policy_path)?;
     let registry = NpmRegistry::new(registry_base);
     let (name, version_str) = parse_spec_flexible(pkg_spec, &registry)?;
-    let store = BaselineStore::open().map_err(|e| anyhow::anyhow!("baseline store: {e}"))?;
+    let store = BaselineStore::open()?;
 
     let (verdict, delta, integrity) =
         evaluate_package(&name, &version_str, registry_base, &store, &policy)?;
@@ -191,6 +213,9 @@ pub fn run(
                 "Cannot auto-approve {}@{}: risk verdict is {} (score: {}). Refusing to proceed (--yes).",
                 name, version_str, verdict.band, verdict.risk_score
             );
+            if let Some(hint) = bootstrap_hint(&verdict) {
+                eprintln!("{hint}");
+            }
             std::process::exit(2);
         }
     }
@@ -206,6 +231,9 @@ pub fn run(
                 "Non-interactive terminal detected without `--yes`. Risk verdict is {} (score: {}). Refusing to proceed.",
                 verdict.band, verdict.risk_score
             );
+            if let Some(hint) = bootstrap_hint(&verdict) {
+                eprintln!("{hint}");
+            }
         }
         std::process::exit(2);
     }
@@ -224,7 +252,7 @@ pub fn install(
     let policy = Policy::load_or_default(policy_path)?;
     let registry = NpmRegistry::new(registry_base);
     let (name, version_str) = parse_spec_flexible(pkg_spec, &registry)?;
-    let store = BaselineStore::open().map_err(|e| anyhow::anyhow!("baseline store: {e}"))?;
+    let store = BaselineStore::open()?;
 
     let (verdict, delta, integrity) =
         evaluate_package(&name, &version_str, registry_base, &store, &policy)?;
@@ -254,6 +282,9 @@ pub fn install(
                 "Cannot auto-approve {}@{}: risk verdict is {} (score: {}). Refusing to install (--yes).",
                 name, version_str, verdict.band, verdict.risk_score
             );
+            if let Some(hint) = bootstrap_hint(&verdict) {
+                eprintln!("{hint}");
+            }
             false
         }
     } else if is_interactive {
@@ -264,6 +295,9 @@ pub fn install(
                 "Non-interactive terminal detected without `--yes`. Risk verdict is {} (score: {}). Refusing to install.",
                 verdict.band, verdict.risk_score
             );
+            if let Some(hint) = bootstrap_hint(&verdict) {
+                eprintln!("{hint}");
+            }
         }
         verdict.band == crate::verdict::VerdictBand::Low
     };

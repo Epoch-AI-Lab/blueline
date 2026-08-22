@@ -75,8 +75,7 @@ pub fn run_stdio(registry_base: &str, policy_path: Option<&Path>) -> anyhow::Res
     let mut stdout = std::io::stdout();
 
     let policy = Policy::load_or_default(policy_path)?;
-    let store =
-        BaselineStore::open().map_err(|e| anyhow::anyhow!("opening baseline store: {e}"))?;
+    let store = BaselineStore::open()?;
 
     eprintln!("blueline-mcp: starting stdio server loop (ready for JSON-RPC 2.0)");
 
@@ -310,7 +309,7 @@ fn execute_tool(
 
             let clean_versions = store
                 .list_clean_versions(pkg_name)
-                .map_err(|e| JsonRpcError::internal_error(format!("baseline store error: {e}")))?;
+                .map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
 
             let is_clean = clean_versions.iter().any(|(v, _)| v.to_string() == version);
             let clean_version_strings: Vec<String> =

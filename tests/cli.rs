@@ -1611,3 +1611,143 @@ fn ci_rejects_flag_like_base_refs() {
         .failure()
         .stderr(predicate::str::contains("cannot start with '-'"));
 }
+
+#[test]
+fn regression_refusal_hints_name_the_bootstrap_command() {
+    let tarball = make_tarball_with(b"module.exports = { clean: true };");
+    let integrity = sha512_b64(&tarball);
+
+    let fixture = spawn_fixture(
+        move |base| {
+            serde_json::json!({
+                "name": "hint-pkg",
+                "dist-tags": { "latest": "1.1.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": "hint-pkg",
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": format!("{base}/hint-pkg/-/hint-pkg-1.0.0.tgz"),
+                            "integrity": integrity,
+                            "shasum": "0".repeat(40)
+                        }
+                    },
+                    "1.1.0": {
+                        "name": "hint-pkg",
+                        "version": "1.1.0",
+                        "dist": {
+                            "tarball": format!("{base}/hint-pkg/-/hint-pkg-1.1.0.tgz"),
+                            "integrity": integrity,
+                            "shasum": "0".repeat(40)
+                        }
+                    }
+                }
+            })
+            .to_string()
+        },
+        tarball,
+    );
+
+    let data_dir = tempfile::tempdir().unwrap();
+    blueline()
+        .args([
+            "review",
+            "hint-pkg@1.1.0",
+            "--registry",
+            &fixture.base,
+            "--yes",
+        ])
+        .env("BLUELINE_DATA_DIR", data_dir.path())
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("hint: baseline `hint-pkg@1.0.0`"))
+        .stderr(predicate::str::contains("blueline review hint-pkg@1.0.0"));
+}
+
+#[test]
+fn policy_allow_unreviewed_baseline_enables_scripted_onboarding() {
+    let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut builder = tar::Builder::new(encoder);
+    let pkg_json = br#"{"name": "onboard-pkg", "version": "1.0.0"}"#;
+    let mut h = tar::Header::new_gnu();
+    h.set_size(pkg_json.len() as u64);
+    h.set_mode(0o644);
+    h.set_cksum();
+    builder
+        .append_data(&mut h, "package/package.json", &pkg_json[..])
+        .unwrap();
+    let index_js = b"module.exports = {};";
+    let mut h2 = tar::Header::new_gnu();
+    h2.set_size(index_js.len() as u64);
+    h2.set_mode(0o644);
+    h2.set_cksum();
+    builder
+        .append_data(&mut h2, "package/lib/index.js", &index_js[..])
+        .unwrap();
+    let tarball = builder.into_inner().unwrap().finish().unwrap();
+    let integrity = sha512_b64(&tarball);
+
+    let fixture = spawn_fixture(
+        move |base| {
+            serde_json::json!({
+                "name": "onboard-pkg",
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": "onboard-pkg",
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": format!("{base}/onboard-pkg/-/onboard-pkg-1.0.0.tgz"),
+                            "integrity": integrity,
+                            "shasum": "0".repeat(40)
+                        }
+                    }
+                }
+            })
+            .to_string()
+        },
+        tarball,
+    );
+
+    let temp_policy = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        temp_policy.path(),
+        r#"
+[[allowlist.packages]]
+name = "onboard-pkg"
+allow_unreviewed_baseline = true
+"#,
+    )
+    .unwrap();
+
+    let data_dir = tempfile::tempdir().unwrap();
+    let output = blueline()
+        .args([
+            "review",
+            "onboard-pkg@1.0.0",
+            "--registry",
+            &fixture.base,
+            "--policy",
+            temp_policy.path().to_str().unwrap(),
+            "--yes",
+            "--output",
+            "json",
+        ])
+        .env("BLUELINE_DATA_DIR", data_dir.path())
+        .assert()
+        .code(0)
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output).unwrap()).expect("valid json");
+    assert_eq!(json["band"], "LOW");
+    let findings = json["findings"].as_array().unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|f| f["rule_id"] == "R06_FIRST_SIGHTING" && f["severity"] == "LOW"),
+        "first-sighting finding should stay visible as LOW/INFO"
+    );
+}
