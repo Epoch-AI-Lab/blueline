@@ -221,7 +221,8 @@ pub fn inspect_provenance(
 
     // 2. Check local provenance cache
     if let Some(store) = store
-        && let Ok(Some(cached)) = store.get_cached_provenance(package, version)
+        && let Ok(Some(cached)) =
+            store.get_cached_provenance(crate::registry::Ecosystem::Npm, package, version)
     {
         return ProvenanceReport {
             status: ProvenanceStatus::Verified,
@@ -270,6 +271,7 @@ pub fn inspect_provenance(
                     // Cache in SQLite store
                     if let Some(store) = store {
                         let _ = store.record_provenance(
+                            crate::registry::Ecosystem::Npm,
                             package,
                             version,
                             report.builder_id.as_deref(),

@@ -308,7 +308,7 @@ fn execute_tool(
                 .ok_or_else(|| JsonRpcError::invalid_params("missing `version` argument"))?;
 
             let clean_versions = store
-                .list_clean_versions::<semver::Version>(pkg_name)
+                .list_clean_versions::<semver::Version>(crate::registry::Ecosystem::Npm, pkg_name)
                 .map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
 
             let is_clean = clean_versions.iter().any(|(v, _)| v.to_string() == version);

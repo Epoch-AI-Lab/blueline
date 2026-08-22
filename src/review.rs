@@ -7,8 +7,8 @@ use crate::extract::{ExtractionLimits, safe_extract};
 use crate::heuristic::evaluate_with_trust;
 use crate::manifest::read_package_json;
 use crate::policy::Policy;
-use crate::registry::Registry;
 use crate::registry::npm::NpmRegistry;
+use crate::registry::{Checksum, Ecosystem, Registry};
 use crate::render::{render_json, render_text};
 use crate::store::BaselineStore;
 
@@ -20,11 +20,16 @@ pub fn evaluate_package(
     registry_base: &str,
     store: &BaselineStore,
     policy: &Policy,
-) -> anyhow::Result<(crate::verdict::Verdict, crate::diff::Delta, String)> {
+) -> anyhow::Result<(
+    crate::verdict::Verdict,
+    crate::diff::Delta,
+    crate::registry::Checksum,
+)> {
     let target_semver = semver::Version::parse(version_str)
         .map_err(|e| anyhow::anyhow!("invalid semver for `{version_str}`: {e}"))?;
 
     let registry = NpmRegistry::new(registry_base);
+    let ecosystem = registry.ecosystem();
     let target_pkg = registry.resolve(name, version_str)?;
 
     // fetch_tarball verifies sha512 against dist.integrity and fails closed
@@ -38,7 +43,6 @@ pub fn evaluate_package(
             target_pkg.version
         )
     })?;
-    let integrity = checksum.to_sri();
 
     let target_temp = tempfile::tempdir().map_err(|e| anyhow::anyhow!("creating temp dir: {e}"))?;
     safe_extract(
@@ -63,7 +67,7 @@ pub fn evaluate_package(
         )
     })?;
 
-    store.record_verified(&target_pkg.name, &target_pkg.version, &integrity)?;
+    store.record_verified(ecosystem, &target_pkg.name, &target_pkg.version, &checksum)?;
 
     let baseline_res = resolve_baseline(name, &target_semver, &registry, store)
         .map_err(|e| anyhow::anyhow!("baseline resolution: {e}"))?;
@@ -128,7 +132,7 @@ pub fn evaluate_package(
     let provenance = crate::provenance::inspect_provenance(
         &target_pkg.name,
         &target_pkg.version,
-        &integrity,
+        &checksum.to_sri(),
         None,
         Some(store),
         policy,
@@ -144,7 +148,7 @@ pub fn evaluate_package(
         Some(&provenance),
     );
 
-    Ok((verdict, delta, integrity))
+    Ok((verdict, delta, checksum))
 }
 
 fn bootstrap_hint(verdict: &crate::verdict::Verdict) -> Option<String> {
@@ -193,7 +197,7 @@ pub fn run(
     let (name, version_str) = parse_spec_flexible(pkg_spec, &registry)?;
     let store = BaselineStore::open()?;
 
-    let (verdict, delta, integrity) =
+    let (verdict, delta, checksum) =
         evaluate_package(&name, &version_str, registry_base, &store, &policy)?;
 
     let format = output.resolve(std::io::stdout().is_terminal());
@@ -208,11 +212,12 @@ pub fn run(
 
     if yes {
         if verdict.band == crate::verdict::VerdictBand::Low {
-            store.mark_clean(&name, &version_str, &integrity)?;
+            store.mark_clean(Ecosystem::Npm, &name, &version_str, &checksum)?;
             let _ = store.record_audit_log(
+                Ecosystem::Npm,
                 &name,
                 &version_str,
-                &integrity,
+                &checksum.to_display(),
                 "approve_auto_yes",
                 0,
                 "auto_approved_low_risk",
@@ -242,7 +247,14 @@ pub fn run(
         && std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal()
     {
-        interactive_prompt(&store, &name, &version_str, &integrity, &delta)?;
+        interactive_prompt(
+            &store,
+            Ecosystem::Npm,
+            &name,
+            &version_str,
+            &checksum,
+            &delta,
+        )?;
     } else if verdict.band != crate::verdict::VerdictBand::Low {
         if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
             eprintln!(
@@ -272,18 +284,19 @@ pub fn install(
     let (name, version_str) = parse_spec_flexible(pkg_spec, &registry)?;
     let store = BaselineStore::open()?;
 
-    let (verdict, delta, integrity) =
+    let (verdict, delta, checksum) =
         evaluate_package(&name, &version_str, registry_base, &store, &policy)?;
     render_text(&verdict, &delta);
 
     let is_interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let approved = if yes {
         if verdict.band == crate::verdict::VerdictBand::Low {
-            store.mark_clean(&name, &version_str, &integrity)?;
+            store.mark_clean(Ecosystem::Npm, &name, &version_str, &checksum)?;
             let _ = store.record_audit_log(
+                Ecosystem::Npm,
                 &name,
                 &version_str,
-                &integrity,
+                &checksum.to_display(),
                 "approve_auto_yes",
                 0,
                 "auto_approved_low_risk",
@@ -306,7 +319,14 @@ pub fn install(
             false
         }
     } else if is_interactive {
-        interactive_prompt(&store, &name, &version_str, &integrity, &delta)?
+        interactive_prompt(
+            &store,
+            Ecosystem::Npm,
+            &name,
+            &version_str,
+            &checksum,
+            &delta,
+        )?
     } else {
         if verdict.band != crate::verdict::VerdictBand::Low {
             eprintln!(
@@ -332,9 +352,10 @@ pub fn install(
 
 fn interactive_prompt(
     store: &BaselineStore,
+    ecosystem: Ecosystem,
     name: &str,
     version: &str,
-    integrity: &str,
+    checksum: &Checksum,
     delta: &crate::diff::Delta,
 ) -> anyhow::Result<bool> {
     loop {
@@ -348,9 +369,17 @@ fn interactive_prompt(
         let choice = input.trim().to_lowercase();
         match choice.as_str() {
             "a" | "approve" => {
-                store.mark_clean(name, version, integrity)?;
+                store.mark_clean(ecosystem, name, version, checksum)?;
                 let _ = store.record_audit_log(
-                    name, version, integrity, "approve", 0, "approved", "user", None,
+                    ecosystem,
+                    name,
+                    version,
+                    &checksum.to_display(),
+                    "approve",
+                    0,
+                    "approved",
+                    "user",
+                    None,
                 );
                 println!(
                     "Approved {}@{} and marked clean in baseline store.",
@@ -359,8 +388,17 @@ fn interactive_prompt(
                 return Ok(true);
             }
             "h" | "hold" => {
-                let _ = store
-                    .record_audit_log(name, version, integrity, "hold", 0, "held", "user", None);
+                let _ = store.record_audit_log(
+                    ecosystem,
+                    name,
+                    version,
+                    &checksum.to_display(),
+                    "hold",
+                    0,
+                    "held",
+                    "user",
+                    None,
+                );
                 eprintln!("Held {}@{}; release unapproved.", name, version);
                 std::process::exit(2);
             }

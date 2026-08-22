@@ -118,7 +118,8 @@ pub fn fetch_advisories(
     // 1. Check SQLite cache
     let mut stale_fallback = None;
     if let Some(store) = store
-        && let Ok(Some(cached)) = store.get_cached_advisories(package, version)
+        && let Ok(Some(cached)) =
+            store.get_cached_advisories(crate::registry::Ecosystem::Npm, package, version)
     {
         if !cached.is_expired {
             if let Ok(report) = serde_json::from_str::<AdvisoryReport>(&cached.advisories_json) {
@@ -187,6 +188,7 @@ pub fn fetch_advisories(
                     policy.advisories.vulnerable_cache_ttl_secs()
                 };
                 let _ = store.put_cached_advisories(
+                    crate::registry::Ecosystem::Npm,
                     package,
                     version,
                     &report_json,

@@ -43,7 +43,7 @@ pub fn resolve_baseline<R: Registry, V: VersionInfo>(
     registry: &R,
     store: &BaselineStore,
 ) -> Result<BaselineResolution, BluelineError> {
-    let clean_versions = store.list_clean_versions::<V>(name)?;
+    let clean_versions = store.list_clean_versions::<V>(registry.ecosystem(), name)?;
 
     for (clean_ver, stored_integrity) in clean_versions {
         if clean_ver.baseline_eligible_for(target_ver) {
@@ -189,13 +189,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
         store
-            .record_verified("pkg", "1.0.0", &checksum_for("1.0.0").to_sri())
+            .record_verified(Ecosystem::Npm, "pkg", "1.0.0", &checksum_for("1.0.0"))
             .unwrap();
         store
-            .record_verified("pkg", "1.1.0", &checksum_for("1.1.0").to_sri())
+            .record_verified(Ecosystem::Npm, "pkg", "1.1.0", &checksum_for("1.1.0"))
             .unwrap();
         store
-            .mark_clean("pkg", "1.0.0", &checksum_for("1.0.0").to_sri())
+            .mark_clean(Ecosystem::Npm, "pkg", "1.0.0", &checksum_for("1.0.0"))
             .unwrap();
 
         let registry = MockRegistry::new(vec!["1.0.0".into(), "1.1.0".into(), "1.2.0".into()]);
@@ -234,10 +234,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
         store
-            .record_verified("pkg", "1.0.0", &checksum_for("authentic").to_sri())
+            .record_verified(Ecosystem::Npm, "pkg", "1.0.0", &checksum_for("authentic"))
             .unwrap();
         store
-            .mark_clean("pkg", "1.0.0", &checksum_for("authentic").to_sri())
+            .mark_clean(Ecosystem::Npm, "pkg", "1.0.0", &checksum_for("authentic"))
             .unwrap();
 
         // Registry serves a tampered integrity for 1.0.0
@@ -254,10 +254,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
         store
-            .record_verified("pkg", "1.0.0", &checksum_for("authentic").to_sri())
+            .record_verified(Ecosystem::Npm, "pkg", "1.0.0", &checksum_for("authentic"))
             .unwrap();
         store
-            .mark_clean("pkg", "1.0.0", &checksum_for("authentic").to_sri())
+            .mark_clean(Ecosystem::Npm, "pkg", "1.0.0", &checksum_for("authentic"))
             .unwrap();
 
         let mut registry = MockRegistry::new(vec!["1.0.0".into(), "1.1.0".into()]);

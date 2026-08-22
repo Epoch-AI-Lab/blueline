@@ -221,7 +221,10 @@ fn full_flow_json_output() {
         .unwrap();
     assert_eq!(name, "express");
     assert_eq!(version, "4.21.2");
-    assert_eq!(integrity_row, integrity);
+    // The witness is stored in the canonical display form; it must normalize
+    // to the same digest content as the SRI the fixture served.
+    let stored = blueline::registry::Checksum::parse(&integrity_row).unwrap();
+    assert_eq!(stored.to_sri(), integrity);
     assert_eq!(clean, 0, "review records evidence, never a clean blessing");
 }
 
@@ -1374,11 +1377,22 @@ fn regression_pure_json_output_with_yes_and_clean_exit() {
     let data_dir = tempfile::tempdir().unwrap();
     let db_path = data_dir.path().join("baseline.db");
     let store = blueline::store::BaselineStore::open_at(&db_path).unwrap();
+    let seeded_checksum = blueline::registry::Checksum::parse(&safe_integrity).unwrap();
     store
-        .record_verified("pure-json-pkg", "0.9.0", &safe_integrity)
+        .record_verified(
+            blueline::registry::Ecosystem::Npm,
+            "pure-json-pkg",
+            "0.9.0",
+            &seeded_checksum,
+        )
         .unwrap();
     store
-        .mark_clean("pure-json-pkg", "0.9.0", &safe_integrity)
+        .mark_clean(
+            blueline::registry::Ecosystem::Npm,
+            "pure-json-pkg",
+            "0.9.0",
+            &seeded_checksum,
+        )
         .unwrap();
     drop(store);
 

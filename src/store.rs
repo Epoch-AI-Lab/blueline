@@ -4,6 +4,7 @@ use std::path::Path;
 use rusqlite_migration::{M, Migrations};
 
 use crate::error::BluelineError;
+use crate::registry::{Checksum, Ecosystem};
 
 const MIGRATIONS: &[&str] = &[
     "
@@ -59,6 +60,77 @@ const MIGRATIONS: &[&str] = &[
     ) STRICT;
 
     CREATE INDEX idx_audit_pkg_ver ON audit_log(package, version);
+    ",
+    // v3: multi-registry. Every row gains an ecosystem dimension; pre-existing
+    // rows are npm-scoped. PKs must be rebuilt, so the three keyed tables are
+    // swapped via `_new` copies. audit_log has no composite key, so a plain
+    // column addition suffices there.
+    "
+    ALTER TABLE audit_log ADD COLUMN ecosystem TEXT NOT NULL DEFAULT 'npm';
+
+    CREATE TABLE known_clean_new (
+        ecosystem   TEXT NOT NULL,
+        name        TEXT NOT NULL,
+        version     TEXT NOT NULL,
+        integrity   TEXT NOT NULL,
+        clean       INTEGER NOT NULL DEFAULT 0,
+        reviewed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        PRIMARY KEY (ecosystem, name, version)
+    ) STRICT;
+
+    INSERT INTO known_clean_new (ecosystem, name, version, integrity, clean, reviewed_at)
+        SELECT 'npm', name, version, integrity, clean, reviewed_at FROM known_clean;
+
+    DROP TABLE known_clean;
+    ALTER TABLE known_clean_new RENAME TO known_clean;
+
+    CREATE TABLE advisory_cache_new (
+        ecosystem             TEXT NOT NULL,
+        package               TEXT NOT NULL,
+        version               TEXT NOT NULL,
+        advisories_json       TEXT NOT NULL,
+        hit_count             INTEGER NOT NULL DEFAULT 0,
+        has_blocking_advisory INTEGER NOT NULL DEFAULT 0,
+        fetched_at            INTEGER NOT NULL,
+        expires_at            INTEGER NOT NULL,
+        PRIMARY KEY (ecosystem, package, version)
+    ) STRICT;
+
+    INSERT INTO advisory_cache_new (
+            ecosystem, package, version, advisories_json, hit_count,
+            has_blocking_advisory, fetched_at, expires_at)
+        SELECT 'npm', package, version, advisories_json, hit_count,
+               has_blocking_advisory, fetched_at, expires_at
+        FROM advisory_cache;
+
+    DROP TABLE advisory_cache;
+    ALTER TABLE advisory_cache_new RENAME TO advisory_cache;
+
+    CREATE INDEX idx_advisory_cache_expiry ON advisory_cache(expires_at);
+
+    CREATE TABLE provenance_cache_new (
+        ecosystem        TEXT NOT NULL,
+        package          TEXT NOT NULL,
+        version          TEXT NOT NULL,
+        builder_id       TEXT,
+        source_repo      TEXT,
+        commit_sha       TEXT,
+        workflow_path    TEXT,
+        slsa_level       INTEGER NOT NULL DEFAULT 0,
+        signature_valid  INTEGER NOT NULL DEFAULT 0,
+        verified_at      INTEGER NOT NULL,
+        PRIMARY KEY (ecosystem, package, version)
+    ) STRICT;
+
+    INSERT INTO provenance_cache_new (
+            ecosystem, package, version, builder_id, source_repo, commit_sha,
+            workflow_path, slsa_level, signature_valid, verified_at)
+        SELECT 'npm', package, version, builder_id, source_repo, commit_sha,
+               workflow_path, slsa_level, signature_valid, verified_at
+        FROM provenance_cache;
+
+    DROP TABLE provenance_cache;
+    ALTER TABLE provenance_cache_new RENAME TO provenance_cache;
     ",
 ];
 
@@ -184,59 +256,116 @@ impl BaselineStore {
     }
 
     /// Record that `name@version` was integrity-verified. This is evidence,
-    /// not a judgment: `clean` stays 0. Re-recording the identical integrity
+    /// not a judgment: `clean` stays 0. Re-recording the identical checksum
     /// is idempotent and refreshes the timestamp; re-recording a DIFFERENT
-    /// integrity for the same version fails closed, because a republished
+    /// checksum for the same version fails closed, because a republished
     /// tarball under the same version string must not silently overwrite what
-    /// was witnessed before.
+    /// was witnessed before. Comparison is on normalized digest content, so
+    /// legacy SRI rows and new display-form rows are judged alike.
     pub fn record_verified(
         &self,
+        ecosystem: Ecosystem,
         name: &str,
         version: &str,
-        integrity: &str,
+        checksum: &Checksum,
     ) -> Result<(), BluelineError> {
-        if integrity.is_empty() || !integrity.starts_with("sha512-") {
-            return Err(BluelineError::Verification(format!(
-                "invalid integrity hash `{integrity}` for {name}@{version}"
-            )));
+        let stored = self.stored_integrity(ecosystem, name, version)?;
+        match stored {
+            Some(existing) => {
+                let existing = Checksum::parse(&existing).map_err(|_| {
+                    BluelineError::Store(format!(
+                        "integrity changed for {name}@{version}: the stored record no longer matches this \
+                         tarball; refusing to overwrite it"
+                    ))
+                })?;
+                if existing != *checksum {
+                    return Err(BluelineError::Store(format!(
+                        "integrity changed for {name}@{version}: the stored record no longer matches this \
+                         tarball; refusing to overwrite it"
+                    )));
+                }
+                self.conn
+                    .prepare_cached(
+                        "UPDATE known_clean
+                         SET reviewed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                         WHERE ecosystem = ?1 AND name = ?2 AND version = ?3",
+                    )
+                    .map_err(|e| BluelineError::Store(format!("preparing refresh: {e}")))?
+                    .execute(rusqlite::params![ecosystem.key(), name, version])
+                    .map_err(|e| {
+                        BluelineError::Store(format!("recording {name}@{version}: {e}"))
+                    })?;
+                Ok(())
+            }
+            None => {
+                self.conn
+                    .prepare_cached(
+                        "INSERT INTO known_clean (ecosystem, name, version, integrity)
+                         VALUES (?1, ?2, ?3, ?4)",
+                    )
+                    .map_err(|e| BluelineError::Store(format!("preparing upsert: {e}")))?
+                    .execute(rusqlite::params![
+                        ecosystem.key(),
+                        name,
+                        version,
+                        checksum.to_display()
+                    ])
+                    .map_err(|e| {
+                        BluelineError::Store(format!("recording {name}@{version}: {e}"))
+                    })?;
+                Ok(())
+            }
         }
-
-        let affected = self
-            .conn
-            .prepare_cached(
-                "INSERT INTO known_clean (name, version, integrity) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(name, version) DO UPDATE SET
-                     integrity = excluded.integrity,
-                     reviewed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-                 WHERE known_clean.integrity = excluded.integrity",
-            )
-            .map_err(|e| BluelineError::Store(format!("preparing upsert: {e}")))?
-            .execute(rusqlite::params![name, version, integrity])
-            .map_err(|e| BluelineError::Store(format!("recording {name}@{version}: {e}")))?;
-        if affected == 0 {
-            return Err(BluelineError::Store(format!(
-                "integrity changed for {name}@{version}: the stored record no longer matches this \
-                 tarball; refusing to overwrite it"
-            )));
-        }
-        Ok(())
     }
 
-    /// Mark a verified version as clean (user approved).
-    pub fn mark_clean(
+    fn stored_integrity(
         &self,
+        ecosystem: Ecosystem,
         name: &str,
         version: &str,
-        integrity: &str,
+    ) -> Result<Option<String>, BluelineError> {
+        use rusqlite::OptionalExtension;
+        self.conn
+            .prepare_cached(
+                "SELECT integrity FROM known_clean
+                 WHERE ecosystem = ?1 AND name = ?2 AND version = ?3",
+            )
+            .map_err(|e| BluelineError::Store(format!("preparing select: {e}")))?
+            .query_row(rusqlite::params![ecosystem.key(), name, version], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(|e| BluelineError::Store(format!("reading {name}@{version}: {e}")))
+    }
+
+    /// Mark a verified version as clean (user approved). The witness checksum
+    /// must match the stored record's normalized digest.
+    pub fn mark_clean(
+        &self,
+        ecosystem: Ecosystem,
+        name: &str,
+        version: &str,
+        checksum: &Checksum,
     ) -> Result<(), BluelineError> {
+        let stored = self.stored_integrity(ecosystem, name, version)?;
+        let matches = stored
+            .as_deref()
+            .and_then(|s| Checksum::parse(s).ok())
+            .is_some_and(|existing| existing == *checksum);
+        if !matches {
+            return Err(BluelineError::Store(format!(
+                "cannot mark clean {name}@{version}: record missing or integrity mismatch"
+            )));
+        }
         let affected = self
             .conn
             .prepare_cached(
-                "UPDATE known_clean SET clean = 1, reviewed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-                 WHERE name = ?1 AND version = ?2 AND integrity = ?3",
+                "UPDATE known_clean
+                 SET clean = 1, reviewed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                 WHERE ecosystem = ?1 AND name = ?2 AND version = ?3",
             )
             .map_err(|e| BluelineError::Store(format!("preparing mark_clean: {e}")))?
-            .execute(rusqlite::params![name, version, integrity])
+            .execute(rusqlite::params![ecosystem.key(), name, version])
             .map_err(|e| BluelineError::Store(format!("marking clean {name}@{version}: {e}")))?;
         if affected == 0 {
             return Err(BluelineError::Store(format!(
@@ -249,16 +378,18 @@ impl BaselineStore {
     /// Retrieve all versions marked clean for a package, sorted descending.
     pub fn list_clean_versions<V: crate::version::VersionInfo>(
         &self,
+        ecosystem: Ecosystem,
         name: &str,
     ) -> Result<Vec<(V, String)>, BluelineError> {
         let mut stmt = self
             .conn
             .prepare_cached(
-                "SELECT version, integrity FROM known_clean WHERE name = ?1 AND clean = 1",
+                "SELECT version, integrity FROM known_clean
+                 WHERE ecosystem = ?1 AND name = ?2 AND clean = 1",
             )
             .map_err(|e| BluelineError::Store(format!("preparing select clean: {e}")))?;
         let rows = stmt
-            .query_map(rusqlite::params![name], |row| {
+            .query_map(rusqlite::params![ecosystem.key(), name], |row| {
                 let ver_str: String = row.get(0)?;
                 let integrity: String = row.get(1)?;
                 Ok((ver_str, integrity))
@@ -279,20 +410,31 @@ impl BaselineStore {
     }
 
     #[cfg(test)]
-    pub fn known_clean(&self, name: &str, version: &str) -> Result<Option<String>, BluelineError> {
+    pub fn known_clean(
+        &self,
+        ecosystem: Ecosystem,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<String>, BluelineError> {
         use rusqlite::OptionalExtension;
         let mut stmt = self
             .conn
-            .prepare_cached("SELECT integrity FROM known_clean WHERE name = ?1 AND version = ?2")
+            .prepare_cached(
+                "SELECT integrity FROM known_clean
+                 WHERE ecosystem = ?1 AND name = ?2 AND version = ?3",
+            )
             .map_err(|e| BluelineError::Store(format!("preparing select: {e}")))?;
-        stmt.query_row(rusqlite::params![name, version], |row| row.get(0))
-            .optional()
-            .map_err(|e| BluelineError::Store(format!("reading {name}@{version}: {e}")))
+        stmt.query_row(rusqlite::params![ecosystem.key(), name, version], |row| {
+            row.get(0)
+        })
+        .optional()
+        .map_err(|e| BluelineError::Store(format!("reading {name}@{version}: {e}")))
     }
 
     /// Retrieve cached advisories for `package@version` if present.
     pub fn get_cached_advisories(
         &self,
+        ecosystem: Ecosystem,
         package: &str,
         version: &str,
     ) -> Result<Option<CachedAdvisories>, BluelineError> {
@@ -301,7 +443,7 @@ impl BaselineStore {
             .conn
             .prepare_cached(
                 "SELECT advisories_json, hit_count, has_blocking_advisory, fetched_at, expires_at
-                 FROM advisory_cache WHERE package = ?1 AND version = ?2",
+                 FROM advisory_cache WHERE ecosystem = ?1 AND package = ?2 AND version = ?3",
             )
             .map_err(|e| BluelineError::Store(format!("preparing get_cached_advisories: {e}")))?;
 
@@ -310,21 +452,24 @@ impl BaselineStore {
             .unwrap_or_default()
             .as_secs() as i64;
 
-        stmt.query_row(rusqlite::params![package, version], |row| {
-            let json: String = row.get(0)?;
-            let hit_count: i64 = row.get(1)?;
-            let has_blocking: i64 = row.get(2)?;
-            let fetched_at: i64 = row.get(3)?;
-            let expires_at: i64 = row.get(4)?;
-            Ok(CachedAdvisories {
-                advisories_json: json,
-                hit_count: hit_count.max(0) as usize,
-                has_blocking: has_blocking != 0,
-                fetched_at,
-                expires_at,
-                is_expired: now >= expires_at,
-            })
-        })
+        stmt.query_row(
+            rusqlite::params![ecosystem.key(), package, version],
+            |row| {
+                let json: String = row.get(0)?;
+                let hit_count: i64 = row.get(1)?;
+                let has_blocking: i64 = row.get(2)?;
+                let fetched_at: i64 = row.get(3)?;
+                let expires_at: i64 = row.get(4)?;
+                Ok(CachedAdvisories {
+                    advisories_json: json,
+                    hit_count: hit_count.max(0) as usize,
+                    has_blocking: has_blocking != 0,
+                    fetched_at,
+                    expires_at,
+                    is_expired: now >= expires_at,
+                })
+            },
+        )
         .optional()
         .map_err(|e| {
             BluelineError::Store(format!(
@@ -334,8 +479,10 @@ impl BaselineStore {
     }
 
     /// Cache advisory results for `package@version` with a specified TTL in seconds.
+    #[allow(clippy::too_many_arguments)]
     pub fn put_cached_advisories(
         &self,
+        ecosystem: Ecosystem,
         package: &str,
         version: &str,
         advisories_json: &str,
@@ -351,9 +498,9 @@ impl BaselineStore {
 
         self.conn
             .prepare_cached(
-                "INSERT INTO advisory_cache (package, version, advisories_json, hit_count, has_blocking_advisory, fetched_at, expires_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(package, version) DO UPDATE SET
+                "INSERT INTO advisory_cache (ecosystem, package, version, advisories_json, hit_count, has_blocking_advisory, fetched_at, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(ecosystem, package, version) DO UPDATE SET
                      advisories_json = excluded.advisories_json,
                      hit_count = excluded.hit_count,
                      has_blocking_advisory = excluded.has_blocking_advisory,
@@ -362,6 +509,7 @@ impl BaselineStore {
             )
             .map_err(|e| BluelineError::Store(format!("preparing put_cached_advisories: {e}")))?
             .execute(rusqlite::params![
+                ecosystem.key(),
                 package,
                 version,
                 advisories_json,
@@ -391,6 +539,7 @@ impl BaselineStore {
     #[allow(clippy::too_many_arguments)]
     pub fn record_provenance(
         &self,
+        ecosystem: Ecosystem,
         package: &str,
         version: &str,
         builder_id: Option<&str>,
@@ -407,9 +556,9 @@ impl BaselineStore {
 
         self.conn
             .prepare_cached(
-                "INSERT INTO provenance_cache (package, version, builder_id, source_repo, commit_sha, workflow_path, slsa_level, signature_valid, verified_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                 ON CONFLICT(package, version) DO UPDATE SET
+                "INSERT INTO provenance_cache (ecosystem, package, version, builder_id, source_repo, commit_sha, workflow_path, slsa_level, signature_valid, verified_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(ecosystem, package, version) DO UPDATE SET
                      builder_id = excluded.builder_id,
                      source_repo = excluded.source_repo,
                      commit_sha = excluded.commit_sha,
@@ -420,6 +569,7 @@ impl BaselineStore {
             )
             .map_err(|e| BluelineError::Store(format!("preparing record_provenance: {e}")))?
             .execute(rusqlite::params![
+                ecosystem.key(),
                 package,
                 version,
                 builder_id,
@@ -440,6 +590,7 @@ impl BaselineStore {
     /// Retrieve cached provenance metadata for `package@version`.
     pub fn get_cached_provenance(
         &self,
+        ecosystem: Ecosystem,
         package: &str,
         version: &str,
     ) -> Result<Option<CachedProvenance>, BluelineError> {
@@ -448,28 +599,31 @@ impl BaselineStore {
             .conn
             .prepare_cached(
                 "SELECT builder_id, source_repo, commit_sha, workflow_path, slsa_level, signature_valid, verified_at
-                 FROM provenance_cache WHERE package = ?1 AND version = ?2",
+                 FROM provenance_cache WHERE ecosystem = ?1 AND package = ?2 AND version = ?3",
             )
             .map_err(|e| BluelineError::Store(format!("preparing get_cached_provenance: {e}")))?;
 
-        stmt.query_row(rusqlite::params![package, version], |row| {
-            let builder_id: Option<String> = row.get(0)?;
-            let source_repo: Option<String> = row.get(1)?;
-            let commit_sha: Option<String> = row.get(2)?;
-            let workflow_path: Option<String> = row.get(3)?;
-            let slsa_level: i64 = row.get(4)?;
-            let signature_valid: i64 = row.get(5)?;
-            let verified_at: i64 = row.get(6)?;
-            Ok(CachedProvenance {
-                builder_id,
-                source_repo,
-                commit_sha,
-                workflow_path,
-                slsa_level: slsa_level.max(0) as u32,
-                signature_valid: signature_valid != 0,
-                verified_at,
-            })
-        })
+        stmt.query_row(
+            rusqlite::params![ecosystem.key(), package, version],
+            |row| {
+                let builder_id: Option<String> = row.get(0)?;
+                let source_repo: Option<String> = row.get(1)?;
+                let commit_sha: Option<String> = row.get(2)?;
+                let workflow_path: Option<String> = row.get(3)?;
+                let slsa_level: i64 = row.get(4)?;
+                let signature_valid: i64 = row.get(5)?;
+                let verified_at: i64 = row.get(6)?;
+                Ok(CachedProvenance {
+                    builder_id,
+                    source_repo,
+                    commit_sha,
+                    workflow_path,
+                    slsa_level: slsa_level.max(0) as u32,
+                    signature_valid: signature_valid != 0,
+                    verified_at,
+                })
+            },
+        )
         .optional()
         .map_err(|e| {
             BluelineError::Store(format!(
@@ -482,6 +636,7 @@ impl BaselineStore {
     #[allow(clippy::too_many_arguments)]
     pub fn record_audit_log(
         &self,
+        ecosystem: Ecosystem,
         package: &str,
         version: &str,
         integrity: &str,
@@ -498,11 +653,12 @@ impl BaselineStore {
 
         self.conn
             .prepare_cached(
-                "INSERT INTO audit_log (package, version, integrity, action, score, verdict, decided_by, notes, decided_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO audit_log (ecosystem, package, version, integrity, action, score, verdict, decided_by, notes, decided_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )
             .map_err(|e| BluelineError::Store(format!("preparing record_audit_log: {e}")))?
             .execute(rusqlite::params![
+                ecosystem.key(),
                 package,
                 version,
                 integrity,
@@ -538,24 +694,43 @@ fn default_db_path() -> Result<std::path::PathBuf, BluelineError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::ChecksumAlg;
+    use sha2::{Digest, Sha512};
+
+    fn ck(tag: &str) -> Checksum {
+        let mut hasher = Sha512::new();
+        hasher.update(tag.as_bytes());
+        Checksum {
+            alg: ChecksumAlg::Sha512,
+            value_hex: format!("{:x}", hasher.finalize()),
+        }
+    }
 
     #[test]
     fn records_verified_witness_as_unclean() {
         let dir = tempfile::tempdir().unwrap();
         let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
         store
-            .record_verified("express", "4.21.2", "sha512-abc")
+            .record_verified(Ecosystem::Npm, "express", "4.21.2", &ck("abc"))
             .unwrap();
         assert_eq!(
-            store.known_clean("express", "4.21.2").unwrap().as_deref(),
-            Some("sha512-abc")
+            store
+                .known_clean(Ecosystem::Npm, "express", "4.21.2")
+                .unwrap()
+                .as_deref(),
+            Some(ck("abc").to_display().as_str())
         );
-        assert_eq!(store.known_clean("express", "4.21.1").unwrap(), None);
+        assert_eq!(
+            store
+                .known_clean(Ecosystem::Npm, "express", "4.21.1")
+                .unwrap(),
+            None
+        );
         let unclean: i64 = {
             let conn = rusqlite::Connection::open(dir.path().join("t.db")).unwrap();
             conn.query_row(
                 "SELECT COUNT(*) FROM known_clean
-                 WHERE name = 'express' AND version = '4.21.2' AND clean = 0",
+                 WHERE ecosystem = 'npm' AND name = 'express' AND version = '4.21.2' AND clean = 0",
                 [],
                 |r| r.get(0),
             )
@@ -568,11 +743,24 @@ mod tests {
     fn re_record_with_same_integrity_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
-        store.record_verified("pkg", "1.0.0", "sha512-one").unwrap();
-        store.record_verified("pkg", "1.0.0", "sha512-one").unwrap();
+        store
+            .record_verified(Ecosystem::Npm, "pkg", "1.0.0", &ck("one"))
+            .unwrap();
+        // Same digest content in a different accepted spelling is still idempotent.
+        store
+            .record_verified(
+                Ecosystem::Npm,
+                "pkg",
+                "1.0.0",
+                &Checksum::parse(&ck("one").to_sri()).unwrap(),
+            )
+            .unwrap();
         assert_eq!(
-            store.known_clean("pkg", "1.0.0").unwrap().as_deref(),
-            Some("sha512-one")
+            store
+                .known_clean(Ecosystem::Npm, "pkg", "1.0.0")
+                .unwrap()
+                .as_deref(),
+            Some(ck("one").to_display().as_str())
         );
         let count: i64 = {
             let conn = rusqlite::Connection::open(dir.path().join("t.db")).unwrap();
@@ -586,15 +774,159 @@ mod tests {
     fn integrity_change_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
-        store.record_verified("pkg", "1.0.0", "sha512-one").unwrap();
+        store
+            .record_verified(Ecosystem::Npm, "pkg", "1.0.0", &ck("one"))
+            .unwrap();
         let err = store
-            .record_verified("pkg", "1.0.0", "sha512-two")
+            .record_verified(Ecosystem::Npm, "pkg", "1.0.0", &ck("two"))
             .unwrap_err();
         assert!(err.to_string().contains("integrity changed"));
         assert_eq!(
-            store.known_clean("pkg", "1.0.0").unwrap().as_deref(),
-            Some("sha512-one"),
+            store
+                .known_clean(Ecosystem::Npm, "pkg", "1.0.0")
+                .unwrap()
+                .as_deref(),
+            Some(ck("one").to_display().as_str()),
             "the stored record must survive a rejected rewrite"
+        );
+    }
+
+    #[test]
+    fn ecosystems_are_isolated() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
+        store
+            .record_verified(Ecosystem::Npm, "pkg", "1.0.0", &ck("npm"))
+            .unwrap();
+        // The same name@version under another ecosystem is an independent row.
+        store
+            .record_verified(Ecosystem::Cargo, "pkg", "1.0.0", &ck("cargo"))
+            .unwrap();
+        assert_eq!(
+            store.known_clean(Ecosystem::Npm, "pkg", "1.0.0").unwrap(),
+            Some(ck("npm").to_display())
+        );
+        assert_eq!(
+            store.known_clean(Ecosystem::Cargo, "pkg", "1.0.0").unwrap(),
+            Some(ck("cargo").to_display())
+        );
+
+        // Approving cargo must not bless the npm row.
+        store
+            .mark_clean(Ecosystem::Cargo, "pkg", "1.0.0", &ck("cargo"))
+            .unwrap();
+        assert_eq!(
+            store
+                .list_clean_versions::<semver::Version>(Ecosystem::Npm, "pkg")
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            store
+                .list_clean_versions::<semver::Version>(Ecosystem::Cargo, "pkg")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn migration_v2_to_v3_scopes_old_rows_to_npm() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.db");
+        let legacy_checksum = ck("legacy");
+
+        // Build a legacy v2 database (first three migrations only).
+        {
+            let mut conn = rusqlite::Connection::open(&db_path).unwrap();
+            let migrations =
+                Migrations::new(MIGRATIONS.iter().take(3).map(|sql| M::up(sql)).collect());
+            migrations.to_latest(&mut conn).unwrap();
+            conn.execute(
+                "INSERT INTO known_clean (name, version, integrity, clean) VALUES ('legacy', '1.0.0', ?1, 1)",
+                rusqlite::params![legacy_checksum.to_sri()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO advisory_cache (package, version, advisories_json, fetched_at, expires_at)
+                 VALUES ('legacy', '1.0.0', '{}', 0, 9223372036854775807)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO provenance_cache (package, version, verified_at) VALUES ('legacy', '1.0.0', 42)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO audit_log (package, version, integrity, action, score, verdict, decided_by, decided_at)
+                 VALUES ('legacy', '1.0.0', 'sha512-YWJjZA==', 'approve', 0, 'LOW', 'user', 7)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Reopening runs the v3 migration; legacy rows must survive npm-scoped.
+        let store = BaselineStore::open_at(&db_path).unwrap();
+
+        let clean = store
+            .list_clean_versions::<semver::Version>(Ecosystem::Npm, "legacy")
+            .unwrap();
+        assert_eq!(clean.len(), 1);
+        assert_eq!(clean[0].0.to_string(), "1.0.0");
+        // The legacy SRI value survives verbatim and normalizes to the same content.
+        assert_eq!(clean[0].1, legacy_checksum.to_sri());
+        assert_eq!(Checksum::parse(&clean[0].1).unwrap(), legacy_checksum);
+
+        assert!(
+            store
+                .get_cached_advisories(Ecosystem::Npm, "legacy", "1.0.0")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .get_cached_provenance(Ecosystem::Npm, "legacy", "1.0.0")
+                .unwrap()
+                .is_some()
+        );
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let audit_eco: String = conn
+                .query_row(
+                    "SELECT ecosystem FROM audit_log WHERE package = 'legacy'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(audit_eco, "npm");
+        }
+
+        // The rebuilt PK admits a non-npm row at the same name@version.
+        store
+            .record_verified(Ecosystem::PyPi, "legacy", "1.0.0", &ck("pypi"))
+            .unwrap();
+
+        // Tamper guard compares normalized content across accepted spellings:
+        // same digest in display form is idempotent against the legacy SRI row...
+        store
+            .record_verified(Ecosystem::Npm, "legacy", "1.0.0", &legacy_checksum)
+            .unwrap();
+        // ...and a genuinely different digest still fails closed.
+        assert!(
+            store
+                .record_verified(
+                    Ecosystem::Npm,
+                    "legacy",
+                    "1.0.0",
+                    &Checksum {
+                        alg: ChecksumAlg::Sha512,
+                        value_hex: format!("{:x}", Sha512::digest(b"tampered")),
+                    },
+                )
+                .is_err()
         );
     }
 
@@ -610,40 +942,51 @@ mod tests {
     fn mark_clean_and_list_clean_versions() {
         let dir = tempfile::tempdir().unwrap();
         let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
-        store.record_verified("pkg", "1.0.0", "sha512-v1").unwrap();
-        store.record_verified("pkg", "1.1.0", "sha512-v2").unwrap();
-        store.record_verified("pkg", "2.0.0", "sha512-v3").unwrap();
+        store
+            .record_verified(Ecosystem::Npm, "pkg", "1.0.0", &ck("v1"))
+            .unwrap();
+        store
+            .record_verified(Ecosystem::Npm, "pkg", "1.1.0", &ck("v2"))
+            .unwrap();
+        store
+            .record_verified(Ecosystem::Npm, "pkg", "2.0.0", &ck("v3"))
+            .unwrap();
 
         assert!(
             store
-                .list_clean_versions::<semver::Version>("pkg")
+                .list_clean_versions::<semver::Version>(Ecosystem::Npm, "pkg")
                 .unwrap()
                 .is_empty()
         );
 
-        store.mark_clean("pkg", "1.0.0", "sha512-v1").unwrap();
-        store.mark_clean("pkg", "2.0.0", "sha512-v3").unwrap();
+        store
+            .mark_clean(Ecosystem::Npm, "pkg", "1.0.0", &ck("v1"))
+            .unwrap();
+        store
+            .mark_clean(Ecosystem::Npm, "pkg", "2.0.0", &ck("v3"))
+            .unwrap();
 
-        let clean = store.list_clean_versions::<semver::Version>("pkg").unwrap();
+        let clean = store
+            .list_clean_versions::<semver::Version>(Ecosystem::Npm, "pkg")
+            .unwrap();
         assert_eq!(clean.len(), 2);
         assert_eq!(clean[0].0, semver::Version::parse("2.0.0").unwrap());
-        assert_eq!(clean[0].1, "sha512-v3");
+        assert_eq!(Checksum::parse(&clean[0].1).unwrap(), ck("v3"));
         assert_eq!(clean[1].0, semver::Version::parse("1.0.0").unwrap());
-        assert_eq!(clean[1].1, "sha512-v1");
+        assert_eq!(Checksum::parse(&clean[1].1).unwrap(), ck("v1"));
 
         // Marking unrecorded version errors
-        assert!(store.mark_clean("pkg", "3.0.0", "sha512-v4").is_err());
+        assert!(
+            store
+                .mark_clean(Ecosystem::Npm, "pkg", "3.0.0", &ck("v4"))
+                .is_err()
+        );
         // Marking with mismatched integrity errors
-        assert!(store.mark_clean("pkg", "1.0.0", "sha512-wrong").is_err());
-    }
-
-    #[test]
-    fn rejects_empty_or_whitespace_only_integrity() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
-        assert!(store.record_verified("pkg", "1.0.0", "").is_err());
-        assert!(store.record_verified("pkg", "1.0.0", "   ").is_err());
-        assert!(store.record_verified("pkg", "1.0.0", "\t\n").is_err());
+        assert!(
+            store
+                .mark_clean(Ecosystem::Npm, "pkg", "1.0.0", &ck("wrong"))
+                .is_err()
+        );
     }
 
     #[test]
@@ -670,17 +1013,25 @@ mod tests {
 
         assert!(
             store
-                .get_cached_advisories("pkg", "1.0.0")
+                .get_cached_advisories(Ecosystem::Npm, "pkg", "1.0.0")
                 .unwrap()
                 .is_none()
         );
 
         store
-            .put_cached_advisories("pkg", "1.0.0", r#"{"vulns":[]}"#, 0, false, 3600)
+            .put_cached_advisories(
+                Ecosystem::Npm,
+                "pkg",
+                "1.0.0",
+                r#"{"vulns":[]}"#,
+                0,
+                false,
+                3600,
+            )
             .unwrap();
 
         let cached = store
-            .get_cached_advisories("pkg", "1.0.0")
+            .get_cached_advisories(Ecosystem::Npm, "pkg", "1.0.0")
             .unwrap()
             .unwrap();
         assert_eq!(cached.advisories_json, r#"{"vulns":[]}"#);
@@ -690,10 +1041,18 @@ mod tests {
 
         // Test expired advisory cache entry
         store
-            .put_cached_advisories("pkg", "2.0.0", r#"{"vulns":[]}"#, 1, true, -10)
+            .put_cached_advisories(
+                Ecosystem::Npm,
+                "pkg",
+                "2.0.0",
+                r#"{"vulns":[]}"#,
+                1,
+                true,
+                -10,
+            )
             .unwrap();
         let expired = store
-            .get_cached_advisories("pkg", "2.0.0")
+            .get_cached_advisories(Ecosystem::Npm, "pkg", "2.0.0")
             .unwrap()
             .unwrap();
         assert!(expired.is_expired);
@@ -705,13 +1064,13 @@ mod tests {
         assert_eq!(cleared, 2);
         assert!(
             store
-                .get_cached_advisories("pkg", "1.0.0")
+                .get_cached_advisories(Ecosystem::Npm, "pkg", "1.0.0")
                 .unwrap()
                 .is_none()
         );
         assert!(
             store
-                .get_cached_advisories("pkg", "2.0.0")
+                .get_cached_advisories(Ecosystem::Npm, "pkg", "2.0.0")
                 .unwrap()
                 .is_none()
         );
@@ -724,13 +1083,14 @@ mod tests {
 
         assert!(
             store
-                .get_cached_provenance("pkg", "1.0.0")
+                .get_cached_provenance(Ecosystem::Npm, "pkg", "1.0.0")
                 .unwrap()
                 .is_none()
         );
 
         store
             .record_provenance(
+                Ecosystem::Npm,
                 "pkg",
                 "1.0.0",
                 Some("https://github.com/actions/runner"),
@@ -743,7 +1103,7 @@ mod tests {
             .unwrap();
 
         let prov = store
-            .get_cached_provenance("pkg", "1.0.0")
+            .get_cached_provenance(Ecosystem::Npm, "pkg", "1.0.0")
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -771,9 +1131,10 @@ mod tests {
 
         store
             .record_audit_log(
+                Ecosystem::Npm,
                 "pkg",
                 "1.0.0",
-                "sha512-test",
+                &ck("test").to_display(),
                 "approve",
                 15,
                 "LOW",
@@ -803,7 +1164,7 @@ mod tests {
 
         assert_eq!(pkg, "pkg");
         assert_eq!(ver, "1.0.0");
-        assert_eq!(integrity, "sha512-test");
+        assert_eq!(integrity, ck("test").to_display());
         assert_eq!(action, "approve");
         assert_eq!(score, 15);
         assert_eq!(verdict, "LOW");
@@ -813,9 +1174,20 @@ mod tests {
 
     mod proptest_invariants {
         use super::*;
+        use crate::registry::ChecksumAlg;
         use proptest::collection;
         use proptest::prelude::*;
+        use sha2::{Digest, Sha512};
         use std::collections::BTreeMap;
+
+        fn ck(tag: &str) -> Checksum {
+            let mut hasher = Sha512::new();
+            hasher.update(tag.as_bytes());
+            Checksum {
+                alg: ChecksumAlg::Sha512,
+                value_hex: format!("{:x}", hasher.finalize()),
+            }
+        }
 
         // K distinct (name, version) keys plus a sequence of actions that
         // reference them. Each action re-verifies a key with either its true
@@ -855,30 +1227,31 @@ mod tests {
                 let store = BaselineStore::open_at(&path).unwrap();
 
                 // Per key index: a "true" integrity and a conflicting one.
-                let good: Vec<String> =
-                    (0..keys.len()).map(|i| format!("sha512-good-{i}")).collect();
-                let bad: Vec<String> =
-                    (0..keys.len()).map(|i| format!("sha512-bad-{i}")).collect();
+                let good: Vec<Checksum> =
+                    (0..keys.len()).map(|i| ck(&format!("good-{i}"))).collect();
+                let bad: Vec<Checksum> =
+                    (0..keys.len()).map(|i| ck(&format!("bad-{i}"))).collect();
 
                 // key -> the integrity the store is currently expected to hold.
-                let mut committed: BTreeMap<(String, String), String> = BTreeMap::new();
+                let mut committed: BTreeMap<(String, String), Checksum> = BTreeMap::new();
 
                 for (ki, use_bad) in actions {
                     let key = keys[ki].clone();
-                    let integrity = if use_bad { bad[ki].clone() } else { good[ki].clone() };
+                    let checksum = if use_bad { bad[ki].clone() } else { good[ki].clone() };
                     let expected_ok = match committed.get(&key) {
                         None => true,
-                        Some(v) => v == &integrity,
+                        Some(v) => v == &checksum,
                     };
-                    let result = store.record_verified(&key.0, &key.1, &integrity);
+                    let result = store.record_verified(Ecosystem::Npm, &key.0, &key.1, &checksum);
                     if expected_ok {
                         prop_assert!(
                             result.is_ok(),
-                            "expected success for {}@{} with {integrity}",
+                            "expected success for {}@{} with {}",
                             key.0,
-                            key.1
+                            key.1,
+                            checksum.to_display()
                         );
-                        committed.insert(key, integrity);
+                        committed.insert(key, checksum);
                     } else {
                         prop_assert!(
                             result.is_err(),
@@ -892,17 +1265,18 @@ mod tests {
                 // Invariant after the whole sequence: every committed row is
                 // exactly what we wrote, and nothing was ever blessed clean.
                 let conn = rusqlite::Connection::open(&path).unwrap();
-                for (key, integrity) in &committed {
+                for (key, checksum) in &committed {
                     let (stored, clean): (String, i64) = conn
                         .query_row(
                             "SELECT integrity, clean FROM known_clean
-                             WHERE name = ?1 AND version = ?2",
+                             WHERE ecosystem = 'npm' AND name = ?1 AND version = ?2",
                             rusqlite::params![key.0, key.1],
                             |r| Ok((r.get(0)?, r.get(1)?)),
                         )
                         .unwrap();
                     prop_assert_eq!(
-                        &stored, integrity,
+                        stored,
+                        checksum.to_display(),
                         "integrity must stay immutable for a given version"
                     );
                     prop_assert_eq!(clean, 0, "a review is evidence, never clean=1");
