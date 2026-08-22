@@ -173,7 +173,7 @@ fn bootstrap_hint(verdict: &crate::verdict::Verdict) -> Option<String> {
             verdict.baseline_version.as_deref().unwrap_or("unknown"),
         );
         Some(format!(
-            "hint: baseline `{name}@{base}` was never approved locally. Run `blueline review {name}@{base}` from an interactive terminal and approve it to establish a baseline."
+            "hint: baseline `{name}@{base}` was never approved locally. Approve it when prompted during an interactive `blueline review`, or run `blueline review {name}@{base}` directly."
         ))
     } else if verdict
         .findings
@@ -416,6 +416,8 @@ fn interactive_prompt(
                 }
                 if !showed_any {
                     println!("\nNo text diffs available.");
+                } else {
+                    println!("\n─── end of blueline diff (trusted output resumes) ───");
                 }
             }
             _ => {
@@ -428,46 +430,69 @@ fn interactive_prompt(
 }
 
 /// Offers to approve the unreviewed baseline in the same session. The
-/// baseline was already fetched, sha512-verified against `dist.integrity`,
-/// and diffed during this review, so approving it records a trust decision
-/// over bytes that were verified moments ago. Anything other than an
-/// explicit `y` leaves it unapproved (fail closed).
+/// baseline tarball was already fetched and sha512-verified against
+/// `dist.integrity` during this review, so approving it records a trust
+/// decision over bytes that were verified moments ago. Anything other than
+/// an explicit `y` or `yes` leaves it unapproved (fail closed). A store
+/// failure here never undoes the target approval; the baseline simply
+/// stays unapproved.
 fn offer_baseline_approval(
     store: &BaselineStore,
     name: &str,
     base: &UnreviewedBaseline,
 ) -> anyhow::Result<()> {
+    offer_baseline_approval_with_reader(store, name, base, &mut std::io::stdin().lock())
+}
+
+fn offer_baseline_approval_with_reader(
+    store: &BaselineStore,
+    name: &str,
+    base: &UnreviewedBaseline,
+    reader: &mut dyn std::io::BufRead,
+) -> anyhow::Result<()> {
     print!(
-        "\nAlso approve unreviewed baseline {name}@{base} (fetched, sha512-verified, \
-         and diffed above)? [y/N] > ",
+        "\nAlso approve unreviewed baseline {name}@{base} (tarball fetched and \
+         sha512-verified this session)? [y/N] > ",
+        name = crate::render::sanitize_single_line(name),
         base = crate::render::sanitize_single_line(&base.version)
     );
     std::io::stdout().flush()?;
     let mut input = String::new();
-    if std::io::stdin().read_line(&mut input)? == 0 {
+    if reader.read_line(&mut input)? == 0 {
         return Ok(());
     }
-    if !input.trim().to_lowercase().starts_with('y') {
+    if !matches!(input.trim().to_lowercase().as_str(), "y" | "yes") {
         return Ok(());
     }
     // The baseline tarball was fetched and sha512-verified during this
     // review but only the target gets record_verified there, so record the
     // baseline row now; mark_clean requires an existing matching record.
-    store.record_verified(name, &base.version, &base.integrity)?;
-    store.mark_clean(name, &base.version, &base.integrity)?;
-    let _ = store.record_audit_log(
-        name,
-        &base.version,
-        &base.integrity,
-        "approve",
-        0,
-        "approved_baseline_chain",
-        "user",
-        None,
-    );
+    let outcome = (|| -> anyhow::Result<()> {
+        store.record_verified(name, &base.version, &base.integrity)?;
+        store.mark_clean(name, &base.version, &base.integrity)?;
+        let _ = store.record_audit_log(
+            name,
+            &base.version,
+            &base.integrity,
+            "approve",
+            0,
+            "approved_baseline_chain",
+            "user",
+            None,
+        );
+        Ok(())
+    })();
+    if let Err(e) = outcome {
+        eprintln!(
+            "note: could not approve baseline {name}@{}: {e:#}; baseline left unapproved",
+            base.version
+        );
+        return Ok(());
+    }
     println!(
         "Approved baseline {}@{} and marked clean in baseline store.",
-        name, base.version
+        crate::render::sanitize_single_line(name),
+        crate::render::sanitize_single_line(&base.version)
     );
     Ok(())
 }
@@ -556,5 +581,70 @@ mod tests {
     #[test]
     fn rejects_bad_semver() {
         assert!(parse_spec("express@latest").is_err());
+    }
+
+    fn test_baseline() -> UnreviewedBaseline {
+        UnreviewedBaseline {
+            version: "0.9.0".into(),
+            integrity: "sha512-baseline".into(),
+        }
+    }
+
+    #[test]
+    fn chain_approval_requires_explicit_yes() {
+        for answer in ["n\n", "no\n", "yeah\n", "yolo\n", "\x1b\n"] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
+            offer_baseline_approval_with_reader(
+                &store,
+                "pkg",
+                &test_baseline(),
+                &mut answer.as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(
+                store.known_clean("pkg", "0.9.0").unwrap(),
+                None,
+                "answer {answer:?} must not approve"
+            );
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
+        offer_baseline_approval_with_reader(&store, "pkg", &test_baseline(), &mut b"".as_slice())
+            .unwrap();
+        assert_eq!(
+            store.known_clean("pkg", "0.9.0").unwrap(),
+            None,
+            "EOF must decline"
+        );
+    }
+
+    #[test]
+    fn chain_approval_accepts_y_and_yes() {
+        for answer in ["y\n", "yes\n", "  Y  \n"] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("t.db");
+            let store = BaselineStore::open_at(&db).unwrap();
+            offer_baseline_approval_with_reader(
+                &store,
+                "pkg",
+                &test_baseline(),
+                &mut answer.as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(
+                store.known_clean("pkg", "0.9.0").unwrap().as_deref(),
+                Some("sha512-baseline"),
+                "answer {answer:?} must approve"
+            );
+            assert!(
+                store
+                    .list_clean_versions("pkg")
+                    .unwrap()
+                    .iter()
+                    .any(|(v, _)| v.to_string() == "0.9.0")
+            );
+        }
     }
 }

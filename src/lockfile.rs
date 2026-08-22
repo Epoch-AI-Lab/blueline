@@ -259,6 +259,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn invalid_json_has_no_source_chain() {
+        use std::error::Error;
+        // The Display already embeds the serde detail; a `source()` would
+        // make `{e:#}` in main print the detail twice.
+        let err =
+            LockfileError::from(serde_json::from_str::<serde_json::Value>("{{{{").unwrap_err());
+        assert!(err.source().is_none(), "source must be None: {err:#}");
+    }
+
+    #[test]
     fn parses_v3_lockfile() {
         let json = r#"{
             "name": "my-app",
