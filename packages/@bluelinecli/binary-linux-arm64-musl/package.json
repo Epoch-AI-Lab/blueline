@@ -3,6 +3,10 @@
   "version": "0.2.0",
   "description": "Native blueline binary for linux-arm64-musl",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Epoch-AI-Lab/blueline.git"
+  },
   "os": [
     "linux"
   ],
