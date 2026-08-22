@@ -37,6 +37,7 @@ runs:
         INPUT_LOCKFILE_PATH: ${{ inputs.lockfile-path }}
         INPUT_FAIL_ON: ${{ inputs.fail-on }}
         INPUT_POLICY_PATH: ${{ inputs.policy-path }}
+        INPUT_OUTPUT_FILE: ${{ inputs.output-file }}
       run: |
         BASE="${INPUT_BASE_REF:-${GITHUB_BASE_REF:-origin/main}}"
         if ! git rev-parse --verify --quiet "$BASE" >/dev/null 2>&1; then
