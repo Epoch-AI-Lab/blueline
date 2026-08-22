@@ -1,6 +1,6 @@
 {
   "name": "@bluelinecli/binary-linux-arm64-musl",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Native blueline binary for linux-arm64-musl",
   "license": "MIT",
   "os": [
