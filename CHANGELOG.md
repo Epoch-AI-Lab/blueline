@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Tag-triggered release pipeline (`.github/workflows/release.yml`): cross-built
+  native binaries for linux (x64 glibc/musl, arm64), macOS (x64, arm64), and
+  Windows (x64, arm64), published as `@bluelinecli/binary-*` npm packages with
+  provenance and attached to GitHub releases with SHA256SUMS.
+- Release smoke gate: the shipped artifact must review a real package
+  end-to-end through the npm path before shims publish.
+- Dogfood CI job: our own composite Action reviews our own npm distribution
+  lockfile (`package-lock.json`) on every PR.
+
 - Published npm distribution: `blueline` and `@bluelinecli/cli` shims with the
   native binary delivered via `@bluelinecli/binary-*` platform packages
   (linux-x64-gnu at v0.1.0; other platforms build from source).

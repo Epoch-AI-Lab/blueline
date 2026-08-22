@@ -7,9 +7,9 @@ branding:
 
 inputs:
   base-ref:
-    description: 'Git base ref to diff against (e.g. origin/main or ${{ github.base_ref }})'
+    description: 'Git base ref to diff against (e.g. origin/main). Defaults to the PR base branch, or origin/main outside PRs.'
     required: false
-    default: 'origin/main'
+    default: ''
   lockfile-path:
     description: 'Path to package-lock.json'
     required: false
@@ -20,6 +20,10 @@ inputs:
     default: 'high'
   policy-path:
     description: 'Optional path to blueline.toml policy file'
+    required: false
+    default: ''
+  output-file:
+    description: 'Optional path to save the JSON report'
     required: false
     default: ''
 
@@ -33,10 +37,18 @@ runs:
         INPUT_LOCKFILE_PATH: ${{ inputs.lockfile-path }}
         INPUT_FAIL_ON: ${{ inputs.fail-on }}
         INPUT_POLICY_PATH: ${{ inputs.policy-path }}
+        INPUT_OUTPUT_FILE: ${{ inputs.output-file }}
       run: |
-        ARGS=(ci --base "$INPUT_BASE_REF" --lockfile "$INPUT_LOCKFILE_PATH" --fail-on "$INPUT_FAIL_ON")
+        BASE="${INPUT_BASE_REF:-${GITHUB_BASE_REF:-origin/main}}"
+        if ! git rev-parse --verify --quiet "$BASE" >/dev/null 2>&1; then
+          BASE="origin/$BASE"
+        fi
+        ARGS=(ci --base "$BASE" --lockfile "$INPUT_LOCKFILE_PATH" --fail-on "$INPUT_FAIL_ON")
         if [ -n "$INPUT_POLICY_PATH" ]; then
           ARGS+=(--policy "$INPUT_POLICY_PATH")
+        fi
+        if [ -n "$INPUT_OUTPUT_FILE" ]; then
+          ARGS+=(--format json --output-file "$INPUT_OUTPUT_FILE")
         fi
 
         echo "Executing: blueline ${ARGS[*]}"
