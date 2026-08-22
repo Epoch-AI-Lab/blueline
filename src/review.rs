@@ -12,6 +12,14 @@ use crate::registry::npm::NpmRegistry;
 use crate::render::{render_json, render_text};
 use crate::store::BaselineStore;
 
+/// A registry-predecessor baseline that was fetched, sha512-verified, and
+/// diffed during this review but has never been approved locally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreviewedBaseline {
+    pub version: String,
+    pub integrity: String,
+}
+
 /// Evaluates a package specification against its baseline, computing delta,
 /// OSV advisories, and Sigstore provenance to produce a final Verdict and Delta.
 pub fn evaluate_package(
@@ -20,7 +28,12 @@ pub fn evaluate_package(
     registry_base: &str,
     store: &BaselineStore,
     policy: &Policy,
-) -> anyhow::Result<(crate::verdict::Verdict, crate::diff::Delta, String)> {
+) -> anyhow::Result<(
+    crate::verdict::Verdict,
+    crate::diff::Delta,
+    String,
+    Option<UnreviewedBaseline>,
+)> {
     let target_semver = semver::Version::parse(version_str)
         .map_err(|e| anyhow::anyhow!("invalid semver for `{version_str}`: {e}"))?;
 
@@ -109,6 +122,16 @@ pub fn evaluate_package(
         crate::baseline::BaselineResolution::RegistryPredecessor(_)
     );
 
+    let unreviewed_baseline = match &baseline_res {
+        crate::baseline::BaselineResolution::RegistryPredecessor(p) => {
+            p.integrity.as_ref().map(|integrity| UnreviewedBaseline {
+                version: p.version.clone(),
+                integrity: integrity.clone(),
+            })
+        }
+        _ => None,
+    };
+
     let advisories = crate::advisory::fetch_advisories(
         &target_pkg.name,
         &target_pkg.version,
@@ -136,7 +159,7 @@ pub fn evaluate_package(
         Some(&provenance),
     );
 
-    Ok((verdict, delta, integrity))
+    Ok((verdict, delta, integrity, unreviewed_baseline))
 }
 
 fn bootstrap_hint(verdict: &crate::verdict::Verdict) -> Option<String> {
@@ -150,7 +173,7 @@ fn bootstrap_hint(verdict: &crate::verdict::Verdict) -> Option<String> {
             verdict.baseline_version.as_deref().unwrap_or("unknown"),
         );
         Some(format!(
-            "hint: baseline `{name}@{base}` was never approved locally. Run `blueline review {name}@{base}` from an interactive terminal and approve it to establish a baseline."
+            "hint: baseline `{name}@{base}` was never approved locally. Approve it when prompted during an interactive `blueline review`, or run `blueline review {name}@{base}` directly."
         ))
     } else if verdict
         .findings
@@ -185,7 +208,7 @@ pub fn run(
     let (name, version_str) = parse_spec_flexible(pkg_spec, &registry)?;
     let store = BaselineStore::open()?;
 
-    let (verdict, delta, integrity) =
+    let (verdict, delta, integrity, unreviewed_baseline) =
         evaluate_package(&name, &version_str, registry_base, &store, &policy)?;
 
     let format = output.resolve(std::io::stdout().is_terminal());
@@ -234,7 +257,14 @@ pub fn run(
         && std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal()
     {
-        interactive_prompt(&store, &name, &version_str, &integrity, &delta)?;
+        interactive_prompt(
+            &store,
+            &name,
+            &version_str,
+            &integrity,
+            &delta,
+            unreviewed_baseline.as_ref(),
+        )?;
     } else if verdict.band != crate::verdict::VerdictBand::Low {
         if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
             eprintln!(
@@ -264,7 +294,7 @@ pub fn install(
     let (name, version_str) = parse_spec_flexible(pkg_spec, &registry)?;
     let store = BaselineStore::open()?;
 
-    let (verdict, delta, integrity) =
+    let (verdict, delta, integrity, unreviewed_baseline) =
         evaluate_package(&name, &version_str, registry_base, &store, &policy)?;
     render_text(&verdict, &delta);
 
@@ -298,7 +328,14 @@ pub fn install(
             false
         }
     } else if is_interactive {
-        interactive_prompt(&store, &name, &version_str, &integrity, &delta)?
+        interactive_prompt(
+            &store,
+            &name,
+            &version_str,
+            &integrity,
+            &delta,
+            unreviewed_baseline.as_ref(),
+        )?
     } else {
         if verdict.band != crate::verdict::VerdictBand::Low {
             eprintln!(
@@ -328,6 +365,7 @@ fn interactive_prompt(
     version: &str,
     integrity: &str,
     delta: &crate::diff::Delta,
+    unreviewed_baseline: Option<&UnreviewedBaseline>,
 ) -> anyhow::Result<bool> {
     loop {
         print!("\n[a]pprove · [h]old · [d]iff > ");
@@ -348,6 +386,9 @@ fn interactive_prompt(
                     "Approved {}@{} and marked clean in baseline store.",
                     name, version
                 );
+                if let Some(base) = unreviewed_baseline {
+                    offer_baseline_approval(store, name, base)?;
+                }
                 return Ok(true);
             }
             "h" | "hold" => {
@@ -375,6 +416,8 @@ fn interactive_prompt(
                 }
                 if !showed_any {
                     println!("\nNo text diffs available.");
+                } else {
+                    println!("\n─── end of blueline diff (trusted output resumes) ───");
                 }
             }
             _ => {
@@ -384,6 +427,74 @@ fn interactive_prompt(
             }
         }
     }
+}
+
+/// Offers to approve the unreviewed baseline in the same session. The
+/// baseline tarball was already fetched and sha512-verified against
+/// `dist.integrity` during this review, so approving it records a trust
+/// decision over bytes that were verified moments ago. Anything other than
+/// an explicit `y` or `yes` leaves it unapproved (fail closed). A store
+/// failure here never undoes the target approval; the baseline simply
+/// stays unapproved.
+fn offer_baseline_approval(
+    store: &BaselineStore,
+    name: &str,
+    base: &UnreviewedBaseline,
+) -> anyhow::Result<()> {
+    offer_baseline_approval_with_reader(store, name, base, &mut std::io::stdin().lock())
+}
+
+fn offer_baseline_approval_with_reader(
+    store: &BaselineStore,
+    name: &str,
+    base: &UnreviewedBaseline,
+    reader: &mut dyn std::io::BufRead,
+) -> anyhow::Result<()> {
+    print!(
+        "\nAlso approve unreviewed baseline {name}@{base} (tarball fetched and \
+         sha512-verified this session)? [y/N] > ",
+        name = crate::render::sanitize_single_line(name),
+        base = crate::render::sanitize_single_line(&base.version)
+    );
+    std::io::stdout().flush()?;
+    let mut input = String::new();
+    if reader.read_line(&mut input)? == 0 {
+        return Ok(());
+    }
+    if !matches!(input.trim().to_lowercase().as_str(), "y" | "yes") {
+        return Ok(());
+    }
+    // The baseline tarball was fetched and sha512-verified during this
+    // review but only the target gets record_verified there, so record the
+    // baseline row now; mark_clean requires an existing matching record.
+    let outcome = (|| -> anyhow::Result<()> {
+        store.record_verified(name, &base.version, &base.integrity)?;
+        store.mark_clean(name, &base.version, &base.integrity)?;
+        let _ = store.record_audit_log(
+            name,
+            &base.version,
+            &base.integrity,
+            "approve",
+            0,
+            "approved_baseline_chain",
+            "user",
+            None,
+        );
+        Ok(())
+    })();
+    if let Err(e) = outcome {
+        eprintln!(
+            "note: could not approve baseline {name}@{}: {e:#}; baseline left unapproved",
+            base.version
+        );
+        return Ok(());
+    }
+    println!(
+        "Approved baseline {}@{} and marked clean in baseline store.",
+        crate::render::sanitize_single_line(name),
+        crate::render::sanitize_single_line(&base.version)
+    );
+    Ok(())
 }
 
 /// `<name>@<version>` → (name, version). Scoped names (`@scope/pkg@1.0.0`)
@@ -470,5 +581,70 @@ mod tests {
     #[test]
     fn rejects_bad_semver() {
         assert!(parse_spec("express@latest").is_err());
+    }
+
+    fn test_baseline() -> UnreviewedBaseline {
+        UnreviewedBaseline {
+            version: "0.9.0".into(),
+            integrity: "sha512-baseline".into(),
+        }
+    }
+
+    #[test]
+    fn chain_approval_requires_explicit_yes() {
+        for answer in ["n\n", "no\n", "yeah\n", "yolo\n", "\x1b\n"] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
+            offer_baseline_approval_with_reader(
+                &store,
+                "pkg",
+                &test_baseline(),
+                &mut answer.as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(
+                store.known_clean("pkg", "0.9.0").unwrap(),
+                None,
+                "answer {answer:?} must not approve"
+            );
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
+        offer_baseline_approval_with_reader(&store, "pkg", &test_baseline(), &mut b"".as_slice())
+            .unwrap();
+        assert_eq!(
+            store.known_clean("pkg", "0.9.0").unwrap(),
+            None,
+            "EOF must decline"
+        );
+    }
+
+    #[test]
+    fn chain_approval_accepts_y_and_yes() {
+        for answer in ["y\n", "yes\n", "  Y  \n"] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("t.db");
+            let store = BaselineStore::open_at(&db).unwrap();
+            offer_baseline_approval_with_reader(
+                &store,
+                "pkg",
+                &test_baseline(),
+                &mut answer.as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(
+                store.known_clean("pkg", "0.9.0").unwrap().as_deref(),
+                Some("sha512-baseline"),
+                "answer {answer:?} must approve"
+            );
+            assert!(
+                store
+                    .list_clean_versions("pkg")
+                    .unwrap()
+                    .iter()
+                    .any(|(v, _)| v.to_string() == "0.9.0")
+            );
+        }
     }
 }

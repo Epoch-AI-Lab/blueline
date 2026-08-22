@@ -102,12 +102,16 @@ impl NpmRegistry {
         // Scoped packages must have the slash percent-encoded in the path.
         let encoded = name.replace('/', "%2f");
         let url = format!("{}/{}", self.base, encoded);
-        let resp = self
-            .agent
-            .get(&url)
-            .set("accept", CORGI_ACCEPT)
-            .call()
-            .map_err(|e| BluelineError::Network(format!("GET {url}: {e}")))?;
+        let resp = match self.agent.get(&url).set("accept", CORGI_ACCEPT).call() {
+            Ok(resp) => resp,
+            Err(ureq::Error::Status(404, _)) => {
+                return Err(BluelineError::Manifest(
+                    name.to_string(),
+                    "package not found in registry".to_string(),
+                ));
+            }
+            Err(e) => return Err(BluelineError::Network(format!("GET {url}: {e}"))),
+        };
 
         let mut body = String::new();
         let mut reader = resp.into_reader().take(self.limits.max_packument_bytes + 1);
@@ -1242,5 +1246,60 @@ mod tests {
             resolve_redirect_url(base, "https://cdn.npmjs.org/pkg.tgz").unwrap(),
             "https://cdn.npmjs.org/pkg.tgz"
         );
+    }
+
+    #[test]
+    fn packument_404_maps_to_manifest_and_500_stays_network() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let _ = listener.set_nonblocking(true);
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_millis(1500) {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf);
+                    let req = String::from_utf8_lossy(&buf);
+                    let (code, reason) = if req.contains("GET /ghostpkg ") {
+                        (404, "Not Found")
+                    } else {
+                        (500, "Internal Server Error")
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {code} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        });
+
+        let reg = NpmRegistry::new(&base);
+
+        for op in [
+            |r: &NpmRegistry| r.resolve("ghostpkg", "1.0.0").err(),
+            |r: &NpmRegistry| r.list_versions("ghostpkg").err(),
+            |r: &NpmRegistry| r.resolve_dist_tag("ghostpkg", "latest").err(),
+        ] {
+            let err = op(&reg).expect("404 must error");
+            assert!(
+                matches!(err, BluelineError::Manifest(_, ref m) if m.contains("not found in registry")),
+                "expected Manifest not-found, got {err:#}"
+            );
+        }
+
+        let err = reg.resolve("boompkg", "1.0.0").unwrap_err();
+        assert!(
+            matches!(err, BluelineError::Network(_)),
+            "500 must stay Network, got {err:#}"
+        );
+
+        let _ = handle.join();
     }
 }

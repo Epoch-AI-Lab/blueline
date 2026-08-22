@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Registry 404s now report "package not found in registry" instead of a
+  generic network error, in both the review and CI paths.
+- Lockfile parse errors no longer print their cause twice.
+- Interactive reviews can approve the unreviewed registry-predecessor
+  baseline in the same session (`[y/N]` prompt after approving the target);
+  non-interactive behavior is unchanged.
+
 ## [0.2.0] - 2026-08-22
 
 ### Added

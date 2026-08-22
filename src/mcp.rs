@@ -254,7 +254,7 @@ fn execute_tool(
                 JsonRpcError::invalid_params(format!("invalid package spec `{pkg_spec}`: {e}"))
             })?;
 
-            let (verdict, _delta, _) =
+            let (verdict, _delta, _, _unreviewed_baseline) =
                 evaluate_package(&pkg_name, &version, registry_base, store, policy).map_err(
                     |e| {
                         JsonRpcError::internal_error(format!(
@@ -343,7 +343,7 @@ fn execute_tool(
                 JsonRpcError::invalid_params(format!("invalid package spec `{pkg_spec}`: {e}"))
             })?;
 
-            let (_verdict, delta, _) =
+            let (_verdict, delta, _, _unreviewed_baseline) =
                 evaluate_package(&pkg_name, &version, registry_base, store, policy).map_err(
                     |e| {
                         JsonRpcError::internal_error(format!(
