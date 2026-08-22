@@ -143,9 +143,15 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          VERSION="${GITHUB_REF_NAME#v}"
           for dir in packages/@bluelinecli/binary-*/; do
             if [ -f "$dir/blueline" ] || [ -f "$dir/blueline.exe" ]; then
-              npm publish "$dir" --access public --provenance
+              pkg="$(basename "$dir")"
+              if npm view "@bluelinecli/$pkg@$VERSION" version >/dev/null 2>&1; then
+                echo "::notice::$pkg@$VERSION already published, skipping"
+              else
+                npm publish "$dir" --access public --provenance
+              fi
             fi
           done
 
@@ -222,8 +228,16 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          npm publish packages/blueline --access public --provenance
-          npm publish packages/npx --access public --provenance
+          VERSION="${GITHUB_REF_NAME#v}"
+          publish_if_missing() {
+            if npm view "$1@$VERSION" version >/dev/null 2>&1; then
+              echo "::notice::$1@$VERSION already published, skipping"
+            else
+              (cd "$2" && npm publish --access public --provenance)
+            fi
+          }
+          publish_if_missing "@bluelinecli/cli" packages/blueline
+          publish_if_missing "blueline" packages/npx
 
   github-release:
     name: Attach binaries to GitHub release
@@ -253,5 +267,6 @@ jobs:
           sha256sum * > SHA256SUMS
           cd ..
           gh release create "$GITHUB_REF_NAME" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
             --title "blueline $VERSION" \
             --generate-notes
