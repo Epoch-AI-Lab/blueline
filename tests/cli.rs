@@ -1601,6 +1601,7 @@ fn ci_rejects_flag_like_base_refs() {
 
     blueline()
         .current_dir(temp_dir.path())
+        .env("BLUELINE_DATA_DIR", temp_dir.path())
         .args([
             "ci",
             "--base=--output=/tmp/pwn",
