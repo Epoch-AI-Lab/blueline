@@ -11,3 +11,6 @@ node_modules/
 .useit/
 .agents/
 
+packages/@bluelinecli/binary-*/blueline
+packages/@bluelinecli/binary-*/blueline.exe
+*.tgz

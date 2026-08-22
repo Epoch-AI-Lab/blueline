@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Published npm distribution: `blueline` and `@bluelinecli/cli` shims with the
+  native binary delivered via `@bluelinecli/binary-*` platform packages
+  (linux-x64-gnu at v0.1.0; other platforms build from source).
+
 ## [0.1.0] - 2026-08-22
 
 ### Added
