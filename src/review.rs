@@ -124,6 +124,7 @@ pub fn evaluate_package(
     let advisories = crate::advisory::fetch_advisories(
         &target_pkg.name,
         &target_pkg.version,
+        ecosystem,
         Some(store),
         policy,
     )
@@ -132,8 +133,9 @@ pub fn evaluate_package(
     let provenance = crate::provenance::inspect_provenance(
         &target_pkg.name,
         &target_pkg.version,
-        &checksum.to_sri(),
+        &checksum,
         None,
+        registry_base,
         Some(store),
         policy,
     );

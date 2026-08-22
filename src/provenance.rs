@@ -4,6 +4,7 @@ use std::io::Read;
 
 use crate::error::BluelineError;
 use crate::policy::Policy;
+use crate::registry::{Checksum, Ecosystem};
 use crate::store::BaselineStore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,10 +130,12 @@ struct InTotoConfigSource {
     entry_point: Option<String>,
 }
 
-/// Parse and verify Sigstore / SLSA in-toto statement against tarball integrity sha512.
+/// Parse and verify a Sigstore / SLSA in-toto statement against the tarball
+/// checksum. The subject digest must equal the expected digest content
+/// (case-insensitive hex) for the checksum's algorithm.
 pub fn parse_attestation_payload(
     raw_payload_base64: &str,
-    expected_integrity: &str,
+    expected_integrity: &Checksum,
 ) -> Result<ProvenanceReport, BluelineError> {
     let engine = base64::engine::general_purpose::STANDARD;
     let decoded_bytes = engine.decode(raw_payload_base64.trim()).map_err(|e| {
@@ -143,29 +146,17 @@ pub fn parse_attestation_payload(
         BluelineError::Provenance(format!("failed to parse in-toto statement JSON: {e}"))
     })?;
 
-    let expected_hex_or_b64 = expected_integrity
-        .strip_prefix("sha512-")
-        .unwrap_or(expected_integrity);
-
-    let expected_hex = engine
-        .decode(expected_hex_or_b64)
-        .ok()
-        .map(|bytes| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>());
-
+    let alg_key = expected_integrity.alg.name();
     let digest_matched = statement.subject.iter().any(|subj| {
-        subj.digest.get("sha512").is_some_and(|val| {
-            val == expected_hex_or_b64
-                || val == expected_integrity
-                || expected_hex
-                    .as_deref()
-                    .is_some_and(|hex| val.eq_ignore_ascii_case(hex))
-        })
+        subj.digest
+            .get(alg_key)
+            .is_some_and(|val| val.eq_ignore_ascii_case(&expected_integrity.value_hex))
     });
 
     if !digest_matched {
-        return Ok(ProvenanceReport::failed_mismatch(
-            "tarball sha512 does not match in-toto statement subject digest",
-        ));
+        return Ok(ProvenanceReport::failed_mismatch(&format!(
+            "tarball {alg_key} does not match in-toto statement subject digest"
+        )));
     }
 
     let mut builder_id = None;
@@ -200,11 +191,14 @@ pub fn parse_attestation_payload(
 }
 
 /// Inspect registry metadata or fetch attestations bundle for target package.
+/// `attestations_base` is the registry base serving the npm attestations
+/// endpoint (threaded from the resolved registry, never hardcoded).
 pub fn inspect_provenance(
     package: &str,
     version: &str,
-    expected_integrity: &str,
+    expected_integrity: &Checksum,
     signatures_json: Option<&serde_json::Value>,
+    attestations_base: &str,
     store: Option<&BaselineStore>,
     _policy: &Policy,
 ) -> ProvenanceReport {
@@ -221,8 +215,7 @@ pub fn inspect_provenance(
 
     // 2. Check local provenance cache
     if let Some(store) = store
-        && let Ok(Some(cached)) =
-            store.get_cached_provenance(crate::registry::Ecosystem::Npm, package, version)
+        && let Ok(Some(cached)) = store.get_cached_provenance(Ecosystem::Npm, package, version)
     {
         return ProvenanceReport {
             status: ProvenanceStatus::Verified,
@@ -243,8 +236,8 @@ pub fn inspect_provenance(
         .build();
 
     let encoded_pkg = package.replace('/', "%2f");
-    let attestations_url =
-        format!("https://registry.npmjs.org/-/npm/v1/attestations/{encoded_pkg}@{version}");
+    let base = attestations_base.trim_end_matches('/');
+    let attestations_url = format!("{base}/-/npm/v1/attestations/{encoded_pkg}@{version}");
     let resp_res = agent
         .get(&attestations_url)
         .set("Accept", "application/json")
@@ -271,7 +264,7 @@ pub fn inspect_provenance(
                     // Cache in SQLite store
                     if let Some(store) = store {
                         let _ = store.record_provenance(
-                            crate::registry::Ecosystem::Npm,
+                            Ecosystem::Npm,
                             package,
                             version,
                             report.builder_id.as_deref(),
@@ -296,6 +289,17 @@ pub fn inspect_provenance(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::ChecksumAlg;
+    use sha2::{Digest, Sha512};
+
+    fn ck(tag: &str) -> Checksum {
+        let mut hasher = Sha512::new();
+        hasher.update(tag.as_bytes());
+        Checksum {
+            alg: ChecksumAlg::Sha512,
+            value_hex: format!("{:x}", hasher.finalize()),
+        }
+    }
 
     #[test]
     fn parses_valid_intoto_statement() {
@@ -305,7 +309,7 @@ mod tests {
                 {
                     "name": "pkg:npm/express@4.21.2",
                     "digest": {
-                        "sha512": "abc123expected"
+                        "sha512": "__HEX__"
                     }
                 }
             ],
@@ -326,8 +330,10 @@ mod tests {
             }
         }"#;
 
+        let expected = ck("expected");
+        let intoto_json = intoto_json.replace("__HEX__", &expected.value_hex);
         let b64 = base64::engine::general_purpose::STANDARD.encode(intoto_json.as_bytes());
-        let report = parse_attestation_payload(&b64, "sha512-abc123expected").unwrap();
+        let report = parse_attestation_payload(&b64, &expected).unwrap();
 
         assert_eq!(report.status, ProvenanceStatus::Verified);
         assert_eq!(report.slsa_level, 3);
@@ -361,7 +367,7 @@ mod tests {
         }"#;
 
         let b64 = base64::engine::general_purpose::STANDARD.encode(intoto_json.as_bytes());
-        let report = parse_attestation_payload(&b64, "sha512-expected_real_hash").unwrap();
+        let report = parse_attestation_payload(&b64, &ck("expected_real_hash")).unwrap();
 
         assert_eq!(report.status, ProvenanceStatus::FailedMismatch);
     }
@@ -380,7 +386,7 @@ mod tests {
         }"#;
 
         let b64 = base64::engine::general_purpose::STANDARD.encode(intoto_json.as_bytes());
-        let report = parse_attestation_payload(&b64, "sha512-anything").unwrap();
+        let report = parse_attestation_payload(&b64, &ck("anything")).unwrap();
 
         assert_eq!(report.status, ProvenanceStatus::FailedMismatch);
     }
