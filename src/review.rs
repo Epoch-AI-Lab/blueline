@@ -31,6 +31,15 @@ pub fn evaluate_package(
     // on any mismatch, so the bytes below are integrity-verified.
     let target_tarball = registry.fetch_tarball(&target_pkg)?;
 
+    let checksum = target_pkg.integrity.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{}@{}: registry provided no dist.integrity; refusing to trust unverifiable bytes",
+            target_pkg.name,
+            target_pkg.version
+        )
+    })?;
+    let integrity = checksum.to_sri();
+
     let target_temp = tempfile::tempdir().map_err(|e| anyhow::anyhow!("creating temp dir: {e}"))?;
     safe_extract(
         &target_tarball,
@@ -54,7 +63,6 @@ pub fn evaluate_package(
         )
     })?;
 
-    let integrity = target_pkg.integrity.clone().unwrap_or_default();
     store.record_verified(&target_pkg.name, &target_pkg.version, &integrity)?;
 
     let baseline_res = resolve_baseline(name, &target_semver, &registry, store)
@@ -402,7 +410,8 @@ pub fn parse_spec(spec: &str) -> anyhow::Result<(String, String)> {
 }
 
 /// Flexible parser for install: `<name>` or `<name>@<version>`.
-/// If version is omitted, resolves `dist-tags.latest` or falls back to latest stable semver release.
+/// If version is omitted, resolves the registry's default version
+/// (`dist-tags.latest` for npm, falling back to latest stable semver release).
 fn parse_spec_flexible(spec: &str, registry: &dyn Registry) -> anyhow::Result<(String, String)> {
     let has_version_sep = if let Some(rest) = spec.strip_prefix('@') {
         rest.contains('@')
@@ -417,16 +426,10 @@ fn parse_spec_flexible(spec: &str, registry: &dyn Registry) -> anyhow::Result<(S
         if name.is_empty() {
             return Err(crate::error::BluelineError::InvalidPackageSpec(spec.to_string()).into());
         }
-        if let Ok(Some(latest_tag)) = registry.resolve_dist_tag(name, "latest") {
-            return Ok((name.to_string(), latest_tag));
+        match registry.default_version(name)? {
+            Some(default) => Ok((name.to_string(), default)),
+            None => Err(anyhow::anyhow!("no versions found for `{name}`")),
         }
-        let versions = registry.list_versions(name)?;
-        let latest = versions
-            .iter()
-            .rfind(|v| v.pre.is_empty())
-            .or_else(|| versions.last())
-            .ok_or_else(|| anyhow::anyhow!("no versions found for `{name}`"))?;
-        Ok((name.to_string(), latest.to_string()))
     }
 }
 

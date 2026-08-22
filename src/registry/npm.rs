@@ -1,20 +1,18 @@
 use std::collections::BTreeMap;
 use std::io::Read;
 
-use base64::Engine;
 use serde::Deserialize;
 use sha2::{Digest, Sha512};
 use ureq::Agent;
 
 use crate::error::BluelineError;
 use crate::registry::http_util::{RegistryLimits, download_bounded};
-use crate::registry::{Package, Registry};
+use crate::registry::{Checksum, ChecksumAlg, Ecosystem, Package, Registry, Release};
 
 /// Abbreviated packument (corgi) media type — small enough to be sane
 /// for large packages like express.
 const CORGI_ACCEPT: &str = "application/vnd.npm.install-v1+json";
 const USER_AGENT: &str = concat!("blueline/", env!("CARGO_PKG_VERSION"));
-const SRI_PREFIX: &str = "sha512-";
 
 pub struct NpmRegistry {
     agent: Agent,
@@ -95,32 +93,29 @@ impl NpmRegistry {
 
         let mut hasher = Sha512::new();
         hasher.update(&bytes);
-        let digest = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
-        match pkg.integrity.as_deref() {
+        let computed = Checksum {
+            alg: ChecksumAlg::Sha512,
+            value_hex: hex_encode(&hasher.finalize()),
+        };
+        match &pkg.integrity {
+            Some(expected) if expected.alg == ChecksumAlg::Sha512 => {
+                if !expected.value_hex.eq_ignore_ascii_case(&computed.value_hex) {
+                    return Err(BluelineError::Verification(format!(
+                        "{}@{}: tarball sha512 mismatch (expected {}, got {})",
+                        pkg.name,
+                        pkg.version,
+                        expected.to_sri(),
+                        computed.to_sri()
+                    )));
+                }
+            }
             Some(expected) => {
-                let mut matched = false;
-                let mut has_sha512 = false;
-                for token in expected.split_whitespace() {
-                    if let Some(expected_b64) = token.strip_prefix(SRI_PREFIX) {
-                        has_sha512 = true;
-                        if digest == expected_b64.trim() {
-                            matched = true;
-                            break;
-                        }
-                    }
-                }
-                if !has_sha512 {
-                    return Err(BluelineError::Verification(format!(
-                        "{}@{}: unsupported dist.integrity `{expected}`, expected `{SRI_PREFIX}<base64>`",
-                        pkg.name, pkg.version
-                    )));
-                }
-                if !matched {
-                    return Err(BluelineError::Verification(format!(
-                        "{}@{}: tarball sha512 mismatch (expected {expected}, got {SRI_PREFIX}{digest})",
-                        pkg.name, pkg.version
-                    )));
-                }
+                return Err(BluelineError::Verification(format!(
+                    "{}@{}: unsupported dist.integrity algorithm `{}`, expected sha512",
+                    pkg.name,
+                    pkg.version,
+                    expected.alg.name()
+                )));
             }
             None => {
                 return Err(BluelineError::Verification(format!(
@@ -131,9 +126,33 @@ impl NpmRegistry {
         }
         Ok(bytes)
     }
+
+    /// Normalize the packument's raw `dist.integrity` string into a typed
+    /// checksum. Fail closed when nothing sha512-shaped can be decoded.
+    fn normalize_integrity(
+        &self,
+        pkg_name: &str,
+        version: &str,
+        raw: &Option<String>,
+    ) -> Result<Option<Checksum>, BluelineError> {
+        match raw {
+            None => Ok(None),
+            Some(s) => Checksum::parse(s)
+                .map(Some)
+                .map_err(|_| {
+                    BluelineError::Verification(format!(
+                        "{pkg_name}@{version}: unsupported dist.integrity `{s}`, expected `sha512-<base64>`"
+                    ))
+                }),
+        }
+    }
 }
 
 impl Registry for NpmRegistry {
+    fn ecosystem(&self) -> Ecosystem {
+        Ecosystem::Npm
+    }
+
     fn resolve(&self, name: &str, version: &str) -> Result<Package, BluelineError> {
         let packument = self.packument(name)?;
         let meta = packument.versions.get(version).ok_or_else(|| {
@@ -160,7 +179,7 @@ impl Registry for NpmRegistry {
             name: meta.name.clone(),
             version: meta.version.clone(),
             tarball_url: meta.dist.tarball.clone(),
-            integrity: meta.dist.integrity.clone(),
+            integrity: self.normalize_integrity(name, version, &meta.dist.integrity)?,
         })
     }
 
@@ -169,8 +188,8 @@ impl Registry for NpmRegistry {
     }
 
     fn list_versions(&self, name: &str) -> Result<Vec<semver::Version>, BluelineError> {
-        let packument = self.packument(name)?;
-        let mut versions: Vec<semver::Version> = packument
+        let mut versions: Vec<semver::Version> = self
+            .packument(name)?
             .versions
             .keys()
             .filter_map(|v| semver::Version::parse(v).ok())
@@ -179,10 +198,40 @@ impl Registry for NpmRegistry {
         Ok(versions)
     }
 
-    fn resolve_dist_tag(&self, name: &str, tag: &str) -> Result<Option<String>, BluelineError> {
-        let packument = self.packument(name)?;
-        Ok(packument.dist_tags.get(tag).cloned())
+    fn list_releases(&self, name: &str) -> Result<Vec<Release>, BluelineError> {
+        let releases = self.list_versions(name)?;
+        // npm's corgi packument does not expose yanked or publish time.
+        Ok(releases
+            .into_iter()
+            .map(|v| Release {
+                version: v.to_string(),
+                yanked: false,
+                publish_time: None,
+            })
+            .collect())
     }
+
+    fn default_version(&self, name: &str) -> Result<Option<String>, BluelineError> {
+        let packument = self.packument(name)?;
+        if let Some(latest) = packument.dist_tags.get("latest") {
+            return Ok(Some(latest.clone()));
+        }
+        let mut versions: Vec<semver::Version> = packument
+            .versions
+            .keys()
+            .filter_map(|v| semver::Version::parse(v).ok())
+            .collect();
+        versions.sort();
+        Ok(versions
+            .iter()
+            .rfind(|v| v.pre.is_empty())
+            .or_else(|| versions.last())
+            .map(|v| v.to_string()))
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn is_valid_name_segment(s: &str) -> bool {
@@ -276,6 +325,10 @@ struct Dist {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
+
+    /// sha512 SRI of the bytes "tarball-content".
+    const TEST_SRI: &str = "sha512-dWJ6JIJkmHG8N3fH1b/hbpmBQ7wKIpEw3zsVl2873OtFXh9QhR1KUU3uojohuIJ/xd+hb1R0q/57C8sMt4tstQ==";
 
     #[test]
     fn list_versions_orders_and_limits() {
@@ -368,15 +421,16 @@ mod tests {
         let base = format!("http://127.0.0.1:{port}");
 
         let handle = std::thread::spawn(move || {
-            // Exactly 4 requests: testpkg dist-tag, testpkg resolve, mismatchname, mismatchver
-            for _ in 0..4 {
+            // Exactly 5 requests: testpkg default_version, testpkg releases,
+            // testpkg resolve, mismatchname, mismatchver
+            for _ in 0..5 {
                 if let Ok((mut stream, _)) = listener.accept() {
                     let mut buf = [0u8; 1024];
                     let n = stream.read(&mut buf).unwrap_or(0);
                     let req = String::from_utf8_lossy(&buf[..n]);
 
                     if req.contains("GET /testpkg ") {
-                        let body = r#"{"name":"testpkg","dist-tags":{"latest":"2.1.0"},"versions":{"2.1.0":{"name":"testpkg","version":"2.1.0","dist":{"tarball":"http://127.0.0.1:1/pkg.tgz","integrity":"sha512-test"}}}}"#;
+                        let body = r#"{"name":"testpkg","dist-tags":{"latest":"2.1.0"},"versions":{"2.1.0":{"name":"testpkg","version":"2.1.0","dist":{"tarball":"http://127.0.0.1:1/pkg.tgz","integrity":"sha512-dWJ6JIJkmHG8N3fH1b/hbpmBQ7wKIpEw3zsVl2873OtFXh9QhR1KUU3uojohuIJ/xd+hb1R0q/57C8sMt4tstQ=="}}}}"#;
                         let resp = format!(
                             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                             body.len(),
@@ -405,12 +459,20 @@ mod tests {
         });
 
         let reg = NpmRegistry::new(&base);
-        let tag = reg.resolve_dist_tag("testpkg", "latest").unwrap();
+        let tag = reg.default_version("testpkg").unwrap();
         assert_eq!(tag, Some("2.1.0".into()));
+
+        let releases = reg.list_releases("testpkg").unwrap();
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].version, "2.1.0");
+        assert!(!releases[0].yanked);
+        assert_eq!(releases[0].publish_time, None);
+        assert_eq!(reg.ecosystem(), Ecosystem::Npm);
 
         let pkg = reg.resolve("testpkg", "2.1.0").unwrap();
         assert_eq!(pkg.name, "testpkg");
         assert_eq!(pkg.version, "2.1.0");
+        assert_eq!(pkg.integrity, Some(Checksum::parse(TEST_SRI).unwrap()));
 
         let err_name = reg.resolve("mismatchname", "1.0.0").unwrap_err();
         assert!(err_name.to_string().contains("registry metadata mismatch"));
@@ -475,7 +537,7 @@ mod tests {
             name: "test".into(),
             version: "1.0.0".into(),
             tarball_url: format!("{base}/redirect1"),
-            integrity: Some(integrity),
+            integrity: Some(Checksum::parse(&integrity).unwrap()),
         };
         let bytes = reg.fetch_url_verified(&pkg_ok).unwrap();
         assert_eq!(bytes, payload);
@@ -485,7 +547,7 @@ mod tests {
             name: "test".into(),
             version: "1.0.0".into(),
             tarball_url: format!("{base}/loop"),
-            integrity: Some("sha512-test".into()),
+            integrity: Some(Checksum::parse(TEST_SRI).unwrap()),
         };
         let err = reg.fetch_url_verified(&pkg_loop).unwrap_err();
         assert!(err.to_string().contains("too many redirects"));
@@ -677,7 +739,7 @@ mod tests {
             name: "exact".into(),
             version: "1.0.0".into(),
             tarball_url: format!("{base}/exact.tgz"),
-            integrity: Some(exact_integrity),
+            integrity: Some(Checksum::parse(&exact_integrity).unwrap()),
         };
         let bytes = reg.fetch_url_verified(&pkg_exact).unwrap();
         assert_eq!(bytes.len(), 50);
@@ -686,7 +748,7 @@ mod tests {
             name: "over".into(),
             version: "1.0.0".into(),
             tarball_url: format!("{base}/over.tgz"),
-            integrity: Some(over_integrity),
+            integrity: Some(Checksum::parse(&over_integrity).unwrap()),
         };
         let err = reg.fetch_url_verified(&pkg_over).unwrap_err();
         assert!(err.to_string().contains("tarball exceeds maximum size cap"));
@@ -770,7 +832,7 @@ mod tests {
             name: "test".into(),
             version: "1.0.0".into(),
             tarball_url: format!("{base}/r1"),
-            integrity: Some(integrity),
+            integrity: Some(Checksum::parse(&integrity).unwrap()),
         };
         let bytes = reg.fetch_url_verified(&pkg_ok).unwrap();
         assert_eq!(bytes, payload);
@@ -780,7 +842,7 @@ mod tests {
             name: "test".into(),
             version: "1.0.0".into(),
             tarball_url: format!("{base}/over1"),
-            integrity: Some("sha512-test".into()),
+            integrity: Some(Checksum::parse(TEST_SRI).unwrap()),
         };
         let err = reg.fetch_url_verified(&pkg_over).unwrap_err();
         assert!(err.to_string().contains("too many redirects"));

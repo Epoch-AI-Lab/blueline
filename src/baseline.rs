@@ -1,5 +1,5 @@
 use crate::error::BluelineError;
-use crate::registry::{Package, Registry};
+use crate::registry::{Checksum, Package, Registry};
 use crate::store::BaselineStore;
 use crate::version::VersionInfo;
 
@@ -47,18 +47,22 @@ pub fn resolve_baseline<R: Registry, V: VersionInfo>(
 
     for (clean_ver, stored_integrity) in clean_versions {
         if clean_ver.baseline_eligible_for(target_ver) {
+            // Compare normalized checksums so legacy SRI rows and new display
+            // forms are judged by content, not by spelling.
+            let stored_checksum = Checksum::parse(&stored_integrity);
             match registry.resolve(name, &clean_ver.canonical()) {
-                Ok(pkg) => match &pkg.integrity {
-                    Some(reg_integ) if reg_integ == &stored_integrity => {
+                Ok(pkg) => match (&pkg.integrity, &stored_checksum) {
+                    (Some(reg_integ), Ok(stored)) if *reg_integ == *stored => {
                         return Ok(BaselineResolution::LocalApproved(pkg));
                     }
-                    Some(reg_integ) => {
+                    (Some(reg_integ), _) => {
                         return Err(BluelineError::Verification(format!(
-                            "stored clean baseline for {name}@{} had integrity `{stored_integrity}`, but registry reported `{reg_integ}`; refusing to trust tampered baseline",
-                            clean_ver.canonical()
+                            "stored clean baseline for {name}@{} had integrity `{stored_integrity}`, but registry reported `{}`; refusing to trust tampered baseline",
+                            clean_ver.canonical(),
+                            reg_integ.to_display()
                         )));
                     }
-                    None => {
+                    (None, _) => {
                         return Err(BluelineError::Verification(format!(
                             "stored clean baseline for {name}@{} had integrity `{stored_integrity}`, but registry reported no integrity; refusing to trust unverified baseline",
                             clean_ver.canonical()
@@ -97,10 +101,22 @@ pub fn resolve_baseline<R: Registry, V: VersionInfo>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::{Checksum, ChecksumAlg, Ecosystem, Release};
+    use sha2::{Digest, Sha512};
+
+    /// Deterministic valid sha512 checksum derived from the version string.
+    fn checksum_for(tag: &str) -> Checksum {
+        let mut hasher = Sha512::new();
+        hasher.update(tag.as_bytes());
+        Checksum {
+            alg: ChecksumAlg::Sha512,
+            value_hex: format!("{:x}", hasher.finalize()),
+        }
+    }
 
     struct MockRegistry {
         versions: Vec<String>,
-        integrity_override: Option<Option<String>>,
+        integrity_override: Option<Option<Checksum>>,
     }
 
     impl MockRegistry {
@@ -113,11 +129,15 @@ mod tests {
     }
 
     impl Registry for MockRegistry {
+        fn ecosystem(&self) -> Ecosystem {
+            Ecosystem::Npm
+        }
+
         fn resolve(&self, name: &str, version: &str) -> Result<Package, BluelineError> {
             if self.versions.contains(&version.to_string()) {
                 let integrity = match &self.integrity_override {
                     Some(custom) => custom.clone(),
-                    None => Some(format!("sha512-{version}")),
+                    None => Some(checksum_for(version)),
                 };
                 Ok(Package {
                     name: name.to_string(),
@@ -147,11 +167,19 @@ mod tests {
             Ok(v)
         }
 
-        fn resolve_dist_tag(
-            &self,
-            _name: &str,
-            _tag: &str,
-        ) -> Result<Option<String>, BluelineError> {
+        fn list_releases(&self, name: &str) -> Result<Vec<Release>, BluelineError> {
+            Ok(self
+                .list_versions(name)?
+                .into_iter()
+                .map(|v| Release {
+                    version: v.to_string(),
+                    yanked: false,
+                    publish_time: None,
+                })
+                .collect())
+        }
+
+        fn default_version(&self, _name: &str) -> Result<Option<String>, BluelineError> {
             Ok(self.versions.last().cloned())
         }
     }
@@ -161,12 +189,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
         store
-            .record_verified("pkg", "1.0.0", "sha512-1.0.0")
+            .record_verified("pkg", "1.0.0", &checksum_for("1.0.0").to_sri())
             .unwrap();
         store
-            .record_verified("pkg", "1.1.0", "sha512-1.1.0")
+            .record_verified("pkg", "1.1.0", &checksum_for("1.1.0").to_sri())
             .unwrap();
-        store.mark_clean("pkg", "1.0.0", "sha512-1.0.0").unwrap();
+        store
+            .mark_clean("pkg", "1.0.0", &checksum_for("1.0.0").to_sri())
+            .unwrap();
 
         let registry = MockRegistry::new(vec!["1.0.0".into(), "1.1.0".into(), "1.2.0".into()]);
 
@@ -204,14 +234,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
         store
-            .record_verified("pkg", "1.0.0", "sha512-authentic")
+            .record_verified("pkg", "1.0.0", &checksum_for("authentic").to_sri())
             .unwrap();
         store
-            .mark_clean("pkg", "1.0.0", "sha512-authentic")
+            .mark_clean("pkg", "1.0.0", &checksum_for("authentic").to_sri())
             .unwrap();
 
         // Registry serves a tampered integrity for 1.0.0
-        let registry = MockRegistry::new(vec!["1.0.0".into(), "1.1.0".into()]);
+        let mut registry = MockRegistry::new(vec!["1.0.0".into(), "1.1.0".into()]);
+        registry.integrity_override = Some(Some(checksum_for("tampered")));
 
         let target = semver::Version::parse("1.1.0").unwrap();
         let err = resolve_baseline("pkg", &target, &registry, &store).unwrap_err();
@@ -223,10 +254,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
         store
-            .record_verified("pkg", "1.0.0", "sha512-authentic")
+            .record_verified("pkg", "1.0.0", &checksum_for("authentic").to_sri())
             .unwrap();
         store
-            .mark_clean("pkg", "1.0.0", "sha512-authentic")
+            .mark_clean("pkg", "1.0.0", &checksum_for("authentic").to_sri())
             .unwrap();
 
         let mut registry = MockRegistry::new(vec!["1.0.0".into(), "1.1.0".into()]);
