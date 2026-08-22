@@ -10,6 +10,7 @@ pr.diff
 node_modules/
 .useit/
 .agents/
+marketing/
 
 packages/@bluelinecli/binary-*/blueline
 packages/@bluelinecli/binary-*/blueline.exe
