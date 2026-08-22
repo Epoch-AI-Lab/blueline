@@ -165,7 +165,8 @@ impl Policy {
     }
 
     /// Check if a package is explicitly declared trusted to onboard without an
-    /// approved baseline. Exact name match, matching `is_script_allowed`.
+    /// approved baseline. Exact name match (no globs), matching
+    /// `is_script_allowed`; a pattern like `@scope/*` grants nothing.
     pub fn allows_unreviewed_baseline(&self, package_name: &str) -> bool {
         self.allowlist
             .packages
