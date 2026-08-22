@@ -157,8 +157,16 @@ fn bootstrap_hint(verdict: &crate::verdict::Verdict) -> Option<String> {
         .iter()
         .any(|f| f.rule_id == "R06_FIRST_SIGHTING")
     {
+        let other_risk = verdict.findings.iter().any(|f| {
+            f.rule_id != "R06_FIRST_SIGHTING" && f.severity > crate::verdict::VerdictBand::Low
+        });
+        let remedy = if other_risk {
+            "Address the findings above first; a baseline allowlist rule will not clear them."
+        } else {
+            "Approve it from an interactive terminal, or add an [[allowlist.packages]] rule with `allow_unreviewed_baseline = true` to blueline.toml to onboard it without one."
+        };
         Some(format!(
-            "hint: no approved baseline exists for `{name}`. Approve it from an interactive terminal, or add an [[allowlist.packages]] rule with `name = \"{name}\"` and `allow_unreviewed_baseline = true` to blueline.toml to onboard it without one."
+            "hint: no approved baseline exists for `{name}`. {remedy}"
         ))
     } else {
         None
