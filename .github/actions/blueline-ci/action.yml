@@ -7,9 +7,9 @@ branding:
 
 inputs:
   base-ref:
-    description: 'Git base ref to diff against (e.g. origin/main or ${{ github.base_ref }})'
+    description: 'Git base ref to diff against (e.g. origin/main). Defaults to the PR base branch, or origin/main outside PRs.'
     required: false
-    default: 'origin/main'
+    default: ''
   lockfile-path:
     description: 'Path to package-lock.json'
     required: false
@@ -34,7 +34,8 @@ runs:
         INPUT_FAIL_ON: ${{ inputs.fail-on }}
         INPUT_POLICY_PATH: ${{ inputs.policy-path }}
       run: |
-        ARGS=(ci --base "$INPUT_BASE_REF" --lockfile "$INPUT_LOCKFILE_PATH" --fail-on "$INPUT_FAIL_ON")
+        BASE="${INPUT_BASE_REF:-${GITHUB_BASE_REF:-origin/main}}"
+        ARGS=(ci --base "$BASE" --lockfile "$INPUT_LOCKFILE_PATH" --fail-on "$INPUT_FAIL_ON")
         if [ -n "$INPUT_POLICY_PATH" ]; then
           ARGS+=(--policy "$INPUT_POLICY_PATH")
         fi
