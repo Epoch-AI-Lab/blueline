@@ -1,8 +1,12 @@
 {
   "name": "blueline",
   "version": "0.2.0",
-  "description": "Approve the delta, not the download — security fail-closed CLI review desk for package installs",
+  "description": "Approve the delta, not the download \u2014 security fail-closed CLI review desk for package installs",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Epoch-AI-Lab/blueline.git"
+  },
   "bin": {
     "blueline": "bin/blueline.js"
   },
