@@ -22,6 +22,10 @@ inputs:
     description: 'Optional path to blueline.toml policy file'
     required: false
     default: ''
+  output-file:
+    description: 'Optional path to save the JSON report'
+    required: false
+    default: ''
 
 runs:
   using: 'composite'
@@ -41,6 +45,9 @@ runs:
         ARGS=(ci --base "$BASE" --lockfile "$INPUT_LOCKFILE_PATH" --fail-on "$INPUT_FAIL_ON")
         if [ -n "$INPUT_POLICY_PATH" ]; then
           ARGS+=(--policy "$INPUT_POLICY_PATH")
+        fi
+        if [ -n "$INPUT_OUTPUT_FILE" ]; then
+          ARGS+=(--output-file "$INPUT_OUTPUT_FILE")
         fi
 
         echo "Executing: blueline ${ARGS[*]}"

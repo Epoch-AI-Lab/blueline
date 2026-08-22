@@ -72,12 +72,41 @@ jobs:
           fetch-depth: 0
       - uses: swatinem/rust-cache@v2
       - uses: ./.github/actions/blueline-ci
+        id: scan
+        continue-on-error: true
         with:
-          # Our own shim legitimately contains process-execution primitives
-          # and ships without a registry baseline, so honest scanning reports
-          # HIGH on itself. Gate hard-fails only at BLOCK; HIGH findings stay
-          # visible in the job summary for every PR.
+          # First-party packages legitimately ship binaries and process-exec
+          # primitives with no registry baseline, so fail-closed scanning
+          # reports BLOCK on ourselves and CI runners keep no approval store.
+          # Risk findings stay visible in the step summary; the hard gate is
+          # scanner health below.
           fail-on: block
+          output-file: blueline-dogfood.json
+      - name: Gate on scanner health, report risk separately
+        run: |
+          python3 - <<'EOF'
+          import json, sys
+
+          r = json.load(open("blueline-dogfood.json"))
+          names = {i["name"] for i in r["items"]}
+          expected = {"@bluelinecli/cli", "blueline", "@bluelinecli/binary-linux-x64-gnu"}
+
+          if r["total_evaluated"] == 0:
+              assert r["unchanged_count"] > 0, "no delta and nothing unchanged — scan saw nothing"
+          else:
+              missing = expected - names
+              assert not missing, f"scanner failed to evaluate: {missing}"
+
+          print(f"dogfood scanner healthy: evaluated {r['total_evaluated']}, "
+                f"unchanged {r['unchanged_count']}, max band {r['max_band']}")
+          for item in r["items"]:
+              print(f"  {item['name']}@{item['new_version']}: {item['verdict']['band']}")
+          EOF
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: blueline-dogfood-report
+          path: blueline-dogfood.json
 
   # Mutation testing guards the trust boundary: it proves the test suite would
   # catch a regression like the poisoned-baseline bug, so audits don't have to.
