@@ -59,6 +59,26 @@ jobs:
       - name: Check advisories, licenses, bans and sources
         run: cargo deny check
 
+  # Dogfood: our own composite Action reviews our own npm distribution
+  # lockfile on every PR. Any dependency added to the shipped packages gets
+  # the same review customers get.
+  dogfood:
+    name: Dogfood (blueline on own npm dist)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: swatinem/rust-cache@v2
+      - uses: ./.github/actions/blueline-ci
+        with:
+          # Our own shim legitimately contains process-execution primitives
+          # and ships without a registry baseline, so honest scanning reports
+          # HIGH on itself. Gate hard-fails only at BLOCK; HIGH findings stay
+          # visible in the job summary for every PR.
+          fail-on: block
+
   # Mutation testing guards the trust boundary: it proves the test suite would
   # catch a regression like the poisoned-baseline bug, so audits don't have to.
   # Warnings must NOT be denied here — a mutation IS the divergence, and

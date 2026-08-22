@@ -1,0 +1,257 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-tag:
+    name: Tag matches Cargo.toml version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify version consistency
+        run: |
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          CARGO_VER="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "$TAG_VER" != "$CARGO_VER" ]; then
+            echo "::error::tag v$TAG_VER does not match Cargo.toml version $CARGO_VER"
+            exit 1
+          fi
+          echo "Releasing blueline $TAG_VER"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [check-tag]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: taiki-e/install-action@v2
+        if: matrix.cross
+        with:
+          tool: cross
+      - name: Add rustup target
+        if: matrix.target != 'x86_64-unknown-linux-gnu' && matrix.target != 'x86_64-pc-windows-msvc'
+        run: rustup target add ${{ matrix.target }}
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --locked --release --target ${{ matrix.target }}
+      - name: Build (cargo)
+        if: ${{ !matrix.cross }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Stage artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            cp "target/${{ matrix.target }}/release/blueline.exe" dist/blueline.exe
+          else
+            cp "target/${{ matrix.target }}/release/blueline" dist/blueline
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/
+
+  publish-platforms:
+    name: Publish @bluelinecli/binary-* to npm
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org/
+      - name: Download all binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Place binaries into platform packages
+        run: |
+          declare -A MAP=(
+            [x86_64-unknown-linux-gnu]=binary-linux-x64-gnu
+            [x86_64-unknown-linux-musl]=binary-linux-x64-musl
+            [aarch64-unknown-linux-gnu]=binary-linux-arm64-gnu
+            [aarch64-apple-darwin]=binary-darwin-arm64
+            [x86_64-apple-darwin]=binary-darwin-x64
+            [x86_64-pc-windows-msvc]=binary-win32-x64
+            [aarch64-pc-windows-msvc]=binary-win32-arm64
+          )
+          for target in "${!MAP[@]}"; do
+            dir="packages/@bluelinecli/${MAP[$target]}"
+            mkdir -p "$dir"
+            if [ -f "artifacts/binary-$target/blueline.exe" ]; then
+              cp "artifacts/binary-$target/blueline.exe" "$dir/blueline.exe"
+            else
+              cp "artifacts/binary-$target/blueline" "$dir/blueline"
+              chmod +x "$dir/blueline"
+            fi
+          done
+      - name: Pin versions from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          for f in packages/@bluelinecli/binary-*/package.json; do
+            node -e "
+              const fs = require('fs');
+              const p = process.argv[1];
+              const j = JSON.parse(fs.readFileSync(p, 'utf8'));
+              j.version = '$VERSION';
+              fs.writeFileSync(p, JSON.stringify(j, null, 2) + '\n');
+            " "$f"
+          done
+      - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for dir in packages/@bluelinecli/binary-*/; do
+            if [ -f "$dir/blueline" ] || [ -f "$dir/blueline.exe" ]; then
+              npm publish "$dir" --access public --provenance
+            fi
+          done
+
+  smoke:
+    name: Dogfood smoke (shipped artifact end-to-end)
+    needs: [publish-platforms]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Pin shim versions from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          for f in packages/blueline/package.json packages/npx/package.json; do
+            node -e "
+              const fs = require('fs');
+              const p = process.argv[1];
+              const j = JSON.parse(fs.readFileSync(p, 'utf8'));
+              j.version = '$VERSION';
+              for (const k of Object.keys(j.optionalDependencies || {})) {
+                if (k.startsWith('@bluelinecli/')) j.optionalDependencies[k] = '$VERSION';
+              }
+              fs.writeFileSync(p, JSON.stringify(j, null, 2) + '\n');
+            " "$f"
+          done
+      - name: Pack and install CLI from tarball
+        run: |
+          cd packages/blueline
+          npm pack
+          npm install -g --prefix /tmp/smoke ./bluelinecli-cli-*.tgz
+      - name: Review a real package through the shipped artifact
+        run: |
+          cat > blueline.toml <<'EOF'
+          [[allowlist.packages]]
+          name = "express"
+          allow_unreviewed_baseline = true
+          EOF
+          OUT="$(/tmp/smoke/bin/blueline review express@4.21.2 --yes)"
+          echo "$OUT" | head -1 | grep -q '"band"'
+          echo "$OUT" | head -1 | grep -q '"integrity":"verified'
+          echo "smoke OK: shipped artifact produced a verified verdict"
+
+  publish-shims:
+    name: Publish shims to npm
+    needs: [smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org/
+      - name: Pin shim versions from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          for f in packages/blueline/package.json packages/npx/package.json; do
+            node -e "
+              const fs = require('fs');
+              const p = process.argv[1];
+              const j = JSON.parse(fs.readFileSync(p, 'utf8'));
+              j.version = '$VERSION';
+              for (const k of Object.keys(j.optionalDependencies || {})) {
+                if (k.startsWith('@bluelinecli/')) j.optionalDependencies[k] = '$VERSION';
+              }
+              fs.writeFileSync(p, JSON.stringify(j, null, 2) + '\n');
+            " "$f"
+          done
+      - name: Publish @bluelinecli/cli and blueline
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm publish packages/blueline --access public --provenance
+          npm publish packages/npx --access public --provenance
+
+  github-release:
+    name: Attach binaries to GitHub release
+    needs: [smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Create release with all binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p release-assets
+          for d in artifacts/binary-*/; do
+            target="$(basename "$d")"
+            if [ -f "$d/blueline.exe" ]; then
+              cp "$d/blueline.exe" "release-assets/blueline-$VERSION-$target.exe"
+            else
+              cp "$d/blueline" "release-assets/blueline-$VERSION-$target"
+            fi
+          done
+          cd release-assets
+          sha256sum * > SHA256SUMS
+          cd ..
+          gh release create "$GITHUB_REF_NAME" release-assets/* \
+            --title "blueline $VERSION" \
+            --generate-notes

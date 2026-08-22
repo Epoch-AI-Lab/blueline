@@ -23,7 +23,7 @@ npm install -g blueline
 blueline install express
 ```
 
-Prebuilt native binaries currently ship for linux-x64 (glibc and musl). On other platforms, build from source: https://github.com/Epoch-AI-Lab/blueline#quickstart
+Prebuilt native binaries are published for common platforms (linux, macOS, Windows). For anything else, build from source: https://github.com/Epoch-AI-Lab/blueline#quickstart
 
 ## Security Invariants
 

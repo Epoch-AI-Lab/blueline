@@ -1,0 +1,7 @@
+{
+  "name": "blueline-monorepo",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ]
+}

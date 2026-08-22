@@ -71,7 +71,7 @@ function resolveBinaryPath() {
   const target = getPlatformTarget();
   if (!target) {
     console.error(`Unsupported platform or architecture: ${process.platform} (${process.arch})`);
-    console.error("Prebuilt native binaries currently ship for linux-x64 (glibc and musl).");
+    console.error("Prebuilt native binaries are published for common platforms (linux, macOS, Windows).");
     console.error("To build from source, see: https://github.com/Epoch-AI-Lab/blueline#quickstart");
     process.exit(1);
   }
