@@ -1,6 +1,7 @@
 use crate::error::BluelineError;
 use crate::registry::{Package, Registry};
 use crate::store::BaselineStore;
+use crate::version::VersionInfo;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BaselineResolution {
@@ -36,30 +37,31 @@ impl BaselineResolution {
     }
 }
 
-pub fn resolve_baseline<R: Registry>(
+pub fn resolve_baseline<R: Registry, V: VersionInfo>(
     name: &str,
-    target_ver: &semver::Version,
+    target_ver: &V,
     registry: &R,
     store: &BaselineStore,
 ) -> Result<BaselineResolution, BluelineError> {
-    let clean_versions = store.list_clean_versions(name)?;
-    let target_is_prerelease = !target_ver.pre.is_empty();
+    let clean_versions = store.list_clean_versions::<V>(name)?;
 
     for (clean_ver, stored_integrity) in clean_versions {
-        if clean_ver < *target_ver && (target_is_prerelease || clean_ver.pre.is_empty()) {
-            match registry.resolve(name, &clean_ver.to_string()) {
+        if clean_ver.baseline_eligible_for(target_ver) {
+            match registry.resolve(name, &clean_ver.canonical()) {
                 Ok(pkg) => match &pkg.integrity {
                     Some(reg_integ) if reg_integ == &stored_integrity => {
                         return Ok(BaselineResolution::LocalApproved(pkg));
                     }
                     Some(reg_integ) => {
                         return Err(BluelineError::Verification(format!(
-                            "stored clean baseline for {name}@{clean_ver} had integrity `{stored_integrity}`, but registry reported `{reg_integ}`; refusing to trust tampered baseline"
+                            "stored clean baseline for {name}@{} had integrity `{stored_integrity}`, but registry reported `{reg_integ}`; refusing to trust tampered baseline",
+                            clean_ver.canonical()
                         )));
                     }
                     None => {
                         return Err(BluelineError::Verification(format!(
-                            "stored clean baseline for {name}@{clean_ver} had integrity `{stored_integrity}`, but registry reported no integrity; refusing to trust unverified baseline"
+                            "stored clean baseline for {name}@{} had integrity `{stored_integrity}`, but registry reported no integrity; refusing to trust unverified baseline",
+                            clean_ver.canonical()
                         )));
                     }
                 },
@@ -73,9 +75,15 @@ pub fn resolve_baseline<R: Registry>(
     }
 
     let reg_versions = registry.list_versions(name)?;
+    let target_semver = semver::Version::parse(&target_ver.canonical()).map_err(|e| {
+        BluelineError::InvalidPackageSpec(format!(
+            "version `{}` is not comparable for baseline selection: {e}",
+            target_ver.canonical()
+        ))
+    })?;
     let predecessor = reg_versions
         .into_iter()
-        .filter(|v| v < target_ver && (target_is_prerelease || v.pre.is_empty()))
+        .filter(|v| *v < target_semver && (target_semver.pre.is_empty() || v.pre.is_empty()))
         .max();
 
     if let Some(pred_ver) = predecessor {

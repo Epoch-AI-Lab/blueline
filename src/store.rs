@@ -246,11 +246,11 @@ impl BaselineStore {
         Ok(())
     }
 
-    /// Retrieve all versions marked clean for a package, sorted by semver descending.
-    pub fn list_clean_versions(
+    /// Retrieve all versions marked clean for a package, sorted descending.
+    pub fn list_clean_versions<V: crate::version::VersionInfo>(
         &self,
         name: &str,
-    ) -> Result<Vec<(semver::Version, String)>, BluelineError> {
+    ) -> Result<Vec<(V, String)>, BluelineError> {
         let mut stmt = self
             .conn
             .prepare_cached(
@@ -270,7 +270,7 @@ impl BaselineStore {
         for row in rows {
             let (v_str, integ) = row
                 .map_err(|e| BluelineError::Store(format!("reading clean row for {name}: {e}")))?;
-            if let Ok(v) = semver::Version::parse(&v_str) {
+            if let Ok(v) = V::parse(&v_str) {
                 versions.push((v, integ));
             }
         }
@@ -614,12 +614,17 @@ mod tests {
         store.record_verified("pkg", "1.1.0", "sha512-v2").unwrap();
         store.record_verified("pkg", "2.0.0", "sha512-v3").unwrap();
 
-        assert!(store.list_clean_versions("pkg").unwrap().is_empty());
+        assert!(
+            store
+                .list_clean_versions::<semver::Version>("pkg")
+                .unwrap()
+                .is_empty()
+        );
 
         store.mark_clean("pkg", "1.0.0", "sha512-v1").unwrap();
         store.mark_clean("pkg", "2.0.0", "sha512-v3").unwrap();
 
-        let clean = store.list_clean_versions("pkg").unwrap();
+        let clean = store.list_clean_versions::<semver::Version>("pkg").unwrap();
         assert_eq!(clean.len(), 2);
         assert_eq!(clean[0].0, semver::Version::parse("2.0.0").unwrap());
         assert_eq!(clean[0].1, "sha512-v3");
