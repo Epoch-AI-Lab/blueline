@@ -26,4 +26,5 @@ pub trait Registry {
     fn resolve_dist_tag(&self, name: &str, tag: &str) -> Result<Option<String>, BluelineError>;
 }
 
+pub mod http_util;
 pub mod npm;
