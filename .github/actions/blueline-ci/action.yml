@@ -35,6 +35,9 @@ runs:
         INPUT_POLICY_PATH: ${{ inputs.policy-path }}
       run: |
         BASE="${INPUT_BASE_REF:-${GITHUB_BASE_REF:-origin/main}}"
+        if ! git rev-parse --verify --quiet "$BASE" >/dev/null 2>&1; then
+          BASE="origin/$BASE"
+        fi
         ARGS=(ci --base "$BASE" --lockfile "$INPUT_LOCKFILE_PATH" --fail-on "$INPUT_FAIL_ON")
         if [ -n "$INPUT_POLICY_PATH" ]; then
           ARGS+=(--policy "$INPUT_POLICY_PATH")
