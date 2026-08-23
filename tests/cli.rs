@@ -202,7 +202,16 @@ fn full_flow_json_output() {
     let json: serde_json::Value = serde_json::from_str(&output).expect("stdout must be valid JSON");
     assert_eq!(json["name"], "express");
     assert_eq!(json["target_version"], "4.21.2");
-    assert_eq!(json["integrity"], "verified (sha512)");
+    // The card/JSON display the verified digest in canonical `sha512:<hex>` form.
+    let displayed = json["integrity"].as_str().unwrap();
+    assert!(displayed.starts_with("sha512:"), "got {displayed}");
+    assert_eq!(
+        blueline::registry::Checksum::parse(displayed)
+            .unwrap()
+            .to_sri(),
+        integrity
+    );
+    assert_eq!(json["ecosystem"], "npm");
     assert_eq!(json["band"], "BLOCK");
     assert!(json["risk_score"].as_u64().unwrap() >= 50);
     assert_eq!(json["diff_summary"]["files_added"], 2);
@@ -249,7 +258,9 @@ fn text_output_lists_install_scripts() {
         .code(2)
         .stdout(
             predicate::str::contains("BLUELINE REVIEW: express@4.21.2")
-                .and(predicate::str::contains("verified (sha512)"))
+                .and(predicate::str::contains("sha512:"))
+                .and(predicate::str::contains("Ecosystem"))
+                .and(predicate::str::contains("npm"))
                 .and(predicate::str::contains("BLOCK"))
                 .and(predicate::str::contains("preinstall"))
                 .and(predicate::str::contains("postinstall")),

@@ -13,13 +13,29 @@ fn main() {
 
 fn run() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
+    let ecosystem = cli.ecosystem.into();
+    // npm talks to the registry base; cargo reviews use the sparse index base.
+    let registry_base = match ecosystem {
+        blueline::registry::Ecosystem::Npm => cli.registry.clone(),
+        _ => cli.index.clone(),
+    };
     match cli.command {
-        cli::Command::Review { pkg, output, yes } => {
-            review::run(&pkg, &cli.registry, output, cli.policy.as_deref(), yes)
-        }
-        cli::Command::Install { pkg, npm_args, yes } => {
-            review::install(&pkg, &cli.registry, &npm_args, cli.policy.as_deref(), yes)
-        }
+        cli::Command::Review { pkg, output, yes } => review::run(
+            &pkg,
+            ecosystem,
+            &registry_base,
+            output,
+            cli.policy.as_deref(),
+            yes,
+        ),
+        cli::Command::Install { pkg, npm_args, yes } => review::install(
+            &pkg,
+            ecosystem,
+            &registry_base,
+            &npm_args,
+            cli.policy.as_deref(),
+            yes,
+        ),
         cli::Command::Ci {
             base,
             lockfile,
@@ -35,6 +51,6 @@ fn run() -> anyhow::Result<()> {
             fail_on,
             output_file.as_deref(),
         ),
-        cli::Command::Mcp => mcp::run_stdio(&cli.registry, cli.policy.as_deref()),
+        cli::Command::Mcp => mcp::run_stdio(&cli.registry, &cli.index, cli.policy.as_deref()),
     }
 }
