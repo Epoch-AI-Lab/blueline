@@ -277,6 +277,26 @@ fn tampered_tarball_fails_closed() {
 }
 
 #[test]
+fn sha256_only_integrity_fails_closed_with_algorithm_error() {
+    let tarball = make_tarball();
+    // npm requires sha512; a packument advertising only sha256 must be
+    // rejected by the algorithm guard itself, not fall through to a digest
+    // comparison against the wrong hash.
+    let sha256_only = format!("sha256:{}", "ab".repeat(32));
+    let fixture = spawn_fixture(move |base| packument(base, "4.21.2", &sha256_only), tarball);
+
+    let data_dir = tempfile::tempdir().unwrap();
+    blueline()
+        .args(["review", "express@4.21.2", "--registry", &fixture.base])
+        .env("BLUELINE_DATA_DIR", data_dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "unsupported dist.integrity algorithm `sha256`",
+        ));
+}
+
+#[test]
 fn republished_tarball_same_version_fails_closed() {
     let tarball_a = make_tarball();
     let tarball_b = make_tarball_with(b"module.exports = 2;");

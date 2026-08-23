@@ -42,6 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `ci_fail_on_case_insensitive`, `mcp_ping_heartbeat`,
   `mcp_stdio_handles_initialize_and_tools_list`), eliminating a flaky race on
   the real user data dir under parallel test runs.
+- Pinned the fail-closed rejection of npm packuments advertising a non-sha512
+  `dist.integrity` with an explicit regression test asserting the algorithm
+  error, closing a surviving mutation-testing gap in `registry::npm`.
 
 ## [0.2.0] - 2026-08-22
 
