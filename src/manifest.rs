@@ -374,6 +374,44 @@ std = []
     }
 
     #[test]
+    fn gypfile_flags_any_single_signal() {
+        let gyp = |body: &str| {
+            let m: PackedCargoToml =
+                toml::from_str(&format!("[package]\nname=\"x\"\n{body}")).unwrap();
+            m.manifest_view().gypfile
+        };
+        // Each signal alone must set the flag; the disjunction must not
+        // degrade into requiring all three at once.
+        assert_eq!(gyp("build = \"b.rs\""), Some(true));
+        assert_eq!(gyp("links = \"z\""), Some(true));
+        assert_eq!(gyp("\n[[bin]]\nname = \"cli\""), Some(true));
+        assert_eq!(gyp(""), Some(false));
+    }
+
+    #[test]
+    fn accepts_manifest_at_exact_size_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Cargo.toml");
+        let head = b"[package]\nname = \"x\"\n#";
+        let mut body = head.to_vec();
+        body.resize(MAX_MANIFEST_BYTES as usize, b'#');
+        assert_eq!(body.len() as u64, MAX_MANIFEST_BYTES);
+        fs::write(&path, &body).unwrap();
+        assert!(read_packed_cargo_toml(&path).is_ok());
+    }
+
+    #[test]
+    fn rejects_manifest_over_size_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Cargo.toml");
+        let body = vec![b'#'; MAX_MANIFEST_BYTES as usize + 1];
+        assert_ne!(body.len() as u64, MAX_MANIFEST_BYTES);
+        fs::write(&path, &body).unwrap();
+        let err = read_packed_cargo_toml(&path).unwrap_err().to_string();
+        assert!(err.contains("exceeds cap"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn rejects_invalid_cargo_toml() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("Cargo.toml");
