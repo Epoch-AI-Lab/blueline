@@ -62,7 +62,7 @@ Rulings:
 ## Status
 
 - [x] PR1 feat/registry-foundation
-- [ ] PR2 feat/crates-io-adapter
+- [x] PR2 feat/crates-io-adapter
 - [ ] PR3 feat/cargo-lock-ci
 - [ ] PR4 feat/pypi-adapter
 
