@@ -1200,9 +1200,11 @@ fn mcp_stdio_handles_initialize_and_tools_list() {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
+    let data_dir = tempfile::tempdir().unwrap();
     let bin_path = assert_cmd::cargo::cargo_bin("blueline");
     let mut child = Command::new(bin_path)
         .arg("mcp")
+        .env("BLUELINE_DATA_DIR", data_dir.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1474,6 +1476,7 @@ fn regression_non_interactive_emits_diagnostic_stderr_on_exit() {
 #[test]
 fn ci_writes_report_to_output_file() {
     let temp_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
     let lockfile_path = temp_dir.path().join("package-lock.json");
     let out_report_path = temp_dir.path().join("ci-summary.md");
 
@@ -1512,6 +1515,7 @@ fn ci_writes_report_to_output_file() {
 
     blueline()
         .current_dir(temp_dir.path())
+        .env("BLUELINE_DATA_DIR", data_dir.path())
         .args([
             "ci",
             "--base",
@@ -1534,8 +1538,10 @@ fn ci_writes_report_to_output_file() {
 #[test]
 fn mcp_ping_heartbeat() {
     let input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n";
+    let data_dir = tempfile::tempdir().unwrap();
     blueline()
         .args(["mcp"])
+        .env("BLUELINE_DATA_DIR", data_dir.path())
         .write_stdin(input)
         .assert()
         .success()
@@ -1545,6 +1551,7 @@ fn mcp_ping_heartbeat() {
 #[test]
 fn ci_fail_on_case_insensitive() {
     let temp_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
     let lockfile_path = temp_dir.path().join("package-lock.json");
 
     let _ = std::process::Command::new("git")
@@ -1578,6 +1585,7 @@ fn ci_fail_on_case_insensitive() {
     // Uppercase HIGH should be parsed successfully without clap enum error
     blueline()
         .current_dir(temp_dir.path())
+        .env("BLUELINE_DATA_DIR", data_dir.path())
         .args([
             "ci",
             "--base",

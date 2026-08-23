@@ -35,6 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   legacy `sha512-<base64>` rows and new `sha512:<hex>` display forms are
   judged alike (fail-closed behavior unchanged).
 
+### Fixed
+
+- Isolated `BLUELINE_DATA_DIR` in the remaining CLI tests that spawn the
+  binary while asserting success (`ci_writes_report_to_output_file`,
+  `ci_fail_on_case_insensitive`, `mcp_ping_heartbeat`,
+  `mcp_stdio_handles_initialize_and_tools_list`), eliminating a flaky race on
+  the real user data dir under parallel test runs.
+
 ## [0.2.0] - 2026-08-22
 
 ### Added
