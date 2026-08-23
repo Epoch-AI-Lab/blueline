@@ -202,7 +202,16 @@ fn full_flow_json_output() {
     let json: serde_json::Value = serde_json::from_str(&output).expect("stdout must be valid JSON");
     assert_eq!(json["name"], "express");
     assert_eq!(json["target_version"], "4.21.2");
-    assert_eq!(json["integrity"], "verified (sha512)");
+    // The card/JSON display the verified digest in canonical `sha512:<hex>` form.
+    let displayed = json["integrity"].as_str().unwrap();
+    assert!(displayed.starts_with("sha512:"), "got {displayed}");
+    assert_eq!(
+        blueline::registry::Checksum::parse(displayed)
+            .unwrap()
+            .to_sri(),
+        integrity
+    );
+    assert_eq!(json["ecosystem"], "npm");
     assert_eq!(json["band"], "BLOCK");
     assert!(json["risk_score"].as_u64().unwrap() >= 50);
     assert_eq!(json["diff_summary"]["files_added"], 2);
@@ -221,7 +230,10 @@ fn full_flow_json_output() {
         .unwrap();
     assert_eq!(name, "express");
     assert_eq!(version, "4.21.2");
-    assert_eq!(integrity_row, integrity);
+    // The witness is stored in the canonical display form; it must normalize
+    // to the same digest content as the SRI the fixture served.
+    let stored = blueline::registry::Checksum::parse(&integrity_row).unwrap();
+    assert_eq!(stored.to_sri(), integrity);
     assert_eq!(clean, 0, "review records evidence, never a clean blessing");
 }
 
@@ -246,7 +258,9 @@ fn text_output_lists_install_scripts() {
         .code(2)
         .stdout(
             predicate::str::contains("BLUELINE REVIEW: express@4.21.2")
-                .and(predicate::str::contains("verified (sha512)"))
+                .and(predicate::str::contains("sha512:"))
+                .and(predicate::str::contains("Ecosystem"))
+                .and(predicate::str::contains("npm"))
                 .and(predicate::str::contains("BLOCK"))
                 .and(predicate::str::contains("preinstall"))
                 .and(predicate::str::contains("postinstall")),
@@ -271,6 +285,26 @@ fn tampered_tarball_fails_closed() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("integrity verification failed"));
+}
+
+#[test]
+fn sha256_only_integrity_fails_closed_with_algorithm_error() {
+    let tarball = make_tarball();
+    // npm requires sha512; a packument advertising only sha256 must be
+    // rejected by the algorithm guard itself, not fall through to a digest
+    // comparison against the wrong hash.
+    let sha256_only = format!("sha256:{}", "ab".repeat(32));
+    let fixture = spawn_fixture(move |base| packument(base, "4.21.2", &sha256_only), tarball);
+
+    let data_dir = tempfile::tempdir().unwrap();
+    blueline()
+        .args(["review", "express@4.21.2", "--registry", &fixture.base])
+        .env("BLUELINE_DATA_DIR", data_dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "unsupported dist.integrity algorithm `sha256`",
+        ));
 }
 
 #[test]
@@ -1197,9 +1231,11 @@ fn mcp_stdio_handles_initialize_and_tools_list() {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
+    let data_dir = tempfile::tempdir().unwrap();
     let bin_path = assert_cmd::cargo::cargo_bin("blueline");
     let mut child = Command::new(bin_path)
         .arg("mcp")
+        .env("BLUELINE_DATA_DIR", data_dir.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1374,11 +1410,22 @@ fn regression_pure_json_output_with_yes_and_clean_exit() {
     let data_dir = tempfile::tempdir().unwrap();
     let db_path = data_dir.path().join("baseline.db");
     let store = blueline::store::BaselineStore::open_at(&db_path).unwrap();
+    let seeded_checksum = blueline::registry::Checksum::parse(&safe_integrity).unwrap();
     store
-        .record_verified("pure-json-pkg", "0.9.0", &safe_integrity)
+        .record_verified(
+            blueline::registry::Ecosystem::Npm,
+            "pure-json-pkg",
+            "0.9.0",
+            &seeded_checksum,
+        )
         .unwrap();
     store
-        .mark_clean("pure-json-pkg", "0.9.0", &safe_integrity)
+        .mark_clean(
+            blueline::registry::Ecosystem::Npm,
+            "pure-json-pkg",
+            "0.9.0",
+            &seeded_checksum,
+        )
         .unwrap();
     drop(store);
 
@@ -1460,6 +1507,7 @@ fn regression_non_interactive_emits_diagnostic_stderr_on_exit() {
 #[test]
 fn ci_writes_report_to_output_file() {
     let temp_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
     let lockfile_path = temp_dir.path().join("package-lock.json");
     let out_report_path = temp_dir.path().join("ci-summary.md");
 
@@ -1498,6 +1546,7 @@ fn ci_writes_report_to_output_file() {
 
     blueline()
         .current_dir(temp_dir.path())
+        .env("BLUELINE_DATA_DIR", data_dir.path())
         .args([
             "ci",
             "--base",
@@ -1520,8 +1569,10 @@ fn ci_writes_report_to_output_file() {
 #[test]
 fn mcp_ping_heartbeat() {
     let input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n";
+    let data_dir = tempfile::tempdir().unwrap();
     blueline()
         .args(["mcp"])
+        .env("BLUELINE_DATA_DIR", data_dir.path())
         .write_stdin(input)
         .assert()
         .success()
@@ -1531,6 +1582,7 @@ fn mcp_ping_heartbeat() {
 #[test]
 fn ci_fail_on_case_insensitive() {
     let temp_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
     let lockfile_path = temp_dir.path().join("package-lock.json");
 
     let _ = std::process::Command::new("git")
@@ -1564,6 +1616,7 @@ fn ci_fail_on_case_insensitive() {
     // Uppercase HIGH should be parsed successfully without clap enum error
     blueline()
         .current_dir(temp_dir.path())
+        .env("BLUELINE_DATA_DIR", data_dir.path())
         .args([
             "ci",
             "--base",
@@ -1601,6 +1654,7 @@ fn ci_rejects_flag_like_base_refs() {
 
     blueline()
         .current_dir(temp_dir.path())
+        .env("BLUELINE_DATA_DIR", temp_dir.path())
         .args([
             "ci",
             "--base=--output=/tmp/pwn",

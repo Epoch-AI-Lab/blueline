@@ -157,6 +157,12 @@ pub fn render_text(verdict: &Verdict, delta: &Delta) {
         Cell::new(sanitize_single_line(&verdict.integrity)).fg(Color::Green),
     ]);
 
+    // Ecosystem row
+    table.add_row(vec![
+        Cell::new("Ecosystem").fg(Color::White),
+        Cell::new(verdict.ecosystem.key()).fg(Color::Cyan),
+    ]);
+
     // Verdict row
     let (band_color, band_label) = match verdict.band {
         VerdictBand::Low => (Color::Green, "[ LOW RISK ]"),
@@ -423,6 +429,7 @@ mod tests {
             target_version: "1.1.0".into(),
             baseline_version: Some("1.0.0".into()),
             integrity: "sha512-test".into(),
+            ecosystem: crate::registry::Ecosystem::Npm,
             band: crate::verdict::VerdictBand::Block,
             risk_score: 75,
             findings: vec![crate::verdict::Finding {

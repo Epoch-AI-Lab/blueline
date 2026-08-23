@@ -2,17 +2,20 @@ use crate::advisory::AdvisoryReport;
 use crate::diff::{Delta, FileKind};
 use crate::policy::Policy;
 use crate::provenance::{ProvenanceReport, ProvenanceStatus};
+use crate::registry::Ecosystem;
 use crate::verdict::{DiffSummary, Finding, TrustSources, Verdict, VerdictBand};
 
 #[allow(dead_code)]
 pub fn evaluate(
     name: &str,
+    ecosystem: Ecosystem,
     integrity: &str,
     delta: &Delta,
     is_unreviewed_baseline: bool,
 ) -> Verdict {
     evaluate_with_policy(
         name,
+        ecosystem,
         integrity,
         delta,
         is_unreviewed_baseline,
@@ -22,6 +25,7 @@ pub fn evaluate(
 
 pub fn evaluate_with_policy(
     name: &str,
+    ecosystem: Ecosystem,
     integrity: &str,
     delta: &Delta,
     is_unreviewed_baseline: bool,
@@ -29,20 +33,25 @@ pub fn evaluate_with_policy(
 ) -> Verdict {
     evaluate_with_trust(
         name,
+        ecosystem,
         integrity,
         delta,
         is_unreviewed_baseline,
+        false,
         policy,
         None,
         None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate_with_trust(
     name: &str,
+    ecosystem: Ecosystem,
     integrity: &str,
     delta: &Delta,
     is_unreviewed_baseline: bool,
+    prior_release_yanked: bool,
     policy: &Policy,
     advisories: Option<&AdvisoryReport>,
     provenance: Option<&ProvenanceReport>,
@@ -50,7 +59,7 @@ pub fn evaluate_with_trust(
     let mut findings = Vec::new();
 
     // P01: Check if package is explicitly blocked by policy
-    if policy.is_package_blocked(name) {
+    if policy.is_package_blocked(name, ecosystem) {
         findings.push(Finding {
             rule_id: "P01_PACKAGE_BLOCKED".into(),
             severity: VerdictBand::Block,
@@ -146,7 +155,7 @@ pub fn evaluate_with_trust(
 
     // R01: Lifecycle scripts
     for script in &delta.new_lifecycle_scripts {
-        if policy.is_script_allowed(name, script) {
+        if policy.is_script_allowed(name, script, ecosystem) {
             findings.push(Finding {
                 rule_id: "P02_LIFECYCLE_SCRIPT_ALLOWED".into(),
                 severity: VerdictBand::Low,
@@ -172,7 +181,7 @@ pub fn evaluate_with_trust(
     }
 
     for script in &delta.modified_lifecycle_scripts {
-        if policy.is_script_allowed(name, script) {
+        if policy.is_script_allowed(name, script, ecosystem) {
             findings.push(Finding {
                 rule_id: "P02_LIFECYCLE_SCRIPT_ALLOWED".into(),
                 severity: VerdictBand::Low,
@@ -194,8 +203,8 @@ pub fn evaluate_with_trust(
     }
 
     // Native build trigger: binding.gyp in root triggers node-gyp rebuild on install
-    let binding_allowed =
-        policy.is_script_allowed(name, "binding.gyp") || policy.is_script_allowed(name, "node-gyp");
+    let binding_allowed = policy.is_script_allowed(name, "binding.gyp", ecosystem)
+        || policy.is_script_allowed(name, "node-gyp", ecosystem);
     if delta.binding_gyp_added
         || delta
             .files_added
@@ -405,7 +414,7 @@ pub fn evaluate_with_trust(
 
     // R06: First sighting
     if delta.baseline_version.is_none() {
-        let severity = if policy.allows_unreviewed_baseline(name) {
+        let severity = if policy.allows_unreviewed_baseline(name, ecosystem) {
             VerdictBand::Low
         } else {
             VerdictBand::Medium
@@ -422,7 +431,7 @@ pub fn evaluate_with_trust(
     // R07: Unreviewed predecessor baseline
     if is_unreviewed_baseline {
         let base_ver = delta.baseline_version.as_deref().unwrap_or("unknown");
-        let severity = if policy.allows_unreviewed_baseline(name) {
+        let severity = if policy.allows_unreviewed_baseline(name, ecosystem) {
             VerdictBand::Low
         } else {
             VerdictBand::Medium
@@ -433,6 +442,24 @@ pub fn evaluate_with_trust(
             title: format!("Unreviewed baseline version `{base_ver}`"),
             description: format!(
                 "Baseline version `{base_ver}` was selected from registry history and has not been approved locally."
+            ),
+        });
+    }
+
+    // R08: Immediate prior release yanked from the registry
+    if prior_release_yanked {
+        let prior_ver = delta
+            .baseline_version
+            .as_deref()
+            .map(|b| b.to_string())
+            .unwrap_or_else(|| "the previous release".to_string());
+        findings.push(Finding {
+            rule_id: "R08_YANKED_PREDECESSOR".into(),
+            severity: VerdictBand::Medium,
+            title: format!("Release immediately preceding `{}` was yanked", delta.target_version),
+            description: format!(
+                "The release immediately before `{}` (`{prior_ver}`) was yanked from the registry. Yanked releases are a common supply-chain attack cleanup signal; the diff anchor may be older than expected.",
+                delta.target_version
             ),
         });
     }
@@ -483,6 +510,7 @@ pub fn evaluate_with_trust(
         target_version: delta.target_version.clone(),
         baseline_version: delta.baseline_version.clone(),
         integrity: integrity.to_string(),
+        ecosystem,
         band,
         risk_score: capped_score,
         findings,
@@ -1631,7 +1659,13 @@ mod tests {
             binding_gyp_added: false,
         };
 
-        let verdict = evaluate("test-pkg", "verified (sha512)", &delta, false);
+        let verdict = evaluate(
+            "test-pkg",
+            Ecosystem::Npm,
+            "verified (sha512)",
+            &delta,
+            false,
+        );
         assert_eq!(verdict.band, VerdictBand::Block);
         assert!(verdict.risk_score >= 50);
         assert!(
@@ -1670,7 +1704,13 @@ mod tests {
             binding_gyp_added: false,
         };
 
-        let verdict = evaluate("test-pkg", "verified (sha512)", &delta, false);
+        let verdict = evaluate(
+            "test-pkg",
+            Ecosystem::Npm,
+            "verified (sha512)",
+            &delta,
+            false,
+        );
         assert_eq!(verdict.band, VerdictBand::High);
         assert!(
             verdict
@@ -1714,7 +1754,13 @@ mod tests {
             binding_gyp_added: false,
         };
 
-        let verdict = evaluate("test-pkg", "verified (sha512)", &delta, false);
+        let verdict = evaluate(
+            "test-pkg",
+            Ecosystem::Npm,
+            "verified (sha512)",
+            &delta,
+            false,
+        );
         assert_eq!(verdict.band, VerdictBand::High);
         assert!(
             verdict
@@ -1752,7 +1798,13 @@ mod tests {
             binding_gyp_added: true,
         };
 
-        let verdict = evaluate("test-pkg", "verified (sha512)", &delta, false);
+        let verdict = evaluate(
+            "test-pkg",
+            Ecosystem::Npm,
+            "verified (sha512)",
+            &delta,
+            false,
+        );
         assert_eq!(verdict.band, VerdictBand::Block);
         assert!(
             verdict
@@ -1806,7 +1858,13 @@ mod tests {
             binding_gyp_added: false,
         };
 
-        let verdict = evaluate("test-pkg", "verified (sha512)", &delta, false);
+        let verdict = evaluate(
+            "test-pkg",
+            Ecosystem::Npm,
+            "verified (sha512)",
+            &delta,
+            false,
+        );
         assert_eq!(verdict.band, VerdictBand::High);
         assert!(
             verdict
@@ -1844,7 +1902,13 @@ mod tests {
             binding_gyp_added: false,
         };
 
-        let verdict = evaluate("test-pkg", "verified (sha512)", &delta, false);
+        let verdict = evaluate(
+            "test-pkg",
+            Ecosystem::Npm,
+            "verified (sha512)",
+            &delta,
+            false,
+        );
         assert_eq!(verdict.band, VerdictBand::Medium);
         assert_eq!(verdict.risk_score, 15);
         assert!(
@@ -1876,7 +1940,13 @@ mod tests {
             binding_gyp_added: false,
         };
 
-        let verdict = evaluate("test-pkg", "verified (sha512)", &delta, true);
+        let verdict = evaluate(
+            "test-pkg",
+            Ecosystem::Npm,
+            "verified (sha512)",
+            &delta,
+            true,
+        );
         assert_eq!(verdict.band, VerdictBand::Medium);
         assert!(
             verdict
@@ -1917,6 +1987,7 @@ mod tests {
             .packages
             .push(crate::policy::PackageAllowRule {
                 name: "test-pkg".into(),
+                ecosystem: None,
                 allowed_scripts: vec![],
                 max_risk: None,
                 integrity: None,
@@ -1929,8 +2000,14 @@ mod tests {
             ("other-pkg", &first_sighting, false),
             ("other-pkg", &unreviewed, true),
         ] {
-            let verdict =
-                evaluate_with_policy(name, "verified (sha512)", delta, unreviewed_flag, &policy);
+            let verdict = evaluate_with_policy(
+                name,
+                Ecosystem::Npm,
+                "verified (sha512)",
+                delta,
+                unreviewed_flag,
+                &policy,
+            );
             let r06 = verdict
                 .findings
                 .iter()
@@ -1992,14 +2069,21 @@ mod tests {
             .packages
             .push(crate::policy::PackageAllowRule {
                 name: "sneaky-pkg".into(),
+                ecosystem: None,
                 allowed_scripts: vec![],
                 max_risk: None,
                 integrity: None,
                 allow_unreviewed_baseline: true,
             });
 
-        let verdict =
-            evaluate_with_policy("sneaky-pkg", "verified (sha512)", &delta, true, &policy);
+        let verdict = evaluate_with_policy(
+            "sneaky-pkg",
+            Ecosystem::Npm,
+            "verified (sha512)",
+            &delta,
+            true,
+            &policy,
+        );
         assert_eq!(verdict.band, VerdictBand::High);
         assert!(
             verdict
@@ -2067,7 +2151,13 @@ mod tests {
             binding_gyp_added: false,
         };
 
-        let verdict = evaluate("test-pkg", "verified (sha512)", &delta, false);
+        let verdict = evaluate(
+            "test-pkg",
+            Ecosystem::Npm,
+            "verified (sha512)",
+            &delta,
+            false,
+        );
         assert_eq!(verdict.band, VerdictBand::High);
         assert!(
             verdict
@@ -2102,7 +2192,13 @@ mod tests {
             binding_gyp_added: false,
         };
 
-        let verdict = evaluate("test-pkg", "verified (sha512)", &delta, false);
+        let verdict = evaluate(
+            "test-pkg",
+            Ecosystem::Npm,
+            "verified (sha512)",
+            &delta,
+            false,
+        );
         assert_eq!(verdict.band, VerdictBand::High);
         assert!(
             verdict
@@ -2182,7 +2278,13 @@ mod tests {
             binding_gyp_added: false,
         };
 
-        let verdict = evaluate("test-pkg", "verified (sha512)", &delta, false);
+        let verdict = evaluate(
+            "test-pkg",
+            Ecosystem::Npm,
+            "verified (sha512)",
+            &delta,
+            false,
+        );
         assert_eq!(verdict.risk_score, 100);
         assert_eq!(verdict.band, VerdictBand::Block);
     }
@@ -2209,10 +2311,22 @@ mod tests {
         };
 
         let mut policy = Policy::default();
-        policy.blocklist.packages.push("blocked-*".into());
+        policy
+            .blocklist
+            .packages
+            .push(crate::policy::PackageBlockRule {
+                pattern: "blocked-*".into(),
+                ecosystem: None,
+            });
 
-        let verdict =
-            evaluate_with_policy("blocked-pkg", "verified (sha512)", &delta, false, &policy);
+        let verdict = evaluate_with_policy(
+            "blocked-pkg",
+            Ecosystem::Npm,
+            "verified (sha512)",
+            &delta,
+            false,
+            &policy,
+        );
         assert_eq!(verdict.band, VerdictBand::Block);
         assert!(
             verdict
@@ -2249,13 +2363,21 @@ mod tests {
             .packages
             .push(crate::policy::PackageAllowRule {
                 name: "esbuild".into(),
+                ecosystem: None,
                 allowed_scripts: vec!["postinstall".into()],
                 max_risk: None,
                 integrity: None,
                 allow_unreviewed_baseline: false,
             });
 
-        let verdict = evaluate_with_policy("esbuild", "verified (sha512)", &delta, false, &policy);
+        let verdict = evaluate_with_policy(
+            "esbuild",
+            Ecosystem::Npm,
+            "verified (sha512)",
+            &delta,
+            false,
+            &policy,
+        );
         assert_eq!(verdict.band, VerdictBand::Low);
         assert!(
             verdict
@@ -2315,8 +2437,10 @@ mod tests {
 
         let verdict = evaluate_with_trust(
             "pkg",
+            Ecosystem::Npm,
             "verified (sha512)",
             &delta,
+            false,
             false,
             &Policy::default(),
             Some(&adv),
@@ -2370,8 +2494,10 @@ mod tests {
 
         let verdict = evaluate_with_trust(
             "pkg",
+            Ecosystem::Npm,
             "verified (sha512)",
             &delta,
+            false,
             false,
             &Policy::default(),
             Some(&adv),
@@ -2412,8 +2538,10 @@ mod tests {
 
         let verdict = evaluate_with_trust(
             "pkg",
+            Ecosystem::Npm,
             "verified (sha512)",
             &delta,
+            false,
             false,
             &Policy::default(),
             None,
@@ -2456,8 +2584,10 @@ mod tests {
         let prov_missing = ProvenanceReport::missing(false, None);
         let verdict = evaluate_with_trust(
             "pkg",
+            Ecosystem::Npm,
             "verified (sha512)",
             &delta,
+            false,
             false,
             &policy,
             None,
@@ -2492,8 +2622,10 @@ mod tests {
 
         let verdict_repo = evaluate_with_trust(
             "pkg",
+            Ecosystem::Npm,
             "verified (sha512)",
             &delta,
+            false,
             false,
             &policy_repo,
             None,
@@ -2783,5 +2915,79 @@ mod tests {
             fold_char_code_calls("String.fromCharCode(118,109)tail"),
             "'vm'tail"
         );
+    }
+
+    fn yanked_delta() -> Delta {
+        Delta {
+            baseline_version: Some("1.0.0".into()),
+            target_version: "1.1.0".into(),
+            files_added: vec![],
+            files_removed: vec![],
+            files_modified: vec![],
+            total_lines_added: 0,
+            total_lines_deleted: 0,
+            new_executables: vec![],
+            new_binaries: vec![],
+            modified_binaries: vec![],
+            new_lifecycle_scripts: vec![],
+            modified_lifecycle_scripts: vec![],
+            new_dependencies: vec![],
+            modified_dependencies: vec![],
+            removed_dependencies: vec![],
+            binding_gyp_added: false,
+        }
+    }
+
+    #[test]
+    fn flags_yanked_predecessor_as_medium() {
+        let delta = yanked_delta();
+        let verdict = evaluate_with_trust(
+            "test-pkg",
+            Ecosystem::Npm,
+            "sha256:abc",
+            &delta,
+            false,
+            true,
+            &Policy::default(),
+            None,
+            None,
+        );
+        let r08 = verdict
+            .findings
+            .iter()
+            .find(|f| f.rule_id == "R08_YANKED_PREDECESSOR");
+        assert!(
+            r08.is_some(),
+            "expected R08 finding, got {:?}",
+            verdict.findings
+        );
+        assert_eq!(r08.unwrap().severity, VerdictBand::Medium);
+        // Medium findings contribute to the risk score.
+        assert_eq!(verdict.risk_score, 10);
+        assert_eq!(verdict.band, VerdictBand::Medium);
+    }
+
+    #[test]
+    fn no_yanked_predecessor_finding_when_prior_is_live() {
+        let delta = yanked_delta();
+        let verdict = evaluate_with_trust(
+            "test-pkg",
+            Ecosystem::Cargo,
+            "sha256:abc",
+            &delta,
+            false,
+            false,
+            &Policy::default(),
+            None,
+            None,
+        );
+        assert!(
+            !verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "R08_YANKED_PREDECESSOR")
+        );
+        assert_eq!(verdict.band, VerdictBand::Low);
+        assert_eq!(verdict.ecosystem, Ecosystem::Cargo);
     }
 }

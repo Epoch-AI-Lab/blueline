@@ -165,8 +165,14 @@ pub fn evaluate_lockfile_diff(
             continue;
         }
 
-        let (verdict, _, _) =
-            evaluate_package(name, new_version, ctx.registry_base, store, policy)?;
+        let (verdict, _, _) = evaluate_package(
+            name,
+            new_version,
+            crate::registry::Ecosystem::Npm,
+            ctx.registry_base,
+            store,
+            policy,
+        )?;
 
         max_band = max_band.max(verdict.band);
 
@@ -386,6 +392,7 @@ mod tests {
                     target_version: "1.0.0".to_string(),
                     baseline_version: None,
                     integrity: "sha512-test".to_string(),
+                    ecosystem: crate::registry::Ecosystem::Npm,
                     band: VerdictBand::Block,
                     risk_score: 95,
                     findings: vec![crate::verdict::Finding {
@@ -431,6 +438,7 @@ mod tests {
                     target_version: "4.17.21".to_string(),
                     baseline_version: Some("4.17.20".to_string()),
                     integrity: "sha512-test".to_string(),
+                    ecosystem: crate::registry::Ecosystem::Npm,
                     band: VerdictBand::Low,
                     risk_score: 5,
                     findings: vec![],

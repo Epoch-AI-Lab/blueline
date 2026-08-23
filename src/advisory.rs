@@ -3,6 +3,7 @@ use std::io::Read;
 
 use crate::error::BluelineError;
 use crate::policy::Policy;
+use crate::registry::Ecosystem;
 use crate::store::BaselineStore;
 use crate::verdict::VerdictBand;
 
@@ -103,9 +104,20 @@ pub(crate) struct OsvDatabaseSpecific {
     pub(crate) malicious: Option<bool>,
 }
 
+/// OSV.dev ecosystem identifier for a blueline ecosystem. Exact casing is
+/// dictated by the OSV schema (`CratesIO` and `PyPI` are not snake_case).
+fn osv_ecosystem(ecosystem: Ecosystem) -> &'static str {
+    match ecosystem {
+        Ecosystem::Npm => "npm",
+        Ecosystem::Cargo => "CratesIO",
+        Ecosystem::PyPi => "PyPI",
+    }
+}
+
 pub fn fetch_advisories(
     package: &str,
     version: &str,
+    ecosystem: Ecosystem,
     store: Option<&BaselineStore>,
     policy: &Policy,
 ) -> Result<AdvisoryReport, BluelineError> {
@@ -118,7 +130,7 @@ pub fn fetch_advisories(
     // 1. Check SQLite cache
     let mut stale_fallback = None;
     if let Some(store) = store
-        && let Ok(Some(cached)) = store.get_cached_advisories(package, version)
+        && let Ok(Some(cached)) = store.get_cached_advisories(ecosystem, package, version)
     {
         if !cached.is_expired {
             if let Ok(report) = serde_json::from_str::<AdvisoryReport>(&cached.advisories_json) {
@@ -141,7 +153,7 @@ pub fn fetch_advisories(
         "version": version,
         "package": {
             "name": package,
-            "ecosystem": "npm"
+            "ecosystem": osv_ecosystem(ecosystem)
         }
     });
 
@@ -187,6 +199,7 @@ pub fn fetch_advisories(
                     policy.advisories.vulnerable_cache_ttl_secs()
                 };
                 let _ = store.put_cached_advisories(
+                    ecosystem,
                     package,
                     version,
                     &report_json,
@@ -488,6 +501,13 @@ mod tests {
         assert!(report.hits[0].is_malware);
         assert_eq!(report.hits[0].severity, VerdictBand::Block);
         assert!(report.has_blocking());
+    }
+
+    #[test]
+    fn osv_ecosystem_casing_matches_schema() {
+        assert_eq!(osv_ecosystem(crate::registry::Ecosystem::Npm), "npm");
+        assert_eq!(osv_ecosystem(crate::registry::Ecosystem::Cargo), "CratesIO");
+        assert_eq!(osv_ecosystem(crate::registry::Ecosystem::PyPi), "PyPI");
     }
 
     #[test]

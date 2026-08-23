@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::policy::Policy;
+use crate::registry::Ecosystem;
 use crate::review::{evaluate_package, parse_spec};
 use crate::store::BaselineStore;
 
@@ -69,7 +70,11 @@ impl JsonRpcError {
     }
 }
 
-pub fn run_stdio(registry_base: &str, policy_path: Option<&Path>) -> anyhow::Result<()> {
+pub fn run_stdio(
+    registry_base: &str,
+    index_base: &str,
+    policy_path: Option<&Path>,
+) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let reader = BufReader::new(stdin.lock());
     let mut stdout = std::io::stdout();
@@ -122,6 +127,7 @@ pub fn run_stdio(registry_base: &str, policy_path: Option<&Path>) -> anyhow::Res
             &request.method,
             request.params,
             registry_base,
+            index_base,
             &store,
             &policy,
         ) {
@@ -152,6 +158,7 @@ fn handle_request(
     method: &str,
     params: Option<serde_json::Value>,
     registry_base: &str,
+    index_base: &str,
     store: &BaselineStore,
     policy: &Policy,
 ) -> Result<serde_json::Value, JsonRpcError> {
@@ -173,13 +180,19 @@ fn handle_request(
             "tools": [
                 {
                     "name": "review_install",
-                    "description": "Reviews an npm package release before installation. Performs sandboxed extraction, dual-release diffing, heuristic risk scoring, OSV advisory lookup, and Sigstore provenance verification.",
+                    "description": "Reviews a package release before installation. Performs sandboxed extraction, dual-release diffing, heuristic risk scoring, OSV advisory lookup, and (npm) Sigstore provenance verification.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "package": {
                                 "type": "string",
                                 "description": "Package specification in the format '<name>@<version>' (e.g. 'lodash@4.17.21')"
+                            },
+                            "ecosystem": {
+                                "type": "string",
+                                "enum": ["npm", "cargo"],
+                                "default": "npm",
+                                "description": "Package ecosystem. npm reviews use dist-tags/semver; cargo reviews use the crates.io sparse index and refuse installs."
                             }
                         },
                         "required": ["package"]
@@ -198,6 +211,12 @@ fn handle_request(
                             "version": {
                                 "type": "string",
                                 "description": "Package version (e.g. '4.17.21')"
+                            },
+                            "ecosystem": {
+                                "type": "string",
+                                "enum": ["npm", "cargo"],
+                                "default": "npm",
+                                "description": "Package ecosystem to scope the baseline lookup."
                             }
                         },
                         "required": ["name", "version"]
@@ -212,6 +231,12 @@ fn handle_request(
                             "package": {
                                 "type": "string",
                                 "description": "Package specification '<name>@<version>'"
+                            },
+                            "ecosystem": {
+                                "type": "string",
+                                "enum": ["npm", "cargo"],
+                                "default": "npm",
+                                "description": "Package ecosystem to review against."
                             }
                         },
                         "required": ["package"]
@@ -229,10 +254,30 @@ fn handle_request(
                 .ok_or_else(|| JsonRpcError::invalid_params("missing tool name in tools/call"))?;
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
-            execute_tool(tool_name, &args, registry_base, store, policy)
+            execute_tool(tool_name, &args, registry_base, index_base, store, policy)
         }
 
         other => Err(JsonRpcError::method_not_found(other)),
+    }
+}
+
+/// Optional `ecosystem` tool argument. Defaults to npm; unknown values fail
+/// with invalid-params instead of being silently coerced.
+fn parse_ecosystem(args: &serde_json::Value) -> Result<Ecosystem, JsonRpcError> {
+    match args.get("ecosystem") {
+        None | Some(serde_json::Value::Null) => Ok(Ecosystem::Npm),
+        Some(v) => {
+            let s = v
+                .as_str()
+                .ok_or_else(|| JsonRpcError::invalid_params("`ecosystem` must be a string"))?;
+            match s {
+                "npm" => Ok(Ecosystem::Npm),
+                "cargo" => Ok(Ecosystem::Cargo),
+                other => Err(JsonRpcError::invalid_params(format!(
+                    "unknown ecosystem `{other}`; expected npm or cargo"
+                ))),
+            }
+        }
     }
 }
 
@@ -240,9 +285,21 @@ fn execute_tool(
     name: &str,
     args: &serde_json::Value,
     registry_base: &str,
+    index_base: &str,
     store: &BaselineStore,
     policy: &Policy,
 ) -> Result<serde_json::Value, JsonRpcError> {
+    let ecosystem = parse_ecosystem(args)?;
+    let base = match ecosystem {
+        Ecosystem::Npm => registry_base,
+        Ecosystem::Cargo => index_base,
+        Ecosystem::PyPi => {
+            return Err(JsonRpcError::invalid_params(
+                "pypi reviews are not available yet",
+            ));
+        }
+    };
+
     match name {
         "review_install" => {
             let pkg_spec = args
@@ -254,14 +311,12 @@ fn execute_tool(
                 JsonRpcError::invalid_params(format!("invalid package spec `{pkg_spec}`: {e}"))
             })?;
 
-            let (verdict, _delta, _) =
-                evaluate_package(&pkg_name, &version, registry_base, store, policy).map_err(
-                    |e| {
-                        JsonRpcError::internal_error(format!(
-                            "review error for `{pkg_spec}`: {e:#}"
-                        ))
-                    },
-                )?;
+            let (verdict, _delta, _) = evaluate_package(
+                &pkg_name, &version, ecosystem, base, store, policy,
+            )
+            .map_err(|e| {
+                JsonRpcError::internal_error(format!("review error for `{pkg_spec}`: {e:#}"))
+            })?;
 
             let recommendation = match verdict.band {
                 crate::verdict::VerdictBand::Low => "APPROVE — Safe to install",
@@ -308,7 +363,7 @@ fn execute_tool(
                 .ok_or_else(|| JsonRpcError::invalid_params("missing `version` argument"))?;
 
             let clean_versions = store
-                .list_clean_versions(pkg_name)
+                .list_clean_versions::<semver::Version>(ecosystem, pkg_name)
                 .map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
 
             let is_clean = clean_versions.iter().any(|(v, _)| v.to_string() == version);
@@ -343,14 +398,12 @@ fn execute_tool(
                 JsonRpcError::invalid_params(format!("invalid package spec `{pkg_spec}`: {e}"))
             })?;
 
-            let (_verdict, delta, _) =
-                evaluate_package(&pkg_name, &version, registry_base, store, policy).map_err(
-                    |e| {
-                        JsonRpcError::internal_error(format!(
-                            "review error for `{pkg_spec}`: {e:#}"
-                        ))
-                    },
-                )?;
+            let (_verdict, delta, _) = evaluate_package(
+                &pkg_name, &version, ecosystem, base, store, policy,
+            )
+            .map_err(|e| {
+                JsonRpcError::internal_error(format!("review error for `{pkg_spec}`: {e:#}"))
+            })?;
 
             let name = crate::render::sanitize_single_line(&pkg_name);
             let ver = crate::render::sanitize_single_line(&version);
@@ -389,8 +442,15 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = BaselineStore::open_at(&temp.path().join("store.db")).unwrap();
         let policy = Policy::default();
-        let resp =
-            handle_request("ping", None, "https://registry.npmjs.org", &store, &policy).unwrap();
+        let resp = handle_request(
+            "ping",
+            None,
+            "https://registry.npmjs.org",
+            "https://index.crates.io",
+            &store,
+            &policy,
+        )
+        .unwrap();
         assert_eq!(resp, json!({}));
     }
 
@@ -403,6 +463,7 @@ mod tests {
             "initialize",
             None,
             "https://registry.npmjs.org",
+            "https://index.crates.io",
             &store,
             &policy,
         )
@@ -420,6 +481,7 @@ mod tests {
             "tools/list",
             None,
             "https://registry.npmjs.org",
+            "https://index.crates.io",
             &store,
             &policy,
         )
@@ -452,6 +514,7 @@ mod tests {
             "nonexistent_method",
             None,
             "https://registry.npmjs.org",
+            "https://index.crates.io",
             &store,
             &policy,
         )
@@ -469,11 +532,68 @@ mod tests {
             "tools/call",
             Some(json!({"name": "check_known_clean", "arguments": {}})),
             "https://registry.npmjs.org",
+            "https://index.crates.io",
             &store,
             &policy,
         )
         .unwrap_err();
         assert_eq!(err.code, -32602);
         assert!(err.message.contains("missing `name` argument"));
+    }
+
+    #[test]
+    fn rejects_unknown_ecosystem_param() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&temp.path().join("store.db")).unwrap();
+        let policy = Policy::default();
+        let err = handle_request(
+            "tools/call",
+            Some(json!({
+                "name": "review_install",
+                "arguments": {"package": "serde@1.0.210", "ecosystem": "pypi"}
+            })),
+            "https://registry.npmjs.org",
+            "https://index.crates.io",
+            &store,
+            &policy,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, -32602);
+        assert!(err.message.contains("unknown ecosystem"));
+    }
+
+    #[test]
+    fn ecosystem_param_defaults_to_npm_and_accepts_cargo_routing() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&temp.path().join("store.db")).unwrap();
+        let policy = Policy::default();
+
+        // Default (no ecosystem) routes to the npm base; the request fails on
+        // the network side, not with invalid params.
+        let err = handle_request(
+            "tools/call",
+            Some(json!({"name": "review_install", "arguments": {"package": "x@1.0.0"}})),
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+            &store,
+            &policy,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, -32603);
+
+        // Explicit cargo routes to the index base; same internal-error shape.
+        let err = handle_request(
+            "tools/call",
+            Some(json!({
+                "name": "inspect_diff",
+                "arguments": {"package": "serde@1.0.210", "ecosystem": "cargo"}
+            })),
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+            &store,
+            &policy,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, -32603);
     }
 }

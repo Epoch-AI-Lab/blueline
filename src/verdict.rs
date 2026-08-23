@@ -61,6 +61,7 @@ pub struct Verdict {
     pub target_version: String,
     pub baseline_version: Option<String>,
     pub integrity: String,
+    pub ecosystem: crate::registry::Ecosystem,
     pub band: VerdictBand,
     pub risk_score: u32,
     pub findings: Vec<Finding>,

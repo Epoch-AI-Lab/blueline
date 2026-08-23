@@ -1,35 +1,96 @@
 use std::io::{IsTerminal, Write};
 
-use crate::baseline::resolve_baseline;
+use crate::baseline::{BaselineSelection, resolve_baseline};
 use crate::cli::{Output, OutputFormat};
 use crate::diff::compute_delta;
 use crate::extract::{ExtractionLimits, safe_extract};
 use crate::heuristic::evaluate_with_trust;
-use crate::manifest::read_package_json;
+use crate::manifest::{read_package_json, read_packed_cargo_toml};
 use crate::policy::Policy;
-use crate::registry::Registry;
+use crate::registry::cratesio::CratesIoRegistry;
 use crate::registry::npm::NpmRegistry;
+use crate::registry::{Checksum, Ecosystem, Registry};
 use crate::render::{render_json, render_text};
 use crate::store::BaselineStore;
+
+/// Build the registry adapter for a review request. PyPI fails closed here
+/// until its adapter ships; nothing downstream may guess an implementation.
+fn make_registry(ecosystem: Ecosystem, registry_base: &str) -> anyhow::Result<Box<dyn Registry>> {
+    match ecosystem {
+        Ecosystem::Npm => Ok(Box::new(NpmRegistry::new(registry_base))),
+        Ecosystem::Cargo => Ok(Box::new(CratesIoRegistry::new(registry_base))),
+        Ecosystem::PyPi => Err(anyhow::anyhow!(
+            "PyPI reviews are not available yet; the adapter lands in an upcoming release"
+        )),
+    }
+}
 
 /// Evaluates a package specification against its baseline, computing delta,
 /// OSV advisories, and Sigstore provenance to produce a final Verdict and Delta.
 pub fn evaluate_package(
     name: &str,
     version_str: &str,
+    ecosystem: Ecosystem,
     registry_base: &str,
     store: &BaselineStore,
     policy: &Policy,
-) -> anyhow::Result<(crate::verdict::Verdict, crate::diff::Delta, String)> {
+) -> anyhow::Result<(
+    crate::verdict::Verdict,
+    crate::diff::Delta,
+    crate::registry::Checksum,
+)> {
+    match ecosystem {
+        Ecosystem::Npm => evaluate_with_registry(
+            NpmRegistry::new(registry_base),
+            name,
+            version_str,
+            registry_base,
+            store,
+            policy,
+        ),
+        Ecosystem::Cargo => evaluate_with_registry(
+            CratesIoRegistry::new(registry_base),
+            name,
+            version_str,
+            registry_base,
+            store,
+            policy,
+        ),
+        Ecosystem::PyPi => Err(anyhow::anyhow!(
+            "PyPI reviews are not available yet; the adapter lands in an upcoming release"
+        )),
+    }
+}
+
+fn evaluate_with_registry<R: Registry>(
+    registry: R,
+    name: &str,
+    version_str: &str,
+    registry_base: &str,
+    store: &BaselineStore,
+    policy: &Policy,
+) -> anyhow::Result<(
+    crate::verdict::Verdict,
+    crate::diff::Delta,
+    crate::registry::Checksum,
+)> {
     let target_semver = semver::Version::parse(version_str)
         .map_err(|e| anyhow::anyhow!("invalid semver for `{version_str}`: {e}"))?;
 
-    let registry = NpmRegistry::new(registry_base);
+    let ecosystem = registry.ecosystem();
     let target_pkg = registry.resolve(name, version_str)?;
 
-    // fetch_tarball verifies sha512 against dist.integrity and fails closed
-    // on any mismatch, so the bytes below are integrity-verified.
+    // fetch_tarball verifies the digest against the registry checksum and
+    // fails closed on any mismatch, so these bytes are integrity-verified.
     let target_tarball = registry.fetch_tarball(&target_pkg)?;
+
+    let checksum = target_pkg.integrity.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{}@{}: registry provided no content checksum; refusing to trust unverifiable bytes",
+            target_pkg.name,
+            target_pkg.version
+        )
+    })?;
 
     let target_temp = tempfile::tempdir().map_err(|e| anyhow::anyhow!("creating temp dir: {e}"))?;
     safe_extract(
@@ -45,22 +106,26 @@ pub fn evaluate_package(
         )
     })?;
 
-    let target_manifest_path = package_json_path(target_temp.path());
-    let target_manifest = read_package_json(&target_manifest_path).map_err(|e| {
+    let (target_root, target_manifest) = prepare_extracted_root(
+        target_temp.path(),
+        ecosystem,
+        &target_pkg.name,
+        &target_pkg.version,
+    )
+    .map_err(|e| {
         anyhow::anyhow!(
-            "failed to parse package.json for {}@{}: {e}",
+            "invalid extracted contents for {}@{}: {e}",
             target_pkg.name,
             target_pkg.version
         )
     })?;
 
-    let integrity = target_pkg.integrity.clone().unwrap_or_default();
-    store.record_verified(&target_pkg.name, &target_pkg.version, &integrity)?;
+    store.record_verified(ecosystem, &target_pkg.name, &target_pkg.version, &checksum)?;
 
-    let baseline_res = resolve_baseline(name, &target_semver, &registry, store)
+    let baseline_res: BaselineSelection = resolve_baseline(name, &target_semver, &registry, store)
         .map_err(|e| anyhow::anyhow!("baseline resolution: {e}"))?;
 
-    let delta = if let Some(base_pkg) = baseline_res.package() {
+    let delta = if let Some(base_pkg) = baseline_res.resolution.package() {
         let base_tarball = registry.fetch_tarball(base_pkg)?;
         let base_temp =
             tempfile::tempdir().map_err(|e| anyhow::anyhow!("creating temp dir: {e}"))?;
@@ -76,20 +141,25 @@ pub fn evaluate_package(
                 base_pkg.version
             )
         })?;
-        let base_manifest_path = package_json_path(base_temp.path());
-        let base_manifest = read_package_json(&base_manifest_path).map_err(|e| {
+        let (base_root, base_manifest) = prepare_extracted_root(
+            base_temp.path(),
+            ecosystem,
+            &base_pkg.name,
+            &base_pkg.version,
+        )
+        .map_err(|e| {
             anyhow::anyhow!(
-                "failed to parse package.json for baseline {}@{}: {e}",
+                "invalid extracted contents for baseline {}@{}: {e}",
                 base_pkg.name,
                 base_pkg.version
             )
         })?;
 
         compute_delta(
-            Some(base_temp.path()),
+            Some(&base_root),
             Some(&base_manifest),
             Some(&base_pkg.version),
-            target_temp.path(),
+            &target_root,
             &target_manifest,
             &target_pkg.version,
         )?
@@ -98,45 +168,83 @@ pub fn evaluate_package(
             None,
             None,
             None,
-            target_temp.path(),
+            &target_root,
             &target_manifest,
             &target_pkg.version,
         )?
     };
 
     let is_unreviewed = matches!(
-        baseline_res,
+        baseline_res.resolution,
         crate::baseline::BaselineResolution::RegistryPredecessor(_)
     );
 
     let advisories = crate::advisory::fetch_advisories(
         &target_pkg.name,
         &target_pkg.version,
+        ecosystem,
         Some(store),
         policy,
     )
     .unwrap_or_else(|e| crate::advisory::AdvisoryReport::unverified(&e.to_string()));
 
-    let provenance = crate::provenance::inspect_provenance(
-        &target_pkg.name,
-        &target_pkg.version,
-        &integrity,
-        None,
-        Some(store),
-        policy,
-    );
+    // Attestations are an npm-registry surface today; other ecosystems report
+    // no provenance rather than querying a meaningless endpoint.
+    let provenance = if ecosystem == Ecosystem::Npm {
+        Some(crate::provenance::inspect_provenance(
+            &target_pkg.name,
+            &target_pkg.version,
+            &checksum,
+            None,
+            registry_base,
+            Some(store),
+            policy,
+        ))
+    } else {
+        None
+    };
 
     let verdict = evaluate_with_trust(
         &target_pkg.name,
-        "verified (sha512)",
+        ecosystem,
+        &checksum.to_display(),
         &delta,
         is_unreviewed,
+        baseline_res.prior_release_yanked,
         policy,
         Some(&advisories),
-        Some(&provenance),
+        provenance.as_ref(),
     );
 
-    Ok((verdict, delta, integrity))
+    Ok((verdict, delta, checksum))
+}
+
+/// Locate and parse the package manifest inside an extracted release tree.
+/// Cargo `.crate` archives additionally must unpack to exactly one top-level
+/// directory named `{canonical-name}-{version}`.
+fn prepare_extracted_root(
+    temp_root: &std::path::Path,
+    ecosystem: Ecosystem,
+    canonical_name: &str,
+    version: &str,
+) -> Result<(std::path::PathBuf, crate::manifest::PackageJson), crate::error::BluelineError> {
+    let root = match ecosystem {
+        Ecosystem::Cargo => {
+            crate::registry::cratesio::verify_single_root(temp_root, canonical_name, version)?
+        }
+        _ => temp_root.to_path_buf(),
+    };
+    let manifest = match ecosystem {
+        Ecosystem::Npm => read_package_json(&package_json_path(&root))?,
+        Ecosystem::Cargo => read_packed_cargo_toml(&root.join("Cargo.toml"))?.manifest_view(),
+        Ecosystem::PyPi => {
+            return Err(crate::error::BluelineError::Manifest(
+                canonical_name.to_string(),
+                "PyPI reviews are not available yet".to_string(),
+            ));
+        }
+    };
+    Ok((root, manifest))
 }
 
 fn bootstrap_hint(verdict: &crate::verdict::Verdict) -> Option<String> {
@@ -175,18 +283,25 @@ fn bootstrap_hint(verdict: &crate::verdict::Verdict) -> Option<String> {
 
 pub fn run(
     pkg_spec: &str,
+    ecosystem: Ecosystem,
     registry_base: &str,
     output: Output,
     policy_path: Option<&std::path::Path>,
     yes: bool,
 ) -> anyhow::Result<()> {
     let policy = Policy::load_or_default(policy_path)?;
-    let registry = NpmRegistry::new(registry_base);
-    let (name, version_str) = parse_spec_flexible(pkg_spec, &registry)?;
+    let registry = make_registry(ecosystem, registry_base)?;
+    let (name, version_str) = parse_spec_flexible(pkg_spec, registry.as_ref())?;
     let store = BaselineStore::open()?;
 
-    let (verdict, delta, integrity) =
-        evaluate_package(&name, &version_str, registry_base, &store, &policy)?;
+    let (verdict, delta, checksum) = evaluate_package(
+        &name,
+        &version_str,
+        ecosystem,
+        registry_base,
+        &store,
+        &policy,
+    )?;
 
     let format = output.resolve(std::io::stdout().is_terminal());
     match format {
@@ -200,11 +315,12 @@ pub fn run(
 
     if yes {
         if verdict.band == crate::verdict::VerdictBand::Low {
-            store.mark_clean(&name, &version_str, &integrity)?;
+            store.mark_clean(ecosystem, &name, &version_str, &checksum)?;
             let _ = store.record_audit_log(
+                Ecosystem::Npm,
                 &name,
                 &version_str,
-                &integrity,
+                &checksum.to_display(),
                 "approve_auto_yes",
                 0,
                 "auto_approved_low_risk",
@@ -234,7 +350,7 @@ pub fn run(
         && std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal()
     {
-        interactive_prompt(&store, &name, &version_str, &integrity, &delta)?;
+        interactive_prompt(&store, ecosystem, &name, &version_str, &checksum, &delta)?;
     } else if verdict.band != crate::verdict::VerdictBand::Low {
         if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
             eprintln!(
@@ -253,29 +369,46 @@ pub fn run(
 
 pub fn install(
     pkg_spec: &str,
+    ecosystem: Ecosystem,
     registry_base: &str,
     npm_args: &[String],
     policy_path: Option<&std::path::Path>,
     yes: bool,
 ) -> anyhow::Result<()> {
+    if ecosystem == Ecosystem::Cargo {
+        eprintln!(
+            "blueline install refuses cargo packages: building a crate executes its `build.rs` \
+             script, which blueline cannot sandbox. Review it instead with \
+             `blueline review <crate>@<version> --ecosystem cargo`."
+        );
+        std::process::exit(2);
+    }
+
     crate::executor::validate_extra_args(npm_args)?;
     let policy = Policy::load_or_default(policy_path)?;
-    let registry = NpmRegistry::new(registry_base);
-    let (name, version_str) = parse_spec_flexible(pkg_spec, &registry)?;
+    let registry = make_registry(ecosystem, registry_base)?;
+    let (name, version_str) = parse_spec_flexible(pkg_spec, registry.as_ref())?;
     let store = BaselineStore::open()?;
 
-    let (verdict, delta, integrity) =
-        evaluate_package(&name, &version_str, registry_base, &store, &policy)?;
+    let (verdict, delta, checksum) = evaluate_package(
+        &name,
+        &version_str,
+        ecosystem,
+        registry_base,
+        &store,
+        &policy,
+    )?;
     render_text(&verdict, &delta);
 
     let is_interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let approved = if yes {
         if verdict.band == crate::verdict::VerdictBand::Low {
-            store.mark_clean(&name, &version_str, &integrity)?;
+            store.mark_clean(ecosystem, &name, &version_str, &checksum)?;
             let _ = store.record_audit_log(
+                Ecosystem::Npm,
                 &name,
                 &version_str,
-                &integrity,
+                &checksum.to_display(),
                 "approve_auto_yes",
                 0,
                 "auto_approved_low_risk",
@@ -298,7 +431,7 @@ pub fn install(
             false
         }
     } else if is_interactive {
-        interactive_prompt(&store, &name, &version_str, &integrity, &delta)?
+        interactive_prompt(&store, ecosystem, &name, &version_str, &checksum, &delta)?
     } else {
         if verdict.band != crate::verdict::VerdictBand::Low {
             eprintln!(
@@ -324,9 +457,10 @@ pub fn install(
 
 fn interactive_prompt(
     store: &BaselineStore,
+    ecosystem: Ecosystem,
     name: &str,
     version: &str,
-    integrity: &str,
+    checksum: &Checksum,
     delta: &crate::diff::Delta,
 ) -> anyhow::Result<bool> {
     loop {
@@ -340,9 +474,17 @@ fn interactive_prompt(
         let choice = input.trim().to_lowercase();
         match choice.as_str() {
             "a" | "approve" => {
-                store.mark_clean(name, version, integrity)?;
+                store.mark_clean(ecosystem, name, version, checksum)?;
                 let _ = store.record_audit_log(
-                    name, version, integrity, "approve", 0, "approved", "user", None,
+                    ecosystem,
+                    name,
+                    version,
+                    &checksum.to_display(),
+                    "approve",
+                    0,
+                    "approved",
+                    "user",
+                    None,
                 );
                 println!(
                     "Approved {}@{} and marked clean in baseline store.",
@@ -351,8 +493,17 @@ fn interactive_prompt(
                 return Ok(true);
             }
             "h" | "hold" => {
-                let _ = store
-                    .record_audit_log(name, version, integrity, "hold", 0, "held", "user", None);
+                let _ = store.record_audit_log(
+                    ecosystem,
+                    name,
+                    version,
+                    &checksum.to_display(),
+                    "hold",
+                    0,
+                    "held",
+                    "user",
+                    None,
+                );
                 eprintln!("Held {}@{}; release unapproved.", name, version);
                 std::process::exit(2);
             }
@@ -402,7 +553,8 @@ pub fn parse_spec(spec: &str) -> anyhow::Result<(String, String)> {
 }
 
 /// Flexible parser for install: `<name>` or `<name>@<version>`.
-/// If version is omitted, resolves `dist-tags.latest` or falls back to latest stable semver release.
+/// If version is omitted, resolves the registry's default version
+/// (`dist-tags.latest` for npm, falling back to latest stable semver release).
 fn parse_spec_flexible(spec: &str, registry: &dyn Registry) -> anyhow::Result<(String, String)> {
     let has_version_sep = if let Some(rest) = spec.strip_prefix('@') {
         rest.contains('@')
@@ -417,16 +569,10 @@ fn parse_spec_flexible(spec: &str, registry: &dyn Registry) -> anyhow::Result<(S
         if name.is_empty() {
             return Err(crate::error::BluelineError::InvalidPackageSpec(spec.to_string()).into());
         }
-        if let Ok(Some(latest_tag)) = registry.resolve_dist_tag(name, "latest") {
-            return Ok((name.to_string(), latest_tag));
+        match registry.default_version(name)? {
+            Some(default) => Ok((name.to_string(), default)),
+            None => Err(anyhow::anyhow!("no versions found for `{name}`")),
         }
-        let versions = registry.list_versions(name)?;
-        let latest = versions
-            .iter()
-            .rfind(|v| v.pre.is_empty())
-            .or_else(|| versions.last())
-            .ok_or_else(|| anyhow::anyhow!("no versions found for `{name}`"))?;
-        Ok((name.to_string(), latest.to_string()))
     }
 }
 

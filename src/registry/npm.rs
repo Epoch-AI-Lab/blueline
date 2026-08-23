@@ -1,36 +1,18 @@
 use std::collections::BTreeMap;
 use std::io::Read;
 
-use base64::Engine;
 use serde::Deserialize;
 use sha2::{Digest, Sha512};
 use ureq::Agent;
 
 use crate::error::BluelineError;
-use crate::registry::{Package, Registry};
+use crate::registry::http_util::{RegistryLimits, download_bounded};
+use crate::registry::{Checksum, ChecksumAlg, Ecosystem, Package, Registry, Release};
 
 /// Abbreviated packument (corgi) media type — small enough to be sane
 /// for large packages like express.
 const CORGI_ACCEPT: &str = "application/vnd.npm.install-v1+json";
 const USER_AGENT: &str = concat!("blueline/", env!("CARGO_PKG_VERSION"));
-const SRI_PREFIX: &str = "sha512-";
-
-#[derive(Debug, Clone, Copy)]
-pub struct RegistryLimits {
-    pub max_packument_bytes: u64,
-    pub max_tarball_bytes: u64,
-    pub max_redirects: usize,
-}
-
-impl Default for RegistryLimits {
-    fn default() -> Self {
-        Self {
-            max_packument_bytes: 64 * 1024 * 1024,
-            max_tarball_bytes: 512 * 1024 * 1024,
-            max_redirects: 5,
-        }
-    }
-}
 
 pub struct NpmRegistry {
     agent: Agent,
@@ -54,47 +36,6 @@ impl NpmRegistry {
             base: base.trim_end_matches('/').to_string(),
             limits,
         }
-    }
-
-    fn validate_tarball_url(&self, tarball_url: &str) -> Result<(), BluelineError> {
-        let (tarball_scheme, tarball_host) =
-            parse_url_scheme_and_host(tarball_url).map_err(|e| {
-                BluelineError::Network(format!("invalid tarball URL `{tarball_url}`: {e}"))
-            })?;
-
-        let (base_scheme, base_host) = parse_url_scheme_and_host(&self.base).map_err(|e| {
-            BluelineError::Network(format!("invalid registry base URL `{}`: {e}", self.base))
-        })?;
-
-        if base_scheme == "https" {
-            if tarball_scheme != "https" {
-                return Err(BluelineError::Network(format!(
-                    "insecure tarball scheme `{tarball_scheme}` in `{tarball_url}`; registry base requires HTTPS"
-                )));
-            }
-        } else if base_scheme == "http" {
-            match tarball_scheme.as_str() {
-                "http" | "https" => {}
-                _ => {
-                    return Err(BluelineError::Network(format!(
-                        "unsupported tarball scheme `{tarball_scheme}` in `{tarball_url}`"
-                    )));
-                }
-            }
-        } else {
-            return Err(BluelineError::Network(format!(
-                "unsupported registry base scheme `{base_scheme}` in `{}`",
-                self.base
-            )));
-        }
-
-        if is_private_or_local_host(&tarball_host) && base_host != tarball_host {
-            return Err(BluelineError::Network(format!(
-                "tarball URL `{tarball_url}` targets private/local host `{tarball_host}`, which does not match registry base host `{base_host}`"
-            )));
-        }
-
-        Ok(())
     }
 
     fn packument(&self, name: &str) -> Result<Packument, BluelineError> {
@@ -135,80 +76,46 @@ impl NpmRegistry {
     /// Stream-download the tarball, hashing as we go, then fail closed unless
     /// the sha512 matches the registry's `dist.integrity`.
     fn fetch_url_verified(&self, pkg: &Package) -> Result<Vec<u8>, BluelineError> {
-        let mut current_url = pkg.tarball_url.clone();
-        let mut redirects_followed = 0;
-
-        let resp = loop {
-            self.validate_tarball_url(&current_url)?;
-            let res = self.agent.get(&current_url).call();
-            match res {
-                Ok(response) if (301..=308).contains(&response.status()) => {
-                    redirects_followed += 1;
-                    if redirects_followed > self.limits.max_redirects {
-                        return Err(BluelineError::Network(format!(
-                            "too many redirects downloading {}",
-                            pkg.tarball_url
-                        )));
-                    }
-                    let location = response.header("location").ok_or_else(|| {
-                        BluelineError::Network(format!(
-                            "redirect {} missing Location header for {current_url}",
-                            response.status()
-                        ))
-                    })?;
-                    current_url = resolve_redirect_url(&current_url, location)?;
-                }
-                Ok(response) => break response,
-                Err(e) => {
-                    return Err(BluelineError::Network(format!(
-                        "GET {}: {e}",
-                        pkg.tarball_url
-                    )));
-                }
-            }
-        };
-
-        let mut bytes = Vec::new();
-        let mut reader = resp.into_reader().take(self.limits.max_tarball_bytes + 1);
-        reader
-            .read_to_end(&mut bytes)
-            .map_err(|e| BluelineError::Network(format!("downloading {}: {e}", pkg.tarball_url)))?;
-
-        if bytes.len() as u64 > self.limits.max_tarball_bytes {
-            return Err(BluelineError::ExtractionLimit(format!(
+        let bytes = download_bounded(
+            &self.agent,
+            &self.base,
+            &pkg.tarball_url,
+            self.limits.max_tarball_bytes,
+            self.limits.max_redirects,
+        )
+        .map_err(|e| match e {
+            BluelineError::ExtractionLimit(_) => BluelineError::ExtractionLimit(format!(
                 "tarball exceeds maximum size cap of {} bytes",
                 self.limits.max_tarball_bytes
-            )));
-        }
+            )),
+            other => other,
+        })?;
 
         let mut hasher = Sha512::new();
         hasher.update(&bytes);
-        let digest = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
-        match pkg.integrity.as_deref() {
+        let computed = Checksum {
+            alg: ChecksumAlg::Sha512,
+            value_hex: hex_encode(&hasher.finalize()),
+        };
+        match &pkg.integrity {
+            Some(expected) if expected.alg == ChecksumAlg::Sha512 => {
+                if !expected.value_hex.eq_ignore_ascii_case(&computed.value_hex) {
+                    return Err(BluelineError::Verification(format!(
+                        "{}@{}: tarball sha512 mismatch (expected {}, got {})",
+                        pkg.name,
+                        pkg.version,
+                        expected.to_sri(),
+                        computed.to_sri()
+                    )));
+                }
+            }
             Some(expected) => {
-                let mut matched = false;
-                let mut has_sha512 = false;
-                for token in expected.split_whitespace() {
-                    if let Some(expected_b64) = token.strip_prefix(SRI_PREFIX) {
-                        has_sha512 = true;
-                        if digest == expected_b64.trim() {
-                            matched = true;
-                            break;
-                        }
-                    }
-                }
-                if !has_sha512 {
-                    return Err(BluelineError::Verification(format!(
-                        "{}@{}: unsupported dist.integrity `{expected}`, expected `{SRI_PREFIX}<base64>`",
-                        pkg.name, pkg.version
-                    )));
-                }
-                if !matched {
-                    return Err(BluelineError::Verification(format!(
-                        "{}@{}: tarball sha512 mismatch (expected {expected}, got {SRI_PREFIX}{digest})",
-                        pkg.name, pkg.version
-                    )));
-                }
+                return Err(BluelineError::Verification(format!(
+                    "{}@{}: unsupported dist.integrity algorithm `{}`, expected sha512",
+                    pkg.name,
+                    pkg.version,
+                    expected.alg.name()
+                )));
             }
             None => {
                 return Err(BluelineError::Verification(format!(
@@ -219,44 +126,33 @@ impl NpmRegistry {
         }
         Ok(bytes)
     }
-}
 
-fn resolve_redirect_url(base_url: &str, location: &str) -> Result<String, BluelineError> {
-    if location.contains("://") {
-        return Ok(location.to_string());
-    }
-    let (scheme, _host) = parse_url_scheme_and_host(base_url).map_err(|e| {
-        BluelineError::Network(format!(
-            "resolving redirect `{location}` from `{base_url}`: {e}"
-        ))
-    })?;
-    let base_without_scheme = base_url
-        .split_once("://")
-        .map(|(_, r)| r)
-        .unwrap_or(base_url);
-    let authority = base_without_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or("");
-    if location.starts_with('/') {
-        Ok(format!("{scheme}://{authority}{location}"))
-    } else {
-        let path_part = match base_without_scheme.split_once('/') {
-            Some((_, rest)) => {
-                let p = rest.split(['?', '#']).next().unwrap_or("");
-                if let Some((dir, _)) = p.rsplit_once('/') {
-                    format!("/{dir}/")
-                } else {
-                    "/".to_string()
-                }
-            }
-            None => "/".to_string(),
-        };
-        Ok(format!("{scheme}://{authority}{path_part}{location}"))
+    /// Normalize the packument's raw `dist.integrity` string into a typed
+    /// checksum. Fail closed when nothing sha512-shaped can be decoded.
+    fn normalize_integrity(
+        &self,
+        pkg_name: &str,
+        version: &str,
+        raw: &Option<String>,
+    ) -> Result<Option<Checksum>, BluelineError> {
+        match raw {
+            None => Ok(None),
+            Some(s) => Checksum::parse(s)
+                .map(Some)
+                .map_err(|_| {
+                    BluelineError::Verification(format!(
+                        "{pkg_name}@{version}: unsupported dist.integrity `{s}`, expected `sha512-<base64>`"
+                    ))
+                }),
+        }
     }
 }
 
 impl Registry for NpmRegistry {
+    fn ecosystem(&self) -> Ecosystem {
+        Ecosystem::Npm
+    }
+
     fn resolve(&self, name: &str, version: &str) -> Result<Package, BluelineError> {
         let packument = self.packument(name)?;
         let meta = packument.versions.get(version).ok_or_else(|| {
@@ -277,13 +173,13 @@ impl Registry for NpmRegistry {
                 ),
             ));
         }
-        self.validate_tarball_url(&meta.dist.tarball)?;
+        crate::registry::http_util::validate_download_url(&self.base, &meta.dist.tarball)?;
         validate_package_name(&meta.name)?;
         Ok(Package {
             name: meta.name.clone(),
             version: meta.version.clone(),
             tarball_url: meta.dist.tarball.clone(),
-            integrity: meta.dist.integrity.clone(),
+            integrity: self.normalize_integrity(name, version, &meta.dist.integrity)?,
         })
     }
 
@@ -292,8 +188,8 @@ impl Registry for NpmRegistry {
     }
 
     fn list_versions(&self, name: &str) -> Result<Vec<semver::Version>, BluelineError> {
-        let packument = self.packument(name)?;
-        let mut versions: Vec<semver::Version> = packument
+        let mut versions: Vec<semver::Version> = self
+            .packument(name)?
             .versions
             .keys()
             .filter_map(|v| semver::Version::parse(v).ok())
@@ -302,10 +198,40 @@ impl Registry for NpmRegistry {
         Ok(versions)
     }
 
-    fn resolve_dist_tag(&self, name: &str, tag: &str) -> Result<Option<String>, BluelineError> {
-        let packument = self.packument(name)?;
-        Ok(packument.dist_tags.get(tag).cloned())
+    fn list_releases(&self, name: &str) -> Result<Vec<Release>, BluelineError> {
+        let releases = self.list_versions(name)?;
+        // npm's corgi packument does not expose yanked or publish time.
+        Ok(releases
+            .into_iter()
+            .map(|v| Release {
+                version: v.to_string(),
+                yanked: false,
+                publish_time: None,
+            })
+            .collect())
     }
+
+    fn default_version(&self, name: &str) -> Result<Option<String>, BluelineError> {
+        let packument = self.packument(name)?;
+        if let Some(latest) = packument.dist_tags.get("latest") {
+            return Ok(Some(latest.clone()));
+        }
+        let mut versions: Vec<semver::Version> = packument
+            .versions
+            .keys()
+            .filter_map(|v| semver::Version::parse(v).ok())
+            .collect();
+        versions.sort();
+        Ok(versions
+            .iter()
+            .rfind(|v| v.pre.is_empty())
+            .or_else(|| versions.last())
+            .map(|v| v.to_string()))
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn is_valid_name_segment(s: &str) -> bool {
@@ -358,127 +284,6 @@ fn validate_package_name(name: &str) -> Result<(), BluelineError> {
     Ok(())
 }
 
-fn parse_url_scheme_and_host(raw_url: &str) -> Result<(String, String), String> {
-    let (scheme, rest) = raw_url
-        .split_once("://")
-        .ok_or_else(|| format!("URL `{raw_url}` is missing `://` scheme separator"))?;
-    let scheme = scheme.to_lowercase();
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if authority.is_empty() {
-        return Err(format!("URL `{raw_url}` has empty host"));
-    }
-    let host_port = if let Some((_, hp)) = authority.rsplit_once('@') {
-        hp
-    } else {
-        authority
-    };
-    let host = if host_port.starts_with('[') {
-        let closing = host_port
-            .find(']')
-            .ok_or_else(|| format!("URL `{raw_url}` has unmatched `[` in IPv6 address"))?;
-        &host_port[1..closing]
-    } else if let Some((h, _port)) = host_port.split_once(':') {
-        h
-    } else {
-        host_port
-    };
-    if host.is_empty() {
-        return Err(format!("URL `{raw_url}` has empty host"));
-    }
-    Ok((scheme, host.to_lowercase()))
-}
-
-fn is_private_v4(v4: std::net::Ipv4Addr) -> bool {
-    let octets = v4.octets();
-    octets[0] == 0 // 0.0.0.0/8 (This host on this network / Linux localhost alias)
-        || v4.is_loopback()
-        || v4.is_link_local()
-        || v4.is_private()
-        || v4.is_unspecified()
-        || v4.is_broadcast()
-        // CGNAT RFC 6598 (100.64.0.0/10)
-        || (octets[0] == 100 && (octets[1] & 0xc0) == 64)
-}
-
-fn is_private_ip(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => is_private_v4(v4),
-        std::net::IpAddr::V6(v6) => {
-            let seg0 = v6.segments()[0];
-            if (seg0 & 0xff00) == 0xff00 // Multicast (ff00::/8)
-                || (seg0 & 0xffc0) == 0xfe80 // Link-local (fe80::/10)
-                || (seg0 & 0xfe00) == 0xfc00 // Unique local (fc00::/7)
-                || seg0 == 0x0100 // Discard prefix (100::/64)
-                || (seg0 == 0x2001 && v6.segments()[1] == 0x0db8)
-            // Documentation (2001:db8::/32)
-            {
-                return true;
-            }
-            if let Some(v4) = v6.to_ipv4() {
-                return is_private_v4(v4);
-            }
-            false
-        }
-    }
-}
-
-fn is_special_local_domain(host: &str) -> bool {
-    host == "localhost"
-        || host.ends_with(".localhost")
-        || host == "metadata.google.internal"
-        || host == "instance-data"
-}
-
-fn is_non_canonical_ip(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("0x")
-        || host.starts_with("0x")
-        || host.starts_with("0X")
-        || host.contains(".0x")
-        || host.contains(".0X")
-    {
-        return true;
-    }
-    if !host.is_empty() && host.chars().all(|c| c.is_ascii_digit()) {
-        return true;
-    }
-    let mut part_count = 0;
-    let mut has_leading_zero = false;
-    let mut all_digits = true;
-
-    for p in host.split('.') {
-        part_count += 1;
-        if p.is_empty() || !p.chars().all(|c| c.is_ascii_digit()) {
-            all_digits = false;
-        } else if p.len() > 1 && p.starts_with('0') {
-            has_leading_zero = true;
-        }
-    }
-
-    all_digits && (part_count != 4 || has_leading_zero)
-}
-
-fn is_private_or_local_host(host: &str) -> bool {
-    if is_special_local_domain(host) || is_non_canonical_ip(host) {
-        return true;
-    }
-
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        return is_private_ip(ip);
-    }
-
-    // Resolve hostname to IP to prevent DNS rebinding or hostname-based SSRF
-    use std::net::ToSocketAddrs;
-    if let Ok(addrs) = (host, 443).to_socket_addrs() {
-        for socket_addr in addrs {
-            if is_private_ip(socket_addr.ip()) {
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
 fn summarize_versions(packument: &Packument) -> String {
     let mut semvers: Vec<semver::Version> = packument
         .versions
@@ -520,6 +325,10 @@ struct Dist {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
+
+    /// sha512 SRI of the bytes "tarball-content".
+    const TEST_SRI: &str = "sha512-dWJ6JIJkmHG8N3fH1b/hbpmBQ7wKIpEw3zsVl2873OtFXh9QhR1KUU3uojohuIJ/xd+hb1R0q/57C8sMt4tstQ==";
 
     #[test]
     fn list_versions_orders_and_limits() {
@@ -571,168 +380,6 @@ mod tests {
     }
 
     #[test]
-    fn validates_tarball_url_ssrf_and_schemes() {
-        let reg = NpmRegistry::new("https://registry.npmjs.org");
-
-        // Public https is valid
-        assert!(
-            reg.validate_tarball_url("https://registry.npmjs.org/express/-/express-4.21.2.tgz")
-                .is_ok()
-        );
-        assert!(
-            reg.validate_tarball_url("https://cdn.example.com/express.tgz")
-                .is_ok()
-        );
-
-        // Insecure http rejected when base is https
-        assert!(
-            reg.validate_tarball_url("http://registry.npmjs.org/express.tgz")
-                .is_err()
-        );
-
-        // Localhost / Loopback rejected
-        assert!(
-            reg.validate_tarball_url("https://127.0.0.1/express.tgz")
-                .is_err()
-        );
-        assert!(
-            reg.validate_tarball_url("https://localhost/express.tgz")
-                .is_err()
-        );
-        assert!(
-            reg.validate_tarball_url("https://[::1]/express.tgz")
-                .is_err()
-        );
-
-        // Cloud metadata rejected
-        assert!(
-            reg.validate_tarball_url("https://169.254.169.254/latest/meta-data")
-                .is_err()
-        );
-        assert!(
-            reg.validate_tarball_url("https://metadata.google.internal/computeMetadata")
-                .is_err()
-        );
-
-        // RFC 1918 private IPs rejected
-        assert!(
-            reg.validate_tarball_url("https://10.0.0.1/tarball.tgz")
-                .is_err()
-        );
-        assert!(
-            reg.validate_tarball_url("https://192.168.1.50/tarball.tgz")
-                .is_err()
-        );
-        assert!(
-            reg.validate_tarball_url("https://172.16.0.10/tarball.tgz")
-                .is_err()
-        );
-
-        // Local registry allows matching local host
-        let local_reg = NpmRegistry::new("http://127.0.0.1:8080");
-        assert!(
-            local_reg
-                .validate_tarball_url("http://127.0.0.1:8080/express/-/express-1.0.0.tgz")
-                .is_ok()
-        );
-        assert!(
-            local_reg
-                .validate_tarball_url("https://127.0.0.1:8080/express/-/express-1.0.0.tgz")
-                .is_ok()
-        );
-        assert!(
-            local_reg
-                .validate_tarball_url("ftp://127.0.0.1:8080/express/-/express-1.0.0.tgz")
-                .is_err()
-        );
-        assert!(
-            local_reg
-                .validate_tarball_url("file:///etc/passwd")
-                .is_err()
-        );
-        let ftp_reg = NpmRegistry::new("ftp://127.0.0.1:8080");
-        assert!(
-            ftp_reg
-                .validate_tarball_url("ftp://127.0.0.1:8080/pkg.tgz")
-                .is_err()
-        );
-        // But local registry cannot be bounced to metadata
-        assert!(
-            local_reg
-                .validate_tarball_url("http://169.254.169.254/latest/meta-data")
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn is_private_or_local_host_covers_all_ranges() {
-        assert!(is_private_or_local_host("localhost"));
-        assert!(is_private_or_local_host("foo.localhost"));
-        assert!(is_private_or_local_host("metadata.google.internal"));
-        assert!(is_private_or_local_host("instance-data"));
-        assert!(is_private_or_local_host("127.0.0.1"));
-        assert!(is_private_or_local_host("169.254.169.254"));
-        assert!(is_private_or_local_host("10.0.0.1"));
-        assert!(is_private_or_local_host("172.16.0.1"));
-        assert!(is_private_or_local_host("192.168.1.1"));
-        assert!(is_private_or_local_host("0.0.0.0"));
-        assert!(is_private_or_local_host("255.255.255.255"));
-        assert!(is_private_or_local_host("::1"));
-        assert!(is_private_or_local_host("::"));
-        assert!(is_private_or_local_host("fe80::1"));
-        assert!(is_private_or_local_host("fc00::1"));
-        assert!(is_private_or_local_host("fd00::1"));
-        assert!(is_private_or_local_host("::ffff:127.0.0.1"));
-        assert!(is_private_or_local_host("::ffff:169.254.169.254"));
-        assert!(is_private_or_local_host("::ffff:10.0.0.1"));
-        assert!(is_private_or_local_host("100.64.0.1"));
-        assert!(is_private_or_local_host("100.127.255.254"));
-        assert!(is_private_or_local_host("ff02::1"));
-        assert!(is_private_or_local_host("ff02::2"));
-        assert!(is_private_or_local_host("2001:db8::1"));
-        assert!(is_private_or_local_host("100::1"));
-
-        assert!(!is_private_or_local_host("registry.npmjs.org"));
-        assert!(!is_private_or_local_host("8.8.8.8"));
-        assert!(!is_private_or_local_host("1.1.1.1"));
-        assert!(!is_private_or_local_host("100.63.255.255"));
-        assert!(!is_private_or_local_host("100.128.0.1"));
-        assert!(!is_private_or_local_host("2607:f8b0:4005:805::200e"));
-        assert!(!is_private_or_local_host("2001:cafe::1"));
-        assert!(!is_private_or_local_host("2002:db8::1"));
-
-        // Direct is_private_ip invariant checks
-        assert!(is_private_ip("::1".parse().unwrap()));
-        assert!(is_private_ip("::".parse().unwrap()));
-        assert!(!is_private_ip("2001:cafe::1".parse().unwrap()));
-        assert!(!is_private_ip("2002:db8::1".parse().unwrap()));
-    }
-
-    #[test]
-    fn special_local_domain_and_non_canonical_ip_tests() {
-        assert!(is_special_local_domain("localhost"));
-        assert!(is_special_local_domain("sub.localhost"));
-        assert!(is_special_local_domain("metadata.google.internal"));
-        assert!(is_special_local_domain("instance-data"));
-        assert!(!is_special_local_domain("registry.npmjs.org"));
-        assert!(!is_special_local_domain("notlocalhost"));
-
-        assert!(is_non_canonical_ip("0x7f000001"));
-        assert!(is_non_canonical_ip("0X7F000001"));
-        assert!(is_non_canonical_ip("127.0x0.0.1"));
-        assert!(is_non_canonical_ip("127.0X0.0.1"));
-        assert!(is_non_canonical_ip("2130706433"));
-        assert!(is_non_canonical_ip("127.1"));
-        assert!(is_non_canonical_ip("0177.0.0.1"));
-
-        assert!(!is_non_canonical_ip(""));
-        assert!(!is_non_canonical_ip("127.0.0.1"));
-        assert!(!is_non_canonical_ip("8.8.8.8"));
-        assert!(!is_non_canonical_ip("127.0..1"));
-        assert!(!is_non_canonical_ip("registry.npmjs.org"));
-    }
-
-    #[test]
     fn validates_package_names_rejects_query_and_specials() {
         assert!(validate_package_name("express?foo=bar").is_err());
         assert!(validate_package_name("express#anchor").is_err());
@@ -774,15 +421,16 @@ mod tests {
         let base = format!("http://127.0.0.1:{port}");
 
         let handle = std::thread::spawn(move || {
-            // Exactly 4 requests: testpkg dist-tag, testpkg resolve, mismatchname, mismatchver
-            for _ in 0..4 {
+            // Exactly 5 requests: testpkg default_version, testpkg releases,
+            // testpkg resolve, mismatchname, mismatchver
+            for _ in 0..5 {
                 if let Ok((mut stream, _)) = listener.accept() {
                     let mut buf = [0u8; 1024];
                     let n = stream.read(&mut buf).unwrap_or(0);
                     let req = String::from_utf8_lossy(&buf[..n]);
 
                     if req.contains("GET /testpkg ") {
-                        let body = r#"{"name":"testpkg","dist-tags":{"latest":"2.1.0"},"versions":{"2.1.0":{"name":"testpkg","version":"2.1.0","dist":{"tarball":"http://127.0.0.1:1/pkg.tgz","integrity":"sha512-test"}}}}"#;
+                        let body = r#"{"name":"testpkg","dist-tags":{"latest":"2.1.0"},"versions":{"2.1.0":{"name":"testpkg","version":"2.1.0","dist":{"tarball":"http://127.0.0.1:1/pkg.tgz","integrity":"sha512-dWJ6JIJkmHG8N3fH1b/hbpmBQ7wKIpEw3zsVl2873OtFXh9QhR1KUU3uojohuIJ/xd+hb1R0q/57C8sMt4tstQ=="}}}}"#;
                         let resp = format!(
                             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                             body.len(),
@@ -811,12 +459,20 @@ mod tests {
         });
 
         let reg = NpmRegistry::new(&base);
-        let tag = reg.resolve_dist_tag("testpkg", "latest").unwrap();
+        let tag = reg.default_version("testpkg").unwrap();
         assert_eq!(tag, Some("2.1.0".into()));
+
+        let releases = reg.list_releases("testpkg").unwrap();
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].version, "2.1.0");
+        assert!(!releases[0].yanked);
+        assert_eq!(releases[0].publish_time, None);
+        assert_eq!(reg.ecosystem(), Ecosystem::Npm);
 
         let pkg = reg.resolve("testpkg", "2.1.0").unwrap();
         assert_eq!(pkg.name, "testpkg");
         assert_eq!(pkg.version, "2.1.0");
+        assert_eq!(pkg.integrity, Some(Checksum::parse(TEST_SRI).unwrap()));
 
         let err_name = reg.resolve("mismatchname", "1.0.0").unwrap_err();
         assert!(err_name.to_string().contains("registry metadata mismatch"));
@@ -881,7 +537,7 @@ mod tests {
             name: "test".into(),
             version: "1.0.0".into(),
             tarball_url: format!("{base}/redirect1"),
-            integrity: Some(integrity),
+            integrity: Some(Checksum::parse(&integrity).unwrap()),
         };
         let bytes = reg.fetch_url_verified(&pkg_ok).unwrap();
         assert_eq!(bytes, payload);
@@ -891,7 +547,7 @@ mod tests {
             name: "test".into(),
             version: "1.0.0".into(),
             tarball_url: format!("{base}/loop"),
-            integrity: Some("sha512-test".into()),
+            integrity: Some(Checksum::parse(TEST_SRI).unwrap()),
         };
         let err = reg.fetch_url_verified(&pkg_loop).unwrap_err();
         assert!(err.to_string().contains("too many redirects"));
@@ -1083,7 +739,7 @@ mod tests {
             name: "exact".into(),
             version: "1.0.0".into(),
             tarball_url: format!("{base}/exact.tgz"),
-            integrity: Some(exact_integrity),
+            integrity: Some(Checksum::parse(&exact_integrity).unwrap()),
         };
         let bytes = reg.fetch_url_verified(&pkg_exact).unwrap();
         assert_eq!(bytes.len(), 50);
@@ -1092,7 +748,7 @@ mod tests {
             name: "over".into(),
             version: "1.0.0".into(),
             tarball_url: format!("{base}/over.tgz"),
-            integrity: Some(over_integrity),
+            integrity: Some(Checksum::parse(&over_integrity).unwrap()),
         };
         let err = reg.fetch_url_verified(&pkg_over).unwrap_err();
         assert!(err.to_string().contains("tarball exceeds maximum size cap"));
@@ -1176,7 +832,7 @@ mod tests {
             name: "test".into(),
             version: "1.0.0".into(),
             tarball_url: format!("{base}/r1"),
-            integrity: Some(integrity),
+            integrity: Some(Checksum::parse(&integrity).unwrap()),
         };
         let bytes = reg.fetch_url_verified(&pkg_ok).unwrap();
         assert_eq!(bytes, payload);
@@ -1186,61 +842,11 @@ mod tests {
             name: "test".into(),
             version: "1.0.0".into(),
             tarball_url: format!("{base}/over1"),
-            integrity: Some("sha512-test".into()),
+            integrity: Some(Checksum::parse(TEST_SRI).unwrap()),
         };
         let err = reg.fetch_url_verified(&pkg_over).unwrap_err();
         assert!(err.to_string().contains("too many redirects"));
 
         let _ = handle.join();
-    }
-
-    #[test]
-    fn ssrf_rejects_alternative_encodings_and_ranges() {
-        assert!(is_private_or_local_host("0.0.0.0"));
-        assert!(is_private_or_local_host("0.0.0.1"));
-        assert!(is_private_or_local_host("0.42.42.42"));
-        assert!(is_private_or_local_host("127.0.0.1"));
-        assert!(is_private_or_local_host("10.0.0.1"));
-        assert!(is_private_or_local_host("169.254.169.254"));
-        assert!(is_private_or_local_host("0x7f000001"));
-        assert!(is_private_or_local_host("0X7F000001"));
-        assert!(is_private_or_local_host("127.0x0.0.1"));
-        assert!(is_private_or_local_host("127.0X0.0.1"));
-        assert!(is_private_or_local_host("0177.0.0.1"));
-        assert!(is_private_or_local_host("2130706433"));
-        assert!(is_private_or_local_host("127.1"));
-        assert!(is_private_or_local_host("::1"));
-        assert!(is_private_or_local_host("::127.0.0.1"));
-        assert!(is_private_or_local_host("::ffff:127.0.0.1"));
-        assert!(is_private_or_local_host("::10.0.0.1"));
-        assert!(is_private_or_local_host("::172.16.0.1"));
-        assert!(is_private_or_local_host("::192.168.1.1"));
-        assert!(is_private_or_local_host("metadata.google.internal"));
-        assert!(is_private_or_local_host("instance-data"));
-        assert!(is_private_or_local_host("localhost"));
-        assert!(is_private_or_local_host("sub.localhost"));
-
-        assert!(!is_private_or_local_host("registry.npmjs.org"));
-        assert!(!is_private_or_local_host("8.8.8.8"));
-        assert!(!is_private_or_local_host("1.1.1.1"));
-        assert!(!is_private_or_local_host("::8.8.8.8"));
-        assert!(!is_private_or_local_host("::1.1.1.1"));
-    }
-
-    #[test]
-    fn relative_redirect_resolution() {
-        let base = "https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz";
-        assert_eq!(
-            resolve_redirect_url(base, "/downloads/pkg-1.0.0.tgz").unwrap(),
-            "https://registry.npmjs.org/downloads/pkg-1.0.0.tgz"
-        );
-        assert_eq!(
-            resolve_redirect_url(base, "relative.tgz").unwrap(),
-            "https://registry.npmjs.org/pkg/-/relative.tgz"
-        );
-        assert_eq!(
-            resolve_redirect_url(base, "https://cdn.npmjs.org/pkg.tgz").unwrap(),
-            "https://cdn.npmjs.org/pkg.tgz"
-        );
     }
 }

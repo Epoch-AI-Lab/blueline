@@ -7,6 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- crates.io registry adapter (`blueline --ecosystem cargo review <crate>@<ver>`):
+  sparse-index NDJSON client with fail-closed parsing (bad `vers` on a
+  recognized row aborts; unknown schema `v > 2` rows are skipped with a note;
+  missing `yanked` reads as false), `config.json` handling that refuses
+  authenticated registries, canonical crate names (`serde_json` → `serde-json`),
+  and `.crate` downloads verified by sha256 against the index checksum before
+  extraction. Extracted archives must unpack to exactly one top-level
+  `{name}-{version}` directory.
+- Packed `Cargo.toml` reader: `[package] build`/`links`, `[[bin]]` targets,
+  dependency maps, and `[features]`; dependencies project onto the existing
+  diff/heuristic engine.
+- Global `--ecosystem` flag (default npm) and `--index` override for cargo
+  reviews; `blueline install` refuses cargo packages (building a crate executes
+  its `build.rs`).
+- Yanked-aware baselines: the diff anchor skips yanked releases, an all-yanked
+  history degrades to first sighting, and a new `R08_YANKED_PREDECESSOR`
+  (MEDIUM) finding fires when the release immediately before the target was
+  yanked.
+- Review card/JSON gain an `ecosystem` field; integrity displays as the
+  canonical digest (`sha256:<hex>` / `sha512:<hex>`) instead of the old
+  "verified (sha512)" label.
+- MCP `review_install`, `inspect_diff`, and `check_known_clean` accept an
+  optional `ecosystem` parameter (`npm` default, `cargo`); unknown values are
+  rejected.
+
+### Changed
+
+- Baseline predecessor selection now consults `list_releases` (yank flags)
+  instead of the plain version list.
+
+### Added
+
+- Multi-registry foundation: `Ecosystem` enum (`npm`/`cargo`/`pypi`) with a
+  `Registry::ecosystem()` accessor, a typed `Checksum { alg, value_hex }`
+  replacing raw SRI strings, and `Release { version, yanked, publish_time }`
+  with `list_releases` + `default_version` replacing `resolve_dist_tag`.
+- `VersionInfo` seam in `src/version.rs`: baseline selection and the store's
+  clean-version listing now work over any version grammar (semver today,
+  PEP 440 later).
+- Shared registry HTTP plumbing in `src/registry/http_util.rs`: URL scheme
+  validation, private/local-host SSRF guards, capped redirect following, and
+  bounded reads, reusable by future registry adapters.
+- Optional `ecosystem` field on policy allow/blocklist rules; absent means the
+  rule matches every ecosystem. Plain-string blocklist entries keep working.
+- Store schema v3: every table gains an `ecosystem` column with composite
+  primary keys `(ecosystem, name, version)`; existing rows become npm-scoped.
+
+### Changed
+
+- Advisory lookups send the resolved ecosystem to OSV.dev with exact schema
+  casing (`npm`, `CratesIO`, `PyPI`).
+- Provenance attestation endpoint is threaded from the configured registry
+  base instead of hardcoding `registry.npmjs.org`; DSSE subject digests are
+  compared against the typed checksum.
+- Baseline integrity tamper checks compare normalized digest content, so
+  legacy `sha512-<base64>` rows and new `sha512:<hex>` display forms are
+  judged alike (fail-closed behavior unchanged).
+
+### Fixed
+
+- Isolated `BLUELINE_DATA_DIR` in the remaining CLI tests that spawn the
+  binary while asserting success (`ci_writes_report_to_output_file`,
+  `ci_fail_on_case_insensitive`, `mcp_ping_heartbeat`,
+  `mcp_stdio_handles_initialize_and_tools_list`), eliminating a flaky race on
+  the real user data dir under parallel test runs.
+- Pinned the fail-closed rejection of npm packuments advertising a non-sha512
+  `dist.integrity` with an explicit regression test asserting the algorithm
+  error, closing a surviving mutation-testing gap in `registry::npm`.
+
 ## [0.2.0] - 2026-08-22
 
 ### Added

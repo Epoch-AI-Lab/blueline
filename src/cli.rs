@@ -30,9 +30,34 @@ pub struct Cli {
     #[arg(long, global = true, default_value = "https://registry.npmjs.org")]
     pub registry: String,
 
+    /// Package ecosystem to review against
+    #[arg(long, global = true, value_enum, default_value_t = EcosystemArg::Npm)]
+    pub ecosystem: EcosystemArg,
+
+    /// crates.io sparse-index base URL (cargo reviews; mirrors / local fixtures)
+    #[arg(long, global = true, default_value = "https://index.crates.io")]
+    pub index: String,
+
     /// Path to blueline.toml policy file
     #[arg(long, global = true)]
     pub policy: Option<std::path::PathBuf>,
+}
+
+/// Package ecosystems selectable on the command line. PyPI is intentionally
+/// absent: its adapter is not shipped, and offering it would invite guessing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum EcosystemArg {
+    Npm,
+    Cargo,
+}
+
+impl From<EcosystemArg> for crate::registry::Ecosystem {
+    fn from(arg: EcosystemArg) -> Self {
+        match arg {
+            EcosystemArg::Npm => crate::registry::Ecosystem::Npm,
+            EcosystemArg::Cargo => crate::registry::Ecosystem::Cargo,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
