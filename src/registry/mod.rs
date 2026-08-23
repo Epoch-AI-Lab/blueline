@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::BluelineError;
 
+pub mod cratesio;
 pub mod http_util;
 pub mod npm;
 
