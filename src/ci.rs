@@ -500,4 +500,61 @@ mod tests {
             extract_base_lockfile("nonexistent_ref_123456789", Path::new("package-lock.json"));
         assert!(res_nonexistent.is_err());
     }
+
+    #[test]
+    fn cargo_dispatch_by_filename_or_ecosystem() {
+        // Kills the || → && mutant at evaluate_lockfile_diff:142.
+        // Either condition alone must select the Cargo parser.
+        let cargo_toml = r#"
+version = 4
+[[package]]
+name = "a"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+"#;
+        let empty_toml = "version = 4\n";
+        let store =
+            BaselineStore::open_at(&tempfile::tempdir().unwrap().path().join("t.db")).unwrap();
+        let policy = Policy::load_or_default(None).unwrap();
+
+        // Case 1: filename is Cargo.lock but ecosystem is Npm → must still parse as Cargo.
+        let ctx_file = CiContext {
+            base_ref: "origin/main",
+            lockfile_path: "Cargo.lock",
+            registry_base: "https://index.crates.io",
+            fail_on: Some(VerdictBand::Block),
+            ecosystem: crate::registry::Ecosystem::Npm,
+        };
+        let r1 =
+            evaluate_lockfile_diff(cargo_toml, empty_toml, &ctx_file, &store, &policy).unwrap();
+        // a 1.0.0 removed (was in base, not in head) → removed path, still a valid cargo diff
+        assert_eq!(r1.unchanged_count, 0);
+
+        // Case 2: ecosystem is Cargo but path is not Cargo.lock → must still parse as Cargo.
+        let ctx_eco = CiContext {
+            base_ref: "origin/main",
+            lockfile_path: "my.lock",
+            registry_base: "https://index.crates.io",
+            fail_on: Some(VerdictBand::Block),
+            ecosystem: crate::registry::Ecosystem::Cargo,
+        };
+        let r2 = evaluate_lockfile_diff(cargo_toml, empty_toml, &ctx_eco, &store, &policy).unwrap();
+        assert_eq!(r2.unchanged_count, 0);
+
+        // Case 3: neither matches → npm JSON path (empty JSON object would be npm, not cargo).
+        let ctx_npm = CiContext {
+            base_ref: "origin/main",
+            lockfile_path: "package-lock.json",
+            registry_base: "https://registry.npmjs.org",
+            fail_on: Some(VerdictBand::Block),
+            ecosystem: crate::registry::Ecosystem::Npm,
+        };
+        // npm empty packages JSON should parse as npm, not cargo.
+        let npm_json =
+            r#"{"lockfileVersion": 3, "packages": {"node_modules/a": {"version": "1.0.0"}}}"#;
+        let empty_npm = r#"{"lockfileVersion": 3, "packages": {}}"#;
+        let r3 = evaluate_lockfile_diff(npm_json, empty_npm, &ctx_npm, &store, &policy).unwrap();
+        assert_eq!(r3.unchanged_count, 0);
+    }
 }
