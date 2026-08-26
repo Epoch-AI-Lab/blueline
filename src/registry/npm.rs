@@ -43,12 +43,16 @@ impl NpmRegistry {
         // Scoped packages must have the slash percent-encoded in the path.
         let encoded = name.replace('/', "%2f");
         let url = format!("{}/{}", self.base, encoded);
-        let resp = self
-            .agent
-            .get(&url)
-            .set("accept", CORGI_ACCEPT)
-            .call()
-            .map_err(|e| BluelineError::Network(format!("GET {url}: {e}")))?;
+        let resp = match self.agent.get(&url).set("accept", CORGI_ACCEPT).call() {
+            Ok(resp) => resp,
+            Err(ureq::Error::Status(404, _)) => {
+                return Err(BluelineError::Manifest(
+                    name.to_string(),
+                    "package not found in registry".to_string(),
+                ));
+            }
+            Err(e) => return Err(BluelineError::Network(format!("GET {url}: {e}"))),
+        };
 
         let mut body = String::new();
         let mut reader = resp.into_reader().take(self.limits.max_packument_bytes + 1);

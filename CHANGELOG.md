@@ -69,6 +69,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Registry 404s now report "package not found in registry" instead of a
+  generic network error, in both the review and CI paths.
+- Lockfile parse errors no longer print their cause twice.
+- Interactive reviews can approve the unreviewed registry-predecessor
+  baseline in the same session (`[y/N]` prompt after approving the target);
+  non-interactive behavior is unchanged.
 - Isolated `BLUELINE_DATA_DIR` in the remaining CLI tests that spawn the
   binary while asserting success (`ci_writes_report_to_output_file`,
   `ci_fail_on_case_insensitive`, `mcp_ping_heartbeat`,
