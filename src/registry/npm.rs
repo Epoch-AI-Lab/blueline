@@ -43,12 +43,16 @@ impl NpmRegistry {
         // Scoped packages must have the slash percent-encoded in the path.
         let encoded = name.replace('/', "%2f");
         let url = format!("{}/{}", self.base, encoded);
-        let resp = self
-            .agent
-            .get(&url)
-            .set("accept", CORGI_ACCEPT)
-            .call()
-            .map_err(|e| BluelineError::Network(format!("GET {url}: {e}")))?;
+        let resp = match self.agent.get(&url).set("accept", CORGI_ACCEPT).call() {
+            Ok(resp) => resp,
+            Err(ureq::Error::Status(404, _)) => {
+                return Err(BluelineError::Manifest(
+                    name.to_string(),
+                    "package not found in registry".to_string(),
+                ));
+            }
+            Err(e) => return Err(BluelineError::Network(format!("GET {url}: {e}"))),
+        };
 
         let mut body = String::new();
         let mut reader = resp.into_reader().take(self.limits.max_packument_bytes + 1);
@@ -846,6 +850,43 @@ mod tests {
         };
         let err = reg.fetch_url_verified(&pkg_over).unwrap_err();
         assert!(err.to_string().contains("too many redirects"));
+
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn packument_404_reports_not_found() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let _ = listener.set_nonblocking(true);
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_millis(600) {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 1024];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    if req.contains("GET /ghost ") {
+                        let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        let _ = stream.write_all(resp.as_bytes());
+                    }
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        });
+
+        let reg = NpmRegistry::new(&base);
+
+        // A 404 must read as "package not found in registry" (distinct from an
+        // outage) so a lockfile pointing at a ghost package is tamper evidence.
+        let err = reg.list_releases("ghost").unwrap_err();
+        assert!(err.to_string().contains("package not found in registry"));
 
         let _ = handle.join();
     }

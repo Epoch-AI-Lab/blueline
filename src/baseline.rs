@@ -101,7 +101,13 @@ pub fn resolve_baseline<R: Registry, V: VersionInfo>(
                     }
                 },
                 Err(BluelineError::Manifest(_, _)) => {
-                    // Version yanked/missing from registry; continue looking for older clean versions
+                    // A version-level Manifest error here means this specific
+                    // stored-clean version is yanked/missing from the registry,
+                    // so we keep looking at older clean versions. A package-wide
+                    // 404 (the whole package removed) is gated earlier at
+                    // `list_releases(name)?` above and fails closed there — it
+                    // must never reach this loop, so do NOT reinterpret Manifest
+                    // as a benign "skip the candidate" for a missing package.
                     continue;
                 }
                 Err(e) => return Err(e),

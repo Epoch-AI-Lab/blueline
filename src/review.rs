@@ -13,6 +13,14 @@ use crate::registry::{Checksum, Ecosystem, Registry};
 use crate::render::{render_json, render_text};
 use crate::store::BaselineStore;
 
+/// A registry-predecessor baseline that was fetched, verified, and
+/// diffed during this review but has never been approved locally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreviewedBaseline {
+    pub version: String,
+    pub checksum: Checksum,
+}
+
 /// Build the registry adapter for a review request. PyPI fails closed here
 /// until its adapter ships; nothing downstream may guess an implementation.
 fn make_registry(ecosystem: Ecosystem, registry_base: &str) -> anyhow::Result<Box<dyn Registry>> {
@@ -38,6 +46,7 @@ pub fn evaluate_package(
     crate::verdict::Verdict,
     crate::diff::Delta,
     crate::registry::Checksum,
+    Option<UnreviewedBaseline>,
 )> {
     match ecosystem {
         Ecosystem::Npm => evaluate_with_registry(
@@ -73,6 +82,7 @@ fn evaluate_with_registry<R: Registry>(
     crate::verdict::Verdict,
     crate::diff::Delta,
     crate::registry::Checksum,
+    Option<UnreviewedBaseline>,
 )> {
     let target_semver = semver::Version::parse(version_str)
         .map_err(|e| anyhow::anyhow!("invalid semver for `{version_str}`: {e}"))?;
@@ -179,6 +189,14 @@ fn evaluate_with_registry<R: Registry>(
         crate::baseline::BaselineResolution::RegistryPredecessor(_)
     );
 
+    let unreviewed_baseline = match baseline_res.resolution.package() {
+        Some(pkg) if is_unreviewed => pkg.integrity.clone().map(|checksum| UnreviewedBaseline {
+            version: pkg.version.clone(),
+            checksum,
+        }),
+        _ => None,
+    };
+
     let advisories = crate::advisory::fetch_advisories(
         &target_pkg.name,
         &target_pkg.version,
@@ -216,7 +234,7 @@ fn evaluate_with_registry<R: Registry>(
         provenance.as_ref(),
     );
 
-    Ok((verdict, delta, checksum))
+    Ok((verdict, delta, checksum, unreviewed_baseline))
 }
 
 /// Locate and parse the package manifest inside an extracted release tree.
@@ -258,7 +276,7 @@ fn bootstrap_hint(verdict: &crate::verdict::Verdict) -> Option<String> {
             verdict.baseline_version.as_deref().unwrap_or("unknown"),
         );
         Some(format!(
-            "hint: baseline `{name}@{base}` was never approved locally. Run `blueline review {name}@{base}` from an interactive terminal and approve it to establish a baseline."
+            "hint: baseline `{name}@{base}` was never approved locally. Approve it when prompted during an interactive `blueline review`, or run `blueline review {name}@{base}` directly."
         ))
     } else if verdict
         .findings
@@ -294,7 +312,7 @@ pub fn run(
     let (name, version_str) = parse_spec_flexible(pkg_spec, registry.as_ref())?;
     let store = BaselineStore::open()?;
 
-    let (verdict, delta, checksum) = evaluate_package(
+    let (verdict, delta, checksum, unreviewed_baseline) = evaluate_package(
         &name,
         &version_str,
         ecosystem,
@@ -317,7 +335,7 @@ pub fn run(
         if verdict.band == crate::verdict::VerdictBand::Low {
             store.mark_clean(ecosystem, &name, &version_str, &checksum)?;
             let _ = store.record_audit_log(
-                Ecosystem::Npm,
+                ecosystem,
                 &name,
                 &version_str,
                 &checksum.to_display(),
@@ -350,7 +368,15 @@ pub fn run(
         && std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal()
     {
-        interactive_prompt(&store, ecosystem, &name, &version_str, &checksum, &delta)?;
+        interactive_prompt(
+            &store,
+            ecosystem,
+            &name,
+            &version_str,
+            &checksum,
+            &delta,
+            unreviewed_baseline.as_ref(),
+        )?;
     } else if verdict.band != crate::verdict::VerdictBand::Low {
         if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
             eprintln!(
@@ -390,7 +416,7 @@ pub fn install(
     let (name, version_str) = parse_spec_flexible(pkg_spec, registry.as_ref())?;
     let store = BaselineStore::open()?;
 
-    let (verdict, delta, checksum) = evaluate_package(
+    let (verdict, delta, checksum, unreviewed_baseline) = evaluate_package(
         &name,
         &version_str,
         ecosystem,
@@ -405,7 +431,7 @@ pub fn install(
         if verdict.band == crate::verdict::VerdictBand::Low {
             store.mark_clean(ecosystem, &name, &version_str, &checksum)?;
             let _ = store.record_audit_log(
-                Ecosystem::Npm,
+                ecosystem,
                 &name,
                 &version_str,
                 &checksum.to_display(),
@@ -431,7 +457,15 @@ pub fn install(
             false
         }
     } else if is_interactive {
-        interactive_prompt(&store, ecosystem, &name, &version_str, &checksum, &delta)?
+        interactive_prompt(
+            &store,
+            ecosystem,
+            &name,
+            &version_str,
+            &checksum,
+            &delta,
+            unreviewed_baseline.as_ref(),
+        )?
     } else {
         if verdict.band != crate::verdict::VerdictBand::Low {
             eprintln!(
@@ -462,6 +496,7 @@ fn interactive_prompt(
     version: &str,
     checksum: &Checksum,
     delta: &crate::diff::Delta,
+    unreviewed_baseline: Option<&UnreviewedBaseline>,
 ) -> anyhow::Result<bool> {
     loop {
         print!("\n[a]pprove · [h]old · [d]iff > ");
@@ -490,6 +525,9 @@ fn interactive_prompt(
                     "Approved {}@{} and marked clean in baseline store.",
                     name, version
                 );
+                if let Some(base) = unreviewed_baseline {
+                    offer_baseline_approval(store, ecosystem, name, base)?;
+                }
                 return Ok(true);
             }
             "h" | "hold" => {
@@ -526,6 +564,8 @@ fn interactive_prompt(
                 }
                 if !showed_any {
                     println!("\nNo text diffs available.");
+                } else {
+                    println!("\n─── end of blueline diff (trusted output resumes) ───");
                 }
             }
             _ => {
@@ -535,6 +575,74 @@ fn interactive_prompt(
             }
         }
     }
+}
+
+/// Offers to approve the unreviewed baseline in the same session. The
+/// baseline tarball was already fetched and verified against the registry
+/// checksum during this review, so approving it records a trust
+/// decision over bytes that were verified moments ago. Anything other than
+/// an explicit `y` or `yes` leaves it unapproved (fail closed). A store
+/// failure here never undoes the target approval; the baseline simply
+/// stays unapproved.
+fn offer_baseline_approval(
+    store: &BaselineStore,
+    ecosystem: Ecosystem,
+    name: &str,
+    base: &UnreviewedBaseline,
+) -> anyhow::Result<()> {
+    offer_baseline_approval_with_reader(store, ecosystem, name, base, &mut std::io::stdin().lock())
+}
+
+fn offer_baseline_approval_with_reader(
+    store: &BaselineStore,
+    ecosystem: Ecosystem,
+    name: &str,
+    base: &UnreviewedBaseline,
+    reader: &mut dyn std::io::BufRead,
+) -> anyhow::Result<()> {
+    print!(
+        "\nAlso approve unreviewed baseline {name}@{base} (tarball fetched and \
+         verified this session)? [y/N] > ",
+        name = crate::render::sanitize_single_line(name),
+        base = crate::render::sanitize_single_line(&base.version)
+    );
+    std::io::stdout().flush()?;
+    let mut input = String::new();
+    if reader.read_line(&mut input)? == 0 {
+        return Ok(());
+    }
+    if !matches!(input.trim().to_lowercase().as_str(), "y" | "yes") {
+        return Ok(());
+    }
+    let outcome = (|| -> anyhow::Result<()> {
+        store.record_verified(ecosystem, name, &base.version, &base.checksum)?;
+        store.mark_clean(ecosystem, name, &base.version, &base.checksum)?;
+        let _ = store.record_audit_log(
+            ecosystem,
+            name,
+            &base.version,
+            &base.checksum.to_display(),
+            "approve",
+            0,
+            "approved_baseline_chain",
+            "user",
+            None,
+        );
+        Ok(())
+    })();
+    if let Err(e) = outcome {
+        eprintln!(
+            "note: could not approve baseline {name}@{}: {e:#}; baseline left unapproved",
+            base.version
+        );
+        return Ok(());
+    }
+    println!(
+        "Approved baseline {}@{} and marked clean in baseline store.",
+        crate::render::sanitize_single_line(name),
+        crate::render::sanitize_single_line(&base.version)
+    );
+    Ok(())
 }
 
 /// `<name>@<version>` → (name, version). Scoped names (`@scope/pkg@1.0.0`)
@@ -616,5 +724,99 @@ mod tests {
     #[test]
     fn rejects_bad_semver() {
         assert!(parse_spec("express@latest").is_err());
+    }
+
+    #[test]
+    fn chain_approval_rejects_non_y() {
+        use crate::registry::{Checksum, ChecksumAlg};
+        use crate::store::BaselineStore;
+        fn test_baseline() -> UnreviewedBaseline {
+            UnreviewedBaseline {
+                version: "0.9.0".into(),
+                checksum: Checksum {
+                    alg: ChecksumAlg::Sha512,
+                    value_hex: "aa".repeat(64),
+                },
+            }
+        }
+        for answer in ["n\n", "no\n", "N\n", "\n", "yess\n"] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("t.db");
+            let store = BaselineStore::open_at(&db).unwrap();
+            offer_baseline_approval_with_reader(
+                &store,
+                Ecosystem::Npm,
+                "pkg",
+                &test_baseline(),
+                &mut answer.as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(
+                store.known_clean(Ecosystem::Npm, "pkg", "0.9.0").unwrap(),
+                None,
+                "answer {answer:?} must not approve"
+            );
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
+        let baseline = UnreviewedBaseline {
+            version: "0.9.0".into(),
+            checksum: Checksum {
+                alg: ChecksumAlg::Sha512,
+                value_hex: "aa".repeat(64),
+            },
+        };
+        offer_baseline_approval_with_reader(
+            &store,
+            Ecosystem::Npm,
+            "pkg",
+            &baseline,
+            &mut b"".as_slice(),
+        )
+        .unwrap();
+        assert_eq!(
+            store.known_clean(Ecosystem::Npm, "pkg", "0.9.0").unwrap(),
+            None,
+            "EOF must decline"
+        );
+    }
+
+    #[test]
+    fn chain_approval_accepts_y_and_yes() {
+        use crate::registry::{Checksum, ChecksumAlg};
+        use crate::store::BaselineStore;
+        for answer in ["y\n", "yes\n", "  Y  \n"] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("t.db");
+            let store = BaselineStore::open_at(&db).unwrap();
+            let baseline = UnreviewedBaseline {
+                version: "0.9.0".into(),
+                checksum: Checksum {
+                    alg: ChecksumAlg::Sha512,
+                    value_hex: "bb".repeat(64),
+                },
+            };
+            offer_baseline_approval_with_reader(
+                &store,
+                Ecosystem::Npm,
+                "pkg",
+                &baseline,
+                &mut answer.as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(
+                store.known_clean(Ecosystem::Npm, "pkg", "0.9.0").unwrap(),
+                Some(baseline.checksum.to_display()),
+                "answer {answer:?} must approve"
+            );
+            assert!(
+                store
+                    .list_clean_versions::<semver::Version>(Ecosystem::Npm, "pkg")
+                    .unwrap()
+                    .iter()
+                    .any(|(v, _)| v.to_string() == "0.9.0")
+            );
+        }
     }
 }

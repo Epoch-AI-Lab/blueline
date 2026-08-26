@@ -165,7 +165,7 @@ pub fn evaluate_lockfile_diff(
             continue;
         }
 
-        let (verdict, _, _) = evaluate_package(
+        let (verdict, _, _, _) = evaluate_package(
             name,
             new_version,
             crate::registry::Ecosystem::Npm,
