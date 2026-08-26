@@ -5,8 +5,9 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
-use crate::lockfile::compute_lockfile_delta;
+use crate::lockfile::{compute_delta_from_maps, compute_lockfile_delta};
 use crate::policy::Policy;
+use crate::registry::Ecosystem;
 use crate::render::sanitize_terminal;
 use crate::review::evaluate_package;
 use crate::store::BaselineStore;
@@ -46,12 +47,15 @@ pub struct CiContext<'a> {
     pub lockfile_path: &'a str,
     pub registry_base: &'a str,
     pub fail_on: Option<VerdictBand>,
+    pub ecosystem: Ecosystem,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     base_ref: &str,
     lockfile_path: &Path,
     registry_base: &str,
+    ecosystem: Ecosystem,
     policy_path: Option<&Path>,
     format: CiOutputFormat,
     fail_on_override: Option<VerdictBand>,
@@ -80,6 +84,7 @@ pub fn run(
         lockfile_path: &lockfile_str,
         registry_base,
         fail_on: fail_on_override,
+        ecosystem,
     };
 
     let report = evaluate_lockfile_diff(&base_content, &head_content, &ctx, &store, &policy)?;
@@ -133,7 +138,17 @@ pub fn evaluate_lockfile_diff(
     store: &BaselineStore,
     policy: &Policy,
 ) -> anyhow::Result<CiReport> {
-    let delta = compute_lockfile_delta(base_content, head_content)?;
+    let is_cargo = ctx.ecosystem == Ecosystem::Cargo
+        || Path::new(ctx.lockfile_path)
+            .file_name()
+            .is_some_and(|n| n == "Cargo.lock");
+    let delta = if is_cargo {
+        let base_pkgs = crate::lockfile::parse_cargo_lock_packages(base_content)?;
+        let head_pkgs = crate::lockfile::parse_cargo_lock_packages(head_content)?;
+        compute_delta_from_maps(&base_pkgs, &head_pkgs)
+    } else {
+        compute_lockfile_delta(base_content, head_content)?
+    };
 
     let total_to_eval = delta.added.len() + delta.upgraded.len();
     if total_to_eval > policy.ci.max_evaluations {
@@ -168,7 +183,7 @@ pub fn evaluate_lockfile_diff(
         let (verdict, _, _, _) = evaluate_package(
             name,
             new_version,
-            crate::registry::Ecosystem::Npm,
+            ctx.ecosystem,
             ctx.registry_base,
             store,
             policy,

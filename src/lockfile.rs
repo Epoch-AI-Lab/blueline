@@ -7,6 +7,9 @@ pub enum LockfileError {
     #[error("failed to parse lockfile JSON: {0}")]
     InvalidJson(serde_json::Error),
 
+    #[error("failed to parse Cargo.lock TOML: {0}")]
+    InvalidToml(String),
+
     #[error("lockfile is missing mandatory field: {0}")]
     MissingField(&'static str),
 
@@ -190,13 +193,92 @@ fn normalize_node_modules_path(path: &str) -> String {
         .to_string()
 }
 
-pub fn compute_lockfile_delta(
-    base_json: &str,
-    head_json: &str,
-) -> Result<LockfileDelta, LockfileError> {
-    let base_pkgs = parse_lockfile_packages(base_json)?;
-    let head_pkgs = parse_lockfile_packages(head_json)?;
+const MAX_CARGO_LOCK_BYTES: usize = 10 * 1024 * 1024;
 
+#[derive(Deserialize)]
+struct CargoLockFile {
+    package: Option<Vec<CargoPackage>>,
+}
+
+#[derive(Deserialize)]
+struct CargoPackage {
+    name: Option<String>,
+    version: Option<String>,
+    source: Option<String>,
+    checksum: Option<String>,
+}
+
+pub fn parse_cargo_lock_packages(
+    toml_content: &str,
+) -> Result<BTreeMap<String, PackageEntry>, LockfileError> {
+    if toml_content.len() > MAX_CARGO_LOCK_BYTES {
+        return Err(LockfileError::InvalidData(format!(
+            "Cargo.lock exceeds maximum size of {} bytes (got {})",
+            MAX_CARGO_LOCK_BYTES,
+            toml_content.len()
+        )));
+    }
+
+    let parsed: CargoLockFile =
+        toml::from_str(toml_content).map_err(|e| LockfileError::InvalidToml(e.to_string()))?;
+
+    let packages = parsed.package.unwrap_or_default();
+    let mut out = BTreeMap::new();
+
+    for pkg in packages {
+        let name = pkg.name.ok_or_else(|| {
+            LockfileError::InvalidData("cargo package missing mandatory field: name".to_string())
+        })?;
+        let version = pkg.version.ok_or_else(|| {
+            LockfileError::InvalidData("cargo package missing mandatory field: version".to_string())
+        })?;
+
+        if name.is_empty() || version.is_empty() {
+            return Err(LockfileError::InvalidData(
+                "cargo package has empty name or version".to_string(),
+            ));
+        }
+
+        let integrity = match pkg.checksum {
+            Some(c) => {
+                let hex = c.to_lowercase();
+                if hex.len() != 64 || !hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+                    return Err(LockfileError::InvalidData(format!(
+                        "invalid cargo checksum for {name}@{version}: expected 64 hex chars, got `{c}`",
+                    )));
+                }
+                Some(format!("sha256:{hex}"))
+            }
+            None => None,
+        };
+        let resolved = pkg.source.clone();
+
+        let entry = PackageEntry {
+            name: name.clone(),
+            version: version.clone(),
+            integrity,
+            resolved,
+            is_dev: false,
+        };
+
+        let key = format!("cargo/{}@{}", name, version);
+        if let Some(prev) = out.get(&key)
+            && prev != &entry
+        {
+            return Err(LockfileError::InvalidData(format!(
+                "duplicate cargo package entry for {key} with differing data",
+            )));
+        }
+        out.insert(key, entry);
+    }
+
+    Ok(out)
+}
+
+pub fn compute_delta_from_maps(
+    base_pkgs: &BTreeMap<String, PackageEntry>,
+    head_pkgs: &BTreeMap<String, PackageEntry>,
+) -> LockfileDelta {
     let mut added = Vec::new();
     let mut upgraded = Vec::new();
     let mut removed = Vec::new();
@@ -209,11 +291,11 @@ pub fn compute_lockfile_delta(
         match (base_iter.peek(), head_iter.peek()) {
             (Some(&(b_key, b_val)), Some(&(h_key, h_val))) => match b_key.cmp(h_key) {
                 std::cmp::Ordering::Less => {
-                    removed.push(b_val.clone());
+                    removed.push((*b_val).clone());
                     base_iter.next();
                 }
                 std::cmp::Ordering::Greater => {
-                    added.push(h_val.clone());
+                    added.push((*h_val).clone());
                     head_iter.next();
                 }
                 std::cmp::Ordering::Equal => {
@@ -235,23 +317,32 @@ pub fn compute_lockfile_delta(
                 }
             },
             (Some(&(_, b_val)), None) => {
-                removed.push(b_val.clone());
+                removed.push((*b_val).clone());
                 base_iter.next();
             }
             (None, Some(&(_, h_val))) => {
-                added.push(h_val.clone());
+                added.push((*h_val).clone());
                 head_iter.next();
             }
             (None, None) => break,
         }
     }
 
-    Ok(LockfileDelta {
+    LockfileDelta {
         added,
         upgraded,
         removed,
         unchanged_count,
-    })
+    }
+}
+
+pub fn compute_lockfile_delta(
+    base_json: &str,
+    head_json: &str,
+) -> Result<LockfileDelta, LockfileError> {
+    let base_pkgs = parse_lockfile_packages(base_json)?;
+    let head_pkgs = parse_lockfile_packages(head_json)?;
+    Ok(compute_delta_from_maps(&base_pkgs, &head_pkgs))
 }
 
 #[cfg(test)]
@@ -474,6 +565,210 @@ mod tests {
         assert_eq!(
             delta.upgraded[0].new_integrity.as_deref(),
             Some("sha512-new")
+        );
+    }
+
+    #[test]
+    fn parses_cargo_lock_registry_dep() {
+        let toml = r#"
+version = 4
+
+[[package]]
+name = "serde"
+version = "1.0.210"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890"
+"#;
+        let pkgs = parse_cargo_lock_packages(toml).unwrap();
+        assert_eq!(pkgs.len(), 1);
+        let entry = pkgs.get("cargo/serde@1.0.210").unwrap();
+        assert_eq!(entry.name, "serde");
+        assert_eq!(entry.version, "1.0.210");
+        assert_eq!(
+            entry.integrity.as_deref(),
+            Some("sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890")
+        );
+        assert_eq!(
+            entry.resolved.as_deref(),
+            Some("registry+https://github.com/rust-lang/crates.io-index")
+        );
+        assert!(!entry.is_dev);
+    }
+
+    #[test]
+    fn parses_cargo_lock_git_and_path_deps() {
+        let toml = r#"
+version = 4
+
+[[package]]
+name = "my-git-dep"
+version = "0.1.0"
+source = "git+https://github.com/example/repo#abc123"
+
+[[package]]
+name = "my-path-dep"
+version = "0.2.0"
+
+[[package]]
+name = "regular"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"
+"#;
+        let pkgs = parse_cargo_lock_packages(toml).unwrap();
+        assert_eq!(pkgs.len(), 3);
+
+        let git = pkgs.get("cargo/my-git-dep@0.1.0").unwrap();
+        assert_eq!(git.integrity, None);
+        assert_eq!(
+            git.resolved.as_deref(),
+            Some("git+https://github.com/example/repo#abc123")
+        );
+
+        let path = pkgs.get("cargo/my-path-dep@0.2.0").unwrap();
+        assert_eq!(path.integrity, None);
+        assert_eq!(path.resolved, None);
+
+        let reg = pkgs.get("cargo/regular@1.0.0").unwrap();
+        assert_eq!(
+            reg.integrity.as_deref(),
+            Some("sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+        );
+        assert!(reg.resolved.is_some());
+    }
+
+    #[test]
+    fn cargo_lock_delta_via_parse_pair() {
+        let base_toml = r#"
+version = 4
+
+[[package]]
+name = "serde"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+[[package]]
+name = "unchanged"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+
+[[package]]
+name = "removed"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+"#;
+
+        let head_toml = r#"
+version = 4
+
+[[package]]
+name = "serde"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
+
+[[package]]
+name = "unchanged"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+
+[[package]]
+name = "added"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE"
+"#;
+
+        let base = parse_cargo_lock_packages(base_toml).unwrap();
+        let head = parse_cargo_lock_packages(head_toml).unwrap();
+        let delta = compute_delta_from_maps(&base, &head);
+
+        // With `cargo/name@version` keys, a version bump is not an `upgraded` but
+        // a `removed` old key + `added` new key. Both are still evaluated in CI.
+        assert_eq!(delta.added.len(), 2, "serde 1.1.0 + added");
+        assert_eq!(delta.removed.len(), 2, "serde 1.0.0 + removed");
+        assert_eq!(delta.upgraded.len(), 0);
+        assert_eq!(delta.unchanged_count, 1);
+        assert!(
+            delta
+                .added
+                .iter()
+                .any(|e| e.name == "serde" && e.version == "1.1.0")
+        );
+        assert!(delta.added.iter().any(|e| e.name == "added"));
+
+        // Integrity-only change on same key is an `upgraded`.
+        let base2 = parse_cargo_lock_packages(
+            r#"
+version = 4
+[[package]]
+name = "tampered"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+"#,
+        )
+        .unwrap();
+        let head2 = parse_cargo_lock_packages(
+            r#"
+version = 4
+[[package]]
+name = "tampered"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+"#,
+        )
+        .unwrap();
+        let delta2 = compute_delta_from_maps(&base2, &head2);
+        assert_eq!(delta2.upgraded.len(), 1);
+        assert_eq!(delta2.upgraded[0].name, "tampered");
+        assert_eq!(delta2.unchanged_count, 0);
+    }
+
+    #[test]
+    fn cargo_lock_invalid_toml_fails_closed() {
+        let bad = "[[package\nname = \"oops\"";
+        let err = parse_cargo_lock_packages(bad).unwrap_err();
+        assert!(
+            matches!(err, LockfileError::InvalidToml(_)),
+            "malformed TOML must be InvalidToml, got {err:?}"
+        );
+
+        let empty_pkg = r#"
+version = 4
+
+[[package]]
+name = "no-version"
+"#;
+        let err2 = parse_cargo_lock_packages(empty_pkg).unwrap_err();
+        match err2 {
+            LockfileError::InvalidData(_) => {}
+            other => panic!("expected InvalidData for missing version, got {other:?}"),
+        }
+
+        let oversized = "a".repeat(MAX_CARGO_LOCK_BYTES + 1);
+        let err3 = parse_cargo_lock_packages(&oversized).unwrap_err();
+        match err3 {
+            LockfileError::InvalidData(msg) => assert!(msg.contains("exceeds maximum size")),
+            other => panic!("expected InvalidData for oversized, got {other:?}"),
+        }
+
+        let bad_checksum = r#"
+version = 4
+[[package]]
+name = "bad"
+version = "1.0.0"
+checksum = "not-hex"
+"#;
+        let err4 = parse_cargo_lock_packages(bad_checksum).unwrap_err();
+        assert!(
+            matches!(err4, LockfileError::InvalidData(_)),
+            "bad checksum must be InvalidData, got {err4:?}"
         );
     }
 }

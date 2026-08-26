@@ -1,0 +1,934 @@
+# blueline.toml — bootstrap for cargo dogfood CI (PR3 feat/cargo-lock-ci)
+# The current Cargo.lock crate set is onboarded without an approved baseline so
+# `dogfood-cargo` can scan `Cargo.lock` on PRs touching it with `--fail-on high`.
+# Findings stay visible (rendered as [INFO]/LOW in JSON) but no longer block;
+# content heuristics (eval/network/script etc.) still apply in full and will
+# still reach HIGH/BLOCK. To graduate a crate, approve its baseline via
+# `blueline review <crate>@<version> --yes` and remove its entry here.
+# See src/policy.rs:PackageAllowRule.allow_unreviewed_baseline
+
+[[allowlist.packages]]
+name = "adler2"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "ahash"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "aho-corasick"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "anstream"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "anstyle"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "anstyle-parse"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "anstyle-query"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "anstyle-wincon"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "anyhow"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "assert_cmd"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "autocfg"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "base64"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "bit-set"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "bit-vec"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "bitflags"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "block-buffer"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "bstr"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "cc"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "cfg-if"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "clap"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "clap_builder"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "clap_derive"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "clap_lex"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "colorchoice"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "comfy-table"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "cpufeatures"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "crc32fast"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "crossterm"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "crossterm_winapi"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "crypto-common"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "difflib"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "digest"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "dirs"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "dirs-sys"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "displaydoc"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "document-features"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "equivalent"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "errno"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "fallible-iterator"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "fallible-streaming-iterator"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "fastrand"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "filetime"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "find-msvc-tools"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "flate2"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "float-cmp"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "fnv"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "form_urlencoded"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "generic-array"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "getrandom"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "hashbrown"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "hashlink"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "heck"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "icu_collections"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "icu_locale_core"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "icu_normalizer"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "icu_normalizer_data"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "icu_properties"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "icu_properties_data"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "icu_provider"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "idna"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "idna_adapter"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "indexmap"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "is_terminal_polyfill"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "itoa"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "libc"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "libredox"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "libsqlite3-sys"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "linux-raw-sys"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "litemap"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "litrs"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "lock_api"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "log"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "memchr"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "miniz_oxide"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "normalize-line-endings"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "num-traits"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "once_cell"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "once_cell_polyfill"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "option-ext"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "parking_lot"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "parking_lot_core"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "percent-encoding"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "pkg-config"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "potential_utf"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "ppv-lite86"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "predicates"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "predicates-core"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "predicates-tree"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "proc-macro2"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "proptest"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "quick-error"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "quote"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "r-efi"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "rand"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "rand_chacha"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "rand_core"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "rand_xorshift"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "redox_syscall"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "redox_users"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "regex"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "regex-automata"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "regex-syntax"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "ring"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "rusqlite"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "rusqlite_migration"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "rustix"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "rustls"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "rustls-pki-types"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "rustls-webpki"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "rusty-fork"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "same-file"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "scopeguard"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "semver"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "serde"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "serde_core"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "serde_derive"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "serde_json"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "serde_spanned"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "sha2"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "shlex"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "simd-adler32"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "similar"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "smallvec"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "stable_deref_trait"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "strsim"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "subtle"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "syn"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "synstructure"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "tar"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "tempfile"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "termtree"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "thiserror"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "thiserror-impl"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "tinystr"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "toml"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "toml_datetime"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "toml_edit"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "toml_write"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "typenum"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "unarray"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "unicode-ident"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "unicode-segmentation"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "unicode-width"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "untrusted"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "ureq"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "url"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "utf8_iter"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "utf8parse"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "vcpkg"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "version_check"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "wait-timeout"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "walkdir"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "wasi"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "wasip2"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "webpki-roots"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "winapi"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "winapi-i686-pc-windows-gnu"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "winapi-util"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "winapi-x86_64-pc-windows-gnu"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "windows-link"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "windows-sys"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "windows-targets"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "windows_aarch64_gnullvm"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "windows_aarch64_msvc"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "windows_i686_gnu"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "windows_i686_gnullvm"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "windows_i686_msvc"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "windows_x86_64_gnu"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "windows_x86_64_gnullvm"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "windows_x86_64_msvc"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "winnow"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "wit-bindgen"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "writeable"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "xattr"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "yoke"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "yoke-derive"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "zerocopy"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "zerocopy-derive"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "zerofrom"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "zerofrom-derive"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "zeroize"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "zerotrie"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "zerovec"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "zerovec-derive"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+
+[[allowlist.packages]]
+name = "zmij"
+ecosystem = "cargo"
+allow_unreviewed_baseline = true
+

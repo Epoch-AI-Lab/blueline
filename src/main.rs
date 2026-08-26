@@ -45,7 +45,8 @@ fn run() -> anyhow::Result<()> {
         } => ci::run(
             &base,
             &lockfile,
-            &cli.registry,
+            &registry_base,
+            ecosystem,
             cli.policy.as_deref(),
             format.to_ci_format(),
             fail_on,

@@ -33,6 +33,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - MCP `review_install`, `inspect_diff`, and `check_known_clean` accept an
   optional `ecosystem` parameter (`npm` default, `cargo`); unknown values are
   rejected.
+- Cargo.lock CI dogfood: `blueline ci` now scans `Cargo.lock` (TOML) alongside
+  `package-lock.json` (bounded, `__`/`_` canonicalization, `source = "git+…"`
+  honored via `allow_git_dependencies`); new `dogfood-cargo` job in
+  `.github/workflows/ci.yml:110` runs
+  `cargo run -- --ecosystem cargo ci --lockfile Cargo.lock --fail-on high`
+  on PRs touching `Cargo.lock` (`hashFiles('Cargo.lock')` gate + diff check),
+  bootstrapped via committed `blueline.toml:1` with
+  `allow_unreviewed_baseline = true` for the current crate set (content
+  heuristics still apply in full).
 
 ### Changed
 
