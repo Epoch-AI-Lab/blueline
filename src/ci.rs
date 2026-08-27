@@ -76,7 +76,9 @@ pub fn run(
         )
     })?;
 
-    let base_content = extract_base_lockfile(base_ref, lockfile_path)?;
+    let is_cargo = ecosystem == Ecosystem::Cargo
+        || lockfile_path.file_name().is_some_and(|n| n == "Cargo.lock");
+    let base_content = extract_base_lockfile(base_ref, lockfile_path, is_cargo)?;
 
     let lockfile_str = lockfile_path.display().to_string();
     let ctx = CiContext {
@@ -217,7 +219,11 @@ pub fn evaluate_lockfile_diff(
     })
 }
 
-fn extract_base_lockfile(base_ref: &str, lockfile_path: &Path) -> anyhow::Result<String> {
+fn extract_base_lockfile(
+    base_ref: &str,
+    lockfile_path: &Path,
+    is_cargo: bool,
+) -> anyhow::Result<String> {
     let trimmed_ref = base_ref.trim();
     if trimmed_ref.starts_with('-') || trimmed_ref.is_empty() {
         anyhow::bail!("invalid git base ref `{base_ref}`: cannot start with '-' or be empty");
@@ -238,6 +244,9 @@ fn extract_base_lockfile(base_ref: &str, lockfile_path: &Path) -> anyhow::Result
             "does not exist in",
         ];
         if NOT_IN_BASE.iter().any(|pat| stderr.contains(pat)) {
+            if is_cargo {
+                return Ok("version = 4\n".to_string());
+            }
             return Ok(r#"{"lockfileVersion": 3, "packages": {}}"#.to_string());
         }
         anyhow::bail!("git show `{spec}` failed: {stderr}");
@@ -380,11 +389,12 @@ mod tests {
 
     #[test]
     fn rejects_flag_like_base_refs() {
-        let err =
-            extract_base_lockfile("--output=/tmp/pwn", Path::new("package-lock.json")).unwrap_err();
+        let err = extract_base_lockfile("--output=/tmp/pwn", Path::new("package-lock.json"), false)
+            .unwrap_err();
         assert!(err.to_string().contains("cannot start with '-'"));
 
-        let err_empty = extract_base_lockfile("  ", Path::new("package-lock.json")).unwrap_err();
+        let err_empty =
+            extract_base_lockfile("  ", Path::new("package-lock.json"), false).unwrap_err();
         assert!(err_empty.to_string().contains("or be empty"));
     }
 
@@ -494,11 +504,31 @@ mod tests {
 
     #[test]
     fn invalid_git_ref_fails_closed() {
-        let res = extract_base_lockfile("-leading-hyphen", Path::new("package-lock.json"));
+        let res = extract_base_lockfile("-leading-hyphen", Path::new("package-lock.json"), false);
         assert!(res.is_err());
-        let res_nonexistent =
-            extract_base_lockfile("nonexistent_ref_123456789", Path::new("package-lock.json"));
+        let res_nonexistent = extract_base_lockfile(
+            "nonexistent_ref_123456789",
+            Path::new("package-lock.json"),
+            false,
+        );
         assert!(res_nonexistent.is_err());
+    }
+
+    #[test]
+    fn cargo_missing_base_returns_empty_cargo_toml() {
+        let cargo_empty =
+            extract_base_lockfile("HEAD", Path::new("Cargo.lock.missing-for-test-xyz"), true)
+                .unwrap();
+        assert_eq!(cargo_empty, "version = 4\n");
+        assert!(crate::lockfile::parse_cargo_lock_packages(&cargo_empty).is_ok());
+        let npm_empty = extract_base_lockfile(
+            "HEAD",
+            Path::new("package-lock.missing-for-test-xyz"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(npm_empty, r#"{"lockfileVersion": 3, "packages": {}}"#);
+        assert!(crate::lockfile::parse_lockfile_packages(&npm_empty).is_ok());
     }
 
     #[test]
