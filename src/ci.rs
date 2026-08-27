@@ -54,6 +54,26 @@ fn is_cargo_lockfile(ecosystem: Ecosystem, lockfile_path: &Path) -> bool {
     ecosystem == Ecosystem::Cargo || lockfile_path.file_name().is_some_and(|n| n == "Cargo.lock")
 }
 
+fn check_evaluation_budget(added: usize, upgraded: usize, max: usize) -> anyhow::Result<usize> {
+    let total = added + upgraded;
+    if total > max {
+        anyhow::bail!(
+            "CI review exceeded maximum configured package evaluations ({} > {})",
+            total,
+            max
+        );
+    }
+    Ok(total)
+}
+
+fn evaluation_skipped(include_dev: bool, is_dev: bool) -> bool {
+    !include_dev && is_dev
+}
+
+fn band_passes(max_band: VerdictBand, threshold: VerdictBand) -> bool {
+    max_band < threshold
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     base_ref: &str,
@@ -143,10 +163,7 @@ pub fn evaluate_lockfile_diff(
     store: &BaselineStore,
     policy: &Policy,
 ) -> anyhow::Result<CiReport> {
-    let is_cargo = ctx.ecosystem == Ecosystem::Cargo
-        || Path::new(ctx.lockfile_path)
-            .file_name()
-            .is_some_and(|n| n == "Cargo.lock");
+    let is_cargo = is_cargo_lockfile(ctx.ecosystem, Path::new(ctx.lockfile_path));
     let delta = if is_cargo {
         let base_pkgs = crate::lockfile::parse_cargo_lock_packages(base_content)?;
         let head_pkgs = crate::lockfile::parse_cargo_lock_packages(head_content)?;
@@ -155,14 +172,11 @@ pub fn evaluate_lockfile_diff(
         compute_lockfile_delta(base_content, head_content)?
     };
 
-    let total_to_eval = delta.added.len() + delta.upgraded.len();
-    if total_to_eval > policy.ci.max_evaluations {
-        anyhow::bail!(
-            "CI review exceeded maximum configured package evaluations ({} > {})",
-            total_to_eval,
-            policy.ci.max_evaluations
-        );
-    }
+    check_evaluation_budget(
+        delta.added.len(),
+        delta.upgraded.len(),
+        policy.ci.max_evaluations,
+    )?;
 
     let mut items = Vec::new();
     let mut max_band = VerdictBand::Low;
@@ -181,7 +195,7 @@ pub fn evaluate_lockfile_diff(
         }));
 
     for (name, old_version, new_version, is_dev) in eval_candidates {
-        if !policy.ci.include_dev && is_dev {
+        if evaluation_skipped(policy.ci.include_dev, is_dev) {
             continue;
         }
 
@@ -209,7 +223,7 @@ pub fn evaluate_lockfile_diff(
         .fail_on
         .unwrap_or_else(|| parse_band_str(&policy.ci.fail_on).unwrap_or(VerdictBand::High));
 
-    let passed = max_band < fail_threshold;
+    let passed = band_passes(max_band, fail_threshold);
 
     Ok(CiReport {
         base_ref: ctx.base_ref.to_string(),
@@ -411,6 +425,34 @@ mod tests {
             Path::new("sub/dir/package-lock.json")
         ));
         assert!(!is_cargo_lockfile(Ecosystem::Npm, Path::new("cargo.lock")));
+    }
+
+    #[test]
+    fn evaluation_budget_sums_both_kinds_and_allows_exact_boundary() {
+        let err = check_evaluation_budget(2, 1, 2).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "CI review exceeded maximum configured package evaluations (3 > 2)"
+        );
+        assert_eq!(check_evaluation_budget(1, 1, 2).unwrap(), 2);
+        assert_eq!(check_evaluation_budget(1, 0, 2).unwrap(), 1);
+        assert_eq!(check_evaluation_budget(0, 0, 0).unwrap(), 0);
+    }
+
+    #[test]
+    fn only_dev_packages_are_skipped_and_only_when_not_included() {
+        assert!(evaluation_skipped(false, true));
+        assert!(!evaluation_skipped(false, false));
+        assert!(!evaluation_skipped(true, true));
+        assert!(!evaluation_skipped(true, false));
+    }
+
+    #[test]
+    fn band_equal_to_threshold_fails_and_below_passes() {
+        assert!(band_passes(VerdictBand::Medium, VerdictBand::High));
+        assert!(!band_passes(VerdictBand::High, VerdictBand::High));
+        assert!(!band_passes(VerdictBand::Low, VerdictBand::Low));
+        assert!(!band_passes(VerdictBand::Block, VerdictBand::High));
     }
 
     #[test]

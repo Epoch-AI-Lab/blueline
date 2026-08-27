@@ -1631,6 +1631,128 @@ fn ci_fail_on_case_insensitive() {
 }
 
 #[test]
+fn ci_missing_lockfile_error_hints_at_the_flag() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+
+    blueline()
+        .current_dir(temp_dir.path())
+        .env("BLUELINE_DATA_DIR", data_dir.path())
+        .args([
+            "ci",
+            "--base",
+            "HEAD",
+            "--lockfile",
+            "does-not-exist-lock.json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("use `--lockfile <path>`"));
+}
+
+#[test]
+fn ci_appends_markdown_to_github_step_summary() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let lockfile_path = temp_dir.path().join("package-lock.json");
+    let summary_path = temp_dir.path().join("step-summary.md");
+
+    let _ = std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(temp_dir.path())
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["config", "user.name", "CI Test"])
+        .current_dir(temp_dir.path())
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["config", "user.email", "ci@test.local"])
+        .current_dir(temp_dir.path())
+        .output();
+
+    std::fs::write(
+        &lockfile_path,
+        r#"{"name": "app", "version": "1.0.0", "lockfileVersion": 3, "packages": {}}"#,
+    )
+    .unwrap();
+
+    let _ = std::process::Command::new("git")
+        .args(["add", "package-lock.json"])
+        .current_dir(temp_dir.path())
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["commit", "-m", "init"])
+        .current_dir(temp_dir.path())
+        .output();
+
+    blueline()
+        .current_dir(temp_dir.path())
+        .env("BLUELINE_DATA_DIR", data_dir.path())
+        .env("GITHUB_STEP_SUMMARY", summary_path.to_str().unwrap())
+        .args(["ci", "--base", "HEAD", "--lockfile", "package-lock.json"])
+        .assert()
+        .success();
+
+    let summary = std::fs::read_to_string(&summary_path).unwrap();
+    assert!(summary.contains("Blueline CI Security Review"));
+}
+
+#[test]
+fn ci_text_output_renders_report_header() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let lockfile_path = temp_dir.path().join("package-lock.json");
+
+    let _ = std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(temp_dir.path())
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["config", "user.name", "CI Test"])
+        .current_dir(temp_dir.path())
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["config", "user.email", "ci@test.local"])
+        .current_dir(temp_dir.path())
+        .output();
+
+    std::fs::write(
+        &lockfile_path,
+        r#"{"name": "app", "version": "1.0.0", "lockfileVersion": 3, "packages": {}}"#,
+    )
+    .unwrap();
+
+    let _ = std::process::Command::new("git")
+        .args(["add", "package-lock.json"])
+        .current_dir(temp_dir.path())
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["commit", "-m", "init"])
+        .current_dir(temp_dir.path())
+        .output();
+
+    blueline()
+        .current_dir(temp_dir.path())
+        .env("BLUELINE_DATA_DIR", data_dir.path())
+        .args([
+            "ci",
+            "--base",
+            "HEAD",
+            "--lockfile",
+            "package-lock.json",
+            "--format",
+            "text",
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("Base Ref:")
+                .and(predicate::str::contains("Status:"))
+                .and(predicate::str::contains("PASSED")),
+        );
+}
+
+#[test]
 fn install_blocks_extra_positional_args() {
     blueline()
         .args([
