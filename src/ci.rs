@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::lockfile::{compute_delta_from_maps, compute_lockfile_delta};
 use crate::policy::Policy;
 use crate::registry::Ecosystem;
-use crate::render::sanitize_terminal;
+use crate::render::{sanitize_single_line, sanitize_terminal};
 use crate::review::evaluate_package;
 use crate::store::BaselineStore;
 use crate::verdict::{Verdict, VerdictBand};
@@ -283,12 +283,7 @@ fn parse_band_str(s: &str) -> Option<VerdictBand> {
 }
 
 fn is_missing_base_error(stderr: &str) -> bool {
-    const NOT_IN_BASE: [&str; 4] = [
-        "does not exist",
-        "path not in",
-        "exists on disk, but not in",
-        "does not exist in",
-    ];
+    const NOT_IN_BASE: [&str; 2] = ["does not exist", "exists on disk, but not in"];
     NOT_IN_BASE.iter().any(|pat| stderr.contains(pat))
 }
 
@@ -370,7 +365,7 @@ pub fn render_text_summary_to_string(report: &CiReport) -> String {
     out.push_str("=======================================================\n");
     out.push_str(&format!(
         "Base Ref:          {}\n",
-        sanitize_terminal(&report.base_ref)
+        sanitize_single_line(&report.base_ref)
     ));
     out.push_str(&format!("Evaluated:         {}\n", report.total_evaluated));
     out.push_str(&format!("Unchanged:         {}\n", report.unchanged_count));
@@ -385,17 +380,17 @@ pub fn render_text_summary_to_string(report: &CiReport) -> String {
         let old_v = item.old_version.as_deref().unwrap_or("new");
         out.push_str(&format!(
             "{:<30} {:<10} -> {:<10} | Score: {:<3} | Band: {:<6}\n",
-            sanitize_terminal(&item.name),
-            sanitize_terminal(old_v),
-            sanitize_terminal(&item.new_version),
+            sanitize_single_line(&item.name),
+            sanitize_single_line(old_v),
+            sanitize_single_line(&item.new_version),
             item.verdict.risk_score,
             item.verdict.band
         ));
         for f in &item.verdict.findings {
             out.push_str(&format!(
                 "  ! [{}] {}\n",
-                sanitize_terminal(&f.rule_id),
-                sanitize_terminal(&f.title)
+                sanitize_single_line(&f.rule_id),
+                sanitize_single_line(&f.title)
             ));
         }
     }
@@ -437,16 +432,19 @@ mod tests {
         assert!(is_missing_base_error(
             "fatal: path 'Cargo.lock' exists on disk, but not in 'HEAD'"
         ));
-        assert!(is_missing_base_error("error: path not in HEAD"));
         assert!(is_missing_base_error("does not exist"));
         assert!(!is_missing_base_error("fatal: ambiguous argument 'HEAD'"));
+        assert!(!is_missing_base_error(
+            "fatal: ambiguous argument 'HEAD~999': unknown revision or path not in the working tree"
+        ));
         assert!(!is_missing_base_error(""));
     }
 
     #[test]
     fn missing_base_error_any_not_all() {
         assert!(is_missing_base_error("does not exist"));
-        assert!(is_missing_base_error("path not in somewhere"));
+        assert!(is_missing_base_error("exists on disk, but not in 'HEAD'"));
+        assert!(!is_missing_base_error("path not in the working tree"));
     }
 
     #[test]
@@ -529,6 +527,10 @@ mod tests {
         let err = extract_base_lockfile("--output=/tmp/pwn", Path::new("package-lock.json"), false)
             .unwrap_err();
         assert!(err.to_string().contains("cannot start with '-'"));
+
+        let err_ws_flag =
+            extract_base_lockfile("  --evil", Path::new("package-lock.json"), false).unwrap_err();
+        assert!(err_ws_flag.to_string().contains("cannot start with '-'"));
 
         let err_empty =
             extract_base_lockfile("  ", Path::new("package-lock.json"), false).unwrap_err();
@@ -732,6 +734,61 @@ mod tests {
         assert!(text.contains("1.0.0"));
         assert!(text.contains("2.0.0"));
         assert!(text.contains("R01"));
+    }
+
+    #[test]
+    fn renders_text_summary_strips_newlines_via_single_line() {
+        let report = CiReport {
+            base_ref: "origin/main\nInjected: evil".to_string(),
+            lockfile_path: "package-lock.json".to_string(),
+            total_evaluated: 1,
+            unchanged_count: 0,
+            max_band: VerdictBand::High,
+            passed: false,
+            items: vec![CiReviewItem {
+                name: "pkg\nInjected line".to_string(),
+                old_version: Some("1.0.0\nfake".to_string()),
+                new_version: "2.0.0\nfake".to_string(),
+                is_dev: false,
+                verdict: Verdict {
+                    name: "pkg".to_string(),
+                    target_version: "2.0.0".to_string(),
+                    baseline_version: None,
+                    integrity: "sha512-test".to_string(),
+                    ecosystem: crate::registry::Ecosystem::Npm,
+                    band: VerdictBand::High,
+                    risk_score: 80,
+                    findings: vec![crate::verdict::Finding {
+                        rule_id: "R01\nInject".to_string(),
+                        severity: VerdictBand::High,
+                        title: "title\nwith newline".to_string(),
+                        description: "desc".to_string(),
+                    }],
+                    diff_summary: crate::verdict::DiffSummary {
+                        files_added: 0,
+                        files_removed: 0,
+                        files_modified: 0,
+                        lines_added: 0,
+                        lines_deleted: 0,
+                    },
+                    trust_sources: None,
+                },
+            }],
+        };
+        let text = render_text_summary_to_string(&report);
+        assert!(
+            text.contains("origin/main Injected: evil"),
+            "newline in base_ref must be flattened to space: {text}"
+        );
+        assert!(
+            text.contains("pkg Injected line"),
+            "newline in name must be flattened: {text}"
+        );
+        assert!(
+            !text.lines().any(|l| l.trim_start().starts_with("Injected")),
+            "newline injection must not create new line: {text}"
+        );
+        assert!(!text.contains("pkg\nInjected"), "newline must not survive");
     }
 
     #[test]

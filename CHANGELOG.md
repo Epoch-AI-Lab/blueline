@@ -62,9 +62,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   rule matches every ecosystem. Plain-string blocklist entries keep working.
 - Store schema v3: every table gains an `ecosystem` column with composite
   primary keys `(ecosystem, name, version)`; existing rows become npm-scoped.
-
-### Changed
-
 - Advisory lookups send the resolved ecosystem to OSV.dev with exact schema
   casing (`npm`, `CratesIO`, `PyPI`).
 - Provenance attestation endpoint is threaded from the configured registry
