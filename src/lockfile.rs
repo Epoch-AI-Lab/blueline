@@ -778,17 +778,30 @@ checksum = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         ));
 
         // Size cap: > MAX fails, == MAX passes. Kills *→+ and >→>= mutants.
-        let at_limit = "a".repeat(MAX_CARGO_LOCK_BYTES);
-        // Valid minimal Cargo.lock at exactly MAX bytes (pad with name)
-        // Instead test boundary via direct len check: oversized vs at-limit toml
-        let oversized = "a".repeat(MAX_CARGO_LOCK_BYTES + 1);
+        assert_eq!(
+            MAX_CARGO_LOCK_BYTES, 10_485_760,
+            "MAX must be 10 MiB; hard literal kills *→+ mutants"
+        );
+        let header = "version = 4\n";
+        let mut at_limit_toml = String::with_capacity(MAX_CARGO_LOCK_BYTES);
+        at_limit_toml.push_str(header);
+        let remaining = MAX_CARGO_LOCK_BYTES - at_limit_toml.len() - 2;
+        at_limit_toml.push('#');
+        at_limit_toml.push_str(&"a".repeat(remaining));
+        at_limit_toml.push('\n');
+        assert_eq!(at_limit_toml.len(), MAX_CARGO_LOCK_BYTES);
+        let at_limit_res = parse_cargo_lock_packages(&at_limit_toml);
+        assert!(
+            at_limit_res.is_ok(),
+            "exactly MAX bytes must not be rejected by size cap (> vs >= mutant), got {at_limit_res:?}"
+        );
+        let oversized = format!("{at_limit_toml}a");
+        assert_eq!(oversized.len(), MAX_CARGO_LOCK_BYTES + 1);
         let err3 = parse_cargo_lock_packages(&oversized).unwrap_err();
         match err3 {
             LockfileError::InvalidData(msg) => assert!(msg.contains("exceeds maximum size")),
             other => panic!("expected InvalidData for oversized, got {other:?}"),
         }
-        // At-limit with valid TOML must not hit size cap (can be larger due to valid content, so use len check)
-        assert!(at_limit.len() == MAX_CARGO_LOCK_BYTES, "boundary sanity");
 
         // Checksum validation: wrong length vs bad hex must each fail (|| vs &&).
         let bad_len = r#"
