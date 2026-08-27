@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -121,9 +122,6 @@ jobs:
         id: changed
         run: |
           BASE="origin/${{ github.base_ref }}"
-          if ! git rev-parse --verify --quiet "$BASE" >/dev/null 2>&1; then
-            BASE="${{ github.base_ref }}"
-          fi
           if git diff --name-only "$BASE"...HEAD | grep -qE '(^|/)Cargo\.lock$'; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
@@ -199,7 +197,7 @@ jobs:
         with:
           tool: cargo-mutants
       - name: Mutate the trust boundary
-        run: cargo mutants --shard ${{ matrix.shard }}/4 --file src/extract.rs --file src/manifest.rs --file src/registry/npm.rs --file src/store.rs --in-place --baseline=skip --timeout 300
+        run: cargo mutants --shard ${{ matrix.shard }}/4 --file src/extract.rs --file src/manifest.rs --file src/registry/npm.rs --file src/store.rs --file src/executor.rs --file src/lockfile.rs --file src/ci.rs --file src/mcp.rs --in-place --baseline=skip --timeout 300
       - uses: actions/upload-artifact@v4
         if: always()
         with:

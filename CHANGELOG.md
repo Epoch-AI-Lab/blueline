@@ -38,7 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   honored via `allow_git_dependencies`); new `dogfood-cargo` job in
   `.github/workflows/ci.yml:110` runs
   `cargo run -- --ecosystem cargo ci --lockfile Cargo.lock --fail-on high`
-  on PRs touching `Cargo.lock` (`hashFiles('Cargo.lock')` gate + diff check),
+  on PRs touching `Cargo.lock` (diff check for `Cargo.lock`),
   bootstrapped via committed `blueline.toml:1` with
   `allow_unreviewed_baseline = true` for the current crate set (content
   heuristics still apply in full).
@@ -47,8 +47,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - Baseline predecessor selection now consults `list_releases` (yank flags)
   instead of the plain version list.
-
-### Added
 
 - Multi-registry foundation: `Ecosystem` enum (`npm`/`cargo`/`pypi`) with a
   `Registry::ecosystem()` accessor, a typed `Checksum { alg, value_hex }`
