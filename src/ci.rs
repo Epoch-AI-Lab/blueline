@@ -5,9 +5,10 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
-use crate::lockfile::compute_lockfile_delta;
+use crate::lockfile::{compute_delta_from_maps, compute_lockfile_delta};
 use crate::policy::Policy;
-use crate::render::sanitize_terminal;
+use crate::registry::Ecosystem;
+use crate::render::{sanitize_single_line, sanitize_terminal};
 use crate::review::evaluate_package;
 use crate::store::BaselineStore;
 use crate::verdict::{Verdict, VerdictBand};
@@ -46,12 +47,39 @@ pub struct CiContext<'a> {
     pub lockfile_path: &'a str,
     pub registry_base: &'a str,
     pub fail_on: Option<VerdictBand>,
+    pub ecosystem: Ecosystem,
 }
 
+fn is_cargo_lockfile(ecosystem: Ecosystem, lockfile_path: &Path) -> bool {
+    ecosystem == Ecosystem::Cargo || lockfile_path.file_name().is_some_and(|n| n == "Cargo.lock")
+}
+
+fn check_evaluation_budget(added: usize, upgraded: usize, max: usize) -> anyhow::Result<usize> {
+    let total = added + upgraded;
+    if total > max {
+        anyhow::bail!(
+            "CI review exceeded maximum configured package evaluations ({} > {})",
+            total,
+            max
+        );
+    }
+    Ok(total)
+}
+
+fn evaluation_skipped(include_dev: bool, is_dev: bool) -> bool {
+    !include_dev && is_dev
+}
+
+fn band_passes(max_band: VerdictBand, threshold: VerdictBand) -> bool {
+    max_band < threshold
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     base_ref: &str,
     lockfile_path: &Path,
     registry_base: &str,
+    ecosystem: Ecosystem,
     policy_path: Option<&Path>,
     format: CiOutputFormat,
     fail_on_override: Option<VerdictBand>,
@@ -72,7 +100,8 @@ pub fn run(
         )
     })?;
 
-    let base_content = extract_base_lockfile(base_ref, lockfile_path)?;
+    let is_cargo = is_cargo_lockfile(ecosystem, lockfile_path);
+    let base_content = extract_base_lockfile(base_ref, lockfile_path, is_cargo)?;
 
     let lockfile_str = lockfile_path.display().to_string();
     let ctx = CiContext {
@@ -80,6 +109,7 @@ pub fn run(
         lockfile_path: &lockfile_str,
         registry_base,
         fail_on: fail_on_override,
+        ecosystem,
     };
 
     let report = evaluate_lockfile_diff(&base_content, &head_content, &ctx, &store, &policy)?;
@@ -133,16 +163,20 @@ pub fn evaluate_lockfile_diff(
     store: &BaselineStore,
     policy: &Policy,
 ) -> anyhow::Result<CiReport> {
-    let delta = compute_lockfile_delta(base_content, head_content)?;
+    let is_cargo = is_cargo_lockfile(ctx.ecosystem, Path::new(ctx.lockfile_path));
+    let delta = if is_cargo {
+        let base_pkgs = crate::lockfile::parse_cargo_lock_packages(base_content)?;
+        let head_pkgs = crate::lockfile::parse_cargo_lock_packages(head_content)?;
+        compute_delta_from_maps(&base_pkgs, &head_pkgs)
+    } else {
+        compute_lockfile_delta(base_content, head_content)?
+    };
 
-    let total_to_eval = delta.added.len() + delta.upgraded.len();
-    if total_to_eval > policy.ci.max_evaluations {
-        anyhow::bail!(
-            "CI review exceeded maximum configured package evaluations ({} > {})",
-            total_to_eval,
-            policy.ci.max_evaluations
-        );
-    }
+    check_evaluation_budget(
+        delta.added.len(),
+        delta.upgraded.len(),
+        policy.ci.max_evaluations,
+    )?;
 
     let mut items = Vec::new();
     let mut max_band = VerdictBand::Low;
@@ -161,20 +195,20 @@ pub fn evaluate_lockfile_diff(
         }));
 
     for (name, old_version, new_version, is_dev) in eval_candidates {
-        if !policy.ci.include_dev && is_dev {
+        if evaluation_skipped(policy.ci.include_dev, is_dev) {
             continue;
         }
 
         let (verdict, _, _, _) = evaluate_package(
             name,
             new_version,
-            crate::registry::Ecosystem::Npm,
+            ctx.ecosystem,
             ctx.registry_base,
             store,
             policy,
         )?;
 
-        max_band = max_band.max(verdict.band);
+        max_band = update_max_band(max_band, verdict.band);
 
         items.push(CiReviewItem {
             name: name.to_string(),
@@ -189,7 +223,7 @@ pub fn evaluate_lockfile_diff(
         .fail_on
         .unwrap_or_else(|| parse_band_str(&policy.ci.fail_on).unwrap_or(VerdictBand::High));
 
-    let passed = max_band < fail_threshold;
+    let passed = band_passes(max_band, fail_threshold);
 
     Ok(CiReport {
         base_ref: ctx.base_ref.to_string(),
@@ -202,7 +236,11 @@ pub fn evaluate_lockfile_diff(
     })
 }
 
-fn extract_base_lockfile(base_ref: &str, lockfile_path: &Path) -> anyhow::Result<String> {
+fn extract_base_lockfile(
+    base_ref: &str,
+    lockfile_path: &Path,
+    is_cargo: bool,
+) -> anyhow::Result<String> {
     let trimmed_ref = base_ref.trim();
     if trimmed_ref.starts_with('-') || trimmed_ref.is_empty() {
         anyhow::bail!("invalid git base ref `{base_ref}`: cannot start with '-' or be empty");
@@ -216,13 +254,10 @@ fn extract_base_lockfile(base_ref: &str, lockfile_path: &Path) -> anyhow::Result
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        const NOT_IN_BASE: [&str; 4] = [
-            "does not exist",
-            "path not in",
-            "exists on disk, but not in",
-            "does not exist in",
-        ];
-        if NOT_IN_BASE.iter().any(|pat| stderr.contains(pat)) {
+        if is_missing_base_error(&stderr) {
+            if is_cargo {
+                return Ok("version = 4\n".to_string());
+            }
             return Ok(r#"{"lockfileVersion": 3, "packages": {}}"#.to_string());
         }
         anyhow::bail!("git show `{spec}` failed: {stderr}");
@@ -233,13 +268,27 @@ fn extract_base_lockfile(base_ref: &str, lockfile_path: &Path) -> anyhow::Result
 }
 
 fn parse_band_str(s: &str) -> Option<VerdictBand> {
-    match s.trim().to_lowercase().as_str() {
-        "low" => Some(VerdictBand::Low),
-        "medium" => Some(VerdictBand::Medium),
-        "high" => Some(VerdictBand::High),
-        "block" => Some(VerdictBand::Block),
-        _ => None,
+    let t = s.trim();
+    if t.eq_ignore_ascii_case("low") {
+        Some(VerdictBand::Low)
+    } else if t.eq_ignore_ascii_case("medium") {
+        Some(VerdictBand::Medium)
+    } else if t.eq_ignore_ascii_case("high") {
+        Some(VerdictBand::High)
+    } else if t.eq_ignore_ascii_case("block") {
+        Some(VerdictBand::Block)
+    } else {
+        None
     }
+}
+
+fn is_missing_base_error(stderr: &str) -> bool {
+    const NOT_IN_BASE: [&str; 2] = ["does not exist", "exists on disk, but not in"];
+    NOT_IN_BASE.iter().any(|pat| stderr.contains(pat))
+}
+
+fn update_max_band(current: VerdictBand, next: VerdictBand) -> VerdictBand {
+    current.max(next)
 }
 
 fn escape_markdown_cell(s: &str) -> String {
@@ -314,7 +363,10 @@ pub fn render_text_summary_to_string(report: &CiReport) -> String {
     out.push_str("\n=======================================================\n");
     out.push_str("             BLUELINE CI REVIEW SUMMARY                \n");
     out.push_str("=======================================================\n");
-    out.push_str(&format!("Base Ref:          {}\n", report.base_ref));
+    out.push_str(&format!(
+        "Base Ref:          {}\n",
+        sanitize_single_line(&report.base_ref)
+    ));
     out.push_str(&format!("Evaluated:         {}\n", report.total_evaluated));
     out.push_str(&format!("Unchanged:         {}\n", report.unchanged_count));
     out.push_str(&format!("Max Risk Band:     {}\n", report.max_band));
@@ -328,17 +380,17 @@ pub fn render_text_summary_to_string(report: &CiReport) -> String {
         let old_v = item.old_version.as_deref().unwrap_or("new");
         out.push_str(&format!(
             "{:<30} {:<10} -> {:<10} | Score: {:<3} | Band: {:<6}\n",
-            sanitize_terminal(&item.name),
-            old_v,
-            item.new_version,
+            sanitize_single_line(&item.name),
+            sanitize_single_line(old_v),
+            sanitize_single_line(&item.new_version),
             item.verdict.risk_score,
             item.verdict.band
         ));
         for f in &item.verdict.findings {
             out.push_str(&format!(
                 "  ! [{}] {}\n",
-                f.rule_id,
-                sanitize_terminal(&f.title)
+                sanitize_single_line(&f.rule_id),
+                sanitize_single_line(&f.title)
             ));
         }
     }
@@ -364,12 +416,124 @@ mod tests {
     }
 
     #[test]
+    fn parses_band_strings_with_whitespace_and_case() {
+        assert_eq!(parse_band_str("  low  "), Some(VerdictBand::Low));
+        assert_eq!(parse_band_str("\tMEDIUM\n"), Some(VerdictBand::Medium));
+        assert_eq!(parse_band_str("  HIGH "), Some(VerdictBand::High));
+        assert_eq!(parse_band_str(" Block "), Some(VerdictBand::Block));
+        assert_eq!(parse_band_str("  unknown  "), None);
+    }
+
+    #[test]
+    fn missing_base_error_matches_each_pattern_independently() {
+        assert!(is_missing_base_error(
+            "fatal: path 'Cargo.lock' does not exist in 'HEAD'"
+        ));
+        assert!(is_missing_base_error(
+            "fatal: path 'Cargo.lock' exists on disk, but not in 'HEAD'"
+        ));
+        assert!(is_missing_base_error("does not exist"));
+        assert!(!is_missing_base_error("fatal: ambiguous argument 'HEAD'"));
+        assert!(!is_missing_base_error(
+            "fatal: ambiguous argument 'HEAD~999': unknown revision or path not in the working tree"
+        ));
+        assert!(!is_missing_base_error(""));
+    }
+
+    #[test]
+    fn missing_base_error_any_not_all() {
+        assert!(is_missing_base_error("does not exist"));
+        assert!(is_missing_base_error("exists on disk, but not in 'HEAD'"));
+        assert!(!is_missing_base_error("path not in the working tree"));
+    }
+
+    #[test]
+    fn max_band_tracks_maximum_not_minimum() {
+        assert_eq!(
+            update_max_band(VerdictBand::Low, VerdictBand::Block),
+            VerdictBand::Block
+        );
+        assert_eq!(
+            update_max_band(VerdictBand::Block, VerdictBand::Low),
+            VerdictBand::Block
+        );
+        assert_eq!(
+            update_max_band(VerdictBand::Medium, VerdictBand::High),
+            VerdictBand::High
+        );
+        assert_eq!(
+            update_max_band(VerdictBand::High, VerdictBand::High),
+            VerdictBand::High
+        );
+        assert_eq!(
+            update_max_band(VerdictBand::Low, VerdictBand::Low),
+            VerdictBand::Low
+        );
+    }
+
+    #[test]
+    fn cargo_lockfile_dispatch_matches_each_signal_independently() {
+        assert!(is_cargo_lockfile(Ecosystem::Cargo, Path::new("Cargo.lock")));
+        assert!(is_cargo_lockfile(
+            Ecosystem::Cargo,
+            Path::new("package-lock.json")
+        ));
+        assert!(is_cargo_lockfile(Ecosystem::Npm, Path::new("Cargo.lock")));
+        assert!(is_cargo_lockfile(
+            Ecosystem::Npm,
+            Path::new("sub/dir/Cargo.lock")
+        ));
+        assert!(!is_cargo_lockfile(
+            Ecosystem::Npm,
+            Path::new("package-lock.json")
+        ));
+        assert!(!is_cargo_lockfile(
+            Ecosystem::Npm,
+            Path::new("sub/dir/package-lock.json")
+        ));
+        assert!(!is_cargo_lockfile(Ecosystem::Npm, Path::new("cargo.lock")));
+    }
+
+    #[test]
+    fn evaluation_budget_sums_both_kinds_and_allows_exact_boundary() {
+        let err = check_evaluation_budget(2, 1, 2).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "CI review exceeded maximum configured package evaluations (3 > 2)"
+        );
+        assert_eq!(check_evaluation_budget(1, 1, 2).unwrap(), 2);
+        assert_eq!(check_evaluation_budget(1, 0, 2).unwrap(), 1);
+        assert_eq!(check_evaluation_budget(0, 0, 0).unwrap(), 0);
+    }
+
+    #[test]
+    fn only_dev_packages_are_skipped_and_only_when_not_included() {
+        assert!(evaluation_skipped(false, true));
+        assert!(!evaluation_skipped(false, false));
+        assert!(!evaluation_skipped(true, true));
+        assert!(!evaluation_skipped(true, false));
+    }
+
+    #[test]
+    fn band_equal_to_threshold_fails_and_below_passes() {
+        assert!(band_passes(VerdictBand::Medium, VerdictBand::High));
+        assert!(!band_passes(VerdictBand::High, VerdictBand::High));
+        assert!(!band_passes(VerdictBand::Low, VerdictBand::Low));
+        assert!(!band_passes(VerdictBand::Block, VerdictBand::High));
+    }
+
+    #[test]
     fn rejects_flag_like_base_refs() {
-        let err =
-            extract_base_lockfile("--output=/tmp/pwn", Path::new("package-lock.json")).unwrap_err();
+        let err = extract_base_lockfile("--output=/tmp/pwn", Path::new("package-lock.json"), false)
+            .unwrap_err();
         assert!(err.to_string().contains("cannot start with '-'"));
 
-        let err_empty = extract_base_lockfile("  ", Path::new("package-lock.json")).unwrap_err();
+        let err_ws_flag =
+            extract_base_lockfile("  --evil", Path::new("package-lock.json"), false).unwrap_err();
+        assert!(err_ws_flag.to_string().contains("cannot start with '-'"));
+
+        let err_empty =
+            extract_base_lockfile("  ", Path::new("package-lock.json"), false).unwrap_err();
         assert!(err_empty.to_string().contains("or be empty"));
     }
 
@@ -417,6 +581,51 @@ mod tests {
         assert!(md.contains(r"malicious\|pkg"));
         assert!(md.contains(r"EVAL\|NETWORK"));
         assert!(md.contains(r"eval \| payload<br/>multiline"));
+    }
+
+    #[test]
+    fn escapes_markdown_cells_strips_terminal_escapes() {
+        let report = CiReport {
+            base_ref: "origin/main\x1b[31mred\x1b[0m".to_string(),
+            lockfile_path: "package-lock.json".to_string(),
+            total_evaluated: 1,
+            unchanged_count: 0,
+            max_band: VerdictBand::Block,
+            passed: false,
+            items: vec![CiReviewItem {
+                name: "pkg\x1b[2Jinjected".to_string(),
+                old_version: Some("1.0.0\x1b[31m".to_string()),
+                new_version: "2.0.0\x1b[31m".to_string(),
+                is_dev: false,
+                verdict: Verdict {
+                    name: "pkg".to_string(),
+                    target_version: "2.0.0".to_string(),
+                    baseline_version: None,
+                    integrity: "sha512-test".to_string(),
+                    ecosystem: crate::registry::Ecosystem::Npm,
+                    band: VerdictBand::Block,
+                    risk_score: 90,
+                    findings: vec![crate::verdict::Finding {
+                        rule_id: "R01\x1b[2Jevil".to_string(),
+                        severity: VerdictBand::Block,
+                        title: "title\x1b[31m|pipe\nnewline".to_string(),
+                        description: "desc".to_string(),
+                    }],
+                    diff_summary: crate::verdict::DiffSummary {
+                        files_added: 0,
+                        files_removed: 0,
+                        files_modified: 0,
+                        lines_added: 0,
+                        lines_deleted: 0,
+                    },
+                    trust_sources: None,
+                },
+            }],
+        };
+        let md = render_markdown_summary(&report);
+        assert!(!md.contains('\x1b'), "markdown must strip terminal escapes");
+        assert!(md.contains(r"title\|pipe<br/>newline"));
+        assert!(!md.contains("injected\x1b"));
     }
 
     #[test]
@@ -478,11 +687,193 @@ mod tests {
     }
 
     #[test]
+    fn renders_text_summary_sanitizes_versions_and_findings() {
+        let report = CiReport {
+            base_ref: "origin/main\x1b[31mred".to_string(),
+            lockfile_path: "package-lock.json".to_string(),
+            total_evaluated: 1,
+            unchanged_count: 0,
+            max_band: VerdictBand::High,
+            passed: false,
+            items: vec![CiReviewItem {
+                name: "pkg\x1b[2Jeval".to_string(),
+                old_version: Some("1.0.0\x1b[31m".to_string()),
+                new_version: "2.0.0\x1b[2J".to_string(),
+                is_dev: false,
+                verdict: Verdict {
+                    name: "pkg".to_string(),
+                    target_version: "2.0.0".to_string(),
+                    baseline_version: None,
+                    integrity: "sha512-test".to_string(),
+                    ecosystem: crate::registry::Ecosystem::Npm,
+                    band: VerdictBand::High,
+                    risk_score: 80,
+                    findings: vec![crate::verdict::Finding {
+                        rule_id: "R01\x1b[31m".to_string(),
+                        severity: VerdictBand::High,
+                        title: "evil\x1b[2Jtitle".to_string(),
+                        description: "desc".to_string(),
+                    }],
+                    diff_summary: crate::verdict::DiffSummary {
+                        files_added: 0,
+                        files_removed: 0,
+                        files_modified: 0,
+                        lines_added: 0,
+                        lines_deleted: 0,
+                    },
+                    trust_sources: None,
+                },
+            }],
+        };
+        let text = render_text_summary_to_string(&report);
+        assert!(
+            !text.contains('\x1b'),
+            "text summary must strip escapes from all fields"
+        );
+        assert!(text.contains("pkg"));
+        assert!(text.contains("1.0.0"));
+        assert!(text.contains("2.0.0"));
+        assert!(text.contains("R01"));
+    }
+
+    #[test]
+    fn renders_text_summary_strips_newlines_via_single_line() {
+        let report = CiReport {
+            base_ref: "origin/main\nInjected: evil".to_string(),
+            lockfile_path: "package-lock.json".to_string(),
+            total_evaluated: 1,
+            unchanged_count: 0,
+            max_band: VerdictBand::High,
+            passed: false,
+            items: vec![CiReviewItem {
+                name: "pkg\nInjected line".to_string(),
+                old_version: Some("1.0.0\nfake".to_string()),
+                new_version: "2.0.0\nfake".to_string(),
+                is_dev: false,
+                verdict: Verdict {
+                    name: "pkg".to_string(),
+                    target_version: "2.0.0".to_string(),
+                    baseline_version: None,
+                    integrity: "sha512-test".to_string(),
+                    ecosystem: crate::registry::Ecosystem::Npm,
+                    band: VerdictBand::High,
+                    risk_score: 80,
+                    findings: vec![crate::verdict::Finding {
+                        rule_id: "R01\nInject".to_string(),
+                        severity: VerdictBand::High,
+                        title: "title\nwith newline".to_string(),
+                        description: "desc".to_string(),
+                    }],
+                    diff_summary: crate::verdict::DiffSummary {
+                        files_added: 0,
+                        files_removed: 0,
+                        files_modified: 0,
+                        lines_added: 0,
+                        lines_deleted: 0,
+                    },
+                    trust_sources: None,
+                },
+            }],
+        };
+        let text = render_text_summary_to_string(&report);
+        assert!(
+            text.contains("origin/main Injected: evil"),
+            "newline in base_ref must be flattened to space: {text}"
+        );
+        assert!(
+            text.contains("pkg Injected line"),
+            "newline in name must be flattened: {text}"
+        );
+        assert!(
+            !text.lines().any(|l| l.trim_start().starts_with("Injected")),
+            "newline injection must not create new line: {text}"
+        );
+        assert!(!text.contains("pkg\nInjected"), "newline must not survive");
+    }
+
+    #[test]
     fn invalid_git_ref_fails_closed() {
-        let res = extract_base_lockfile("-leading-hyphen", Path::new("package-lock.json"));
+        let res = extract_base_lockfile("-leading-hyphen", Path::new("package-lock.json"), false);
         assert!(res.is_err());
-        let res_nonexistent =
-            extract_base_lockfile("nonexistent_ref_123456789", Path::new("package-lock.json"));
+        let res_nonexistent = extract_base_lockfile(
+            "nonexistent_ref_123456789",
+            Path::new("package-lock.json"),
+            false,
+        );
         assert!(res_nonexistent.is_err());
+    }
+
+    #[test]
+    fn cargo_missing_base_returns_empty_cargo_toml() {
+        let cargo_empty =
+            extract_base_lockfile("HEAD", Path::new("Cargo.lock.missing-for-test-xyz"), true)
+                .unwrap();
+        assert_eq!(cargo_empty, "version = 4\n");
+        assert!(crate::lockfile::parse_cargo_lock_packages(&cargo_empty).is_ok());
+        let npm_empty = extract_base_lockfile(
+            "HEAD",
+            Path::new("package-lock.missing-for-test-xyz"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(npm_empty, r#"{"lockfileVersion": 3, "packages": {}}"#);
+        assert!(crate::lockfile::parse_lockfile_packages(&npm_empty).is_ok());
+    }
+
+    #[test]
+    fn cargo_dispatch_by_filename_or_ecosystem() {
+        // Kills the || → && mutant at evaluate_lockfile_diff:142.
+        // Either condition alone must select the Cargo parser.
+        let cargo_toml = r#"
+version = 4
+[[package]]
+name = "a"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+"#;
+        let empty_toml = "version = 4\n";
+        let store =
+            BaselineStore::open_at(&tempfile::tempdir().unwrap().path().join("t.db")).unwrap();
+        let policy = Policy::load_or_default(None).unwrap();
+
+        // Case 1: filename is Cargo.lock but ecosystem is Npm → must still parse as Cargo.
+        let ctx_file = CiContext {
+            base_ref: "origin/main",
+            lockfile_path: "Cargo.lock",
+            registry_base: "https://index.crates.io",
+            fail_on: Some(VerdictBand::Block),
+            ecosystem: crate::registry::Ecosystem::Npm,
+        };
+        let r1 =
+            evaluate_lockfile_diff(cargo_toml, empty_toml, &ctx_file, &store, &policy).unwrap();
+        // a 1.0.0 removed (was in base, not in head) → removed path, still a valid cargo diff
+        assert_eq!(r1.unchanged_count, 0);
+
+        // Case 2: ecosystem is Cargo but path is not Cargo.lock → must still parse as Cargo.
+        let ctx_eco = CiContext {
+            base_ref: "origin/main",
+            lockfile_path: "my.lock",
+            registry_base: "https://index.crates.io",
+            fail_on: Some(VerdictBand::Block),
+            ecosystem: crate::registry::Ecosystem::Cargo,
+        };
+        let r2 = evaluate_lockfile_diff(cargo_toml, empty_toml, &ctx_eco, &store, &policy).unwrap();
+        assert_eq!(r2.unchanged_count, 0);
+
+        // Case 3: neither matches → npm JSON path (empty JSON object would be npm, not cargo).
+        let ctx_npm = CiContext {
+            base_ref: "origin/main",
+            lockfile_path: "package-lock.json",
+            registry_base: "https://registry.npmjs.org",
+            fail_on: Some(VerdictBand::Block),
+            ecosystem: crate::registry::Ecosystem::Npm,
+        };
+        // npm empty packages JSON should parse as npm, not cargo.
+        let npm_json =
+            r#"{"lockfileVersion": 3, "packages": {"node_modules/a": {"version": "1.0.0"}}}"#;
+        let empty_npm = r#"{"lockfileVersion": 3, "packages": {}}"#;
+        let r3 = evaluate_lockfile_diff(npm_json, empty_npm, &ctx_npm, &store, &policy).unwrap();
+        assert_eq!(r3.unchanged_count, 0);
     }
 }

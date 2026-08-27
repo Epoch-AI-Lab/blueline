@@ -33,13 +33,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - MCP `review_install`, `inspect_diff`, and `check_known_clean` accept an
   optional `ecosystem` parameter (`npm` default, `cargo`); unknown values are
   rejected.
+- Cargo.lock CI dogfood: `blueline ci` now scans `Cargo.lock` (TOML) alongside
+  `package-lock.json` (bounded, `__`/`_` canonicalization, `source = "git+…"`
+  honored via `allow_git_dependencies`); new `dogfood-cargo` job in
+  `.github/workflows/ci.yml:110` runs
+  `cargo run -- --ecosystem cargo ci --lockfile Cargo.lock --fail-on high`
+  on PRs touching `Cargo.lock` (diff check for `Cargo.lock`),
+  bootstrapped via committed `blueline.toml:1` with
+  `allow_unreviewed_baseline = true` for the current crate set (content
+  heuristics still apply in full).
 
 ### Changed
 
 - Baseline predecessor selection now consults `list_releases` (yank flags)
   instead of the plain version list.
-
-### Added
 
 - Multi-registry foundation: `Ecosystem` enum (`npm`/`cargo`/`pypi`) with a
   `Registry::ecosystem()` accessor, a typed `Checksum { alg, value_hex }`
@@ -55,9 +62,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   rule matches every ecosystem. Plain-string blocklist entries keep working.
 - Store schema v3: every table gains an `ecosystem` column with composite
   primary keys `(ecosystem, name, version)`; existing rows become npm-scoped.
-
-### Changed
-
 - Advisory lookups send the resolved ecosystem to OSV.dev with exact schema
   casing (`npm`, `CratesIO`, `PyPI`).
 - Provenance attestation endpoint is threaded from the configured registry

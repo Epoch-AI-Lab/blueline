@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -108,6 +109,36 @@ jobs:
           name: blueline-dogfood-report
           path: blueline-dogfood.json
 
+  dogfood-cargo:
+    name: Dogfood (blueline on own Cargo.lock)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: swatinem/rust-cache@v2
+      - name: Check Cargo.lock changed vs base
+        id: changed
+        run: |
+          BASE="origin/${{ github.base_ref }}"
+          if git diff --name-only "$BASE"...HEAD | grep -qE '(^|/)Cargo\.lock$'; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Cargo.lock unchanged vs $BASE — skipping cargo dogfood"
+          fi
+      - name: Run blueline on Cargo.lock (cargo)
+        if: steps.changed.outputs.changed == 'true'
+        run: |
+          BASE_REF="origin/${{ github.base_ref }}"
+          if git show "$BASE_REF:blueline.toml" > /tmp/base_blueline.toml 2>/dev/null; then
+            POLICY_ARG="--policy /tmp/base_blueline.toml"
+          else
+            POLICY_ARG=""
+          fi
+          cargo run --locked -- --ecosystem cargo ci --lockfile Cargo.lock --fail-on high --base "$BASE_REF" $POLICY_ARG
+
   # Mutation testing guards the trust boundary: it proves the test suite would
   # catch a regression like the poisoned-baseline bug, so audits don't have to.
   # Warnings must NOT be denied here — a mutation IS the divergence, and
@@ -166,7 +197,7 @@ jobs:
         with:
           tool: cargo-mutants
       - name: Mutate the trust boundary
-        run: cargo mutants --shard ${{ matrix.shard }}/4 --file src/extract.rs --file src/manifest.rs --file src/registry/npm.rs --file src/store.rs --in-place --baseline=skip --timeout 300
+        run: cargo mutants --shard ${{ matrix.shard }}/4 --file src/extract.rs --file src/manifest.rs --file src/registry/npm.rs --file src/store.rs --file src/executor.rs --file src/lockfile.rs --file src/ci.rs --file src/mcp.rs --in-place --baseline=skip --timeout 300
       - uses: actions/upload-artifact@v4
         if: always()
         with:
