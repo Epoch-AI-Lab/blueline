@@ -50,6 +50,10 @@ pub struct CiContext<'a> {
     pub ecosystem: Ecosystem,
 }
 
+fn is_cargo_lockfile(ecosystem: Ecosystem, lockfile_path: &Path) -> bool {
+    ecosystem == Ecosystem::Cargo || lockfile_path.file_name().is_some_and(|n| n == "Cargo.lock")
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     base_ref: &str,
@@ -76,8 +80,7 @@ pub fn run(
         )
     })?;
 
-    let is_cargo = ecosystem == Ecosystem::Cargo
-        || lockfile_path.file_name().is_some_and(|n| n == "Cargo.lock");
+    let is_cargo = is_cargo_lockfile(ecosystem, lockfile_path);
     let base_content = extract_base_lockfile(base_ref, lockfile_path, is_cargo)?;
 
     let lockfile_str = lockfile_path.display().to_string();
@@ -385,6 +388,29 @@ mod tests {
         assert_eq!(parse_band_str("high"), Some(VerdictBand::High));
         assert_eq!(parse_band_str("block"), Some(VerdictBand::Block));
         assert_eq!(parse_band_str("unknown"), None);
+    }
+
+    #[test]
+    fn cargo_lockfile_dispatch_matches_each_signal_independently() {
+        assert!(is_cargo_lockfile(Ecosystem::Cargo, Path::new("Cargo.lock")));
+        assert!(is_cargo_lockfile(
+            Ecosystem::Cargo,
+            Path::new("package-lock.json")
+        ));
+        assert!(is_cargo_lockfile(Ecosystem::Npm, Path::new("Cargo.lock")));
+        assert!(is_cargo_lockfile(
+            Ecosystem::Npm,
+            Path::new("sub/dir/Cargo.lock")
+        ));
+        assert!(!is_cargo_lockfile(
+            Ecosystem::Npm,
+            Path::new("package-lock.json")
+        ));
+        assert!(!is_cargo_lockfile(
+            Ecosystem::Npm,
+            Path::new("sub/dir/package-lock.json")
+        ));
+        assert!(!is_cargo_lockfile(Ecosystem::Npm, Path::new("cargo.lock")));
     }
 
     #[test]
