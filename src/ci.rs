@@ -208,7 +208,7 @@ pub fn evaluate_lockfile_diff(
             policy,
         )?;
 
-        max_band = max_band.max(verdict.band);
+        max_band = update_max_band(max_band, verdict.band);
 
         items.push(CiReviewItem {
             name: name.to_string(),
@@ -254,13 +254,7 @@ fn extract_base_lockfile(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        const NOT_IN_BASE: [&str; 4] = [
-            "does not exist",
-            "path not in",
-            "exists on disk, but not in",
-            "does not exist in",
-        ];
-        if NOT_IN_BASE.iter().any(|pat| stderr.contains(pat)) {
+        if is_missing_base_error(&stderr) {
             if is_cargo {
                 return Ok("version = 4\n".to_string());
             }
@@ -274,13 +268,32 @@ fn extract_base_lockfile(
 }
 
 fn parse_band_str(s: &str) -> Option<VerdictBand> {
-    match s.trim().to_lowercase().as_str() {
-        "low" => Some(VerdictBand::Low),
-        "medium" => Some(VerdictBand::Medium),
-        "high" => Some(VerdictBand::High),
-        "block" => Some(VerdictBand::Block),
-        _ => None,
+    let t = s.trim();
+    if t.eq_ignore_ascii_case("low") {
+        Some(VerdictBand::Low)
+    } else if t.eq_ignore_ascii_case("medium") {
+        Some(VerdictBand::Medium)
+    } else if t.eq_ignore_ascii_case("high") {
+        Some(VerdictBand::High)
+    } else if t.eq_ignore_ascii_case("block") {
+        Some(VerdictBand::Block)
+    } else {
+        None
     }
+}
+
+fn is_missing_base_error(stderr: &str) -> bool {
+    const NOT_IN_BASE: [&str; 4] = [
+        "does not exist",
+        "path not in",
+        "exists on disk, but not in",
+        "does not exist in",
+    ];
+    NOT_IN_BASE.iter().any(|pat| stderr.contains(pat))
+}
+
+fn update_max_band(current: VerdictBand, next: VerdictBand) -> VerdictBand {
+    current.max(next)
 }
 
 fn escape_markdown_cell(s: &str) -> String {
@@ -355,7 +368,10 @@ pub fn render_text_summary_to_string(report: &CiReport) -> String {
     out.push_str("\n=======================================================\n");
     out.push_str("             BLUELINE CI REVIEW SUMMARY                \n");
     out.push_str("=======================================================\n");
-    out.push_str(&format!("Base Ref:          {}\n", report.base_ref));
+    out.push_str(&format!(
+        "Base Ref:          {}\n",
+        sanitize_terminal(&report.base_ref)
+    ));
     out.push_str(&format!("Evaluated:         {}\n", report.total_evaluated));
     out.push_str(&format!("Unchanged:         {}\n", report.unchanged_count));
     out.push_str(&format!("Max Risk Band:     {}\n", report.max_band));
@@ -370,15 +386,15 @@ pub fn render_text_summary_to_string(report: &CiReport) -> String {
         out.push_str(&format!(
             "{:<30} {:<10} -> {:<10} | Score: {:<3} | Band: {:<6}\n",
             sanitize_terminal(&item.name),
-            old_v,
-            item.new_version,
+            sanitize_terminal(old_v),
+            sanitize_terminal(&item.new_version),
             item.verdict.risk_score,
             item.verdict.band
         ));
         for f in &item.verdict.findings {
             out.push_str(&format!(
                 "  ! [{}] {}\n",
-                f.rule_id,
+                sanitize_terminal(&f.rule_id),
                 sanitize_terminal(&f.title)
             ));
         }
@@ -402,6 +418,59 @@ mod tests {
         assert_eq!(parse_band_str("high"), Some(VerdictBand::High));
         assert_eq!(parse_band_str("block"), Some(VerdictBand::Block));
         assert_eq!(parse_band_str("unknown"), None);
+    }
+
+    #[test]
+    fn parses_band_strings_with_whitespace_and_case() {
+        assert_eq!(parse_band_str("  low  "), Some(VerdictBand::Low));
+        assert_eq!(parse_band_str("\tMEDIUM\n"), Some(VerdictBand::Medium));
+        assert_eq!(parse_band_str("  HIGH "), Some(VerdictBand::High));
+        assert_eq!(parse_band_str(" Block "), Some(VerdictBand::Block));
+        assert_eq!(parse_band_str("  unknown  "), None);
+    }
+
+    #[test]
+    fn missing_base_error_matches_each_pattern_independently() {
+        assert!(is_missing_base_error(
+            "fatal: path 'Cargo.lock' does not exist in 'HEAD'"
+        ));
+        assert!(is_missing_base_error(
+            "fatal: path 'Cargo.lock' exists on disk, but not in 'HEAD'"
+        ));
+        assert!(is_missing_base_error("error: path not in HEAD"));
+        assert!(is_missing_base_error("does not exist"));
+        assert!(!is_missing_base_error("fatal: ambiguous argument 'HEAD'"));
+        assert!(!is_missing_base_error(""));
+    }
+
+    #[test]
+    fn missing_base_error_any_not_all() {
+        assert!(is_missing_base_error("does not exist"));
+        assert!(is_missing_base_error("path not in somewhere"));
+    }
+
+    #[test]
+    fn max_band_tracks_maximum_not_minimum() {
+        assert_eq!(
+            update_max_band(VerdictBand::Low, VerdictBand::Block),
+            VerdictBand::Block
+        );
+        assert_eq!(
+            update_max_band(VerdictBand::Block, VerdictBand::Low),
+            VerdictBand::Block
+        );
+        assert_eq!(
+            update_max_band(VerdictBand::Medium, VerdictBand::High),
+            VerdictBand::High
+        );
+        assert_eq!(
+            update_max_band(VerdictBand::High, VerdictBand::High),
+            VerdictBand::High
+        );
+        assert_eq!(
+            update_max_band(VerdictBand::Low, VerdictBand::Low),
+            VerdictBand::Low
+        );
     }
 
     #[test]
@@ -513,6 +582,51 @@ mod tests {
     }
 
     #[test]
+    fn escapes_markdown_cells_strips_terminal_escapes() {
+        let report = CiReport {
+            base_ref: "origin/main\x1b[31mred\x1b[0m".to_string(),
+            lockfile_path: "package-lock.json".to_string(),
+            total_evaluated: 1,
+            unchanged_count: 0,
+            max_band: VerdictBand::Block,
+            passed: false,
+            items: vec![CiReviewItem {
+                name: "pkg\x1b[2Jinjected".to_string(),
+                old_version: Some("1.0.0\x1b[31m".to_string()),
+                new_version: "2.0.0\x1b[31m".to_string(),
+                is_dev: false,
+                verdict: Verdict {
+                    name: "pkg".to_string(),
+                    target_version: "2.0.0".to_string(),
+                    baseline_version: None,
+                    integrity: "sha512-test".to_string(),
+                    ecosystem: crate::registry::Ecosystem::Npm,
+                    band: VerdictBand::Block,
+                    risk_score: 90,
+                    findings: vec![crate::verdict::Finding {
+                        rule_id: "R01\x1b[2Jevil".to_string(),
+                        severity: VerdictBand::Block,
+                        title: "title\x1b[31m|pipe\nnewline".to_string(),
+                        description: "desc".to_string(),
+                    }],
+                    diff_summary: crate::verdict::DiffSummary {
+                        files_added: 0,
+                        files_removed: 0,
+                        files_modified: 0,
+                        lines_added: 0,
+                        lines_deleted: 0,
+                    },
+                    trust_sources: None,
+                },
+            }],
+        };
+        let md = render_markdown_summary(&report);
+        assert!(!md.contains('\x1b'), "markdown must strip terminal escapes");
+        assert!(md.contains(r"title\|pipe<br/>newline"));
+        assert!(!md.contains("injected\x1b"));
+    }
+
+    #[test]
     fn renders_markdown_table() {
         let report = CiReport {
             base_ref: "origin/main".to_string(),
@@ -568,6 +682,56 @@ mod tests {
         assert!(text.contains("BLUELINE CI REVIEW SUMMARY"));
         assert!(text.contains("Base Ref:          origin/main"));
         assert!(text.contains("Status:            PASSED"));
+    }
+
+    #[test]
+    fn renders_text_summary_sanitizes_versions_and_findings() {
+        let report = CiReport {
+            base_ref: "origin/main\x1b[31mred".to_string(),
+            lockfile_path: "package-lock.json".to_string(),
+            total_evaluated: 1,
+            unchanged_count: 0,
+            max_band: VerdictBand::High,
+            passed: false,
+            items: vec![CiReviewItem {
+                name: "pkg\x1b[2Jeval".to_string(),
+                old_version: Some("1.0.0\x1b[31m".to_string()),
+                new_version: "2.0.0\x1b[2J".to_string(),
+                is_dev: false,
+                verdict: Verdict {
+                    name: "pkg".to_string(),
+                    target_version: "2.0.0".to_string(),
+                    baseline_version: None,
+                    integrity: "sha512-test".to_string(),
+                    ecosystem: crate::registry::Ecosystem::Npm,
+                    band: VerdictBand::High,
+                    risk_score: 80,
+                    findings: vec![crate::verdict::Finding {
+                        rule_id: "R01\x1b[31m".to_string(),
+                        severity: VerdictBand::High,
+                        title: "evil\x1b[2Jtitle".to_string(),
+                        description: "desc".to_string(),
+                    }],
+                    diff_summary: crate::verdict::DiffSummary {
+                        files_added: 0,
+                        files_removed: 0,
+                        files_modified: 0,
+                        lines_added: 0,
+                        lines_deleted: 0,
+                    },
+                    trust_sources: None,
+                },
+            }],
+        };
+        let text = render_text_summary_to_string(&report);
+        assert!(
+            !text.contains('\x1b'),
+            "text summary must strip escapes from all fields"
+        );
+        assert!(text.contains("pkg"));
+        assert!(text.contains("1.0.0"));
+        assert!(text.contains("2.0.0"));
+        assert!(text.contains("R01"));
     }
 
     #[test]
