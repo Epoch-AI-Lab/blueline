@@ -4,6 +4,7 @@ use crate::policy::Policy;
 use crate::provenance::{ProvenanceReport, ProvenanceStatus};
 use crate::registry::Ecosystem;
 use crate::verdict::{DiffSummary, Finding, TrustSources, Verdict, VerdictBand};
+use crate::version::VersionInfo;
 
 #[allow(dead_code)]
 pub fn evaluate(
@@ -379,37 +380,73 @@ pub fn evaluate_with_trust(
 
     // R05: Large diff anomaly on patch or non-standard semver
     if let Some(base_ver_str) = &delta.baseline_version {
-        match (
-            semver::Version::parse(base_ver_str),
-            semver::Version::parse(&delta.target_version),
-        ) {
-            (Ok(base_v), Ok(target_v)) => {
-                if base_v.major == target_v.major
-                    && base_v.minor == target_v.minor
-                    && delta.total_lines_added > 500
-                {
+        if ecosystem == Ecosystem::PyPi {
+            if let (Ok(base_v), Ok(target_v)) = (
+                crate::version::Pep440Version::parse(base_ver_str),
+                crate::version::Pep440Version::parse(&delta.target_version),
+            ) {
+                let same_major_minor = base_v.epoch() == target_v.epoch()
+                    && base_v.release().len() >= 2
+                    && target_v.release().len() >= 2
+                    && base_v.release()[0] == target_v.release()[0]
+                    && base_v.release()[1] == target_v.release()[1];
+                if same_major_minor && delta.total_lines_added > 500 {
                     findings.push(Finding {
                         rule_id: "R05_LARGE_PATCH_DIFF".into(),
                         severity: VerdictBand::Medium,
                         title: format!("Large patch delta (+{} lines)", delta.total_lines_added),
                         description: format!(
-                            "Patch release {base_v} -> {target_v} added {} lines across {} files.",
+                            "Patch release {base_ver_str} -> {} added {} lines across {} files.",
+                            delta.target_version,
                             delta.total_lines_added,
                             delta.files_added.len() + delta.files_modified.len()
                         ),
                     });
                 }
-            }
-            _ => {
+            } else {
                 findings.push(Finding {
                     rule_id: "R05_NON_STANDARD_VERSION".into(),
                     severity: VerdictBand::Medium,
                     title: "Non-standard version format".into(),
                     description: format!(
-                        "Baseline `{base_ver_str}` or target `{}` does not conform to strict semver.",
+                        "Baseline `{base_ver_str}` or target `{}` does not conform to PEP 440.",
                         delta.target_version
                     ),
                 });
+            }
+        } else {
+            match (
+                semver::Version::parse(base_ver_str),
+                semver::Version::parse(&delta.target_version),
+            ) {
+                (Ok(base_v), Ok(target_v)) => {
+                    if base_v.major == target_v.major
+                        && base_v.minor == target_v.minor
+                        && delta.total_lines_added > 500
+                    {
+                        findings.push(Finding {
+                            rule_id: "R05_LARGE_PATCH_DIFF".into(),
+                            severity: VerdictBand::Medium,
+                            title: format!("Large patch delta (+{} lines)", delta.total_lines_added),
+                            description: format!(
+                                "Patch release {base_v} -> {target_v} added {} lines across {} files.",
+                                delta.total_lines_added,
+                                delta.files_added.len() + delta.files_modified.len()
+                            ),
+                        });
+                    }
+                }
+                _ => {
+                    findings.push(Finding {
+                        rule_id: "R05_NON_STANDARD_VERSION".into(),
+                        severity: VerdictBand::Medium,
+                        title: "Non-standard version format".into(),
+                        description: format!(
+                            "Baseline `{base_ver_str}` or target `{}` does not conform to strict semver.",
+                            delta.target_version
+                        ),
+                    });
+                }
             }
         }
     }
@@ -688,19 +725,32 @@ fn scan_diff_for_suspicious_patterns(path: &str, diff: &str, findings: &mut Vec<
         });
     }
 
-    for line in added_lines {
-        if is_suspicious_high_entropy(line) {
-            findings.push(Finding {
-                rule_id: "R03_HIGH_ENTROPY".into(),
-                severity: VerdictBand::High,
-                title: format!("High-entropy obfuscated token in `{path}`"),
-                description: format!(
-                    "Diff introduced high-entropy obfuscated string/payload in `{path}`."
-                ),
-            });
-            break;
+    if !is_metadata_or_lockfile(path) {
+        for line in added_lines {
+            if is_suspicious_high_entropy(line) {
+                findings.push(Finding {
+                    rule_id: "R03_HIGH_ENTROPY".into(),
+                    severity: VerdictBand::High,
+                    title: format!("High-entropy obfuscated token in `{path}`"),
+                    description: format!(
+                        "Diff introduced high-entropy obfuscated string/payload in `{path}`."
+                    ),
+                });
+                break;
+            }
         }
     }
+}
+
+fn is_metadata_or_lockfile(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    p.ends_with(".dist-info/record")
+        || p.ends_with("/record")
+        || p == "record"
+        || p.ends_with("cargo.lock")
+        || p.ends_with("package-lock.json")
+        || p.ends_with("pnpm-lock.yaml")
+        || p.ends_with("yarn.lock")
 }
 
 fn unescape_js(s: &str) -> String {

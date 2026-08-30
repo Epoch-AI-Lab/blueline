@@ -94,6 +94,14 @@ pub fn validate_pypi_name(name: &str) -> bool {
 }
 
 impl Pep440Version {
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub fn release(&self) -> &[u64] {
+        &self.release
+    }
+
     fn suffix(&self) -> (i32, u64, i32, u64, i32, u64) {
         let (pre_rank, pre_n) = match &self.pre {
             None => {
