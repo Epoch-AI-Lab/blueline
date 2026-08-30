@@ -1168,4 +1168,85 @@ mod wheel_tests {
             & 0o777;
         assert_eq!(mode, 0o755);
     }
+
+    #[test]
+    fn wheel_exact_limits_and_mode_tests() {
+        // Exact entry count
+        let limits_entries = ExtractionLimits {
+            max_entries: 2,
+            ..ExtractionLimits::default()
+        };
+        let b2 = make_wheel(&[
+            ("a.txt", b"a", zip::CompressionMethod::Stored),
+            ("b.txt", b"b", zip::CompressionMethod::Stored),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        assert!(safe_extract_wheel(&b2, dir.path(), &limits_entries).is_ok());
+
+        let b3 = make_wheel(&[
+            ("a.txt", b"a", zip::CompressionMethod::Stored),
+            ("b.txt", b"b", zip::CompressionMethod::Stored),
+            ("c.txt", b"c", zip::CompressionMethod::Stored),
+        ]);
+        assert!(matches!(
+            safe_extract_wheel(&b3, dir.path(), &limits_entries).unwrap_err(),
+            BluelineError::ExtractionLimit(_)
+        ));
+
+        // Exact declared entry bytes
+        let limits_entry_bytes = ExtractionLimits {
+            max_entry_bytes: 100,
+            ..ExtractionLimits::default()
+        };
+        let b_exact = make_wheel(&[("exact.bin", &[0u8; 100], zip::CompressionMethod::Stored)]);
+        let dir2 = tempfile::tempdir().unwrap();
+        assert!(safe_extract_wheel(&b_exact, dir2.path(), &limits_entry_bytes).is_ok());
+
+        let b_over = make_wheel(&[("over.bin", &[0u8; 101], zip::CompressionMethod::Stored)]);
+        assert!(matches!(
+            safe_extract_wheel(&b_over, dir2.path(), &limits_entry_bytes).unwrap_err(),
+            BluelineError::ExtractionLimit(_)
+        ));
+
+        // Exact total unpacked bytes
+        let limits_total = ExtractionLimits {
+            max_entry_bytes: 100,
+            max_unpacked_bytes: 200,
+            ..ExtractionLimits::default()
+        };
+        let b_tot_exact = make_wheel(&[
+            ("a.bin", &[0u8; 100], zip::CompressionMethod::Stored),
+            ("b.bin", &[0u8; 100], zip::CompressionMethod::Stored),
+        ]);
+        let dir3 = tempfile::tempdir().unwrap();
+        assert!(safe_extract_wheel(&b_tot_exact, dir3.path(), &limits_total).is_ok());
+
+        let b_tot_over = make_wheel(&[
+            ("a.bin", &[0u8; 100], zip::CompressionMethod::Stored),
+            ("b.bin", &[0u8; 100], zip::CompressionMethod::Stored),
+            ("c.bin", &[0u8; 1], zip::CompressionMethod::Stored),
+        ]);
+        assert!(matches!(
+            safe_extract_wheel(&b_tot_over, dir3.path(), &limits_total).unwrap_err(),
+            BluelineError::ExtractionLimit(_)
+        ));
+
+        // Symlink via unix mode
+        let mut sym_wheel = make_wheel(&[("link.txt", b"target", zip::CompressionMethod::Stored)]);
+        for i in 0..sym_wheel.len().saturating_sub(4) {
+            if sym_wheel[i..i + 4] == [0x50, 0x4b, 0x01, 0x02] && i + 42 <= sym_wheel.len() {
+                sym_wheel[i + 5] = 3; // System::Unix
+                let mode: u32 = 0o120777;
+                let attrs = mode << 16;
+                sym_wheel[i + 38] = (attrs & 0xFF) as u8;
+                sym_wheel[i + 39] = ((attrs >> 8) & 0xFF) as u8;
+                sym_wheel[i + 40] = ((attrs >> 16) & 0xFF) as u8;
+                sym_wheel[i + 41] = ((attrs >> 24) & 0xFF) as u8;
+            }
+        }
+        let dir4 = tempfile::tempdir().unwrap();
+        let err =
+            safe_extract_wheel(&sym_wheel, dir4.path(), &ExtractionLimits::default()).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+    }
 }

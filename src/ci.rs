@@ -994,4 +994,27 @@ checksum = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         let r3 = evaluate_lockfile_diff(npm_json, empty_npm, &ctx_npm, &store, &policy).unwrap();
         assert_eq!(r3.unchanged_count, 0);
     }
+
+    #[test]
+    fn test_is_pypi_lockfile_detection() {
+        use crate::registry::Ecosystem;
+        assert!(is_pypi_lockfile(
+            Ecosystem::PyPi,
+            Path::new("anything.lock")
+        ));
+        assert!(is_pypi_lockfile(
+            Ecosystem::Npm,
+            Path::new("requirements.txt")
+        ));
+        assert!(is_pypi_lockfile(
+            Ecosystem::Npm,
+            Path::new("dev-requirements.in")
+        ));
+        assert!(is_pypi_lockfile(Ecosystem::Npm, Path::new("deps.txt")));
+        assert!(!is_pypi_lockfile(
+            Ecosystem::Npm,
+            Path::new("package-lock.json")
+        ));
+        assert!(!is_pypi_lockfile(Ecosystem::Cargo, Path::new("Cargo.lock")));
+    }
 }

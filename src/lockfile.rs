@@ -1138,5 +1138,23 @@ requests==2.31.0 \
         assert!(
             matches!(err, LockfileError::InvalidData(msg) if msg.contains("missing hash value"))
         );
+
+        // Exact MAX_REQUIREMENTS_TXT_BYTES size boundary test
+        let header = "requests==2.31.0\n";
+        let mut at_limit = String::with_capacity(MAX_REQUIREMENTS_TXT_BYTES);
+        at_limit.push_str(header);
+        let remaining = MAX_REQUIREMENTS_TXT_BYTES - at_limit.len() - 2;
+        at_limit.push('#');
+        at_limit.push_str(&"a".repeat(remaining));
+        at_limit.push('\n');
+        assert_eq!(at_limit.len(), MAX_REQUIREMENTS_TXT_BYTES);
+        assert!(parse_requirements_txt_packages(&at_limit).is_ok());
+
+        let over_limit = format!("{at_limit}a");
+        assert_eq!(over_limit.len(), MAX_REQUIREMENTS_TXT_BYTES + 1);
+        let err_over = parse_requirements_txt_packages(&over_limit).unwrap_err();
+        assert!(
+            matches!(err_over, LockfileError::InvalidData(msg) if msg.contains("exceeds maximum size"))
+        );
     }
 }

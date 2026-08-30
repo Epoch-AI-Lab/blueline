@@ -417,4 +417,21 @@ mod tests {
             other => panic!("expected predecessor 1.0a1, got {other:?}"),
         }
     }
+
+    #[test]
+    fn baseline_detects_target_and_prior_yanked() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
+        let mut registry = MockRegistry::new(vec!["1.0.0".into(), "1.1.0".into(), "1.2.0".into()]);
+        registry.yanked_versions = vec!["1.1.0".into(), "1.2.0".into()];
+        let target = semver::Version::parse("1.2.0").unwrap();
+        let res = resolve_baseline("pkg", &target, &registry, &store).unwrap();
+        assert!(res.target_release_yanked);
+        assert!(res.prior_release_yanked);
+
+        let target_stable = semver::Version::parse("1.0.0").unwrap();
+        let res2 = resolve_baseline("pkg", &target_stable, &registry, &store).unwrap();
+        assert!(!res2.target_release_yanked);
+        assert!(!res2.prior_release_yanked);
+    }
 }

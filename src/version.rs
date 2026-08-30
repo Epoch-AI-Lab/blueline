@@ -508,10 +508,7 @@ fn parse_suffix_label(s: &str, labels: &[(&str, PreKind)]) -> Option<(usize, Pre
         pos += 1;
         had_sep = true;
     }
-    let mut end = pos;
-    while end < s.len() && b[end].is_ascii_digit() {
-        end += 1;
-    }
+    let end = pos + s[pos..].bytes().take_while(|c| c.is_ascii_digit()).count();
     if had_sep && pos == end {
         return None;
     }
