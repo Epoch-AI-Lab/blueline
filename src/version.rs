@@ -843,4 +843,51 @@ mod tests {
         assert!(!validate_pypi_name("hello!"));
         assert!(!validate_pypi_name("hello world"));
     }
+
+    #[test]
+    fn pep440_accessors_and_equality() {
+        let v1 = pv("2!1.2.3");
+        assert_eq!(v1.epoch(), 2);
+        assert_eq!(v1.release(), &[1, 2, 3]);
+
+        let v2 = pv("1.0.0");
+        assert_eq!(v2.epoch(), 0);
+        assert_eq!(v2.release(), &[1, 0, 0]);
+
+        assert_eq!(pv("1.0"), pv("1.0.0"));
+        assert_ne!(pv("1.0"), pv("2.0"));
+        assert_ne!(pv("1.0a1"), pv("1.0a2"));
+        assert_eq!(pv("0"), pv("0.0.0"));
+        assert_eq!(pv("0.0"), pv("0"));
+    }
+
+    #[test]
+    fn pep440_suffix_separators() {
+        for s in [
+            "1.0.post.1",
+            "1.0.post_1",
+            "1.0.post-1",
+            "1.0.a.1",
+            "1.0.a_1",
+            "1.0.a-1",
+            "1.0.b.2",
+            "1.0.b_2",
+            "1.0.b-2",
+            "1.0.rc.3",
+            "1.0.rc_3",
+            "1.0.rc-3",
+            "1.0.dev.4",
+            "1.0.dev_4",
+            "1.0.dev-4",
+        ] {
+            assert!(Pep440Version::parse(s).is_ok(), "failed to parse {s}");
+        }
+
+        for s in ["1.0.post.", "1.0.post_", "1.0.post-", "1.0.a.", "1.0.rc-"] {
+            assert!(
+                Pep440Version::parse(s).is_err(),
+                "must reject trailing separator {s}"
+            );
+        }
+    }
 }

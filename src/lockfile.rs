@@ -1105,4 +1105,38 @@ urllib3==2.1.0 # trailing comment
         assert!(err.contains("line 3: unpinned range `pytest~=7.0`"));
         assert!(err.contains("line 4: unpinned package `black`"));
     }
+
+    #[test]
+    fn requirements_txt_flags_and_edge_cases() {
+        let content = r#"
+# Flags to ignore
+-i https://pypi.org/simple
+--extra-index-url https://example.com/pypi
+-r base.txt
+--requirement other.txt
+-f /path/to/wheels
+
+# Empty lines and comments with whitespace
+   # leading space comment
+   
+requests==2.31.0 \
+    --hash sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890 \
+    --hash=sha256:1111111111111111111111111111111111111111111111111111111111111111
+"#;
+        let pkgs = parse_requirements_txt_packages(content).unwrap();
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs["requests"].version, "2.31.0");
+
+        // Trailing line continuation with no trailing newline
+        let no_nl = "urllib3==2.1.0 \\\n  --hash sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let pkgs2 = parse_requirements_txt_packages(no_nl).unwrap();
+        assert_eq!(pkgs2["urllib3"].version, "2.1.0");
+
+        // Missing hash value after `--hash`
+        let missing_hash = "requests==2.31.0 --hash";
+        let err = parse_requirements_txt_packages(missing_hash).unwrap_err();
+        assert!(
+            matches!(err, LockfileError::InvalidData(msg) if msg.contains("missing hash value"))
+        );
+    }
 }

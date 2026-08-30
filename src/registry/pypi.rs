@@ -302,5 +302,284 @@ fn extract_version_from_filename(n: &str) -> Option<String> {
 }
 #[rustfmt::skip]
 fn parse_upload_time(s: &str) -> Option<i64> { let s = s.trim().strip_suffix('Z').unwrap_or(s.trim()); let s = s.split('.').next().unwrap_or(s); let (d, t) = s.split_once('T')?; let mut d = d.split('-'); let y:i64=d.next()?.parse().ok()?; let m:i64=d.next()?.parse().ok()?; let day:i64=d.next()?.parse().ok()?; let mut t=t.split(':'); let hh:i64=t.next()?.parse().ok()?; let mm:i64=t.next()?.parse().ok()?; let ss:i64=t.next()?.parse().ok()?; if !(1..=12).contains(&m)||!(1..=31).contains(&day){return None;} let a=(14-m)/12; let yy=y+4800-a; let mo=m+12*a-3; let jdn=day+(153*mo+2)/5+365*yy+yy/4-yy/100+yy/400-32045; Some((jdn-2440588)*86400+hh*3600+mm*60+ss) }
-#[rustfmt::skip]
-#[cfg(test)] mod tests { use super::*; #[test] fn yanked_field_is_yanked(){ for (s, e) in [("false", false), ("true", true), ("\"reason\"", true), ("\"\"", false)] { let f: YankedField = serde_json::from_str(s).unwrap(); assert_eq!(f.is_yanked(), e); } } #[test] fn select_prefers_universal(){ let mk=|n:&str| SimpleFile{ filename:n.into(), url:"https://e.com/a.whl".into(), hashes:BTreeMap::new(), size:None, upload_time:None, yanked:YankedField::NotYanked, provenance:None }; let a=mk("pkg-1.0-cp311-cp311-linux_x86_64.whl"); let b=mk("pkg-1.0-py3-none-any.whl"); assert_eq!(select_wheel(&[&a,&b]).unwrap().filename,b.filename); } #[test] fn parse_upload_time_iso8601(){ assert_eq!(parse_upload_time("2024-01-17T16:53:12.779164Z"),Some(1705510392)); assert_eq!(parse_upload_time("2024-01-17T16:53:12Z"),Some(1705510392)); assert!(parse_upload_time("not-a-time").is_none()); } #[test] fn extracts_version_from_hyphenated_names(){ for (f, e) in [("scikit-learn-1.4.0-py3-none-any.whl", Some("1.4.0")), ("my-package-1.0-py3-none-any.whl", Some("1.0")), ("scikit-learn-1.4.0.tar.gz", Some("1.4.0")), ("pkg-2.28.1.zip", Some("2.28.1"))] { assert_eq!(extract_version_from_filename(f), e.map(|s| s.to_string())); } assert!(extract_version_from_filename("notawheel").is_none()); } }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::sync::Arc;
+
+    #[test]
+    fn yanked_field_is_yanked() {
+        for (s, e) in [
+            ("false", false),
+            ("true", true),
+            ("\"reason\"", true),
+            ("\"\"", false),
+        ] {
+            let f: YankedField = serde_json::from_str(s).unwrap();
+            assert_eq!(f.is_yanked(), e);
+        }
+    }
+
+    #[test]
+    fn yanked_field_reasons() {
+        assert_eq!(YankedField::NotYanked.yanked_reason(), None);
+        assert_eq!(YankedField::Bool(false).yanked_reason(), None);
+        assert_eq!(YankedField::Bool(true).yanked_reason(), Some("yanked"));
+        assert_eq!(
+            YankedField::Reason("security bug".into()).yanked_reason(),
+            Some("security bug")
+        );
+        assert_eq!(YankedField::Reason("".into()).yanked_reason(), None);
+    }
+
+    #[test]
+    fn select_prefers_universal() {
+        let mk = |n: &str| SimpleFile {
+            filename: n.into(),
+            url: "https://e.com/a.whl".into(),
+            hashes: BTreeMap::new(),
+            size: None,
+            upload_time: None,
+            yanked: YankedField::NotYanked,
+            provenance: None,
+        };
+        let a = mk("pkg-1.0-cp311-cp311-linux_x86_64.whl");
+        let b = mk("pkg-1.0-py3-none-any.whl");
+        assert_eq!(select_wheel(&[&a, &b]).unwrap().filename, b.filename);
+    }
+
+    #[test]
+    fn parse_upload_time_iso8601() {
+        assert_eq!(
+            parse_upload_time("2024-01-17T16:53:12.779164Z"),
+            Some(1705510392)
+        );
+        assert_eq!(parse_upload_time("2024-01-17T16:53:12Z"), Some(1705510392));
+        assert!(parse_upload_time("not-a-time").is_none());
+        assert!(parse_upload_time("2024-00-17T16:53:12Z").is_none());
+        assert!(parse_upload_time("2024-13-17T16:53:12Z").is_none());
+        assert!(parse_upload_time("2024-01-00T16:53:12Z").is_none());
+        assert!(parse_upload_time("2024-01-32T16:53:12Z").is_none());
+    }
+
+    #[test]
+    fn extracts_version_from_hyphenated_names() {
+        for (f, e) in [
+            ("scikit-learn-1.4.0-py3-none-any.whl", Some("1.4.0")),
+            ("my-package-1.0-py3-none-any.whl", Some("1.0")),
+            ("scikit-learn-1.4.0.tar.gz", Some("1.4.0")),
+            ("pkg-2.28.1.zip", Some("2.28.1")),
+            ("pkg-1.0-cp311.whl", None),
+            ("pkg-1.0.whl", None),
+            ("pkg.whl", None),
+        ] {
+            assert_eq!(extract_version_from_filename(f), e.map(|s| s.to_string()));
+        }
+        assert!(extract_version_from_filename("notawheel").is_none());
+    }
+
+    struct MockPyPIServer {
+        base: String,
+        _handle: std::thread::JoinHandle<()>,
+    }
+
+    impl MockPyPIServer {
+        fn spawn<F: Fn(&str) -> (String, Vec<u8>) + Send + Sync + 'static>(handler: F) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let handler = Arc::new(handler);
+            let handle = std::thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    let h = handler.clone();
+                    std::thread::spawn(move || {
+                        let mut stream = stream;
+                        let mut buf = [0u8; 4096];
+                        let n = stream.read(&mut buf).unwrap_or(0);
+                        let req = String::from_utf8_lossy(&buf[..n]);
+                        let path = req
+                            .lines()
+                            .next()
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .unwrap_or("/");
+                        let (ctype, body) = h(path);
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(head.as_bytes());
+                        let _ = stream.write_all(&body);
+                    });
+                }
+            });
+            Self {
+                base,
+                _handle: handle,
+            }
+        }
+    }
+
+    #[test]
+    fn pypi_packument_exact_limits_boundary() {
+        let max_bytes = 1024u64;
+        let server = MockPyPIServer::spawn(move |path| {
+            if path == "/simple/pkg-exact/" {
+                let base = "{\"name\":\"pkg-exact\",\"files\":[],\"versions\":[]}";
+                let padding = " ".repeat(max_bytes as usize - base.len());
+                let body = format!("{base}{padding}");
+                (SIMPLE_ACCEPT.to_string(), body.into_bytes())
+            } else if path == "/simple/pkg-over/" {
+                let base = "{\"name\":\"pkg-over\",\"files\":[],\"versions\":[]}";
+                let padding = " ".repeat(max_bytes as usize + 1 - base.len());
+                let body = format!("{base}{padding}");
+                (SIMPLE_ACCEPT.to_string(), body.into_bytes())
+            } else {
+                ("text/plain".into(), b"not found".to_vec())
+            }
+        });
+
+        let reg = PyPIRegistry::with_limits(
+            &server.base,
+            RegistryLimits {
+                max_packument_bytes: max_bytes,
+                max_tarball_bytes: 512,
+                ..RegistryLimits::default()
+            },
+        );
+
+        assert!(reg.fetch_simple("pkg-exact").is_ok());
+        let err = reg.fetch_simple("pkg-over").unwrap_err();
+        assert!(matches!(err, BluelineError::ExtractionLimit(_)));
+    }
+
+    #[test]
+    fn pypi_releases_and_default_version_selection() {
+        let server = MockPyPIServer::spawn(|path| {
+            if path == "/simple/demo/" {
+                let json = serde_json::json!({
+                    "name": "demo",
+                    "versions": ["1.0.0", "1.1.0", "2.0.0a1", "2.0.0"],
+                    "files": [
+                        {
+                            "filename": "demo-1.0.0-py3-none-any.whl",
+                            "url": "http://127.0.0.1/demo-1.0.0.whl",
+                            "hashes": {"sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+                            "yanked": false,
+                            "upload-time": "2024-01-01T00:00:00Z"
+                        },
+                        {
+                            "filename": "demo-1.1.0-py3-none-any.whl",
+                            "url": "http://127.0.0.1/demo-1.1.0.whl",
+                            "hashes": {"sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+                            "yanked": false,
+                            "upload-time": "2024-02-01T00:00:00Z"
+                        },
+                        {
+                            "filename": "demo-2.0.0a1-py3-none-any.whl",
+                            "url": "http://127.0.0.1/demo-2.0.0a1.whl",
+                            "hashes": {"sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+                            "yanked": false,
+                            "upload-time": "2024-03-01T00:00:00Z"
+                        },
+                        {
+                            "filename": "demo-2.0.0-py3-none-any.whl",
+                            "url": "http://127.0.0.1/demo-2.0.0.whl",
+                            "hashes": {"sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+                            "yanked": "critical security bug",
+                            "upload-time": "2024-04-01T00:00:00Z"
+                        }
+                    ]
+                });
+                (
+                    SIMPLE_ACCEPT.to_string(),
+                    serde_json::to_vec(&json).unwrap(),
+                )
+            } else if path == "/simple/only-pre/" {
+                let json = serde_json::json!({
+                    "name": "only-pre",
+                    "versions": ["1.0.0a1"],
+                    "files": [
+                        {
+                            "filename": "only-pre-1.0.0a1-py3-none-any.whl",
+                            "url": "http://127.0.0.1/only-pre-1.0.0a1.whl",
+                            "hashes": {"sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+                            "yanked": false
+                        }
+                    ]
+                });
+                (
+                    SIMPLE_ACCEPT.to_string(),
+                    serde_json::to_vec(&json).unwrap(),
+                )
+            } else if path == "/simple/empty/" {
+                let json = serde_json::json!({
+                    "name": "empty",
+                    "versions": [],
+                    "files": []
+                });
+                (
+                    SIMPLE_ACCEPT.to_string(),
+                    serde_json::to_vec(&json).unwrap(),
+                )
+            } else if path == "/simple/dual-files/" {
+                let json = serde_json::json!({
+                    "name": "dual-files",
+                    "versions": ["1.0.0"],
+                    "files": [
+                        {
+                            "filename": "dual-files-1.0.0-cp311-cp311-linux_x86_64.whl",
+                            "url": "http://127.0.0.1/yanked.whl",
+                            "hashes": {"sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+                            "yanked": true
+                        },
+                        {
+                            "filename": "dual-files-1.0.0-py3-none-any.whl",
+                            "url": "http://127.0.0.1/good.whl",
+                            "hashes": {"sha256": "1111111111111111111111111111111111111111111111111111111111111111"},
+                            "yanked": false
+                        }
+                    ]
+                });
+                (
+                    SIMPLE_ACCEPT.to_string(),
+                    serde_json::to_vec(&json).unwrap(),
+                )
+            } else {
+                ("text/plain".into(), b"not found".to_vec())
+            }
+        });
+
+        let reg = PyPIRegistry::new(&server.base);
+
+        let releases = reg.list_releases("demo").unwrap();
+        assert_eq!(releases.len(), 4);
+        assert_eq!(releases[0].version, "1.0.0");
+        assert!(!releases[0].yanked);
+        assert_eq!(releases[0].publish_time, Some(1704067200));
+        assert!(releases[3].yanked);
+
+        let versions = reg.list_versions("demo").unwrap();
+        assert_eq!(versions.len(), 3);
+        assert_eq!(versions[0], semver::Version::new(1, 0, 0));
+        assert_eq!(versions[1], semver::Version::new(1, 1, 0));
+        assert_eq!(versions[2], semver::Version::new(2, 0, 0));
+
+        assert_eq!(reg.default_version("demo").unwrap(), Some("1.1.0".into()));
+        assert_eq!(
+            reg.default_version("only-pre").unwrap(),
+            Some("1.0.0a1".into())
+        );
+        assert_eq!(reg.default_version("empty").unwrap(), None);
+
+        let pkg = reg.resolve("dual-files", "1.0.0").unwrap();
+        assert_eq!(pkg.tarball_url, "http://127.0.0.1/good.whl");
+        assert_eq!(
+            pkg.integrity.unwrap().to_display(),
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+        );
+
+        assert!(reg.resolve("invalid!name", "1.0.0").is_err());
+        assert!(reg.resolve("demo", "invalid-ver!").is_err());
+    }
+}
