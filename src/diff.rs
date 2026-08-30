@@ -239,7 +239,8 @@ pub fn compute_delta(
                 .file_name()
                 .map(|n| n.to_string_lossy().eq_ignore_ascii_case("binding.gyp"))
                 .unwrap_or(false)
-    }) || target_manifest.gypfile == Some(true);
+    }) || (target_manifest.gypfile == Some(true)
+        && baseline_manifest.is_none_or(|b| b.gypfile != Some(true)));
 
     Ok(Delta {
         baseline_version: baseline_version.map(|s| s.to_string()),

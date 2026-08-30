@@ -25,3 +25,9 @@ name = "read_package_json"
 path = "fuzz_targets/read_package_json.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "pypi_version"
+path = "fuzz_targets/pypi_version.rs"
+test = false
+doc = false

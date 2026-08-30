@@ -64,6 +64,6 @@ Rulings:
 - [x] PR1 feat/registry-foundation
 - [x] PR2 feat/crates-io-adapter
 - [x] PR3 feat/cargo-lock-ci
-- [ ] PR4 feat/pypi-adapter
+- [x] PR4 feat/pypi-adapter
 
 Mark your PR's box `[x]` in the same branch before opening it.

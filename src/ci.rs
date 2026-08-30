@@ -54,6 +54,14 @@ fn is_cargo_lockfile(ecosystem: Ecosystem, lockfile_path: &Path) -> bool {
     ecosystem == Ecosystem::Cargo || lockfile_path.file_name().is_some_and(|n| n == "Cargo.lock")
 }
 
+fn is_pypi_lockfile(ecosystem: Ecosystem, lockfile_path: &Path) -> bool {
+    ecosystem == Ecosystem::PyPi
+        || lockfile_path.file_name().is_some_and(|n| {
+            let s = n.to_string_lossy();
+            s.contains("requirements") || s.ends_with(".txt")
+        })
+}
+
 fn check_evaluation_budget(added: usize, upgraded: usize, max: usize) -> anyhow::Result<usize> {
     let total = added + upgraded;
     if total > max {
@@ -101,7 +109,8 @@ pub fn run(
     })?;
 
     let is_cargo = is_cargo_lockfile(ecosystem, lockfile_path);
-    let base_content = extract_base_lockfile(base_ref, lockfile_path, is_cargo)?;
+    let is_pypi = is_pypi_lockfile(ecosystem, lockfile_path);
+    let base_content = extract_base_lockfile(base_ref, lockfile_path, is_cargo, is_pypi)?;
 
     let lockfile_str = lockfile_path.display().to_string();
     let ctx = CiContext {
@@ -164,12 +173,40 @@ pub fn evaluate_lockfile_diff(
     policy: &Policy,
 ) -> anyhow::Result<CiReport> {
     let is_cargo = is_cargo_lockfile(ctx.ecosystem, Path::new(ctx.lockfile_path));
-    let delta = if is_cargo {
+    let is_pypi = is_pypi_lockfile(ctx.ecosystem, Path::new(ctx.lockfile_path));
+
+    let (delta, head_integrity_map) = if is_cargo {
         let base_pkgs = crate::lockfile::parse_cargo_lock_packages(base_content)?;
         let head_pkgs = crate::lockfile::parse_cargo_lock_packages(head_content)?;
-        compute_delta_from_maps(&base_pkgs, &head_pkgs)
+        let mut integrity_map = std::collections::HashMap::new();
+        for pkg in head_pkgs.values() {
+            if let Some(integ) = &pkg.integrity {
+                integrity_map.insert(pkg.name.clone(), integ.clone());
+            }
+        }
+        (
+            compute_delta_from_maps(&base_pkgs, &head_pkgs),
+            integrity_map,
+        )
+    } else if is_pypi {
+        let base_pkgs = crate::lockfile::parse_requirements_txt_packages(base_content)?;
+        let head_pkgs = crate::lockfile::parse_requirements_txt_packages(head_content)?;
+        let mut integrity_map = std::collections::HashMap::new();
+        for pkg in head_pkgs.values() {
+            if let Some(integ) = &pkg.integrity {
+                integrity_map.insert(pkg.name.clone(), integ.clone());
+                integrity_map.insert(crate::version::canonicalize_name(&pkg.name), integ.clone());
+            }
+        }
+        (
+            compute_delta_from_maps(&base_pkgs, &head_pkgs),
+            integrity_map,
+        )
     } else {
-        compute_lockfile_delta(base_content, head_content)?
+        (
+            compute_lockfile_delta(base_content, head_content)?,
+            std::collections::HashMap::new(),
+        )
     };
 
     check_evaluation_budget(
@@ -199,7 +236,7 @@ pub fn evaluate_lockfile_diff(
             continue;
         }
 
-        let (verdict, _, _, _) = evaluate_package(
+        let (mut verdict, _, checksum, _) = evaluate_package(
             name,
             new_version,
             ctx.ecosystem,
@@ -207,6 +244,25 @@ pub fn evaluate_lockfile_diff(
             store,
             policy,
         )?;
+
+        // If lockfile declared a hash, verify it matches
+        if let Some(expected_integ) = head_integrity_map.get(name) {
+            let matches_integ = checksum.to_display().eq_ignore_ascii_case(expected_integ)
+                || format!("sha256:{}", checksum.value_hex).eq_ignore_ascii_case(expected_integ);
+            if !matches_integ {
+                verdict.findings.push(crate::verdict::Finding {
+                    rule_id: "R10_LOCKFILE_HASH_MISMATCH".into(),
+                    severity: VerdictBand::Block,
+                    title: format!("Lockfile hash mismatch for `{name}`"),
+                    description: format!(
+                        "Lockfile pinned `{expected_integ}`, but downloaded release has checksum `{}`",
+                        checksum.to_display()
+                    ),
+                });
+                verdict.band = VerdictBand::Block;
+                verdict.risk_score = verdict.risk_score.saturating_add(50);
+            }
+        }
 
         max_band = update_max_band(max_band, verdict.band);
 
@@ -240,6 +296,7 @@ fn extract_base_lockfile(
     base_ref: &str,
     lockfile_path: &Path,
     is_cargo: bool,
+    is_pypi: bool,
 ) -> anyhow::Result<String> {
     let trimmed_ref = base_ref.trim();
     if trimmed_ref.starts_with('-') || trimmed_ref.is_empty() {
@@ -257,6 +314,9 @@ fn extract_base_lockfile(
         if is_missing_base_error(&stderr) {
             if is_cargo {
                 return Ok("version = 4\n".to_string());
+            }
+            if is_pypi {
+                return Ok(String::new());
             }
             return Ok(r#"{"lockfileVersion": 3, "packages": {}}"#.to_string());
         }
@@ -495,6 +555,31 @@ mod tests {
     }
 
     #[test]
+    fn pypi_lockfile_dispatch_matches_signals() {
+        assert!(is_pypi_lockfile(
+            Ecosystem::PyPi,
+            Path::new("requirements.txt")
+        ));
+        assert!(is_pypi_lockfile(
+            Ecosystem::PyPi,
+            Path::new("random-name.lock")
+        ));
+        assert!(is_pypi_lockfile(
+            Ecosystem::Npm,
+            Path::new("requirements.txt")
+        ));
+        assert!(is_pypi_lockfile(
+            Ecosystem::Npm,
+            Path::new("requirements-dev.txt")
+        ));
+        assert!(!is_pypi_lockfile(
+            Ecosystem::Npm,
+            Path::new("package-lock.json")
+        ));
+        assert!(!is_pypi_lockfile(Ecosystem::Cargo, Path::new("Cargo.lock")));
+    }
+
+    #[test]
     fn evaluation_budget_sums_both_kinds_and_allows_exact_boundary() {
         let err = check_evaluation_budget(2, 1, 2).unwrap_err();
         assert_eq!(
@@ -524,16 +609,22 @@ mod tests {
 
     #[test]
     fn rejects_flag_like_base_refs() {
-        let err = extract_base_lockfile("--output=/tmp/pwn", Path::new("package-lock.json"), false)
-            .unwrap_err();
+        let err = extract_base_lockfile(
+            "--output=/tmp/pwn",
+            Path::new("package-lock.json"),
+            false,
+            false,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("cannot start with '-'"));
 
         let err_ws_flag =
-            extract_base_lockfile("  --evil", Path::new("package-lock.json"), false).unwrap_err();
+            extract_base_lockfile("  --evil", Path::new("package-lock.json"), false, false)
+                .unwrap_err();
         assert!(err_ws_flag.to_string().contains("cannot start with '-'"));
 
         let err_empty =
-            extract_base_lockfile("  ", Path::new("package-lock.json"), false).unwrap_err();
+            extract_base_lockfile("  ", Path::new("package-lock.json"), false, false).unwrap_err();
         assert!(err_empty.to_string().contains("or be empty"));
     }
 
@@ -793,11 +884,17 @@ mod tests {
 
     #[test]
     fn invalid_git_ref_fails_closed() {
-        let res = extract_base_lockfile("-leading-hyphen", Path::new("package-lock.json"), false);
+        let res = extract_base_lockfile(
+            "-leading-hyphen",
+            Path::new("package-lock.json"),
+            false,
+            false,
+        );
         assert!(res.is_err());
         let res_nonexistent = extract_base_lockfile(
             "nonexistent_ref_123456789",
             Path::new("package-lock.json"),
+            false,
             false,
         );
         assert!(res_nonexistent.is_err());
@@ -805,19 +902,33 @@ mod tests {
 
     #[test]
     fn cargo_missing_base_returns_empty_cargo_toml() {
-        let cargo_empty =
-            extract_base_lockfile("HEAD", Path::new("Cargo.lock.missing-for-test-xyz"), true)
-                .unwrap();
+        let cargo_empty = extract_base_lockfile(
+            "HEAD",
+            Path::new("Cargo.lock.missing-for-test-xyz"),
+            true,
+            false,
+        )
+        .unwrap();
         assert_eq!(cargo_empty, "version = 4\n");
         assert!(crate::lockfile::parse_cargo_lock_packages(&cargo_empty).is_ok());
         let npm_empty = extract_base_lockfile(
             "HEAD",
             Path::new("package-lock.missing-for-test-xyz"),
             false,
+            false,
         )
         .unwrap();
         assert_eq!(npm_empty, r#"{"lockfileVersion": 3, "packages": {}}"#);
         assert!(crate::lockfile::parse_lockfile_packages(&npm_empty).is_ok());
+        let pypi_empty = extract_base_lockfile(
+            "HEAD",
+            Path::new("requirements.missing-for-test-xyz.txt"),
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(pypi_empty, "");
+        assert!(crate::lockfile::parse_requirements_txt_packages(&pypi_empty).is_ok());
     }
 
     #[test]

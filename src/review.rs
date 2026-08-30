@@ -209,8 +209,8 @@ fn evaluate_with_registry<R: Registry, V: VersionInfo>(
     )
     .unwrap_or_else(|e| crate::advisory::AdvisoryReport::unverified(&e.to_string()));
 
-    let provenance = if ecosystem == Ecosystem::Npm {
-        Some(crate::provenance::inspect_provenance(
+    let provenance = match ecosystem {
+        Ecosystem::Npm => Some(crate::provenance::inspect_provenance(
             &target_pkg.name,
             &target_pkg.version,
             &checksum,
@@ -218,9 +218,24 @@ fn evaluate_with_registry<R: Registry, V: VersionInfo>(
             registry_base,
             Some(store),
             policy,
-        ))
-    } else {
-        None
+        )),
+        Ecosystem::PyPi => {
+            let filename = target_pkg
+                .tarball_url
+                .rsplit('/')
+                .next()
+                .unwrap_or(&target_pkg.name);
+            Some(crate::provenance::inspect_provenance_pypi(
+                &target_pkg.name,
+                &target_pkg.version,
+                filename,
+                &checksum,
+                registry_base,
+                Some(store),
+                policy,
+            ))
+        }
+        Ecosystem::Cargo => None,
     };
 
     let verdict = evaluate_with_trust(

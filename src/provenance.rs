@@ -286,6 +286,135 @@ pub fn inspect_provenance(
     ProvenanceReport::missing(has_sig, sig_key_id)
 }
 
+#[derive(Debug, Deserialize)]
+struct PyPiProvenanceResponse {
+    #[serde(default)]
+    attestation_bundles: Vec<PyPiAttestationBundle>,
+    #[serde(default)]
+    attestations: Vec<NpmAttestationItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PyPiAttestationBundle {
+    #[serde(default)]
+    attestations: Vec<NpmAttestationItem>,
+}
+
+/// Parse PEP 740 provenance response JSON and verify in-toto subject hash.
+pub fn parse_pypi_provenance_json(
+    body: &str,
+    expected_integrity: &Checksum,
+) -> Result<ProvenanceReport, BluelineError> {
+    if let Ok(resp) = serde_json::from_str::<PyPiProvenanceResponse>(body) {
+        let mut all_items = resp.attestations;
+        for bundle in resp.attestation_bundles {
+            all_items.extend(bundle.attestations);
+        }
+        for item in all_items {
+            if let Some(payload_b64) = item
+                .bundle
+                .and_then(|b| b.dsse_envelope)
+                .and_then(|d| d.payload)
+            {
+                let mut report = parse_attestation_payload(&payload_b64, expected_integrity)?;
+                if report.status == ProvenanceStatus::Verified {
+                    report.message = Some(
+                        "PEP 740 attestation verified (crypto verification not performed)".into(),
+                    );
+                }
+                return Ok(report);
+            }
+        }
+    }
+
+    // Direct DSSE envelope format: {"payload": "..."}
+    if let Ok(dsse) = serde_json::from_str::<DsseEnvelope>(body)
+        && let Some(payload_b64) = dsse.payload
+    {
+        let mut report = parse_attestation_payload(&payload_b64, expected_integrity)?;
+        if report.status == ProvenanceStatus::Verified {
+            report.message =
+                Some("PEP 740 attestation verified (crypto verification not performed)".into());
+        }
+        return Ok(report);
+    }
+
+    Ok(ProvenanceReport::missing(false, None))
+}
+
+/// Inspect PEP 740 provenance for a PyPI release.
+pub fn inspect_provenance_pypi(
+    package: &str,
+    version: &str,
+    filename: &str,
+    expected_integrity: &Checksum,
+    registry_base: &str,
+    store: Option<&BaselineStore>,
+    _policy: &Policy,
+) -> ProvenanceReport {
+    let norm = crate::version::canonicalize_name(package);
+
+    // 1. Check local cache
+    if let Some(store) = store
+        && let Ok(Some(cached)) = store.get_cached_provenance(Ecosystem::PyPi, package, version)
+    {
+        return ProvenanceReport {
+            status: ProvenanceStatus::Verified,
+            slsa_level: cached.slsa_level,
+            builder_id: cached.builder_id,
+            source_repo: cached.source_repo,
+            commit_sha: cached.commit_sha,
+            workflow_path: cached.workflow_path,
+            registry_signature_present: cached.signature_valid,
+            registry_signature_key_id: None,
+            message: Some(
+                "PEP 740 attestation verified from cache (crypto verification not performed)"
+                    .into(),
+            ),
+        };
+    }
+
+    // 2. Fetch PyPI provenance endpoint
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_millis(3000))
+        .build();
+
+    let base = registry_base.trim_end_matches('/');
+    let provenance_url = format!("{base}/integrity/{norm}/{version}/{filename}/provenance");
+    let resp_res = agent
+        .get(&provenance_url)
+        .set("Accept", "application/json")
+        .set("User-Agent", "blueline-security/0.1.0")
+        .call();
+
+    if let Ok(resp) = resp_res {
+        let mut reader = resp.into_reader().take(1024 * 1024);
+        let mut body = String::new();
+        if reader.read_to_string(&mut body).is_ok()
+            && let Ok(report) = parse_pypi_provenance_json(&body, expected_integrity)
+        {
+            if report.status == ProvenanceStatus::Verified
+                && let Some(store) = store
+            {
+                let _ = store.record_provenance(
+                    Ecosystem::PyPi,
+                    package,
+                    version,
+                    report.builder_id.as_deref(),
+                    report.source_repo.as_deref(),
+                    report.commit_sha.as_deref(),
+                    report.workflow_path.as_deref(),
+                    report.slsa_level,
+                    false,
+                );
+            }
+            return report;
+        }
+    }
+
+    ProvenanceReport::missing(false, None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,5 +518,56 @@ mod tests {
         let report = parse_attestation_payload(&b64, &ck("anything")).unwrap();
 
         assert_eq!(report.status, ProvenanceStatus::FailedMismatch);
+    }
+
+    #[test]
+    fn parses_pypi_provenance_bundles() {
+        let expected_sha256 = Checksum {
+            alg: ChecksumAlg::Sha256,
+            value_hex: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890".into(),
+        };
+
+        let statement = format!(
+            r#"{{
+                "_type": "https://in-toto.io/Statement/v0.1",
+                "subject": [
+                    {{
+                        "name": "pkg:pypi/requests@2.31.0",
+                        "digest": {{
+                            "sha256": "{}"
+                        }}
+                    }}
+                ],
+                "predicateType": "https://slsa.dev/provenance/v0.2"
+            }}"#,
+            expected_sha256.value_hex
+        );
+        let b64 = base64::engine::general_purpose::STANDARD.encode(statement.as_bytes());
+        let bundle_json = format!(
+            r#"{{
+                "attestation_bundles": [
+                    {{
+                        "attestations": [
+                            {{
+                                "bundle": {{
+                                    "dsseEnvelope": {{
+                                        "payload": "{b64}"
+                                    }}
+                                }}
+                            }}
+                        ]
+                    }}
+                ]
+            }}"#
+        );
+
+        let report = parse_pypi_provenance_json(&bundle_json, &expected_sha256).unwrap();
+        assert_eq!(report.status, ProvenanceStatus::Verified);
+        assert!(
+            report
+                .message
+                .unwrap()
+                .contains("crypto verification not performed")
+        );
     }
 }

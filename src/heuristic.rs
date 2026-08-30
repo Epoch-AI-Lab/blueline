@@ -464,6 +464,60 @@ pub fn evaluate_with_trust(
         });
     }
 
+    // PyPI-specific findings: entry points, native binaries, and sdist build code
+    let has_entry_points = delta
+        .files_added
+        .iter()
+        .chain(delta.files_modified.iter())
+        .any(|f| {
+            f.relative_path.ends_with("entry_points.txt")
+                || f.relative_path.contains(".data/scripts/")
+                || f.relative_path.contains("data/scripts/")
+        });
+    if has_entry_points {
+        findings.push(Finding {
+            rule_id: "R02_ENTRY_POINTS_SCRIPT".into(),
+            severity: VerdictBand::Medium,
+            title: "New executable entry points or scripts introduced".into(),
+            description: "The package adds console_scripts entry points or .data/scripts files that install executables into PATH.".into(),
+        });
+    }
+
+    let has_native_binary = delta
+        .files_added
+        .iter()
+        .chain(delta.files_modified.iter())
+        .any(|f| {
+            let p = f.relative_path.to_ascii_lowercase();
+            p.ends_with(".so")
+                || p.ends_with(".pyd")
+                || p.ends_with(".dylib")
+                || p.ends_with(".dll")
+        });
+    if has_native_binary && ecosystem == Ecosystem::PyPi {
+        findings.push(Finding {
+            rule_id: "R06_NATIVE_PLATFORM_WHEEL".into(),
+            severity: VerdictBand::Low,
+            title: "Native binary extensions in wheel artifact".into(),
+            description:
+                "Target artifact contains compiled binary extensions (.so / .pyd / .dylib / .dll)."
+                    .into(),
+        });
+    }
+
+    let has_sdist_setup = delta
+        .files_added
+        .iter()
+        .any(|f| f.relative_path == "setup.py" || f.relative_path == "setup.cfg");
+    if has_sdist_setup && ecosystem == Ecosystem::PyPi {
+        findings.push(Finding {
+            rule_id: "R04_SDIST_BUILD_CODE".into(),
+            severity: VerdictBand::Medium,
+            title: "Source distribution (sdist) executes build code on install".into(),
+            description: "Target artifact is a source distribution containing setup.py/setup.cfg which executes arbitrary code during build/install.".into(),
+        });
+    }
+
     let mut score: u32 = 0;
     let mut band = VerdictBand::Low;
 
