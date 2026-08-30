@@ -354,7 +354,7 @@ pub fn parse_requirements_txt_packages(
             continue;
         }
 
-        let mut hash_val = None;
+        let mut hashes = Vec::new();
         let mut spec_tokens = Vec::new();
 
         let mut i = 0;
@@ -362,13 +362,13 @@ pub fn parse_requirements_txt_packages(
             let tok = tokens[i];
             if let Some(h) = tok.strip_prefix("--hash=") {
                 let h_clean = h.strip_prefix("sha256:").unwrap_or(h).trim();
-                hash_val = Some(h_clean.to_string());
+                hashes.push(h_clean.to_string());
                 i += 1;
             } else if tok == "--hash" {
                 if i + 1 < tokens.len() {
                     let next = tokens[i + 1];
                     let h_clean = next.strip_prefix("sha256:").unwrap_or(next).trim();
-                    hash_val = Some(h_clean.to_string());
+                    hashes.push(h_clean.to_string());
                     i += 2;
                 } else {
                     return Err(LockfileError::InvalidData(format!(
@@ -421,17 +421,20 @@ pub fn parse_requirements_txt_packages(
                 )));
             }
 
-            let integrity = match hash_val {
-                Some(h) => {
-                    let hex = h.to_lowercase();
-                    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-                        return Err(LockfileError::InvalidData(format!(
-                            "line {line_num}: invalid sha256 hash length (expected 64 hex chars, got `{h}`)"
-                        )));
-                    }
-                    Some(format!("sha256:{hex}"))
+            let mut formatted_hashes = Vec::new();
+            for h in hashes {
+                let hex = h.to_lowercase();
+                if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Err(LockfileError::InvalidData(format!(
+                        "line {line_num}: invalid sha256 hash length (expected 64 hex chars, got `{h}`)"
+                    )));
                 }
-                None => None,
+                formatted_hashes.push(format!("sha256:{hex}"));
+            }
+            let integrity = if formatted_hashes.is_empty() {
+                None
+            } else {
+                Some(formatted_hashes.join(" "))
             };
 
             let canon_name = crate::version::canonicalize_name(name);

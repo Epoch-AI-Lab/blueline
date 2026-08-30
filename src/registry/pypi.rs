@@ -46,7 +46,7 @@ impl PyPIRegistry {
         };
         if resp
             .header("content-type")
-            .is_some_and(|ct| !ct.contains("json"))
+            .is_some_and(|ct| !ct.to_ascii_lowercase().contains("json"))
         {
             return Err(BluelineError::Manifest(
                 n.to_string(),

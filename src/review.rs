@@ -220,11 +220,12 @@ fn evaluate_with_registry<R: Registry, V: VersionInfo>(
             policy,
         )),
         Ecosystem::PyPi => {
-            let filename = target_pkg
+            let raw_name = target_pkg
                 .tarball_url
                 .rsplit('/')
                 .next()
                 .unwrap_or(&target_pkg.name);
+            let filename = raw_name.split(&['?', '#'][..]).next().unwrap_or(raw_name);
             Some(crate::provenance::inspect_provenance_pypi(
                 &target_pkg.name,
                 &target_pkg.version,
@@ -245,6 +246,7 @@ fn evaluate_with_registry<R: Registry, V: VersionInfo>(
         &delta,
         is_unreviewed,
         baseline_res.prior_release_yanked,
+        baseline_res.target_release_yanked,
         policy,
         Some(&advisories),
         provenance.as_ref(),

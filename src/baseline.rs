@@ -21,6 +21,8 @@ pub struct BaselineSelection {
     /// The release immediately preceding the target is yanked. Supply-chain
     /// signal regardless of which anchor won (feeds R08_YANKED_PREDECESSOR).
     pub prior_release_yanked: bool,
+    /// The target release itself is yanked on the registry (feeds R09_YANKED_TARGET).
+    pub target_release_yanked: bool,
 }
 
 impl BaselineResolution {
@@ -53,8 +55,13 @@ pub fn resolve_baseline<R: Registry, V: VersionInfo>(
     registry: &R,
     store: &BaselineStore,
 ) -> Result<BaselineSelection, BluelineError> {
-    let mut eligible: Vec<(V, Release)> = registry
-        .list_releases(name)?
+    let all_releases = registry.list_releases(name)?;
+    let target_release_yanked = all_releases
+        .iter()
+        .find(|r| V::parse(&r.version).ok().as_ref() == Some(target_ver))
+        .is_some_and(|r| r.yanked);
+
+    let mut eligible: Vec<(V, Release)> = all_releases
         .into_iter()
         .filter_map(|r| V::parse(&r.version).ok().map(|v| (v, r)))
         .filter(|(v, _)| v.baseline_eligible_for(target_ver))
@@ -75,6 +82,7 @@ pub fn resolve_baseline<R: Registry, V: VersionInfo>(
                         return Ok(BaselineSelection {
                             resolution: BaselineResolution::LocalApproved(pkg),
                             prior_release_yanked,
+                            target_release_yanked,
                         });
                     }
                     (Some(reg_integ), _) => {
@@ -119,12 +127,14 @@ pub fn resolve_baseline<R: Registry, V: VersionInfo>(
         return Ok(BaselineSelection {
             resolution: BaselineResolution::RegistryPredecessor(pkg),
             prior_release_yanked,
+            target_release_yanked,
         });
     }
 
     Ok(BaselineSelection {
         resolution: BaselineResolution::FirstSighting,
         prior_release_yanked,
+        target_release_yanked,
     })
 }
 

@@ -38,6 +38,7 @@ pub fn evaluate_with_policy(
         delta,
         is_unreviewed_baseline,
         false,
+        false,
         policy,
         None,
         None,
@@ -52,6 +53,7 @@ pub fn evaluate_with_trust(
     delta: &Delta,
     is_unreviewed_baseline: bool,
     prior_release_yanked: bool,
+    target_release_yanked: bool,
     policy: &Policy,
     advisories: Option<&AdvisoryReport>,
     provenance: Option<&ProvenanceReport>,
@@ -464,16 +466,32 @@ pub fn evaluate_with_trust(
         });
     }
 
-    // PyPI-specific findings: entry points, native binaries, and sdist build code
-    let has_entry_points = delta
-        .files_added
-        .iter()
-        .chain(delta.files_modified.iter())
-        .any(|f| {
-            f.relative_path.ends_with("entry_points.txt")
-                || f.relative_path.contains(".data/scripts/")
-                || f.relative_path.contains("data/scripts/")
+    // R09: Target release itself was yanked on the registry
+    if target_release_yanked {
+        findings.push(Finding {
+            rule_id: "R09_YANKED_TARGET".into(),
+            severity: VerdictBand::Medium,
+            title: format!("Target release `{}` was yanked", delta.target_version),
+            description: format!(
+                "The target release `{}` is marked as yanked on the registry. Yanked releases are often withdrawn due to critical bugs or security compromises.",
+                delta.target_version
+            ),
         });
+    }
+
+    // PyPI-specific findings: entry points, native binaries, and sdist build code
+    let has_entry_points = ecosystem == Ecosystem::PyPi
+        && delta
+            .files_added
+            .iter()
+            .chain(delta.files_modified.iter())
+            .any(|f| {
+                f.relative_path.ends_with(".dist-info/entry_points.txt")
+                    || f.relative_path.ends_with("/entry_points.txt")
+                    || f.relative_path == "entry_points.txt"
+                    || f.relative_path.contains(".data/scripts/")
+                    || f.relative_path.starts_with("data/scripts/")
+            });
     if has_entry_points {
         findings.push(Finding {
             rule_id: "R02_ENTRY_POINTS_SCRIPT".into(),
@@ -2496,6 +2514,7 @@ mod tests {
             &delta,
             false,
             false,
+            false,
             &Policy::default(),
             Some(&adv),
             None,
@@ -2553,6 +2572,7 @@ mod tests {
             &delta,
             false,
             false,
+            false,
             &Policy::default(),
             Some(&adv),
             None,
@@ -2595,6 +2615,7 @@ mod tests {
             Ecosystem::Npm,
             "verified (sha512)",
             &delta,
+            false,
             false,
             false,
             &Policy::default(),
@@ -2643,6 +2664,7 @@ mod tests {
             &delta,
             false,
             false,
+            false,
             &policy,
             None,
             Some(&prov_missing),
@@ -2679,6 +2701,7 @@ mod tests {
             Ecosystem::Npm,
             "verified (sha512)",
             &delta,
+            false,
             false,
             false,
             &policy_repo,
@@ -3002,6 +3025,7 @@ mod tests {
             &delta,
             false,
             true,
+            false,
             &Policy::default(),
             None,
             None,
@@ -3022,6 +3046,35 @@ mod tests {
     }
 
     #[test]
+    fn flags_yanked_target_as_medium() {
+        let delta = yanked_delta();
+        let verdict = evaluate_with_trust(
+            "test-pkg",
+            Ecosystem::PyPi,
+            "sha256:abc",
+            &delta,
+            false,
+            false,
+            true,
+            &Policy::default(),
+            None,
+            None,
+        );
+        let r09 = verdict
+            .findings
+            .iter()
+            .find(|f| f.rule_id == "R09_YANKED_TARGET");
+        assert!(
+            r09.is_some(),
+            "expected R09 finding, got {:?}",
+            verdict.findings
+        );
+        assert_eq!(r09.unwrap().severity, VerdictBand::Medium);
+        assert_eq!(verdict.risk_score, 10);
+        assert_eq!(verdict.band, VerdictBand::Medium);
+    }
+
+    #[test]
     fn no_yanked_predecessor_finding_when_prior_is_live() {
         let delta = yanked_delta();
         let verdict = evaluate_with_trust(
@@ -3029,6 +3082,7 @@ mod tests {
             Ecosystem::Cargo,
             "sha256:abc",
             &delta,
+            false,
             false,
             false,
             &Policy::default(),

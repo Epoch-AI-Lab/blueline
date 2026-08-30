@@ -246,9 +246,16 @@ pub fn evaluate_lockfile_diff(
         )?;
 
         // If lockfile declared a hash, verify it matches
-        if let Some(expected_integ) = head_integrity_map.get(name) {
-            let matches_integ = checksum.to_display().eq_ignore_ascii_case(expected_integ)
-                || format!("sha256:{}", checksum.value_hex).eq_ignore_ascii_case(expected_integ);
+        if let Some(expected_integ) = head_integrity_map
+            .get(name)
+            .or_else(|| head_integrity_map.get(&crate::version::canonicalize_name(name)))
+        {
+            let matches_integ = expected_integ.split_whitespace().any(|expected_one| {
+                let expected_hex = expected_one.strip_prefix("sha256:").unwrap_or(expected_one);
+                checksum.value_hex.eq_ignore_ascii_case(expected_hex)
+                    || checksum.to_display().eq_ignore_ascii_case(expected_one)
+            });
+
             if !matches_integ {
                 verdict.findings.push(crate::verdict::Finding {
                     rule_id: "R10_LOCKFILE_HASH_MISMATCH".into(),

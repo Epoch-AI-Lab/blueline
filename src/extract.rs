@@ -326,6 +326,12 @@ pub fn validate_entry_path(path: &Path) -> Result<(), String> {
         return Err(format!("absolute entry path `{}` rejected", path.display()));
     }
     let bytes = path.as_os_str().as_encoded_bytes();
+    if bytes.contains(&0) {
+        return Err(format!(
+            "entry path `{}` containing NUL byte rejected",
+            path.display()
+        ));
+    }
     if bytes.contains(&b'\\') {
         return Err(format!(
             "entry path `{}` containing backslash rejected",

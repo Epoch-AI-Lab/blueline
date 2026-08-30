@@ -57,6 +57,20 @@ impl ProvenanceReport {
             message: Some(format!("Provenance digest mismatch: {details}")),
         }
     }
+
+    pub fn unverified(msg: &str) -> Self {
+        Self {
+            status: ProvenanceStatus::Missing,
+            slsa_level: 0,
+            builder_id: None,
+            source_repo: None,
+            commit_sha: None,
+            workflow_path: None,
+            registry_signature_present: false,
+            registry_signature_key_id: None,
+            message: Some(format!("Provenance unverified: {msg}")),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -390,25 +404,30 @@ pub fn inspect_provenance_pypi(
     if let Ok(resp) = resp_res {
         let mut reader = resp.into_reader().take(1024 * 1024);
         let mut body = String::new();
-        if reader.read_to_string(&mut body).is_ok()
-            && let Ok(report) = parse_pypi_provenance_json(&body, expected_integrity)
-        {
-            if report.status == ProvenanceStatus::Verified
-                && let Some(store) = store
-            {
-                let _ = store.record_provenance(
-                    Ecosystem::PyPi,
-                    package,
-                    version,
-                    report.builder_id.as_deref(),
-                    report.source_repo.as_deref(),
-                    report.commit_sha.as_deref(),
-                    report.workflow_path.as_deref(),
-                    report.slsa_level,
-                    false,
-                );
+        if reader.read_to_string(&mut body).is_ok() {
+            match parse_pypi_provenance_json(&body, expected_integrity) {
+                Ok(report) => {
+                    if report.status == ProvenanceStatus::Verified
+                        && let Some(store) = store
+                    {
+                        let _ = store.record_provenance(
+                            Ecosystem::PyPi,
+                            package,
+                            version,
+                            report.builder_id.as_deref(),
+                            report.source_repo.as_deref(),
+                            report.commit_sha.as_deref(),
+                            report.workflow_path.as_deref(),
+                            report.slsa_level,
+                            false,
+                        );
+                    }
+                    return report;
+                }
+                Err(e) => {
+                    return ProvenanceReport::unverified(&e.to_string());
+                }
             }
-            return report;
         }
     }
 
