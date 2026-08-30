@@ -19,7 +19,9 @@ fn run() -> anyhow::Result<()> {
         blueline::registry::Ecosystem::Npm => cli.registry.clone(),
         blueline::registry::Ecosystem::Cargo => cli.index.clone(),
         blueline::registry::Ecosystem::PyPi => {
-            if cli.registry != "https://registry.npmjs.org" {
+            if cli.index != "https://index.crates.io" {
+                cli.index.clone()
+            } else if cli.registry != "https://registry.npmjs.org" {
                 cli.registry.clone()
             } else {
                 "https://pypi.org".to_string()
