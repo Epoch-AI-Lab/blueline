@@ -357,6 +357,11 @@ mod tests {
             Some(1705510392)
         );
         assert_eq!(parse_upload_time("2024-01-17T16:53:12Z"), Some(1705510392));
+        assert_eq!(parse_upload_time("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_upload_time("2024-03-15T12:00:00Z"), Some(1710504000));
+        assert_eq!(parse_upload_time("2024-07-20T08:30:00Z"), Some(1721464200));
+        assert_eq!(parse_upload_time("2024-11-05T18:45:15Z"), Some(1730832315));
+        assert_eq!(parse_upload_time("2024-02-29T23:59:59Z"), Some(1709251199));
         assert!(parse_upload_time("not-a-time").is_none());
         assert!(parse_upload_time("2024-00-17T16:53:12Z").is_none());
         assert!(parse_upload_time("2024-13-17T16:53:12Z").is_none());
