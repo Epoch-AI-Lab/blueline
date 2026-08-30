@@ -386,28 +386,52 @@ pub fn parse_requirements_txt_packages(
             continue;
         }
 
-        let has_range_op = spec.contains(">=")
-            || spec.contains("<=")
-            || spec.contains('>')
-            || spec.contains('<')
-            || spec.contains("~=")
-            || spec.contains("!=")
-            || spec.contains("===")
-            || spec.contains('@');
+        // Separate environment marker `; ...` before range checking the requirement
+        let (req_spec, _marker) = match spec.split_once(';') {
+            Some((before, after)) => (before.trim(), Some(after.trim())),
+            None => (spec.as_str(), None),
+        };
 
-        if has_range_op {
-            unpinned_errors.push(format!("  line {line_num}: unpinned range `{spec}`"));
+        if req_spec.is_empty() {
             continue;
         }
 
-        if let Some((name_part, ver_part)) = spec.split_once("==") {
-            let name = name_part.trim();
+        let has_range_op = req_spec.contains(">=")
+            || req_spec.contains("<=")
+            || req_spec.contains('>')
+            || req_spec.contains('<')
+            || req_spec.contains("~=")
+            || req_spec.contains("!=")
+            || req_spec.contains("===")
+            || req_spec.contains('@');
+
+        if has_range_op {
+            unpinned_errors.push(format!("  line {line_num}: unpinned range `{req_spec}`"));
+            continue;
+        }
+
+        if let Some((name_part, ver_part)) = req_spec.split_once("==") {
+            let raw_name = name_part.trim();
             let ver = ver_part.trim();
 
-            if name.is_empty() || ver.is_empty() {
-                unpinned_errors.push(format!("  line {line_num}: invalid requirement `{spec}`"));
+            if raw_name.is_empty() || ver.is_empty() {
+                unpinned_errors.push(format!(
+                    "  line {line_num}: invalid requirement `{req_spec}`"
+                ));
                 continue;
             }
+
+            // Extract base package name and extras if present: `foo[extra1,extra2]`
+            let name = if let Some((base, extras_part)) = raw_name.split_once('[') {
+                if !extras_part.ends_with(']') {
+                    return Err(LockfileError::InvalidData(format!(
+                        "line {line_num}: unclosed extras bracket in `{raw_name}`"
+                    )));
+                }
+                base.trim()
+            } else {
+                raw_name
+            };
 
             if !crate::version::validate_pypi_name(name) {
                 return Err(LockfileError::InvalidData(format!(
@@ -417,7 +441,7 @@ pub fn parse_requirements_txt_packages(
 
             if crate::version::Pep440Version::parse(ver).is_err() {
                 return Err(LockfileError::InvalidData(format!(
-                    "line {line_num}: invalid PEP 440 version `{ver}` in `{spec}`"
+                    "line {line_num}: invalid PEP 440 version `{ver}` in `{req_spec}`"
                 )));
             }
 

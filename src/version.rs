@@ -503,12 +503,17 @@ fn parse_suffix_label(s: &str, labels: &[(&str, PreKind)]) -> Option<(usize, Pre
     let cand = &s[sep..];
     let (lab, kind) = labels.iter().find(|(lab, _)| cand.starts_with(*lab))?;
     let mut pos = sep + lab.len();
+    let mut had_sep = false;
     if pos < s.len() && (b[pos] == b'.' || b[pos] == b'_' || b[pos] == b'-') {
         pos += 1;
+        had_sep = true;
     }
     let mut end = pos;
     while end < s.len() && b[end].is_ascii_digit() {
         end += 1;
+    }
+    if had_sep && pos == end {
+        return None;
     }
     let n = if pos == end {
         0
@@ -750,6 +755,9 @@ mod tests {
             "1.0+",
             "1.0-",
             "1.0..",
+            "1.0.post.",
+            "1.0.dev.",
+            "1.0a.",
         ];
         for s in invalid {
             assert!(Pep440Version::parse(s).is_err(), "expected invalid: {s:?}");
