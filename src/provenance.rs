@@ -319,6 +319,9 @@ pub fn parse_pypi_provenance_json(
     body: &str,
     expected_integrity: &Checksum,
 ) -> Result<ProvenanceReport, BluelineError> {
+    let mut had_attestations = false;
+    let mut mismatch_details = None;
+
     if let Ok(resp) = serde_json::from_str::<PyPiProvenanceResponse>(body) {
         let mut all_items = resp.attestations;
         for bundle in resp.attestation_bundles {
@@ -330,13 +333,16 @@ pub fn parse_pypi_provenance_json(
                 .and_then(|b| b.dsse_envelope)
                 .and_then(|d| d.payload)
             {
+                had_attestations = true;
                 let mut report = parse_attestation_payload(&payload_b64, expected_integrity)?;
                 if report.status == ProvenanceStatus::Verified {
                     report.message = Some(
                         "PEP 740 attestation verified (crypto verification not performed)".into(),
                     );
+                    return Ok(report);
+                } else if report.status == ProvenanceStatus::FailedMismatch {
+                    mismatch_details = report.message;
                 }
-                return Ok(report);
             }
         }
     }
@@ -345,12 +351,21 @@ pub fn parse_pypi_provenance_json(
     if let Ok(dsse) = serde_json::from_str::<DsseEnvelope>(body)
         && let Some(payload_b64) = dsse.payload
     {
+        had_attestations = true;
         let mut report = parse_attestation_payload(&payload_b64, expected_integrity)?;
         if report.status == ProvenanceStatus::Verified {
             report.message =
                 Some("PEP 740 attestation verified (crypto verification not performed)".into());
+            return Ok(report);
+        } else if report.status == ProvenanceStatus::FailedMismatch {
+            mismatch_details = report.message;
         }
-        return Ok(report);
+    }
+
+    if had_attestations {
+        let msg = mismatch_details
+            .unwrap_or_else(|| "subject digest does not match release artifact".into());
+        return Ok(ProvenanceReport::failed_mismatch(&msg));
     }
 
     Ok(ProvenanceReport::missing(false, None))

@@ -205,6 +205,9 @@ impl VersionInfo for Pep440Version {
         if trimmed.is_empty() {
             return Err(err("empty version"));
         }
+        if trimmed.len() > 256 {
+            return Err(err("version string exceeds maximum length of 256"));
+        }
         let after_v = if trimmed.starts_with('v') || trimmed.starts_with('V') {
             &trimmed[1..]
         } else {
@@ -351,6 +354,9 @@ impl VersionInfo for Pep440Version {
             return Err(err("empty release segment"));
         }
         let rel_parts: Vec<&str> = release_str.split('.').collect();
+        if rel_parts.len() > 32 {
+            return Err(err("release segments exceed limit of 32"));
+        }
         if rel_parts.iter().any(|x| x.is_empty()) {
             return Err(err("empty release segment"));
         }
