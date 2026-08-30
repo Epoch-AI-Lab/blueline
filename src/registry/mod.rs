@@ -6,6 +6,7 @@ use crate::error::BluelineError;
 pub mod cratesio;
 pub mod http_util;
 pub mod npm;
+pub mod pypi;
 
 /// The package ecosystems blueline knows about. npm is fully wired; cargo and
 /// PyPI adapters build on these seams in later PRs.
@@ -128,6 +129,10 @@ impl Checksum {
     }
 }
 
+pub fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn hex_to_bytes(hex: &str) -> Vec<u8> {
     (0..hex.len() / 2)
         .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap_or(0))
@@ -162,7 +167,7 @@ fn base64_to_hex(alg: ChecksumAlg, b64: &str) -> Result<Checksum, BluelineError>
                 alg.name()
             ))
         })?;
-    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let hex = hex_encode(&bytes);
     hex_to_checksum(alg, &hex)
 }
 

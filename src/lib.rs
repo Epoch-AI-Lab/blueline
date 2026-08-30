@@ -20,3 +20,4 @@ pub mod review;
 pub mod store;
 pub mod verdict;
 pub mod version;
+pub mod wheel_extract;

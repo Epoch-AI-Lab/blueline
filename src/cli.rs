@@ -43,12 +43,11 @@ pub struct Cli {
     pub policy: Option<std::path::PathBuf>,
 }
 
-/// Package ecosystems selectable on the command line. PyPI is intentionally
-/// absent: its adapter is not shipped, and offering it would invite guessing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum EcosystemArg {
     Npm,
     Cargo,
+    Pypi,
 }
 
 impl From<EcosystemArg> for crate::registry::Ecosystem {
@@ -56,6 +55,7 @@ impl From<EcosystemArg> for crate::registry::Ecosystem {
         match arg {
             EcosystemArg::Npm => crate::registry::Ecosystem::Npm,
             EcosystemArg::Cargo => crate::registry::Ecosystem::Cargo,
+            EcosystemArg::Pypi => crate::registry::Ecosystem::PyPi,
         }
     }
 }

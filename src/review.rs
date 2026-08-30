@@ -9,9 +9,11 @@ use crate::manifest::{read_package_json, read_packed_cargo_toml};
 use crate::policy::Policy;
 use crate::registry::cratesio::CratesIoRegistry;
 use crate::registry::npm::NpmRegistry;
+use crate::registry::pypi::PyPIRegistry;
 use crate::registry::{Checksum, Ecosystem, Registry};
 use crate::render::{render_json, render_text};
 use crate::store::BaselineStore;
+use crate::version::VersionInfo;
 
 /// A registry-predecessor baseline that was fetched, verified, and
 /// diffed during this review but has never been approved locally.
@@ -21,15 +23,11 @@ pub struct UnreviewedBaseline {
     pub checksum: Checksum,
 }
 
-/// Build the registry adapter for a review request. PyPI fails closed here
-/// until its adapter ships; nothing downstream may guess an implementation.
 fn make_registry(ecosystem: Ecosystem, registry_base: &str) -> anyhow::Result<Box<dyn Registry>> {
     match ecosystem {
         Ecosystem::Npm => Ok(Box::new(NpmRegistry::new(registry_base))),
         Ecosystem::Cargo => Ok(Box::new(CratesIoRegistry::new(registry_base))),
-        Ecosystem::PyPi => Err(anyhow::anyhow!(
-            "PyPI reviews are not available yet; the adapter lands in an upcoming release"
-        )),
+        Ecosystem::PyPi => Ok(Box::new(PyPIRegistry::new(registry_base))),
     }
 }
 
@@ -49,7 +47,7 @@ pub fn evaluate_package(
     Option<UnreviewedBaseline>,
 )> {
     match ecosystem {
-        Ecosystem::Npm => evaluate_with_registry(
+        Ecosystem::Npm => evaluate_with_registry::<NpmRegistry, semver::Version>(
             NpmRegistry::new(registry_base),
             name,
             version_str,
@@ -57,7 +55,7 @@ pub fn evaluate_package(
             store,
             policy,
         ),
-        Ecosystem::Cargo => evaluate_with_registry(
+        Ecosystem::Cargo => evaluate_with_registry::<CratesIoRegistry, semver::Version>(
             CratesIoRegistry::new(registry_base),
             name,
             version_str,
@@ -65,13 +63,18 @@ pub fn evaluate_package(
             store,
             policy,
         ),
-        Ecosystem::PyPi => Err(anyhow::anyhow!(
-            "PyPI reviews are not available yet; the adapter lands in an upcoming release"
-        )),
+        Ecosystem::PyPi => evaluate_with_registry::<PyPIRegistry, crate::version::Pep440Version>(
+            PyPIRegistry::new(registry_base),
+            name,
+            version_str,
+            registry_base,
+            store,
+            policy,
+        ),
     }
 }
 
-fn evaluate_with_registry<R: Registry>(
+fn evaluate_with_registry<R: Registry, V: VersionInfo>(
     registry: R,
     name: &str,
     version_str: &str,
@@ -84,14 +87,12 @@ fn evaluate_with_registry<R: Registry>(
     crate::registry::Checksum,
     Option<UnreviewedBaseline>,
 )> {
-    let target_semver = semver::Version::parse(version_str)
-        .map_err(|e| anyhow::anyhow!("invalid semver for `{version_str}`: {e}"))?;
+    let target_ver = V::parse(version_str)
+        .map_err(|e| anyhow::anyhow!("invalid version for `{version_str}`: {e}"))?;
 
     let ecosystem = registry.ecosystem();
     let target_pkg = registry.resolve(name, version_str)?;
 
-    // fetch_tarball verifies the digest against the registry checksum and
-    // fails closed on any mismatch, so these bytes are integrity-verified.
     let target_tarball = registry.fetch_tarball(&target_pkg)?;
 
     let checksum = target_pkg.integrity.clone().ok_or_else(|| {
@@ -103,10 +104,11 @@ fn evaluate_with_registry<R: Registry>(
     })?;
 
     let target_temp = tempfile::tempdir().map_err(|e| anyhow::anyhow!("creating temp dir: {e}"))?;
-    safe_extract(
+    extract_for_ecosystem(
         &target_tarball,
         target_temp.path(),
-        &ExtractionLimits::default(),
+        ecosystem,
+        &target_pkg.tarball_url,
     )
     .map_err(|e| {
         anyhow::anyhow!(
@@ -132,17 +134,18 @@ fn evaluate_with_registry<R: Registry>(
 
     store.record_verified(ecosystem, &target_pkg.name, &target_pkg.version, &checksum)?;
 
-    let baseline_res: BaselineSelection = resolve_baseline(name, &target_semver, &registry, store)
+    let baseline_res: BaselineSelection = resolve_baseline(name, &target_ver, &registry, store)
         .map_err(|e| anyhow::anyhow!("baseline resolution: {e}"))?;
 
     let delta = if let Some(base_pkg) = baseline_res.resolution.package() {
         let base_tarball = registry.fetch_tarball(base_pkg)?;
         let base_temp =
             tempfile::tempdir().map_err(|e| anyhow::anyhow!("creating temp dir: {e}"))?;
-        safe_extract(
+        extract_for_ecosystem(
             &base_tarball,
             base_temp.path(),
-            &ExtractionLimits::default(),
+            ecosystem,
+            &base_pkg.tarball_url,
         )
         .map_err(|e| {
             anyhow::anyhow!(
@@ -206,8 +209,6 @@ fn evaluate_with_registry<R: Registry>(
     )
     .unwrap_or_else(|e| crate::advisory::AdvisoryReport::unverified(&e.to_string()));
 
-    // Attestations are an npm-registry surface today; other ecosystems report
-    // no provenance rather than querying a meaningless endpoint.
     let provenance = if ecosystem == Ecosystem::Npm {
         Some(crate::provenance::inspect_provenance(
             &target_pkg.name,
@@ -237,6 +238,22 @@ fn evaluate_with_registry<R: Registry>(
     Ok((verdict, delta, checksum, unreviewed_baseline))
 }
 
+fn extract_for_ecosystem(
+    tarball: &[u8],
+    dest: &std::path::Path,
+    ecosystem: Ecosystem,
+    tarball_url: &str,
+) -> Result<crate::extract::ExtractStats, crate::error::BluelineError> {
+    if ecosystem == Ecosystem::PyPi && tarball_url.ends_with(".whl") {
+        return crate::wheel_extract::safe_extract_wheel(
+            tarball,
+            dest,
+            &ExtractionLimits::default(),
+        );
+    }
+    safe_extract(tarball, dest, &ExtractionLimits::default())
+}
+
 /// Locate and parse the package manifest inside an extracted release tree.
 /// Cargo `.crate` archives additionally must unpack to exactly one top-level
 /// directory named `{canonical-name}-{version}`.
@@ -256,10 +273,34 @@ fn prepare_extracted_root(
         Ecosystem::Npm => read_package_json(&package_json_path(&root))?,
         Ecosystem::Cargo => read_packed_cargo_toml(&root.join("Cargo.toml"))?.manifest_view(),
         Ecosystem::PyPi => {
-            return Err(crate::error::BluelineError::Manifest(
-                canonical_name.to_string(),
-                "PyPI reviews are not available yet".to_string(),
-            ));
+            let candidate = root.join("METADATA");
+            if candidate.exists() {
+                let raw = std::fs::read_to_string(&candidate).unwrap_or_default();
+                let mut deps = std::collections::BTreeMap::new();
+                for line in raw.lines() {
+                    if let Some(rest) = line.strip_prefix("Requires-Dist:") {
+                        let dep = rest.trim().split(';').next().unwrap_or("").trim();
+                        if !dep.is_empty() {
+                            let name = dep.split_whitespace().next().unwrap_or(dep).to_string();
+                            deps.insert(name.clone(), dep.to_string());
+                        }
+                    }
+                }
+                crate::manifest::PackageJson {
+                    name: canonical_name.to_string(),
+                    version: version.to_string(),
+                    gypfile: None,
+                    scripts: std::collections::BTreeMap::new(),
+                    dependencies: deps,
+                    ..Default::default()
+                }
+            } else {
+                crate::manifest::PackageJson {
+                    name: canonical_name.to_string(),
+                    version: version.to_string(),
+                    ..Default::default()
+                }
+            }
         }
     };
     Ok((root, manifest))
@@ -406,6 +447,14 @@ pub fn install(
             "blueline install refuses cargo packages: building a crate executes its `build.rs` \
              script, which blueline cannot sandbox. Review it instead with \
              `blueline review <crate>@<version> --ecosystem cargo`."
+        );
+        std::process::exit(2);
+    }
+    if ecosystem == Ecosystem::PyPi {
+        eprintln!(
+            "blueline install refuses PyPI packages: installing a Python sdist executes arbitrary \
+             build code and wheels may contain installer hooks; review it instead with \
+             `blueline review <package>==<version> --ecosystem pypi`."
         );
         std::process::exit(2);
     }
@@ -647,14 +696,35 @@ fn offer_baseline_approval_with_reader(
 
 /// `<name>@<version>` → (name, version). Scoped names (`@scope/pkg@1.0.0`)
 /// split from the right so the scope's leading `@` stays with the name.
+/// PyPI alias `name==version` is also accepted.
 pub fn parse_spec(spec: &str) -> anyhow::Result<(String, String)> {
+    if let Some((name, version)) = spec.split_once("==") {
+        if name.is_empty() || version.is_empty() || name.contains('@') || version.contains('@') {
+            return Err(crate::error::BluelineError::InvalidPackageSpec(spec.to_string()).into());
+        }
+        if name.contains('[')
+            || name.contains(']')
+            || version.contains('[')
+            || version.contains(' ')
+        {
+            return Err(crate::error::BluelineError::InvalidPackageSpec(spec.to_string()).into());
+        }
+        if crate::version::Pep440Version::parse(version).is_err()
+            && semver::Version::parse(version).is_err()
+        {
+            return Err(crate::error::BluelineError::InvalidPackageSpec(spec.to_string()).into());
+        }
+        return Ok((name.to_string(), version.to_string()));
+    }
     let mut parts = spec.rsplitn(2, '@');
     let version = parts.next().unwrap_or("");
     let name = parts.next().unwrap_or("");
     if name.is_empty() || version.is_empty() {
         return Err(crate::error::BluelineError::InvalidPackageSpec(spec.to_string()).into());
     }
-    if semver::Version::parse(version).is_err() {
+    if semver::Version::parse(version).is_err()
+        && crate::version::Pep440Version::parse(version).is_err()
+    {
         return Err(crate::error::BluelineError::InvalidPackageSpec(spec.to_string()).into());
     }
     Ok((name.to_string(), version.to_string()))
@@ -664,11 +734,12 @@ pub fn parse_spec(spec: &str) -> anyhow::Result<(String, String)> {
 /// If version is omitted, resolves the registry's default version
 /// (`dist-tags.latest` for npm, falling back to latest stable semver release).
 fn parse_spec_flexible(spec: &str, registry: &dyn Registry) -> anyhow::Result<(String, String)> {
-    let has_version_sep = if let Some(rest) = spec.strip_prefix('@') {
-        rest.contains('@')
-    } else {
-        spec.contains('@')
-    };
+    let has_version_sep = spec.contains("==")
+        || if let Some(rest) = spec.strip_prefix('@') {
+            rest.contains('@')
+        } else {
+            spec.contains('@')
+        };
 
     if has_version_sep {
         parse_spec(spec)
@@ -818,5 +889,63 @@ mod tests {
                     .any(|(v, _)| v.to_string() == "0.9.0")
             );
         }
+    }
+
+    #[test]
+    fn parse_spec_accepts_pypi_double_equals() {
+        assert_eq!(
+            parse_spec("requests==2.28.1").unwrap(),
+            ("requests".into(), "2.28.1".into())
+        );
+        assert_eq!(
+            parse_spec("my-package==1.0a1").unwrap(),
+            ("my-package".into(), "1.0a1".into())
+        );
+    }
+
+    #[test]
+    fn flexible_spec_handles_pypi_alias() {
+        use crate::registry::{Package, Release};
+        struct Fake;
+        impl crate::registry::Registry for Fake {
+            fn ecosystem(&self) -> Ecosystem {
+                Ecosystem::PyPi
+            }
+            fn resolve(&self, n: &str, v: &str) -> Result<Package, crate::error::BluelineError> {
+                Ok(Package {
+                    name: n.into(),
+                    version: v.into(),
+                    tarball_url: "https://example.com/pkg.whl".into(),
+                    integrity: None,
+                })
+            }
+            fn fetch_tarball(&self, _: &Package) -> Result<Vec<u8>, crate::error::BluelineError> {
+                Ok(vec![])
+            }
+            fn list_versions(
+                &self,
+                _: &str,
+            ) -> Result<Vec<semver::Version>, crate::error::BluelineError> {
+                Ok(vec![])
+            }
+            fn list_releases(&self, _: &str) -> Result<Vec<Release>, crate::error::BluelineError> {
+                Ok(vec![])
+            }
+            fn default_version(
+                &self,
+                _: &str,
+            ) -> Result<Option<String>, crate::error::BluelineError> {
+                Ok(Some("9.9.9".into()))
+            }
+        }
+        let reg = Fake;
+        assert_eq!(
+            parse_spec_flexible("requests==2.28.1", &reg).unwrap(),
+            ("requests".into(), "2.28.1".into())
+        );
+        assert_eq!(
+            parse_spec_flexible("requests", &reg).unwrap(),
+            ("requests".into(), "9.9.9".into())
+        );
     }
 }

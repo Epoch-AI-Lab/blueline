@@ -164,7 +164,7 @@ jobs:
           BASE_REF: ${{ github.base_ref }}
         run: git diff "origin/${BASE_REF}" -- > pr.diff
       - name: Mutate the changed lines
-        run: cargo mutants --in-diff pr.diff --file src/extract.rs --file src/manifest.rs --file src/registry/npm.rs --file src/store.rs --file src/executor.rs --file src/lockfile.rs --file src/ci.rs --file src/mcp.rs --in-place --no-shuffle --timeout 300
+        run: cargo mutants --in-diff pr.diff --file src/extract.rs --file src/manifest.rs --file src/registry/npm.rs --file src/registry/pypi.rs --file src/wheel_extract.rs --file src/baseline.rs --file src/version.rs --file src/review.rs --file src/store.rs --file src/executor.rs --file src/lockfile.rs --file src/ci.rs --file src/mcp.rs --in-place --no-shuffle --timeout 300
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -197,7 +197,7 @@ jobs:
         with:
           tool: cargo-mutants
       - name: Mutate the trust boundary
-        run: cargo mutants --shard ${{ matrix.shard }}/4 --file src/extract.rs --file src/manifest.rs --file src/registry/npm.rs --file src/store.rs --file src/executor.rs --file src/lockfile.rs --file src/ci.rs --file src/mcp.rs --in-place --baseline=skip --timeout 300
+        run: cargo mutants --shard ${{ matrix.shard }}/4 --file src/extract.rs --file src/manifest.rs --file src/registry/npm.rs --file src/registry/pypi.rs --file src/wheel_extract.rs --file src/baseline.rs --file src/version.rs --file src/review.rs --file src/store.rs --file src/executor.rs --file src/lockfile.rs --file src/ci.rs --file src/mcp.rs --in-place --baseline=skip --timeout 300
       - uses: actions/upload-artifact@v4
         if: always()
         with:

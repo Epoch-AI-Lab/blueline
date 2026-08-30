@@ -1,4 +1,6 @@
+use std::collections::HashSet;
 use std::fs;
+use std::io::{Cursor, Read, Write};
 use std::path::{Component, Path};
 
 use crate::error::BluelineError;
@@ -136,13 +138,187 @@ pub fn safe_extract(
     Ok(stats)
 }
 
+pub fn safe_extract_wheel(
+    bytes: &[u8],
+    dest: &Path,
+    limits: &ExtractionLimits,
+) -> Result<ExtractStats, BluelineError> {
+    let cursor = Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(cursor)
+        .map_err(|e| BluelineError::Extraction(format!("reading zip archive: {e}")))?;
+
+    let len = archive.len();
+    if len > limits.max_entries {
+        return Err(BluelineError::ExtractionLimit(format!(
+            "entry count {len} exceeds cap {}",
+            limits.max_entries
+        )));
+    }
+
+    let mut stats = ExtractStats::default();
+    let mut seen: HashSet<String> = HashSet::with_capacity(len);
+
+    for idx in 0..len {
+        if stats.files + stats.dirs >= limits.max_entries {
+            return Err(BluelineError::ExtractionLimit(format!(
+                "entry count exceeded ({}/{})",
+                stats.files + stats.dirs + 1,
+                limits.max_entries
+            )));
+        }
+
+        let mut file = archive
+            .by_index(idx)
+            .map_err(|e| BluelineError::Extraction(format!("reading zip entry {idx}: {e}")))?;
+
+        let raw_name = file.name().to_string();
+
+        if raw_name.as_bytes().contains(&0) {
+            return Err(BluelineError::Extraction(format!(
+                "entry `{raw_name}` contains NUL byte"
+            )));
+        }
+
+        if file.encrypted() {
+            return Err(BluelineError::Extraction(format!(
+                "encrypted entry `{raw_name}` rejected"
+            )));
+        }
+
+        match file.compression() {
+            zip::CompressionMethod::Stored | zip::CompressionMethod::Deflated => {}
+            other => {
+                return Err(BluelineError::Extraction(format!(
+                    "unsupported compression {other:?} for entry `{raw_name}`"
+                )));
+            }
+        }
+
+        let is_dir = raw_name.ends_with('/');
+
+        let enclosed = file.enclosed_name();
+        let Some(enclosed_path) = enclosed else {
+            return Err(BluelineError::Extraction(format!(
+                "entry `{raw_name}` fails enclosed_name check (absolute or traversal)"
+            )));
+        };
+
+        validate_entry_path(&enclosed_path).map_err(BluelineError::Extraction)?;
+
+        let normalized_key = enclosed_path
+            .components()
+            .filter(|c| !matches!(c, std::path::Component::CurDir))
+            .collect::<std::path::PathBuf>()
+            .to_string_lossy()
+            .into_owned();
+        if !seen.insert(normalized_key.clone()) {
+            return Err(BluelineError::Extraction(format!(
+                "duplicate entry `{raw_name}` (normalized `{normalized_key}`)"
+            )));
+        }
+
+        let is_symlink = file.is_symlink();
+        let symlink_via_mode = file.unix_mode().is_some_and(|m| (m & 0o170000) == 0o120000);
+        if is_symlink || symlink_via_mode {
+            return Err(BluelineError::Extraction(format!(
+                "symlink entry `{raw_name}` rejected"
+            )));
+        }
+
+        let declared_size = file.size();
+
+        if is_dir {
+            if declared_size != 0 {
+                return Err(BluelineError::Extraction(format!(
+                    "directory entry `{raw_name}` has non-zero size {declared_size}"
+                )));
+            }
+            let out_path = dest.join(&enclosed_path);
+            fs::create_dir_all(&out_path).map_err(|e| {
+                BluelineError::Extraction(format!("creating dir `{}`: {e}", out_path.display()))
+            })?;
+            set_dir_perm(&out_path);
+            stats.dirs += 1;
+            continue;
+        }
+
+        if declared_size > limits.max_entry_bytes {
+            return Err(BluelineError::ExtractionLimit(format!(
+                "entry `{raw_name}` is {declared_size} bytes, exceeding per-entry cap {}",
+                limits.max_entry_bytes
+            )));
+        }
+        if stats.unpacked_bytes.saturating_add(declared_size) > limits.max_unpacked_bytes {
+            return Err(BluelineError::ExtractionLimit(format!(
+                "total unpacked size would exceed cap {}",
+                limits.max_unpacked_bytes
+            )));
+        }
+
+        let out_path = dest.join(&enclosed_path);
+        if let Some(parent) = out_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(|e| {
+                BluelineError::Extraction(format!(
+                    "creating parent dir `{}`: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+
+        let mut out_file = fs::File::create(&out_path).map_err(|e| {
+            BluelineError::Extraction(format!("creating file `{}`: {e}", out_path.display()))
+        })?;
+
+        let mut actual_written: u64 = 0;
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = file.read(&mut buf).map_err(|e| {
+                BluelineError::Extraction(format!("reading zip entry `{raw_name}`: {e}"))
+            })?;
+            if n == 0 {
+                break;
+            }
+            if actual_written + n as u64 > limits.max_entry_bytes {
+                return Err(BluelineError::ExtractionLimit(format!(
+                    "entry `{raw_name}` exceeds per-entry cap {} during inflate",
+                    limits.max_entry_bytes
+                )));
+            }
+            if stats.unpacked_bytes + actual_written + n as u64 > limits.max_unpacked_bytes {
+                return Err(BluelineError::ExtractionLimit(format!(
+                    "total unpacked size would exceed cap {}",
+                    limits.max_unpacked_bytes
+                )));
+            }
+            out_file.write_all(&buf[..n]).map_err(|e| {
+                BluelineError::Extraction(format!("writing file `{}`: {e}", out_path.display()))
+            })?;
+            actual_written += n as u64;
+        }
+
+        if actual_written != declared_size {
+            return Err(BluelineError::Extraction(format!(
+                "entry `{raw_name}` size mismatch: declared {declared_size} vs actual {actual_written}"
+            )));
+        }
+
+        set_file_perm(&out_path);
+        stats.files += 1;
+        stats.unpacked_bytes += actual_written;
+    }
+
+    Ok(stats)
+}
+
 const WINDOWS_RESERVED_NAMES: &[&str] = &[
     "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
     "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "CONIN$",
     "CONOUT$", "CLOCK$",
 ];
 
-fn validate_entry_path(path: &Path) -> Result<(), String> {
+pub fn validate_entry_path(path: &Path) -> Result<(), String> {
     if path.as_os_str().is_empty() {
         return Err("empty entry path".to_string());
     }
@@ -210,6 +386,15 @@ fn validate_entry_path(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn set_perm(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
+}
+
+#[cfg(not(unix))]
+fn set_perm(_path: &Path, _mode: u32) {}
+
 /// Strip setuid/setgid/sticky from unpacked files and directories (they must never run here).
 /// Ensures directories retain owner read/write/execute permissions so tempdir deletion succeeds.
 #[cfg(unix)]
@@ -231,6 +416,22 @@ fn strip_special_bits(path: &Path) {
 
 #[cfg(not(unix))]
 fn strip_special_bits(_path: &Path) {}
+
+#[cfg(unix)]
+fn set_file_perm(path: &Path) {
+    set_perm(path, 0o644);
+}
+
+#[cfg(not(unix))]
+fn set_file_perm(_path: &Path) {}
+
+#[cfg(unix)]
+fn set_dir_perm(path: &Path) {
+    set_perm(path, 0o755);
+}
+
+#[cfg(not(unix))]
+fn set_dir_perm(_path: &Path) {}
 
 #[cfg(test)]
 mod tests {
@@ -648,5 +849,317 @@ mod tests {
             err.to_string()
                 .contains("total unpacked size would exceed cap")
         );
+    }
+}
+
+#[cfg(test)]
+mod wheel_tests {
+    use super::*;
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    fn make_wheel(entries: &[(&str, &[u8], zip::CompressionMethod)]) -> Vec<u8> {
+        let mut buf = Cursor::new(Vec::new());
+        let mut zw = zip::ZipWriter::new(&mut buf);
+        for (name, data, method) in entries {
+            let opts = SimpleFileOptions::default().compression_method(*method);
+            if name.ends_with('/') {
+                zw.add_directory(*name, opts).unwrap();
+            } else {
+                zw.start_file(*name, opts).unwrap();
+                zw.write_all(data).unwrap();
+            }
+        }
+        zw.finish().unwrap();
+        buf.into_inner()
+    }
+
+    #[allow(dead_code)]
+    fn make_wheel_with_unix_mode(
+        entries: &[(&str, &[u8], zip::CompressionMethod, u32)],
+    ) -> Vec<u8> {
+        let mut buf = Cursor::new(Vec::new());
+        let mut zw = zip::ZipWriter::new(&mut buf);
+        for (name, data, method, mode) in entries {
+            let opts = SimpleFileOptions::default()
+                .compression_method(*method)
+                .unix_permissions(*mode);
+            if name.ends_with('/') {
+                zw.add_directory(*name, opts).unwrap();
+            } else {
+                zw.start_file(*name, opts).unwrap();
+                zw.write_all(data).unwrap();
+            }
+        }
+        zw.finish().unwrap();
+        buf.into_inner()
+    }
+
+    #[test]
+    fn extracts_plain_files() {
+        let bytes = make_wheel(&[
+            (
+                "pkg-1.0.dist-info/METADATA",
+                b"Name: pkg",
+                zip::CompressionMethod::Stored,
+            ),
+            (
+                "pkg/module.py",
+                b"print(1)",
+                zip::CompressionMethod::Deflated,
+            ),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let stats = safe_extract_wheel(&bytes, dir.path(), &ExtractionLimits::default()).unwrap();
+        assert_eq!(stats.files, 2);
+        assert!(dir.path().join("pkg/module.py").exists());
+    }
+
+    #[test]
+    fn rejects_encrypted() {
+        let mut bytes = make_wheel(&[("secret.txt", b"hi", zip::CompressionMethod::Stored)]);
+        for i in 0..bytes.len().saturating_sub(4) {
+            if bytes[i..i + 4] == [0x50, 0x4b, 0x03, 0x04] && i + 6 < bytes.len() {
+                bytes[i + 6] |= 0x01;
+            } else if bytes[i..i + 4] == [0x50, 0x4b, 0x01, 0x02] && i + 8 < bytes.len() {
+                bytes[i + 8] |= 0x01;
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let err = safe_extract_wheel(&bytes, dir.path(), &ExtractionLimits::default()).unwrap_err();
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("encrypted") || msg.contains("password"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_compression() {
+        let bytes_stored = make_wheel(&[("a.txt", b"hi", zip::CompressionMethod::Stored)]);
+        let mut mutated = bytes_stored.clone();
+        let mut count = 0;
+        for i in 0..mutated.len().saturating_sub(4) {
+            if mutated[i..i + 4] == [0x50, 0x4b, 0x03, 0x04]
+                && i + 10 < mutated.len()
+                && mutated[i + 8] == 0
+                && mutated[i + 9] == 0
+            {
+                mutated[i + 8] = 12;
+                mutated[i + 9] = 0;
+                count += 1;
+            } else if mutated[i..i + 4] == [0x50, 0x4b, 0x01, 0x02]
+                && i + 12 < mutated.len()
+                && mutated[i + 10] == 0
+                && mutated[i + 11] == 0
+            {
+                mutated[i + 10] = 12;
+                mutated[i + 11] = 0;
+                count += 1;
+            }
+        }
+        assert!(count >= 2, "failed to patch compression");
+        let dir = tempfile::tempdir().unwrap();
+        let err =
+            safe_extract_wheel(&mutated, dir.path(), &ExtractionLimits::default()).unwrap_err();
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("unsupported") && (msg.contains("compression") || msg.contains("method")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_traversal_via_enclosed() {
+        let bytes = make_wheel(&[("../evil.txt", b"hi", zip::CompressionMethod::Stored)]);
+        let dir = tempfile::tempdir().unwrap();
+        let err = safe_extract_wheel(&bytes, dir.path(), &ExtractionLimits::default()).unwrap_err();
+        assert!(err.to_string().contains("enclosed_name"), "{err}");
+    }
+
+    #[test]
+    fn rejects_absolute_path() {
+        let bytes = make_wheel(&[("/etc/evil", b"hi", zip::CompressionMethod::Stored)]);
+        let dir = tempfile::tempdir().unwrap();
+        let err = safe_extract_wheel(&bytes, dir.path(), &ExtractionLimits::default()).unwrap_err();
+        assert!(err.to_string().contains("enclosed_name"), "{err}");
+    }
+
+    #[test]
+    fn rejects_symlink_via_mode() {
+        let mut bytes = make_wheel(&[("link", b"target", zip::CompressionMethod::Stored)]);
+        for i in 0..bytes.len().saturating_sub(4) {
+            if bytes[i..i + 4] == [0x50, 0x4b, 0x01, 0x02] && i + 42 < bytes.len() {
+                let mode: u32 = 0o120777;
+                let attrs = mode << 16;
+                bytes[i + 38] = (attrs & 0xFF) as u8;
+                bytes[i + 39] = ((attrs >> 8) & 0xFF) as u8;
+                bytes[i + 40] = ((attrs >> 16) & 0xFF) as u8;
+                bytes[i + 41] = ((attrs >> 24) & 0xFF) as u8;
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let err = safe_extract_wheel(&bytes, dir.path(), &ExtractionLimits::default()).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+    }
+
+    #[test]
+    fn rejects_duplicate_names() {
+        let mut buf = Cursor::new(Vec::new());
+        let mut zw = zip::ZipWriter::new(&mut buf);
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zw.start_file("dup.txt", opts).unwrap();
+        zw.write_all(b"a").unwrap();
+        let second = zw.start_file("dup.txt", opts);
+        if second.is_err() {
+            return;
+        }
+        zw.write_all(b"b").unwrap();
+        let finish = zw.finish();
+        if finish.is_err() {
+            return;
+        }
+        let bytes = buf.into_inner();
+        let dir = tempfile::tempdir().unwrap();
+        let err = safe_extract_wheel(&bytes, dir.path(), &ExtractionLimits::default()).unwrap_err();
+        assert!(err.to_string().contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn rejects_normalized_duplicate_paths() {
+        let bytes = {
+            let mut buf = Cursor::new(Vec::new());
+            let mut zw = zip::ZipWriter::new(&mut buf);
+            let opts =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            zw.start_file("a.txt", opts).unwrap();
+            zw.write_all(b"first").unwrap();
+            zw.start_file("./a.txt", opts).unwrap();
+            zw.write_all(b"second").unwrap();
+            zw.finish().unwrap();
+            buf.into_inner()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let err = safe_extract_wheel(&bytes, dir.path(), &ExtractionLimits::default()).unwrap_err();
+        assert!(err.to_string().contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn rejects_backslash_and_colon_via_validate() {
+        for name in ["foo\\bar.txt", "foo:bar.txt"] {
+            let bytes = make_wheel(&[(name, b"hi", zip::CompressionMethod::Stored)]);
+            let dir = tempfile::tempdir().unwrap();
+            let err =
+                safe_extract_wheel(&bytes, dir.path(), &ExtractionLimits::default()).unwrap_err();
+            assert!(
+                err.to_string().contains(name)
+                    || err.to_string().contains("backslash")
+                    || err.to_string().contains("colon"),
+                "{err} for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_windows_reserved() {
+        let bytes = make_wheel(&[("CON.txt", b"hi", zip::CompressionMethod::Stored)]);
+        let dir = tempfile::tempdir().unwrap();
+        let err = safe_extract_wheel(&bytes, dir.path(), &ExtractionLimits::default()).unwrap_err();
+        assert!(err.to_string().contains("reserved"), "{err}");
+    }
+
+    #[test]
+    fn rejects_nul_byte() {
+        let name = "a\0b.txt";
+        let bytes = make_wheel(&[(name, b"hi", zip::CompressionMethod::Stored)]);
+        let dir = tempfile::tempdir().unwrap();
+        let err = safe_extract_wheel(&bytes, dir.path(), &ExtractionLimits::default()).unwrap_err();
+        assert!(err.to_string().contains("NUL"), "{err}");
+    }
+
+    #[test]
+    fn enforces_max_entries() {
+        let bytes = make_wheel(&[
+            ("a.txt", b"a", zip::CompressionMethod::Stored),
+            ("b.txt", b"b", zip::CompressionMethod::Stored),
+            ("c.txt", b"c", zip::CompressionMethod::Stored),
+        ]);
+        let limits = ExtractionLimits {
+            max_entries: 2,
+            ..ExtractionLimits::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let err = safe_extract_wheel(&bytes, dir.path(), &limits).unwrap_err();
+        assert!(matches!(err, BluelineError::ExtractionLimit(_)), "{err}");
+    }
+
+    #[test]
+    fn enforces_max_entry_bytes_declared() {
+        let bytes = make_wheel(&[("big.bin", &[0u8; 1024], zip::CompressionMethod::Stored)]);
+        let limits = ExtractionLimits {
+            max_entry_bytes: 512,
+            ..ExtractionLimits::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let err = safe_extract_wheel(&bytes, dir.path(), &limits).unwrap_err();
+        assert!(matches!(err, BluelineError::ExtractionLimit(_)), "{err}");
+    }
+
+    #[test]
+    fn enforces_max_unpacked_during_stream() {
+        let bytes = make_wheel(&[
+            ("a.bin", &[0u8; 600], zip::CompressionMethod::Stored),
+            ("b.bin", &[0u8; 600], zip::CompressionMethod::Stored),
+        ]);
+        let limits = ExtractionLimits {
+            max_unpacked_bytes: 1000,
+            ..ExtractionLimits::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let err = safe_extract_wheel(&bytes, dir.path(), &limits).unwrap_err();
+        assert!(matches!(err, BluelineError::ExtractionLimit(_)), "{err}");
+    }
+
+    #[test]
+    fn handles_directories() {
+        let bytes = make_wheel(&[
+            ("mydir/", b"", zip::CompressionMethod::Stored),
+            ("mydir/file.txt", b"hi", zip::CompressionMethod::Stored),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let stats = safe_extract_wheel(&bytes, dir.path(), &ExtractionLimits::default()).unwrap();
+        assert_eq!(stats.dirs, 1);
+        assert_eq!(stats.files, 1);
+        assert!(dir.path().join("mydir/file.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_perms_are_644() {
+        use std::os::unix::fs::PermissionsExt;
+        let bytes = make_wheel(&[("a.txt", b"hi", zip::CompressionMethod::Stored)]);
+        let dir = tempfile::tempdir().unwrap();
+        safe_extract_wheel(&bytes, dir.path(), &ExtractionLimits::default()).unwrap();
+        let mode = fs::metadata(dir.path().join("a.txt"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o644);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dir_perms_are_755() {
+        use std::os::unix::fs::PermissionsExt;
+        let bytes = make_wheel(&[("mydir/", b"", zip::CompressionMethod::Stored)]);
+        let dir = tempfile::tempdir().unwrap();
+        safe_extract_wheel(&bytes, dir.path(), &ExtractionLimits::default()).unwrap();
+        let mode = fs::metadata(dir.path().join("mydir"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755);
     }
 }

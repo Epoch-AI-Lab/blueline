@@ -7,7 +7,7 @@ use ureq::Agent;
 
 use crate::error::BluelineError;
 use crate::registry::http_util::{RegistryLimits, download_bounded, validate_download_url};
-use crate::registry::{Checksum, ChecksumAlg, Ecosystem, Package, Registry, Release};
+use crate::registry::{Checksum, ChecksumAlg, Ecosystem, Package, Registry, Release, hex_encode};
 
 const USER_AGENT: &str = concat!("blueline/", env!("CARGO_PKG_VERSION"));
 
@@ -458,10 +458,6 @@ fn summarize_versions(entries: &[IndexEntry]) -> String {
         .map(|v| v.to_string())
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
