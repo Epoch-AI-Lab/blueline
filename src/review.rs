@@ -957,6 +957,27 @@ mod tests {
         assert!(parse_spec("pkg==not-a-version!").is_err());
         assert!(parse_spec("pkg@not-a-version!").is_err());
 
+        // parse_spec with PEP 440 prerelease (valid PEP 440, invalid semver)
+        assert_eq!(
+            parse_spec("pkg==1.0.0a1").unwrap(),
+            ("pkg".into(), "1.0.0a1".into())
+        );
+        assert_eq!(
+            parse_spec("pkg@1.0.0a1").unwrap(),
+            ("pkg".into(), "1.0.0a1".into())
+        );
+
+        // prepare_extracted_root on PyPI with METADATA
+        let pypi_dir = tempfile::tempdir().unwrap();
+        let meta_content = "Name: my-pkg\nVersion: 1.0.0\nRequires-Dist: requests >= 2.0; python_version >= '3.8'\nRequires-Dist:   \n";
+        std::fs::write(pypi_dir.path().join("METADATA"), meta_content).unwrap();
+        let (_root, manifest) =
+            prepare_extracted_root(pypi_dir.path(), Ecosystem::PyPi, "my-pkg", "1.0.0").unwrap();
+        assert_eq!(manifest.name, "my-pkg");
+        assert_eq!(manifest.version, "1.0.0");
+        assert_eq!(manifest.dependencies.len(), 1);
+        assert_eq!(manifest.dependencies["requests"], "requests >= 2.0");
+
         // extract_for_ecosystem handles PyPI sdist tar.gz correctly
         let dir = tempfile::tempdir().unwrap();
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());

@@ -315,15 +315,11 @@ pub fn parse_requirements_txt_packages(
             }
             current_line.push_str(without_slash.trim_end());
             current_line.push(' ');
-        } else {
-            if current_line.is_empty() {
-                start_line_num = line_num;
-                raw_lines.push((start_line_num, trimmed.to_string()));
-            } else {
-                current_line.push_str(trimmed);
-                raw_lines.push((start_line_num, current_line.clone()));
-                current_line.clear();
-            }
+        } else if !current_line.is_empty() {
+            current_line.push_str(trimmed);
+            raw_lines.push((start_line_num, std::mem::take(&mut current_line)));
+        } else if !trimmed.is_empty() {
+            raw_lines.push((line_num, trimmed.to_string()));
         }
     }
     if !current_line.is_empty() {
@@ -332,10 +328,6 @@ pub fn parse_requirements_txt_packages(
 
     for (line_num, raw_line) in raw_lines {
         let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
         let code_part = match line.split_once('#') {
             Some((before, _)) => before.trim(),
             None => line,
@@ -1170,8 +1162,15 @@ requests==2.31.0 \
         }
 
         // Empty name or version
-        assert!(parse_requirements_txt_packages("==1.0.0").is_err());
-        assert!(parse_requirements_txt_packages("pkg==").is_err());
+        let err_noname = parse_requirements_txt_packages("==1.0.0").unwrap_err();
+        assert!(
+            matches!(err_noname, LockfileError::InvalidData(msg) if msg.contains("invalid requirement `==1.0.0`"))
+        );
+
+        let err_nover = parse_requirements_txt_packages("pkg==").unwrap_err();
+        assert!(
+            matches!(err_nover, LockfileError::InvalidData(msg) if msg.contains("invalid requirement `pkg==`"))
+        );
 
         // Unclosed extras bracket
         let err_bracket = parse_requirements_txt_packages("pkg[extra==1.0.0").unwrap_err();
@@ -1185,5 +1184,10 @@ requests==2.31.0 \
         assert!(
             matches!(err_hex, LockfileError::InvalidData(msg) if msg.contains("invalid sha256 hash length"))
         );
+
+        // Trailing continuation line without subsequent non-slash line
+        let trailing_cont = "pkg==1.0.0 \\\n";
+        let parsed_trailing = parse_requirements_txt_packages(trailing_cont).unwrap();
+        assert_eq!(parsed_trailing["pkg"].version, "1.0.0");
     }
 }
