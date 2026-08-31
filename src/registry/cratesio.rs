@@ -7,7 +7,7 @@ use ureq::Agent;
 
 use crate::error::BluelineError;
 use crate::registry::http_util::{RegistryLimits, download_bounded, validate_download_url};
-use crate::registry::{Checksum, ChecksumAlg, Ecosystem, Package, Registry, Release};
+use crate::registry::{Checksum, ChecksumAlg, Ecosystem, Package, Registry, Release, hex_encode};
 
 const USER_AGENT: &str = concat!("blueline/", env!("CARGO_PKG_VERSION"));
 
@@ -332,9 +332,9 @@ fn sparse_index_path(canonical: &str) -> Result<String, BluelineError> {
     Ok(path)
 }
 
-/// Lowercase the name and fold `_` to `-`, matching cargo's canonical form.
+/// Lowercase the crate name, matching crates.io index paths.
 pub fn canonical_crate_name(name: &str) -> String {
-    name.to_ascii_lowercase().replace('_', "-")
+    name.to_ascii_lowercase()
 }
 
 /// Crate names are ASCII alphanumeric plus `-` and `_`, at most 64 chars.
@@ -460,10 +460,6 @@ fn summarize_versions(entries: &[IndexEntry]) -> String {
         .join(", ")
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,9 +482,9 @@ mod tests {
 
     #[test]
     fn canonicalizes_names() {
-        assert_eq!(canonical_crate_name("Serde_JSON"), "serde-json");
+        assert_eq!(canonical_crate_name("Serde_JSON"), "serde_json");
         assert_eq!(canonical_crate_name("tokio"), "tokio");
-        assert_eq!(canonical_crate_name("MiXeD_CaSe"), "mixed-case");
+        assert_eq!(canonical_crate_name("MiXeD_CaSe"), "mixed_case");
     }
 
     #[test]
@@ -819,7 +815,7 @@ mod tests {
 
         let reg = CratesIoRegistry::new(&server.base);
         let pkg = reg.resolve(name, version).unwrap();
-        assert_eq!(pkg.name, "my-crate");
+        assert_eq!(pkg.name, "my_crate");
         assert_eq!(reg.default_version(name).unwrap().as_deref(), Some(version));
     }
 }

@@ -4,6 +4,7 @@ use crate::policy::Policy;
 use crate::provenance::{ProvenanceReport, ProvenanceStatus};
 use crate::registry::Ecosystem;
 use crate::verdict::{DiffSummary, Finding, TrustSources, Verdict, VerdictBand};
+use crate::version::VersionInfo;
 
 #[allow(dead_code)]
 pub fn evaluate(
@@ -38,6 +39,7 @@ pub fn evaluate_with_policy(
         delta,
         is_unreviewed_baseline,
         false,
+        false,
         policy,
         None,
         None,
@@ -52,6 +54,7 @@ pub fn evaluate_with_trust(
     delta: &Delta,
     is_unreviewed_baseline: bool,
     prior_release_yanked: bool,
+    target_release_yanked: bool,
     policy: &Policy,
     advisories: Option<&AdvisoryReport>,
     provenance: Option<&ProvenanceReport>,
@@ -377,37 +380,73 @@ pub fn evaluate_with_trust(
 
     // R05: Large diff anomaly on patch or non-standard semver
     if let Some(base_ver_str) = &delta.baseline_version {
-        match (
-            semver::Version::parse(base_ver_str),
-            semver::Version::parse(&delta.target_version),
-        ) {
-            (Ok(base_v), Ok(target_v)) => {
-                if base_v.major == target_v.major
-                    && base_v.minor == target_v.minor
-                    && delta.total_lines_added > 500
-                {
+        if ecosystem == Ecosystem::PyPi {
+            if let (Ok(base_v), Ok(target_v)) = (
+                crate::version::Pep440Version::parse(base_ver_str),
+                crate::version::Pep440Version::parse(&delta.target_version),
+            ) {
+                let same_major_minor = base_v.epoch() == target_v.epoch()
+                    && base_v.release().len() >= 2
+                    && target_v.release().len() >= 2
+                    && base_v.release()[0] == target_v.release()[0]
+                    && base_v.release()[1] == target_v.release()[1];
+                if same_major_minor && delta.total_lines_added > 500 {
                     findings.push(Finding {
                         rule_id: "R05_LARGE_PATCH_DIFF".into(),
                         severity: VerdictBand::Medium,
                         title: format!("Large patch delta (+{} lines)", delta.total_lines_added),
                         description: format!(
-                            "Patch release {base_v} -> {target_v} added {} lines across {} files.",
+                            "Patch release {base_ver_str} -> {} added {} lines across {} files.",
+                            delta.target_version,
                             delta.total_lines_added,
                             delta.files_added.len() + delta.files_modified.len()
                         ),
                     });
                 }
-            }
-            _ => {
+            } else {
                 findings.push(Finding {
                     rule_id: "R05_NON_STANDARD_VERSION".into(),
                     severity: VerdictBand::Medium,
                     title: "Non-standard version format".into(),
                     description: format!(
-                        "Baseline `{base_ver_str}` or target `{}` does not conform to strict semver.",
+                        "Baseline `{base_ver_str}` or target `{}` does not conform to PEP 440.",
                         delta.target_version
                     ),
                 });
+            }
+        } else {
+            match (
+                semver::Version::parse(base_ver_str),
+                semver::Version::parse(&delta.target_version),
+            ) {
+                (Ok(base_v), Ok(target_v)) => {
+                    if base_v.major == target_v.major
+                        && base_v.minor == target_v.minor
+                        && delta.total_lines_added > 500
+                    {
+                        findings.push(Finding {
+                            rule_id: "R05_LARGE_PATCH_DIFF".into(),
+                            severity: VerdictBand::Medium,
+                            title: format!("Large patch delta (+{} lines)", delta.total_lines_added),
+                            description: format!(
+                                "Patch release {base_v} -> {target_v} added {} lines across {} files.",
+                                delta.total_lines_added,
+                                delta.files_added.len() + delta.files_modified.len()
+                            ),
+                        });
+                    }
+                }
+                _ => {
+                    findings.push(Finding {
+                        rule_id: "R05_NON_STANDARD_VERSION".into(),
+                        severity: VerdictBand::Medium,
+                        title: "Non-standard version format".into(),
+                        description: format!(
+                            "Baseline `{base_ver_str}` or target `{}` does not conform to strict semver.",
+                            delta.target_version
+                        ),
+                    });
+                }
             }
         }
     }
@@ -461,6 +500,76 @@ pub fn evaluate_with_trust(
                 "The release immediately before `{}` (`{prior_ver}`) was yanked from the registry. Yanked releases are a common supply-chain attack cleanup signal; the diff anchor may be older than expected.",
                 delta.target_version
             ),
+        });
+    }
+
+    // R09: Target release itself was yanked on the registry
+    if target_release_yanked {
+        findings.push(Finding {
+            rule_id: "R09_YANKED_TARGET".into(),
+            severity: VerdictBand::Medium,
+            title: format!("Target release `{}` was yanked", delta.target_version),
+            description: format!(
+                "The target release `{}` is marked as yanked on the registry. Yanked releases are often withdrawn due to critical bugs or security compromises.",
+                delta.target_version
+            ),
+        });
+    }
+
+    // PyPI-specific findings: entry points, native binaries, and sdist build code
+    let has_entry_points = ecosystem == Ecosystem::PyPi
+        && delta
+            .files_added
+            .iter()
+            .chain(delta.files_modified.iter())
+            .any(|f| {
+                f.relative_path.ends_with(".dist-info/entry_points.txt")
+                    || f.relative_path.ends_with("/entry_points.txt")
+                    || f.relative_path == "entry_points.txt"
+                    || f.relative_path.contains(".data/scripts/")
+                    || f.relative_path.starts_with("data/scripts/")
+            });
+    if has_entry_points {
+        findings.push(Finding {
+            rule_id: "R02_ENTRY_POINTS_SCRIPT".into(),
+            severity: VerdictBand::Medium,
+            title: "New executable entry points or scripts introduced".into(),
+            description: "The package adds console_scripts entry points or .data/scripts files that install executables into PATH.".into(),
+        });
+    }
+
+    let has_native_binary = delta
+        .files_added
+        .iter()
+        .chain(delta.files_modified.iter())
+        .any(|f| {
+            let p = f.relative_path.to_ascii_lowercase();
+            p.ends_with(".so")
+                || p.ends_with(".pyd")
+                || p.ends_with(".dylib")
+                || p.ends_with(".dll")
+        });
+    if has_native_binary && ecosystem == Ecosystem::PyPi {
+        findings.push(Finding {
+            rule_id: "R06_NATIVE_PLATFORM_WHEEL".into(),
+            severity: VerdictBand::Low,
+            title: "Native binary extensions in wheel artifact".into(),
+            description:
+                "Target artifact contains compiled binary extensions (.so / .pyd / .dylib / .dll)."
+                    .into(),
+        });
+    }
+
+    let has_sdist_setup = delta
+        .files_added
+        .iter()
+        .any(|f| f.relative_path == "setup.py" || f.relative_path == "setup.cfg");
+    if has_sdist_setup && ecosystem == Ecosystem::PyPi {
+        findings.push(Finding {
+            rule_id: "R04_SDIST_BUILD_CODE".into(),
+            severity: VerdictBand::Medium,
+            title: "Source distribution (sdist) executes build code on install".into(),
+            description: "Target artifact is a source distribution containing setup.py/setup.cfg which executes arbitrary code during build/install.".into(),
         });
     }
 
@@ -616,19 +725,32 @@ fn scan_diff_for_suspicious_patterns(path: &str, diff: &str, findings: &mut Vec<
         });
     }
 
-    for line in added_lines {
-        if is_suspicious_high_entropy(line) {
-            findings.push(Finding {
-                rule_id: "R03_HIGH_ENTROPY".into(),
-                severity: VerdictBand::High,
-                title: format!("High-entropy obfuscated token in `{path}`"),
-                description: format!(
-                    "Diff introduced high-entropy obfuscated string/payload in `{path}`."
-                ),
-            });
-            break;
+    if !is_metadata_or_lockfile(path) {
+        for line in added_lines {
+            if is_suspicious_high_entropy(line) {
+                findings.push(Finding {
+                    rule_id: "R03_HIGH_ENTROPY".into(),
+                    severity: VerdictBand::High,
+                    title: format!("High-entropy obfuscated token in `{path}`"),
+                    description: format!(
+                        "Diff introduced high-entropy obfuscated string/payload in `{path}`."
+                    ),
+                });
+                break;
+            }
         }
     }
+}
+
+fn is_metadata_or_lockfile(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    p.ends_with(".dist-info/record")
+        || p.ends_with("/record")
+        || p == "record"
+        || p.ends_with("cargo.lock")
+        || p.ends_with("package-lock.json")
+        || p.ends_with("pnpm-lock.yaml")
+        || p.ends_with("yarn.lock")
 }
 
 fn unescape_js(s: &str) -> String {
@@ -2442,6 +2564,7 @@ mod tests {
             &delta,
             false,
             false,
+            false,
             &Policy::default(),
             Some(&adv),
             None,
@@ -2499,6 +2622,7 @@ mod tests {
             &delta,
             false,
             false,
+            false,
             &Policy::default(),
             Some(&adv),
             None,
@@ -2541,6 +2665,7 @@ mod tests {
             Ecosystem::Npm,
             "verified (sha512)",
             &delta,
+            false,
             false,
             false,
             &Policy::default(),
@@ -2589,6 +2714,7 @@ mod tests {
             &delta,
             false,
             false,
+            false,
             &policy,
             None,
             Some(&prov_missing),
@@ -2625,6 +2751,7 @@ mod tests {
             Ecosystem::Npm,
             "verified (sha512)",
             &delta,
+            false,
             false,
             false,
             &policy_repo,
@@ -2948,6 +3075,7 @@ mod tests {
             &delta,
             false,
             true,
+            false,
             &Policy::default(),
             None,
             None,
@@ -2968,6 +3096,35 @@ mod tests {
     }
 
     #[test]
+    fn flags_yanked_target_as_medium() {
+        let delta = yanked_delta();
+        let verdict = evaluate_with_trust(
+            "test-pkg",
+            Ecosystem::PyPi,
+            "sha256:abc",
+            &delta,
+            false,
+            false,
+            true,
+            &Policy::default(),
+            None,
+            None,
+        );
+        let r09 = verdict
+            .findings
+            .iter()
+            .find(|f| f.rule_id == "R09_YANKED_TARGET");
+        assert!(
+            r09.is_some(),
+            "expected R09 finding, got {:?}",
+            verdict.findings
+        );
+        assert_eq!(r09.unwrap().severity, VerdictBand::Medium);
+        assert_eq!(verdict.risk_score, 10);
+        assert_eq!(verdict.band, VerdictBand::Medium);
+    }
+
+    #[test]
     fn no_yanked_predecessor_finding_when_prior_is_live() {
         let delta = yanked_delta();
         let verdict = evaluate_with_trust(
@@ -2975,6 +3132,7 @@ mod tests {
             Ecosystem::Cargo,
             "sha256:abc",
             &delta,
+            false,
             false,
             false,
             &Policy::default(),

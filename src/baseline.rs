@@ -21,6 +21,8 @@ pub struct BaselineSelection {
     /// The release immediately preceding the target is yanked. Supply-chain
     /// signal regardless of which anchor won (feeds R08_YANKED_PREDECESSOR).
     pub prior_release_yanked: bool,
+    /// The target release itself is yanked on the registry (feeds R09_YANKED_TARGET).
+    pub target_release_yanked: bool,
 }
 
 impl BaselineResolution {
@@ -53,20 +55,16 @@ pub fn resolve_baseline<R: Registry, V: VersionInfo>(
     registry: &R,
     store: &BaselineStore,
 ) -> Result<BaselineSelection, BluelineError> {
-    let target_semver = semver::Version::parse(&target_ver.canonical()).map_err(|e| {
-        BluelineError::InvalidPackageSpec(format!(
-            "version `{}` is not comparable for baseline selection: {e}",
-            target_ver.canonical()
-        ))
-    })?;
+    let all_releases = registry.list_releases(name)?;
+    let target_release_yanked = all_releases
+        .iter()
+        .find(|r| V::parse(&r.version).ok().as_ref() == Some(target_ver))
+        .is_some_and(|r| r.yanked);
 
-    // Yanked-aware history: the immediate prior release and the highest
-    // non-yanked predecessor both come from the release list.
-    let mut eligible: Vec<(semver::Version, Release)> = registry
-        .list_releases(name)?
+    let mut eligible: Vec<(V, Release)> = all_releases
         .into_iter()
-        .filter_map(|r| semver::Version::parse(&r.version).ok().map(|v| (v, r)))
-        .filter(|(v, _)| *v < target_semver && (target_semver.pre.is_empty() || v.pre.is_empty()))
+        .filter_map(|r| V::parse(&r.version).ok().map(|v| (v, r)))
+        .filter(|(v, _)| v.baseline_eligible_for(target_ver))
         .collect();
     eligible.sort_by(|a, b| a.0.cmp(&b.0));
     let prior_release_yanked = eligible.last().is_some_and(|(_, r)| r.yanked);
@@ -84,6 +82,7 @@ pub fn resolve_baseline<R: Registry, V: VersionInfo>(
                         return Ok(BaselineSelection {
                             resolution: BaselineResolution::LocalApproved(pkg),
                             prior_release_yanked,
+                            target_release_yanked,
                         });
                     }
                     (Some(reg_integ), _) => {
@@ -117,23 +116,25 @@ pub fn resolve_baseline<R: Registry, V: VersionInfo>(
 
     // Predecessor = highest NON-YANKED eligible release. All-yanked history
     // degrades to FirstSighting (with the R08 warning carried alongside).
-    let predecessor = eligible
+    let predecessor_version = eligible
         .iter()
         .rev()
         .find(|(_, r)| !r.yanked)
-        .map(|(v, _)| v.clone());
+        .map(|(_, r)| r.version.clone());
 
-    if let Some(pred_ver) = predecessor {
-        let pkg = registry.resolve(name, &pred_ver.to_string())?;
+    if let Some(pred_str) = predecessor_version {
+        let pkg = registry.resolve(name, &pred_str)?;
         return Ok(BaselineSelection {
             resolution: BaselineResolution::RegistryPredecessor(pkg),
             prior_release_yanked,
+            target_release_yanked,
         });
     }
 
     Ok(BaselineSelection {
         resolution: BaselineResolution::FirstSighting,
         prior_release_yanked,
+        target_release_yanked,
     })
 }
 
@@ -217,15 +218,26 @@ mod tests {
         }
 
         fn list_releases(&self, name: &str) -> Result<Vec<Release>, BluelineError> {
-            Ok(self
-                .list_versions(name)?
-                .into_iter()
+            let mut releases: Vec<Release> = self
+                .versions
+                .iter()
                 .map(|v| Release {
-                    yanked: self.yanked_versions.contains(&v.to_string()),
-                    version: v.to_string(),
+                    yanked: self.yanked_versions.contains(v),
+                    version: v.clone(),
                     publish_time: None,
                 })
-                .collect())
+                .collect();
+            releases.sort_by(|a, b| {
+                let av = crate::version::Pep440Version::parse(&a.version)
+                    .ok()
+                    .map(|v| v.canonical());
+                let bv = crate::version::Pep440Version::parse(&b.version)
+                    .ok()
+                    .map(|v| v.canonical());
+                av.cmp(&bv)
+            });
+            let _ = name;
+            Ok(releases)
         }
 
         fn default_version(&self, _name: &str) -> Result<Option<String>, BluelineError> {
@@ -376,5 +388,50 @@ mod tests {
         let target = semver::Version::parse("1.1.0").unwrap();
         let err = resolve_baseline("pkg", &target, &registry, &store).unwrap_err();
         assert!(err.to_string().contains("reported no integrity"));
+    }
+
+    #[test]
+    fn pep440_baseline_skips_prerelease_for_stable_target() {
+        use crate::version::Pep440Version;
+        let dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
+        let registry = MockRegistry::new(vec!["1.0".into(), "1.0a1".into(), "1.0.1".into()]);
+        let target = Pep440Version::parse("1.0.1").unwrap();
+        let res = resolve_baseline("pkg", &target, &registry, &store).unwrap();
+        match res.resolution {
+            BaselineResolution::RegistryPredecessor(p) => assert_eq!(p.version, "1.0"),
+            other => panic!("expected predecessor 1.0, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pep440_baseline_allows_prerelease_for_prerelease_target() {
+        use crate::version::Pep440Version;
+        let dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
+        let registry = MockRegistry::new(vec!["1.0".into(), "1.0a1".into()]);
+        let target = Pep440Version::parse("1.0a2").unwrap();
+        let res = resolve_baseline("pkg", &target, &registry, &store).unwrap();
+        match res.resolution {
+            BaselineResolution::RegistryPredecessor(p) => assert_eq!(p.version, "1.0a1"),
+            other => panic!("expected predecessor 1.0a1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn baseline_detects_target_and_prior_yanked() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
+        let mut registry = MockRegistry::new(vec!["1.0.0".into(), "1.1.0".into(), "1.2.0".into()]);
+        registry.yanked_versions = vec!["1.1.0".into(), "1.2.0".into()];
+        let target = semver::Version::parse("1.2.0").unwrap();
+        let res = resolve_baseline("pkg", &target, &registry, &store).unwrap();
+        assert!(res.target_release_yanked);
+        assert!(res.prior_release_yanked);
+
+        let target_stable = semver::Version::parse("1.0.0").unwrap();
+        let res2 = resolve_baseline("pkg", &target_stable, &registry, &store).unwrap();
+        assert!(!res2.target_release_yanked);
+        assert!(!res2.prior_release_yanked);
     }
 }

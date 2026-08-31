@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
+use crate::version::VersionInfo;
+
 #[derive(Debug, Error)]
 pub enum LockfileError {
     #[error("failed to parse lockfile JSON: {0}")]
@@ -273,6 +275,200 @@ pub fn parse_cargo_lock_packages(
     }
 
     Ok(out)
+}
+
+const MAX_REQUIREMENTS_TXT_BYTES: usize = 10 * 1024 * 1024;
+
+/// Parse a pinned requirements.txt file (PEP 508 / pip requirements format).
+/// Fail-closed rules:
+/// - Size cap 10 MiB.
+/// - Unpinned specifications (e.g. `foo>=1.0`, `bar`, `baz~=2.0`, `qux!=1.1`) fail closed
+///   with line-numbered errors listing every unpinned line.
+/// - Valid lines must have exact pinned version `name == version` (or `name==version`).
+/// - Optional `--hash=sha256:<hex>` is parsed and validated (64 hex characters).
+/// - Comments (`#...`), blank lines, and options like `--index-url`, `--extra-index-url`, `-r` are skipped.
+pub fn parse_requirements_txt_packages(
+    content: &str,
+) -> Result<BTreeMap<String, PackageEntry>, LockfileError> {
+    if content.len() > MAX_REQUIREMENTS_TXT_BYTES {
+        return Err(LockfileError::InvalidData(format!(
+            "requirements.txt exceeds maximum size of {} bytes (got {})",
+            MAX_REQUIREMENTS_TXT_BYTES,
+            content.len()
+        )));
+    }
+
+    let mut packages = BTreeMap::new();
+    let mut unpinned_errors = Vec::new();
+
+    // Process line continuations (lines ending in `\`)
+    let mut raw_lines = Vec::new();
+    let mut current_line = String::new();
+    let mut start_line_num = 1;
+
+    for (idx, line) in content.lines().enumerate() {
+        let line_num = idx + 1;
+        let trimmed = line.trim();
+        if let Some(without_slash) = trimmed.strip_suffix('\\') {
+            if current_line.is_empty() {
+                start_line_num = line_num;
+            }
+            current_line.push_str(without_slash.trim_end());
+            current_line.push(' ');
+        } else if !current_line.is_empty() {
+            current_line.push_str(trimmed);
+            raw_lines.push((start_line_num, std::mem::take(&mut current_line)));
+        } else if !trimmed.is_empty() {
+            raw_lines.push((line_num, trimmed.to_string()));
+        }
+    }
+    if !current_line.is_empty() {
+        raw_lines.push((start_line_num, current_line));
+    }
+
+    for (line_num, raw_line) in raw_lines {
+        let line = raw_line.trim();
+        let code_part = match line.split_once('#') {
+            Some((before, _)) => before.trim(),
+            None => line,
+        };
+        if code_part.is_empty() {
+            continue;
+        }
+
+        // Skip standalone flags: -i, --index-url, --extra-index-url, -r, --requirement, -f, --find-links, etc.
+        if code_part.starts_with('-') && !code_part.starts_with("--hash") {
+            continue;
+        }
+
+        let tokens: Vec<&str> = code_part.split_whitespace().collect();
+        if tokens.is_empty() {
+            continue;
+        }
+
+        let mut hashes = Vec::new();
+        let mut spec_tokens = Vec::new();
+
+        let mut tokens_iter = tokens.into_iter();
+        while let Some(tok) = tokens_iter.next() {
+            if let Some(h) = tok.strip_prefix("--hash=") {
+                let h_clean = h.strip_prefix("sha256:").unwrap_or(h).trim();
+                hashes.push(h_clean.to_string());
+            } else if tok == "--hash" {
+                if let Some(next) = tokens_iter.next() {
+                    let h_clean = next.strip_prefix("sha256:").unwrap_or(next).trim();
+                    hashes.push(h_clean.to_string());
+                } else {
+                    return Err(LockfileError::InvalidData(format!(
+                        "line {line_num}: `--hash` option missing hash value"
+                    )));
+                }
+            } else {
+                spec_tokens.push(tok);
+            }
+        }
+
+        let spec = spec_tokens.join("");
+        if spec.is_empty() {
+            continue;
+        }
+
+        // Separate environment marker `; ...` before range checking the requirement
+        let (req_spec, _marker) = match spec.split_once(';') {
+            Some((before, after)) => (before.trim(), Some(after.trim())),
+            None => (spec.as_str(), None),
+        };
+
+        if req_spec.is_empty() {
+            continue;
+        }
+
+        let has_range_op = [">=", "<=", ">", "<", "~=", "!=", "===", "@"]
+            .into_iter()
+            .any(|op| req_spec.contains(op));
+
+        if has_range_op {
+            unpinned_errors.push(format!("  line {line_num}: unpinned range `{req_spec}`"));
+            continue;
+        }
+
+        if let Some((name_part, ver_part)) = req_spec.split_once("==") {
+            let raw_name = name_part.trim();
+            let ver = ver_part.trim();
+
+            if raw_name.is_empty() || ver.is_empty() {
+                unpinned_errors.push(format!(
+                    "  line {line_num}: invalid requirement `{req_spec}`"
+                ));
+                continue;
+            }
+
+            // Extract base package name and extras if present: `foo[extra1,extra2]`
+            let name = if let Some((base, extras_part)) = raw_name.split_once('[') {
+                if !extras_part.ends_with(']') {
+                    return Err(LockfileError::InvalidData(format!(
+                        "line {line_num}: unclosed extras bracket in `{raw_name}`"
+                    )));
+                }
+                base.trim()
+            } else {
+                raw_name
+            };
+
+            if !crate::version::validate_pypi_name(name) {
+                return Err(LockfileError::InvalidData(format!(
+                    "line {line_num}: invalid PyPI package name `{name}`"
+                )));
+            }
+
+            if crate::version::Pep440Version::parse(ver).is_err() {
+                return Err(LockfileError::InvalidData(format!(
+                    "line {line_num}: invalid PEP 440 version `{ver}` in `{req_spec}`"
+                )));
+            }
+
+            let mut formatted_hashes = Vec::new();
+            for h in hashes {
+                let hex = h.to_lowercase();
+                if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Err(LockfileError::InvalidData(format!(
+                        "line {line_num}: invalid sha256 hash length (expected 64 hex chars, got `{h}`)"
+                    )));
+                }
+                formatted_hashes.push(format!("sha256:{hex}"));
+            }
+            let integrity = if formatted_hashes.is_empty() {
+                None
+            } else {
+                Some(formatted_hashes.join(" "))
+            };
+
+            let canon_name = crate::version::canonicalize_name(name);
+            packages.insert(
+                canon_name,
+                PackageEntry {
+                    name: name.to_string(),
+                    version: ver.to_string(),
+                    integrity,
+                    resolved: None,
+                    is_dev: false,
+                },
+            );
+        } else {
+            unpinned_errors.push(format!(
+                "  line {line_num}: unpinned package `{spec}` (must use `name==version`)"
+            ));
+        }
+    }
+
+    if !unpinned_errors.is_empty() {
+        return Err(LockfileError::InvalidData(format!(
+            "requirements.txt contains unpinned dependencies (all packages must be pinned with `==`):\n{}",
+            unpinned_errors.join("\n")
+        )));
+    }
+
+    Ok(packages)
 }
 
 pub fn compute_delta_from_maps(
@@ -857,5 +1053,141 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 "#;
         assert!(parse_cargo_lock_packages(dup_same).is_ok());
+    }
+
+    #[test]
+    fn parses_pinned_requirements_txt_with_hashes() {
+        let content = r#"
+# Core dependencies
+requests==2.31.0 \
+    --hash=sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890
+
+Flask==3.0.0 --hash sha256:1111111111111111111111111111111111111111111111111111111111111111
+urllib3==2.1.0 # trailing comment
+"#;
+        let pkgs = parse_requirements_txt_packages(content).unwrap();
+        assert_eq!(pkgs.len(), 3);
+        assert_eq!(pkgs["requests"].version, "2.31.0");
+        assert_eq!(
+            pkgs["requests"].integrity.as_deref(),
+            Some("sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890")
+        );
+        assert_eq!(pkgs["flask"].name, "Flask");
+        assert_eq!(pkgs["flask"].version, "3.0.0");
+        assert_eq!(pkgs["urllib3"].integrity, None);
+    }
+
+    #[test]
+    fn rejects_unpinned_requirements_with_line_numbers() {
+        let content = "requests>=2.0.0\nflask==3.0.0\npytest~=7.0\nblack\n";
+        let err = parse_requirements_txt_packages(content)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("line 1: unpinned range `requests>=2.0.0`"));
+        assert!(err.contains("line 3: unpinned range `pytest~=7.0`"));
+        assert!(err.contains("line 4: unpinned package `black`"));
+    }
+
+    #[test]
+    fn requirements_txt_flags_and_edge_cases() {
+        let content = r#"
+# Flags to ignore
+-i https://pypi.org/simple
+--extra-index-url https://example.com/pypi
+-r base.txt
+--requirement other.txt
+-f /path/to/wheels
+
+# Empty lines and comments with whitespace
+   # leading space comment
+   
+requests==2.31.0 \
+    --hash sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890 \
+    --hash=sha256:1111111111111111111111111111111111111111111111111111111111111111
+"#;
+        let pkgs = parse_requirements_txt_packages(content).unwrap();
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs["requests"].version, "2.31.0");
+
+        // Trailing line continuation with no trailing newline
+        let no_nl = "urllib3==2.1.0 \\\n  --hash sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let pkgs2 = parse_requirements_txt_packages(no_nl).unwrap();
+        assert_eq!(pkgs2["urllib3"].version, "2.1.0");
+
+        // Missing hash value after `--hash`
+        let missing_hash = "requests==2.31.0 --hash";
+        let err = parse_requirements_txt_packages(missing_hash).unwrap_err();
+        assert!(
+            matches!(err, LockfileError::InvalidData(msg) if msg.contains("missing hash value"))
+        );
+
+        // Exact MAX_REQUIREMENTS_TXT_BYTES size boundary test
+        let header = "requests==2.31.0\n";
+        let mut at_limit = String::with_capacity(MAX_REQUIREMENTS_TXT_BYTES);
+        at_limit.push_str(header);
+        let remaining = MAX_REQUIREMENTS_TXT_BYTES - at_limit.len() - 2;
+        at_limit.push('#');
+        at_limit.push_str(&"a".repeat(remaining));
+        at_limit.push('\n');
+        assert_eq!(at_limit.len(), MAX_REQUIREMENTS_TXT_BYTES);
+        assert!(parse_requirements_txt_packages(&at_limit).is_ok());
+
+        let over_limit = format!("{at_limit}a");
+        assert_eq!(over_limit.len(), MAX_REQUIREMENTS_TXT_BYTES + 1);
+        let err_over = parse_requirements_txt_packages(&over_limit).unwrap_err();
+        assert!(
+            matches!(err_over, LockfileError::InvalidData(msg) if msg.contains("exceeds maximum size"))
+        );
+
+        assert_eq!(MAX_REQUIREMENTS_TXT_BYTES, 10 * 1024 * 1024);
+
+        let blanks_and_comments =
+            "\n\n# comment 1\n   # comment 2\n\nflask==3.0.0\n\n# trailing comment\n";
+        let parsed = parse_requirements_txt_packages(blanks_and_comments).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed["flask"].version, "3.0.0");
+
+        // Test each unpinned range operator
+        for op in [">=", "<=", ">", "<", "~=", "!=", "===", "@"] {
+            let spec = if op == "@" {
+                "pkg @ https://example.com/pkg.whl".to_string()
+            } else {
+                format!("pkg{op}1.0.0")
+            };
+            let err = parse_requirements_txt_packages(&spec).unwrap_err();
+            assert!(
+                matches!(err, LockfileError::InvalidData(msg) if msg.contains("unpinned range")),
+                "expected unpinned error for operator {op}"
+            );
+        }
+
+        // Empty name or version
+        let err_noname = parse_requirements_txt_packages("==1.0.0").unwrap_err();
+        assert!(
+            matches!(err_noname, LockfileError::InvalidData(msg) if msg.contains("invalid requirement `==1.0.0`"))
+        );
+
+        let err_nover = parse_requirements_txt_packages("pkg==").unwrap_err();
+        assert!(
+            matches!(err_nover, LockfileError::InvalidData(msg) if msg.contains("invalid requirement `pkg==`"))
+        );
+
+        // Unclosed extras bracket
+        let err_bracket = parse_requirements_txt_packages("pkg[extra==1.0.0").unwrap_err();
+        assert!(
+            matches!(err_bracket, LockfileError::InvalidData(msg) if msg.contains("unclosed extras bracket"))
+        );
+
+        // Invalid hash hex character (64 chars but contains 'z')
+        let bad_hex = format!("pkg==1.0.0 --hash=sha256:{}z", "a".repeat(63));
+        let err_hex = parse_requirements_txt_packages(&bad_hex).unwrap_err();
+        assert!(
+            matches!(err_hex, LockfileError::InvalidData(msg) if msg.contains("invalid sha256 hash length"))
+        );
+
+        // Trailing continuation line without subsequent non-slash line
+        let trailing_cont = "pkg==1.0.0 \\\n";
+        let parsed_trailing = parse_requirements_txt_packages(trailing_cont).unwrap();
+        assert_eq!(parsed_trailing["pkg"].version, "1.0.0");
     }
 }

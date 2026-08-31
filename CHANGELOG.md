@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- PyPI registry adapter (`blueline --ecosystem pypi review <package>==<version>` / `<package>@<version>`):
+  PEP 440 `Pep440Version` (`VersionInfo` seam, epoch, zero-padded release, `a<b<rc` with `c→rc`, `post`/`dev`/`local`) validated against `pypa/packaging` vectors, PEP 503 name normalization (`[-_.]+→-`, lowercased, strict validation), `zip` crate (`default-features=false, features=["deflate"]`) wheel extraction wrapped with stored+deflate-only, encrypted/duplicate/symlink/traversal/absolute/NUL/Corruption and `ExtractionLimits` plus inflated-size-vs-declared checks and CRC propagation, Simple API `GET /simple/{norm}/` (`hashes.sha256`, `yanked` bool|string, `upload-time` RFC3339) powering `list_releases` / `default_version` / `resolve` with deterministic wheel choice (`py3-none-any` preferred, else lex-min) and `sha256` pre-extract verification. `blueline install` refuses PyPI (sdist builds execute arbitrary code).
+- PEP 740 provenance: PyPI provenance endpoint (`GET /integrity/{norm}/{ver}/{filename}/provenance`) parsing DSSE in-toto statements and verifying subject sha256 checksums with cache integration.
+- PyPI security findings: `R09_YANKED_TARGET` for yanked releases, `R02_ENTRY_POINTS_SCRIPT` for console_scripts / .data/scripts, `R06_NATIVE_PLATFORM_WHEEL` for compiled binary extensions, and `R04_SDIST_BUILD_CODE` for source distributions.
+- Pinned `requirements.txt` CI scanning: `blueline ci` parses `name==version` requirements, rejects unpinned range operators with line-numbered errors, and enforces `--hash=sha256:...` checksum validation with `BLOCK` verdicts on mismatch.
+- PEP 440 parser fuzz target under `fuzz/fuzz_targets/pypi_version.rs`.
+- Wheel extraction hardening (`src/wheel_extract.rs`) reusing `validate_entry_path` and `ExtractionLimits` with `0o644`/`0o755` and symlink-via-mode checks.
 - crates.io registry adapter (`blueline --ecosystem cargo review <crate>@<ver>`):
   sparse-index NDJSON client with fail-closed parsing (bad `vers` on a
   recognized row aborts; unknown schema `v > 2` rows are skipped with a note;

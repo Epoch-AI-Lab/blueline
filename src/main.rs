@@ -17,7 +17,16 @@ fn run() -> anyhow::Result<()> {
     // npm talks to the registry base; cargo reviews use the sparse index base.
     let registry_base = match ecosystem {
         blueline::registry::Ecosystem::Npm => cli.registry.clone(),
-        _ => cli.index.clone(),
+        blueline::registry::Ecosystem::Cargo => cli.index.clone(),
+        blueline::registry::Ecosystem::PyPi => {
+            if cli.index != "https://index.crates.io" {
+                cli.index.clone()
+            } else if cli.registry != "https://registry.npmjs.org" {
+                cli.registry.clone()
+            } else {
+                "https://pypi.org".to_string()
+            }
+        }
     };
     match cli.command {
         cli::Command::Review { pkg, output, yes } => review::run(
