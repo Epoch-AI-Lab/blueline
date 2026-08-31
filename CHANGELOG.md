@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-31
+
 ### Added
 
 - PyPI registry adapter (`blueline --ecosystem pypi review <package>==<version>` / `<package>@<version>`):

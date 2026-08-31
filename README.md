@@ -47,11 +47,13 @@ If a release exceeds risk thresholds, Blueline blocks the install and halts the 
 
 ## Project status
 
-- [x] Sandboxed tarball extraction with path traversal and symlink guards
-- [x] Package manifest parser and integrity verification (SHA-512)
-- [x] SQLite store for verified baseline releases
-- [x] CLI review command (`blueline review <pkg@ver>`)
-- [x] Line-level diff engine
+- [x] Multi-registry support: npm, crates.io (`--ecosystem cargo`), and PyPI (`--ecosystem pypi`)
+- [x] Sandboxed archive extraction with path traversal, symlink, and decompression bomb guards
+- [x] Package manifest parsing, cryptographic integrity (SHA-256 / SHA-512), and PEP 740 / SLSA provenance
+- [x] SQLite store for verified baseline releases and audit logging
+- [x] Lockfile CI scanning (`package-lock.json`, `Cargo.lock`, `requirements.txt`)
+- [x] CLI review command (`blueline review <pkg@ver>` / `blueline --ecosystem pypi review <pkg==ver>`)
+- [x] Line-level diff engine and static heuristic risk scoring
 - [x] npm and npx wrapper shim (`@blueline/cli`)
 - [x] GitHub Action PR check
 - [x] Agent hook via Model Context Protocol (MCP)

@@ -1,6 +1,6 @@
 {
   "name": "@bluelinecli/binary-win32-x64",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Native blueline binary for win32-x64",
   "license": "MIT",
   "repository": {
