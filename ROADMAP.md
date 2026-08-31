@@ -32,9 +32,10 @@ Phased plan from greenfield to a trustworthy release-diff review desk. See
 - [x] Model Context Protocol (MCP) server & agent tools (`src/mcp.rs`, `blueline mcp`)
 - [x] Top-tier CI hardening with `cargo-deny` (`deny.toml`) and `cargo-fuzz` (`fuzz/`)
 
-## Phase 4 — Scale
-- Multi-registry adapters (PyPI, cargo) via the `Registry` trait
-- Advisory feed contributions back to OSV / GitHub
+## Phase 4 — Scale & Multi-Registry ✅
+- [x] crates.io registry adapter (`--ecosystem cargo`, `Cargo.lock` CI scanning, `.crate` verification, yanked-aware baselines)
+- [x] PyPI registry adapter (`--ecosystem pypi`, `requirements.txt` CI scanning, PEP 440 / PEP 503, wheel extraction, PEP 740 provenance)
+- [ ] Advisory feed contributions back to OSV / GitHub
 
 ---
 
