@@ -270,13 +270,14 @@ pub fn safe_extract_wheel(
             if n == 0 {
                 break;
             }
-            if actual_written + n as u64 > limits.max_entry_bytes {
+            actual_written += n as u64;
+            if actual_written > limits.max_entry_bytes {
                 return Err(BluelineError::ExtractionLimit(format!(
                     "entry `{raw_name}` exceeds per-entry cap {} during inflate",
                     limits.max_entry_bytes
                 )));
             }
-            if stats.unpacked_bytes + actual_written + n as u64 > limits.max_unpacked_bytes {
+            if stats.unpacked_bytes + actual_written > limits.max_unpacked_bytes {
                 return Err(BluelineError::ExtractionLimit(format!(
                     "total unpacked size would exceed cap {}",
                     limits.max_unpacked_bytes
@@ -285,7 +286,6 @@ pub fn safe_extract_wheel(
             out_file.write_all(&buf[..n]).map_err(|e| {
                 BluelineError::Extraction(format!("writing file `{}`: {e}", out_path.display()))
             })?;
-            actual_written += n as u64;
         }
 
         if actual_written != declared_size {
