@@ -327,12 +327,12 @@ impl VersionInfo for Pep440Version {
         }
         let pb = p.as_bytes();
         let mut end = 0;
-        let mut prev_was_dot = false;
+        let mut prev_was_dot = true;
         for (i, &b) in pb.iter().enumerate() {
             if b.is_ascii_digit() {
                 end = i + 1;
                 prev_was_dot = false;
-            } else if b == b'.' && !prev_was_dot && i > 0 {
+            } else if b == b'.' && !prev_was_dot {
                 prev_was_dot = true;
             } else {
                 break;
