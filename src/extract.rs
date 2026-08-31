@@ -159,14 +159,6 @@ pub fn safe_extract_wheel(
     let mut seen: HashSet<String> = HashSet::with_capacity(len);
 
     for idx in 0..len {
-        if stats.files + stats.dirs >= limits.max_entries {
-            return Err(BluelineError::ExtractionLimit(format!(
-                "entry count exceeded ({}/{})",
-                stats.files + stats.dirs + 1,
-                limits.max_entries
-            )));
-        }
-
         let mut file = archive
             .by_index(idx)
             .map_err(|e| BluelineError::Extraction(format!("reading zip entry {idx}: {e}")))?;
@@ -217,9 +209,7 @@ pub fn safe_extract_wheel(
             )));
         }
 
-        let is_symlink = file.is_symlink();
-        let symlink_via_mode = file.unix_mode().is_some_and(|m| (m & 0o170000) == 0o120000);
-        if is_symlink || symlink_via_mode {
+        if file.is_symlink() {
             return Err(BluelineError::Extraction(format!(
                 "symlink entry `{raw_name}` rejected"
             )));

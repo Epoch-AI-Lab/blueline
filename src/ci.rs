@@ -253,7 +253,6 @@ pub fn evaluate_lockfile_diff(
             let matches_integ = expected_integ.split_whitespace().any(|expected_one| {
                 let expected_hex = expected_one.strip_prefix("sha256:").unwrap_or(expected_one);
                 checksum.value_hex.eq_ignore_ascii_case(expected_hex)
-                    || checksum.to_display().eq_ignore_ascii_case(expected_one)
             });
 
             if !matches_integ {
