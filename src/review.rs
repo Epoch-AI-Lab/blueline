@@ -706,22 +706,27 @@ fn offer_baseline_approval_with_reader(
 /// split from the right so the scope's leading `@` stays with the name.
 /// PyPI alias `name==version` is also accepted.
 pub fn parse_spec(spec: &str) -> anyhow::Result<(String, String)> {
-    let has_bad_chars = |s: &str| s.chars().any(|c| matches!(c, '[' | ']' | '@' | ' '));
-    if let Some((name, version)) = spec.split_once("==") {
-        if name.is_empty() || version.is_empty() || has_bad_chars(name) || has_bad_chars(version) {
-            return Err(crate::error::BluelineError::InvalidPackageSpec(spec.to_string()).into());
-        }
-        let version_valid = crate::version::Pep440Version::parse(version).is_ok()
-            || semver::Version::parse(version).is_ok();
-        if !version_valid {
-            return Err(crate::error::BluelineError::InvalidPackageSpec(spec.to_string()).into());
-        }
-        return Ok((name.to_string(), version.to_string()));
-    }
-    let mut parts = spec.rsplitn(2, '@');
-    let version = parts.next().unwrap_or("");
-    let name = parts.next().unwrap_or("");
+    let (name, version) = if let Some((n, v)) = spec.split_once("==") {
+        (n, v)
+    } else {
+        let mut parts = spec.rsplitn(2, '@');
+        let v = parts.next().unwrap_or("");
+        let n = parts.next().unwrap_or("");
+        (n, v)
+    };
     if name.is_empty() || version.is_empty() {
+        return Err(crate::error::BluelineError::InvalidPackageSpec(spec.to_string()).into());
+    }
+    let name_valid = if let Some(unscoped) = name.strip_prefix('@') {
+        !unscoped
+            .chars()
+            .any(|c| matches!(c, '[' | ']' | '@' | ' ' | '\t'))
+    } else {
+        !name
+            .chars()
+            .any(|c| matches!(c, '[' | ']' | '@' | ' ' | '\t'))
+    };
+    if !name_valid {
         return Err(crate::error::BluelineError::InvalidPackageSpec(spec.to_string()).into());
     }
     let version_valid = semver::Version::parse(version).is_ok()

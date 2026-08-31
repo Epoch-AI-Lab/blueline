@@ -326,21 +326,20 @@ impl VersionInfo for Pep440Version {
             return Err(err("empty public version"));
         }
         let pb = p.as_bytes();
-        let mut end = pb.iter().take_while(|c| c.is_ascii_digit()).count();
-        if end == 0 {
-            return Err(err("release must start with digit"));
-        }
-        loop {
-            if end < pb.len() && pb[end] == b'.' {
-                if end + 1 < pb.len() && pb[end + 1].is_ascii_digit() {
-                    end += 1;
-                    end += pb[end..].iter().take_while(|c| c.is_ascii_digit()).count();
-                } else {
-                    break;
-                }
+        let mut end = 0;
+        let mut prev_was_dot = false;
+        for (i, &b) in pb.iter().enumerate() {
+            if b.is_ascii_digit() {
+                end = i + 1;
+                prev_was_dot = false;
+            } else if b == b'.' && !prev_was_dot && i > 0 {
+                prev_was_dot = true;
             } else {
                 break;
             }
+        }
+        if end == 0 {
+            return Err(err("release must start with digit"));
         }
         let release_str = &p[..end];
         let mut remaining = &p[end..];
