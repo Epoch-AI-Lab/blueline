@@ -345,7 +345,7 @@ impl VersionInfo for Pep440Version {
         let release_str = &p[..end];
         let mut remaining = &p[end..];
 
-        if release_str.starts_with('.') || release_str.ends_with('.') {
+        if release_str.ends_with('.') {
             return Err(err("release starts/ends with dot"));
         }
         if release_str.contains("..") {
@@ -484,7 +484,7 @@ fn parse_suffix_label(s: &str, labels: &[(&str, PreKind)]) -> Option<(usize, Pre
     }
     let b = s.as_bytes();
     let mut sep = 0;
-    if b[0] == b'.' || b[0] == b'_' || b[0] == b'-' {
+    if matches!(b[0], b'.' | b'_' | b'-') {
         if s.len() == 1 {
             return None;
         }
@@ -494,7 +494,7 @@ fn parse_suffix_label(s: &str, labels: &[(&str, PreKind)]) -> Option<(usize, Pre
     let (lab, kind) = labels.iter().find(|(lab, _)| cand.starts_with(*lab))?;
     let mut pos = sep + lab.len();
     let mut had_sep = false;
-    if pos < s.len() && (b[pos] == b'.' || b[pos] == b'_' || b[pos] == b'-') {
+    if pos < s.len() && matches!(b[pos], b'.' | b'_' | b'-') {
         pos += 1;
         had_sep = true;
     }
