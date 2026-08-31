@@ -1169,15 +1169,21 @@ requests==2.31.0 \
             );
         }
 
-        // Continuation line without newline at end
-        let h64 = "a".repeat(64);
-        let cont = format!("pkg==1.0.0 \\\n  --hash=sha256:{h64}");
-        let parsed_cont = parse_requirements_txt_packages(&cont).unwrap();
-        assert_eq!(parsed_cont["pkg"].version, "1.0.0");
-        let expected_integ = format!("sha256:{h64}");
-        assert_eq!(
-            parsed_cont["pkg"].integrity.as_deref(),
-            Some(expected_integ.as_str())
+        // Empty name or version
+        assert!(parse_requirements_txt_packages("==1.0.0").is_err());
+        assert!(parse_requirements_txt_packages("pkg==").is_err());
+
+        // Unclosed extras bracket
+        let err_bracket = parse_requirements_txt_packages("pkg[extra==1.0.0").unwrap_err();
+        assert!(
+            matches!(err_bracket, LockfileError::InvalidData(msg) if msg.contains("unclosed extras bracket"))
+        );
+
+        // Invalid hash hex character (64 chars but contains 'z')
+        let bad_hex = format!("pkg==1.0.0 --hash=sha256:{}z", "a".repeat(63));
+        let err_hex = parse_requirements_txt_packages(&bad_hex).unwrap_err();
+        assert!(
+            matches!(err_hex, LockfileError::InvalidData(msg) if msg.contains("invalid sha256 hash length"))
         );
     }
 }

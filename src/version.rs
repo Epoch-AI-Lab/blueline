@@ -293,8 +293,8 @@ impl VersionInfo for Pep440Version {
                 return Err(err("local ends with separator"));
             }
             let bytes = ls.as_bytes();
-            for i in 0..bytes.len().saturating_sub(1) {
-                if is_sep_byte(bytes[i]) && is_sep_byte(bytes[i + 1]) {
+            for w in bytes.windows(2) {
+                if is_sep_byte(w[0]) && is_sep_byte(w[1]) {
                     return Err(err("consecutive separators in local"));
                 }
             }

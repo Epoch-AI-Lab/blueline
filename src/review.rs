@@ -291,9 +291,8 @@ fn prepare_extracted_root(
         Ecosystem::Cargo => read_packed_cargo_toml(&root.join("Cargo.toml"))?.manifest_view(),
         Ecosystem::PyPi => {
             let candidate = root.join("METADATA");
-            if candidate.exists() {
-                let raw = std::fs::read_to_string(&candidate).unwrap_or_default();
-                let mut deps = std::collections::BTreeMap::new();
+            let mut deps = std::collections::BTreeMap::new();
+            if let Ok(raw) = std::fs::read_to_string(&candidate) {
                 for line in raw.lines() {
                     if let Some(rest) = line.strip_prefix("Requires-Dist:") {
                         let dep = rest.trim().split(';').next().unwrap_or("").trim();
@@ -303,20 +302,12 @@ fn prepare_extracted_root(
                         }
                     }
                 }
-                crate::manifest::PackageJson {
-                    name: canonical_name.to_string(),
-                    version: version.to_string(),
-                    gypfile: None,
-                    scripts: std::collections::BTreeMap::new(),
-                    dependencies: deps,
-                    ..Default::default()
-                }
-            } else {
-                crate::manifest::PackageJson {
-                    name: canonical_name.to_string(),
-                    version: version.to_string(),
-                    ..Default::default()
-                }
+            }
+            crate::manifest::PackageJson {
+                name: canonical_name.to_string(),
+                version: version.to_string(),
+                dependencies: deps,
+                ..Default::default()
             }
         }
     };
@@ -715,20 +706,14 @@ fn offer_baseline_approval_with_reader(
 /// split from the right so the scope's leading `@` stays with the name.
 /// PyPI alias `name==version` is also accepted.
 pub fn parse_spec(spec: &str) -> anyhow::Result<(String, String)> {
+    let has_bad_chars = |s: &str| s.chars().any(|c| matches!(c, '[' | ']' | '@' | ' '));
     if let Some((name, version)) = spec.split_once("==") {
-        if name.is_empty() || version.is_empty() || name.contains('@') || version.contains('@') {
+        if name.is_empty() || version.is_empty() || has_bad_chars(name) || has_bad_chars(version) {
             return Err(crate::error::BluelineError::InvalidPackageSpec(spec.to_string()).into());
         }
-        if name.contains('[')
-            || name.contains(']')
-            || version.contains('[')
-            || version.contains(' ')
-        {
-            return Err(crate::error::BluelineError::InvalidPackageSpec(spec.to_string()).into());
-        }
-        if crate::version::Pep440Version::parse(version).is_err()
-            && semver::Version::parse(version).is_err()
-        {
+        let version_valid = crate::version::Pep440Version::parse(version).is_ok()
+            || semver::Version::parse(version).is_ok();
+        if !version_valid {
             return Err(crate::error::BluelineError::InvalidPackageSpec(spec.to_string()).into());
         }
         return Ok((name.to_string(), version.to_string()));
@@ -739,9 +724,9 @@ pub fn parse_spec(spec: &str) -> anyhow::Result<(String, String)> {
     if name.is_empty() || version.is_empty() {
         return Err(crate::error::BluelineError::InvalidPackageSpec(spec.to_string()).into());
     }
-    if semver::Version::parse(version).is_err()
-        && crate::version::Pep440Version::parse(version).is_err()
-    {
+    let version_valid = semver::Version::parse(version).is_ok()
+        || crate::version::Pep440Version::parse(version).is_ok();
+    if !version_valid {
         return Err(crate::error::BluelineError::InvalidPackageSpec(spec.to_string()).into());
     }
     Ok((name.to_string(), version.to_string()))
@@ -964,5 +949,33 @@ mod tests {
             parse_spec_flexible("requests", &reg).unwrap(),
             ("requests".into(), "9.9.9".into())
         );
+
+        // parse_spec bracket / space / bad version rejection
+        assert!(parse_spec("pkg[extra]==1.0.0").is_err());
+        assert!(parse_spec("pkg==1.0.0[extra]").is_err());
+        assert!(parse_spec("pkg == 1.0.0").is_err());
+        assert!(parse_spec("pkg==not-a-version!").is_err());
+        assert!(parse_spec("pkg@not-a-version!").is_err());
+
+        // extract_for_ecosystem handles PyPI sdist tar.gz correctly
+        let dir = tempfile::tempdir().unwrap();
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        {
+            let mut tar = tar::Builder::new(&mut enc);
+            let mut header = tar::Header::new_gnu();
+            header.set_path("pkg-1.0.0/a.txt").unwrap();
+            header.set_size(5);
+            header.set_cksum();
+            tar.append(&header, &b"hello"[..]).unwrap();
+            tar.finish().unwrap();
+        }
+        let tarball_bytes = enc.finish().unwrap();
+        let res = extract_for_ecosystem(
+            &tarball_bytes,
+            dir.path(),
+            Ecosystem::PyPi,
+            "https://example.com/pkg-1.0.0.tar.gz",
+        );
+        assert!(res.is_ok());
     }
 }
