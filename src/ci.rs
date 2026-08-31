@@ -221,18 +221,27 @@ pub fn evaluate_lockfile_diff(
     let eval_candidates = delta
         .added
         .iter()
-        .map(|e| (&e.name, None, &e.version, e.is_dev))
+        .map(|e| (&e.name, None, &e.version, e.is_dev, e.resolved.as_deref()))
         .chain(delta.upgraded.iter().map(|u| {
             (
                 &u.name,
                 Some(u.old_version.clone()),
                 &u.new_version,
                 u.is_dev,
+                u.resolved.as_deref(),
             )
         }));
 
-    for (name, old_version, new_version, is_dev) in eval_candidates {
+    for (name, old_version, new_version, is_dev, resolved) in eval_candidates {
         if evaluation_skipped(policy.ci.include_dev, is_dev) {
+            continue;
+        }
+
+        // In cargo ecosystem, local workspace members and path dependencies have no registry source
+        // (`resolved` is None or starts with "path+"). Skip querying crates.io for local code.
+        if ctx.ecosystem == crate::registry::Ecosystem::Cargo
+            && (resolved.is_none() || resolved.is_some_and(|r| r.starts_with("path+")))
+        {
             continue;
         }
 
