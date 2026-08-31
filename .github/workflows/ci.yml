@@ -185,6 +185,15 @@ jobs:
           name: mutants-pr-${{ matrix.shard }}.out
           path: mutants.out
 
+  mutants-pr-aggregate:
+    name: Mutation testing (PR diff)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    needs: [mutants-pr]
+    steps:
+      - name: All shards passed
+        run: echo "All 16 mutation testing shards completed successfully."
+
   # Sharded across 8 parallel runners for push to main.
   mutants:
     name: Mutation testing (all, shard ${{ matrix.shard }}/8)
