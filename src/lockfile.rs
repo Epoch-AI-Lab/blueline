@@ -357,19 +357,15 @@ pub fn parse_requirements_txt_packages(
         let mut hashes = Vec::new();
         let mut spec_tokens = Vec::new();
 
-        let mut i = 0;
-        while i < tokens.len() {
-            let tok = tokens[i];
+        let mut tokens_iter = tokens.into_iter();
+        while let Some(tok) = tokens_iter.next() {
             if let Some(h) = tok.strip_prefix("--hash=") {
                 let h_clean = h.strip_prefix("sha256:").unwrap_or(h).trim();
                 hashes.push(h_clean.to_string());
-                i += 1;
             } else if tok == "--hash" {
-                if i + 1 < tokens.len() {
-                    let next = tokens[i + 1];
+                if let Some(next) = tokens_iter.next() {
                     let h_clean = next.strip_prefix("sha256:").unwrap_or(next).trim();
                     hashes.push(h_clean.to_string());
-                    i += 2;
                 } else {
                     return Err(LockfileError::InvalidData(format!(
                         "line {line_num}: `--hash` option missing hash value"
@@ -377,7 +373,6 @@ pub fn parse_requirements_txt_packages(
                 }
             } else {
                 spec_tokens.push(tok);
-                i += 1;
             }
         }
 
