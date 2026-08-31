@@ -1221,6 +1221,22 @@ mod wheel_tests {
             BluelineError::ExtractionLimit(_)
         ));
 
+        let limits_unpack_cap = ExtractionLimits {
+            max_entry_bytes: 200,
+            max_unpacked_bytes: 100,
+            ..ExtractionLimits::default()
+        };
+        let b_exact_100 =
+            make_wheel(&[("single.bin", &[0u8; 100], zip::CompressionMethod::Stored)]);
+        let dir_exact = tempfile::tempdir().unwrap();
+        assert!(safe_extract_wheel(&b_exact_100, dir_exact.path(), &limits_unpack_cap).is_ok());
+
+        let b_over_101 = make_wheel(&[("single.bin", &[0u8; 101], zip::CompressionMethod::Stored)]);
+        let dir_over = tempfile::tempdir().unwrap();
+        let err_unpack =
+            safe_extract_wheel(&b_over_101, dir_over.path(), &limits_unpack_cap).unwrap_err();
+        assert!(matches!(err_unpack, BluelineError::ExtractionLimit(_)));
+
         // Mixed files and dirs exceeding max_entries
         let b_mixed = make_wheel(&[
             ("mydir/", b"", zip::CompressionMethod::Stored),

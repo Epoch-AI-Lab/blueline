@@ -278,25 +278,23 @@ impl VersionInfo for Pep440Version {
         };
 
         let local = if let Some(ls) = local_str_opt {
+            let is_sep_char = |c: char| matches!(c, '.' | '_' | '-');
+            let is_sep_byte = |b: u8| matches!(b, b'.' | b'_' | b'-');
             if !ls
                 .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+                .all(|c| c.is_ascii_alphanumeric() || is_sep_char(c))
             {
                 return Err(err("invalid local chars"));
             }
-            if ls.starts_with('.') || ls.starts_with('_') || ls.starts_with('-') {
+            if ls.starts_with(is_sep_char) {
                 return Err(err("local starts with separator"));
             }
-            if ls.ends_with('.') || ls.ends_with('_') || ls.ends_with('-') {
+            if ls.ends_with(is_sep_char) {
                 return Err(err("local ends with separator"));
             }
             let bytes = ls.as_bytes();
             for i in 0..bytes.len().saturating_sub(1) {
-                let a = bytes[i];
-                let b = bytes[i + 1];
-                let a_sep = a == b'.' || a == b'_' || a == b'-';
-                let b_sep = b == b'.' || b == b'_' || b == b'-';
-                if a_sep && b_sep {
+                if is_sep_byte(bytes[i]) && is_sep_byte(bytes[i + 1]) {
                     return Err(err("consecutive separators in local"));
                 }
             }
@@ -878,5 +876,41 @@ mod tests {
                 "must reject trailing separator {s}"
             );
         }
+    }
+
+    #[test]
+    fn pep440_exact_length_and_segment_limits() {
+        // 256 chars is allowed, 257 is rejected
+        let v256 = format!("1.{}", "0".repeat(254));
+        assert_eq!(v256.len(), 256);
+        assert!(Pep440Version::parse(&v256).is_ok());
+
+        let v257 = format!("1.{}", "0".repeat(255));
+        assert_eq!(v257.len(), 257);
+        assert!(Pep440Version::parse(&v257).is_err());
+
+        // 32 segments is allowed, 33 segments is rejected
+        let segs_32 = (0..32).map(|_| "1").collect::<Vec<_>>().join(".");
+        assert!(Pep440Version::parse(&segs_32).is_ok());
+
+        let segs_33 = (0..33).map(|_| "1").collect::<Vec<_>>().join(".");
+        assert!(Pep440Version::parse(&segs_33).is_err());
+
+        // Leading and trailing dots in release part
+        assert!(Pep440Version::parse(".1.0").is_err());
+        assert!(Pep440Version::parse("1.0.").is_err());
+
+        // Local separator starts and ends
+        assert!(Pep440Version::parse("1.0+a.b_c-d").is_ok());
+        assert!(Pep440Version::parse("1.0+.abc").is_err());
+        assert!(Pep440Version::parse("1.0+_abc").is_err());
+        assert!(Pep440Version::parse("1.0+-abc").is_err());
+        assert!(Pep440Version::parse("1.0+abc.").is_err());
+        assert!(Pep440Version::parse("1.0+abc_").is_err());
+        assert!(Pep440Version::parse("1.0+abc-").is_err());
+        assert!(Pep440Version::parse("1.0+a..b").is_err());
+        assert!(Pep440Version::parse("1.0+a__b").is_err());
+        assert!(Pep440Version::parse("1.0+a--b").is_err());
+        assert!(Pep440Version::parse("1.0+a._b").is_err());
     }
 }

@@ -391,14 +391,9 @@ pub fn parse_requirements_txt_packages(
             continue;
         }
 
-        let has_range_op = req_spec.contains(">=")
-            || req_spec.contains("<=")
-            || req_spec.contains('>')
-            || req_spec.contains('<')
-            || req_spec.contains("~=")
-            || req_spec.contains("!=")
-            || req_spec.contains("===")
-            || req_spec.contains('@');
+        let has_range_op = [">=", "<=", ">", "<", "~=", "!=", "===", "@"]
+            .into_iter()
+            .any(|op| req_spec.contains(op));
 
         if has_range_op {
             unpinned_errors.push(format!("  line {line_num}: unpinned range `{req_spec}`"));
@@ -1159,5 +1154,30 @@ requests==2.31.0 \
         let parsed = parse_requirements_txt_packages(blanks_and_comments).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed["flask"].version, "3.0.0");
+
+        // Test each unpinned range operator
+        for op in [">=", "<=", ">", "<", "~=", "!=", "===", "@"] {
+            let spec = if op == "@" {
+                "pkg @ https://example.com/pkg.whl".to_string()
+            } else {
+                format!("pkg{op}1.0.0")
+            };
+            let err = parse_requirements_txt_packages(&spec).unwrap_err();
+            assert!(
+                matches!(err, LockfileError::InvalidData(msg) if msg.contains("unpinned range")),
+                "expected unpinned error for operator {op}"
+            );
+        }
+
+        // Continuation line without newline at end
+        let h64 = "a".repeat(64);
+        let cont = format!("pkg==1.0.0 \\\n  --hash=sha256:{h64}");
+        let parsed_cont = parse_requirements_txt_packages(&cont).unwrap();
+        assert_eq!(parsed_cont["pkg"].version, "1.0.0");
+        let expected_integ = format!("sha256:{h64}");
+        assert_eq!(
+            parsed_cont["pkg"].integrity.as_deref(),
+            Some(expected_integ.as_str())
+        );
     }
 }
