@@ -249,3 +249,94 @@ fn review_pypi_rejects_checksum_mismatch() {
         .failure()
         .stderr(predicate::str::contains("sha256 mismatch"));
 }
+
+#[test]
+fn ci_pypi_lockfile_hash_verification() {
+    let name = "demo-lock";
+    let version = "1.0.0";
+    let whl_filename = format!("{name}-{version}-py3-none-any.whl");
+    let wheel_bytes = make_wheel_bytes("demo_lock", version);
+    let whl_sha = sha256_hex(&wheel_bytes);
+    let served_sha = whl_sha.clone();
+
+    let server = Fixture::spawn(move |base| {
+        let simple_json = format!(
+            r#"{{
+                "name": "{name}",
+                "versions": ["{version}"],
+                "files": [
+                    {{
+                        "filename": "{whl_filename}",
+                        "url": "{base}/packages/{whl_filename}",
+                        "hashes": {{
+                            "sha256": "{served_sha}"
+                        }},
+                        "yanked": false
+                    }}
+                ]
+            }}"#
+        );
+        let mut downloads = BTreeMap::new();
+        downloads.insert(format!("packages/{whl_filename}"), wheel_bytes);
+        Routes {
+            simple_json,
+            simple_path: format!("simple/{name}/"),
+            downloads,
+            provenance_path: None,
+            provenance_json: None,
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // Mismatched hash
+    let lockfile_mismatch = format!(
+        "{name}=={version} --hash sha256:0000000000000000000000000000000000000000000000000000000000000000\n"
+    );
+    let req_bad_path = dir.path().join("requirements_bad.txt");
+    std::fs::write(&req_bad_path, lockfile_mismatch).unwrap();
+
+    Command::cargo_bin("blueline")
+        .unwrap()
+        .env("HOME", dir.path())
+        .args([
+            "--ecosystem",
+            "pypi",
+            "--index",
+            &server.base,
+            "ci",
+            "--lockfile",
+            req_bad_path.to_str().unwrap(),
+            "--fail-on",
+            "high",
+            "--base",
+            "HEAD",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("BLOCK"));
+
+    // Matching hash
+    let lockfile_matching = format!("{name}=={version} --hash sha256:{whl_sha}\n");
+    let req_ok_path = dir.path().join("requirements_ok.txt");
+    std::fs::write(&req_ok_path, lockfile_matching).unwrap();
+
+    Command::cargo_bin("blueline")
+        .unwrap()
+        .env("HOME", dir.path())
+        .args([
+            "--ecosystem",
+            "pypi",
+            "--index",
+            &server.base,
+            "ci",
+            "--lockfile",
+            req_ok_path.to_str().unwrap(),
+            "--fail-on",
+            "block",
+            "--base",
+            "HEAD",
+        ])
+        .assert()
+        .success();
+}

@@ -1156,5 +1156,13 @@ requests==2.31.0 \
         assert!(
             matches!(err_over, LockfileError::InvalidData(msg) if msg.contains("exceeds maximum size"))
         );
+
+        assert_eq!(MAX_REQUIREMENTS_TXT_BYTES, 10 * 1024 * 1024);
+
+        let blanks_and_comments =
+            "\n\n# comment 1\n   # comment 2\n\nflask==3.0.0\n\n# trailing comment\n";
+        let parsed = parse_requirements_txt_packages(blanks_and_comments).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed["flask"].version, "3.0.0");
     }
 }

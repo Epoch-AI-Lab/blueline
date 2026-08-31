@@ -1231,12 +1231,26 @@ mod wheel_tests {
             BluelineError::ExtractionLimit(_)
         ));
 
+        // Mixed files and dirs exceeding max_entries
+        let b_mixed = make_wheel(&[
+            ("mydir/", b"", zip::CompressionMethod::Stored),
+            ("mydir/a.txt", b"a", zip::CompressionMethod::Stored),
+            ("mydir/b.txt", b"b", zip::CompressionMethod::Stored),
+        ]);
+        let limits_mixed = ExtractionLimits {
+            max_entries: 2,
+            ..ExtractionLimits::default()
+        };
+        let dir_mixed = tempfile::tempdir().unwrap();
+        let err_mixed = safe_extract_wheel(&b_mixed, dir_mixed.path(), &limits_mixed).unwrap_err();
+        assert!(matches!(err_mixed, BluelineError::ExtractionLimit(_)));
+
         // Symlink via unix mode
         let mut sym_wheel = make_wheel(&[("link.txt", b"target", zip::CompressionMethod::Stored)]);
         for i in 0..sym_wheel.len().saturating_sub(4) {
             if sym_wheel[i..i + 4] == [0x50, 0x4b, 0x01, 0x02] && i + 42 <= sym_wheel.len() {
                 sym_wheel[i + 5] = 3; // System::Unix
-                let mode: u32 = 0o120777;
+                let mode: u32 = 0o120644;
                 let attrs = mode << 16;
                 sym_wheel[i + 38] = (attrs & 0xFF) as u8;
                 sym_wheel[i + 39] = ((attrs >> 8) & 0xFF) as u8;
@@ -1248,5 +1262,29 @@ mod wheel_tests {
         let err =
             safe_extract_wheel(&sym_wheel, dir4.path(), &ExtractionLimits::default()).unwrap_err();
         assert!(err.to_string().contains("symlink"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_set_perm_helpers() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fpath = dir.path().join("test.txt");
+        fs::write(&fpath, b"hello").unwrap();
+        fs::set_permissions(&fpath, fs::Permissions::from_mode(0o777)).unwrap();
+        set_file_perm(&fpath);
+        let f_mode = fs::metadata(&fpath).unwrap().permissions().mode() & 0o777;
+        assert_eq!(f_mode, 0o644);
+
+        let dpath = dir.path().join("subdir");
+        fs::create_dir(&dpath).unwrap();
+        fs::set_permissions(&dpath, fs::Permissions::from_mode(0o700)).unwrap();
+        set_dir_perm(&dpath);
+        let d_mode = fs::metadata(&dpath).unwrap().permissions().mode() & 0o777;
+        assert_eq!(d_mode, 0o755);
+
+        set_perm(&fpath, 0o600);
+        let p_mode = fs::metadata(&fpath).unwrap().permissions().mode() & 0o777;
+        assert_eq!(p_mode, 0o600);
     }
 }

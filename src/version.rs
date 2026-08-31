@@ -128,11 +128,8 @@ impl Pep440Version {
     }
 
     fn trimmed_release(release: &[u64]) -> &[u64] {
-        let mut i = release.len();
-        while i > 0 && release[i - 1] == 0 {
-            i -= 1;
-        }
-        &release[..i]
+        let trailing_zeros = release.iter().rev().take_while(|&&x| x == 0).count();
+        &release[..release.len() - trailing_zeros]
     }
 }
 
@@ -331,10 +328,7 @@ impl VersionInfo for Pep440Version {
             return Err(err("empty public version"));
         }
         let pb = p.as_bytes();
-        let mut end = 0usize;
-        while end < pb.len() && pb[end].is_ascii_digit() {
-            end += 1;
-        }
+        let mut end = pb.iter().take_while(|c| c.is_ascii_digit()).count();
         if end == 0 {
             return Err(err("release must start with digit"));
         }
@@ -342,9 +336,7 @@ impl VersionInfo for Pep440Version {
             if end < pb.len() && pb[end] == b'.' {
                 if end + 1 < pb.len() && pb[end + 1].is_ascii_digit() {
                     end += 1;
-                    while end < pb.len() && pb[end].is_ascii_digit() {
-                        end += 1;
-                    }
+                    end += pb[end..].iter().take_while(|c| c.is_ascii_digit()).count();
                 } else {
                     break;
                 }
@@ -406,10 +398,10 @@ impl VersionInfo for Pep440Version {
             && remaining.len() > 1
             && remaining.as_bytes()[1].is_ascii_digit()
         {
-            let mut end = 1;
-            while end < remaining.len() && remaining.as_bytes()[end].is_ascii_digit() {
-                end += 1;
-            }
+            let end = 1 + remaining[1..]
+                .bytes()
+                .take_while(|c| c.is_ascii_digit())
+                .count();
             let n = remaining[1..end]
                 .parse::<u64>()
                 .map_err(|_| err("post overflow"))?;
