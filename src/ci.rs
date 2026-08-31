@@ -237,10 +237,10 @@ pub fn evaluate_lockfile_diff(
             continue;
         }
 
-        // In cargo ecosystem, local workspace members and path dependencies have no registry source
-        // (`resolved` is None or starts with "path+"). Skip querying crates.io for local code.
+        // In cargo ecosystem, only external dependencies (`resolved` starts with "registry+")
+        // are fetched from crates.io. Local workspace members and path dependencies are skipped.
         if ctx.ecosystem == crate::registry::Ecosystem::Cargo
-            && (resolved.is_none() || resolved.is_some_and(|r| r.starts_with("path+")))
+            && !resolved.is_some_and(|r| r.starts_with("registry+"))
         {
             continue;
         }
@@ -1024,5 +1024,49 @@ checksum = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
             Path::new("package-lock.json")
         ));
         assert!(!is_pypi_lockfile(Ecosystem::Cargo, Path::new("Cargo.lock")));
+    }
+
+    #[test]
+    fn test_cargo_lock_skips_local_and_path_packages_in_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&dir.path().join("blueline.db")).unwrap();
+        let policy = Policy::default();
+        let ctx = CiContext {
+            base_ref: "origin/main",
+            lockfile_path: "Cargo.lock",
+            registry_base: "https://index.crates.io",
+            fail_on: None,
+            ecosystem: crate::registry::Ecosystem::Cargo,
+        };
+
+        let base_cargo = r#"
+version = 4
+
+[[package]]
+name = "my-workspace-app"
+version = "0.1.0"
+
+[[package]]
+name = "local-path-dep"
+version = "0.1.0"
+source = "path+file:///some/local/path"
+"#;
+
+        let head_cargo = r#"
+version = 4
+
+[[package]]
+name = "my-workspace-app"
+version = "0.2.0"
+
+[[package]]
+name = "local-path-dep"
+version = "0.2.0"
+source = "path+file:///some/local/path"
+"#;
+
+        let report = evaluate_lockfile_diff(base_cargo, head_cargo, &ctx, &store, &policy).unwrap();
+        assert_eq!(report.items.len(), 0);
+        assert!(report.passed);
     }
 }
