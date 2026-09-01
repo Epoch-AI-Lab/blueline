@@ -3,19 +3,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::BluelineError;
 
+pub mod aur;
 pub mod cratesio;
 pub mod http_util;
 pub mod npm;
 pub mod pypi;
 
-/// The package ecosystems blueline knows about. npm is fully wired; cargo and
-/// PyPI adapters build on these seams in later PRs.
+/// The package ecosystems blueline knows about. npm is fully wired; cargo,
+/// PyPI, and AUR adapters build on these seams in later PRs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Ecosystem {
     Npm,
     Cargo,
     PyPi,
+    Aur,
 }
 
 impl Ecosystem {
@@ -25,6 +27,7 @@ impl Ecosystem {
             Ecosystem::Npm => "npm",
             Ecosystem::Cargo => "cargo",
             Ecosystem::PyPi => "pypi",
+            Ecosystem::Aur => "aur",
         }
     }
 }
@@ -283,5 +286,6 @@ mod tests {
         assert_eq!(Ecosystem::Npm.key(), "npm");
         assert_eq!(Ecosystem::Cargo.key(), "cargo");
         assert_eq!(Ecosystem::PyPi.key(), "pypi");
+        assert_eq!(Ecosystem::Aur.key(), "aur");
     }
 }
