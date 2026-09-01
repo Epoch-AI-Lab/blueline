@@ -43,6 +43,36 @@ pub struct Cli {
     pub policy: Option<std::path::PathBuf>,
 }
 
+/// Derive the registry base URL for an ecosystem from the CLI flag values:
+/// cargo uses `--index`, every other ecosystem uses `--registry` when it was
+/// overridden and its canonical base otherwise.
+pub fn registry_base_for(
+    ecosystem: crate::registry::Ecosystem,
+    registry: &str,
+    index: &str,
+) -> String {
+    match ecosystem {
+        crate::registry::Ecosystem::Npm => registry.to_string(),
+        crate::registry::Ecosystem::Cargo => index.to_string(),
+        crate::registry::Ecosystem::PyPi => {
+            if index != "https://index.crates.io" {
+                index.to_string()
+            } else if registry != "https://registry.npmjs.org" {
+                registry.to_string()
+            } else {
+                "https://pypi.org".to_string()
+            }
+        }
+        crate::registry::Ecosystem::Aur => {
+            if registry != "https://registry.npmjs.org" {
+                registry.to_string()
+            } else {
+                "https://aur.archlinux.org".to_string()
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum EcosystemArg {
     Npm,

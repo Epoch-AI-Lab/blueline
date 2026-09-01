@@ -14,34 +14,7 @@ fn main() {
 fn run() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
     let ecosystem = cli.ecosystem.into();
-    // npm talks to the registry base; cargo reviews use the sparse index base.
-    let registry_base = match ecosystem {
-        blueline::registry::Ecosystem::Npm => cli.registry.clone(),
-        blueline::registry::Ecosystem::Cargo => cli.index.clone(),
-        blueline::registry::Ecosystem::PyPi => {
-            if cli.index != "https://index.crates.io" {
-                cli.index.clone()
-            } else if cli.registry != "https://registry.npmjs.org" {
-                cli.registry.clone()
-            } else {
-                "https://pypi.org".to_string()
-            }
-        }
-        blueline::registry::Ecosystem::Aur => {
-            if cli.registry != "https://registry.npmjs.org" {
-                cli.registry.clone()
-            } else {
-                "https://aur.archlinux.org".to_string()
-            }
-        }
-    };
-    // The MCP server routes each ecosystem to its own base; AUR shares the
-    // CLI's derivation (`--registry` override, else the AUR base URL).
-    let aur_base = if cli.registry != "https://registry.npmjs.org" {
-        cli.registry.clone()
-    } else {
-        "https://aur.archlinux.org".to_string()
-    };
+    let registry_base = cli::registry_base_for(ecosystem, &cli.registry, &cli.index);
     match cli.command {
         cli::Command::Review { pkg, output, yes } => review::run(
             &pkg,
@@ -75,8 +48,20 @@ fn run() -> anyhow::Result<()> {
             fail_on,
             output_file.as_deref(),
         ),
-        cli::Command::Mcp => {
-            mcp::run_stdio(&cli.registry, &cli.index, &aur_base, cli.policy.as_deref())
-        }
+        cli::Command::Mcp => mcp::run_stdio(
+            &cli.registry,
+            &cli.index,
+            &cli::registry_base_for(
+                blueline::registry::Ecosystem::PyPi,
+                &cli.registry,
+                &cli.index,
+            ),
+            &cli::registry_base_for(
+                blueline::registry::Ecosystem::Aur,
+                &cli.registry,
+                &cli.index,
+            ),
+            cli.policy.as_deref(),
+        ),
     }
 }
