@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- AUR registry adapter (`blueline --ecosystem aur review <pkg>@<pkgver-pkgrel>`):
+  a git-history-backed `AurRegistry` on the RPC v5 client — pkgname → pkgbase
+  mapping, full-history clone of `{base}/{pkgbase}.git` through the system
+  `git` binary (argv-only, never a shell, capped output reads, any git failure
+  fails closed), a 200-commit-bounded history walk that states truncation and
+  refuses to resolve when the cap could hide the requested version, per-commit
+  static `.SRCINFO` parsing (PKGBUILDs are never sourced or executed and
+  `makepkg` is never invoked), newest-commit-wins version identity under
+  `AurVersionInfo` (commits sharing a `pkgver-pkgrel` collapse to the newest),
+  `git archive` review bytes extracted by the existing hardened tar path and
+  verified against a resolve-time sha256 digest so the store's baseline-tamper
+  check catches history rewrites, `list_releases`/`default_version` over
+  distinct parsed versions with commit timestamps as publish times, and a
+  `release_author` hook exposing the pinned commit's self-declared author
+  email.
+- `R10_MAINTAINER_TRANSITION` (MEDIUM): fires when the target release's
+  author identity differs from the baseline release's — the AUR maintainer
+  transition that is the Atomic-Arch adoption signal. Unknown authorship on
+  either side is treated as no signal, and other ecosystems are unaffected
+  (the hook defaults to `None`).
+- AUR review manifests: a static `.SRCINFO` reader (`read_aur_srcinfo`,
+  bounded to 1 MiB and 64k lines, fail-closed on duplicate pkgbase sections,
+  malformed lines, or unparseable `pkgver`/`pkgrel`/`epoch`) projecting onto
+  the engine's manifest view with `depends` + `makedepends` merged; extracted
+  AUR archives must carry `PKGBUILD` and `.SRCINFO` at their root or the
+  review fails closed.
+- The MCP `ecosystem` parameter now accepts all four ecosystems (`npm`,
+  `cargo`, `pypi`, `aur`); AUR tool calls route to the AUR base URL, derived
+  from the `--registry` override exactly like the CLI.
 - AUR foundation (`--ecosystem aur`): `Ecosystem::Aur` plumbed through the
   store, policy, CLI, and MCP ecosystem keys; `AurVersionInfo` implementing
   the `VersionInfo` seam as a faithful port of libalpm's `vercmp` (validated

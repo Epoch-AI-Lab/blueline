@@ -5,8 +5,9 @@ use crate::cli::{Output, OutputFormat};
 use crate::diff::compute_delta;
 use crate::extract::{ExtractionLimits, safe_extract};
 use crate::heuristic::evaluate_with_trust;
-use crate::manifest::{read_package_json, read_packed_cargo_toml};
+use crate::manifest::{read_aur_srcinfo, read_package_json, read_packed_cargo_toml};
 use crate::policy::Policy;
+use crate::registry::aur::AurRegistry;
 use crate::registry::cratesio::CratesIoRegistry;
 use crate::registry::npm::NpmRegistry;
 use crate::registry::pypi::PyPIRegistry;
@@ -28,9 +29,7 @@ fn make_registry(ecosystem: Ecosystem, registry_base: &str) -> anyhow::Result<Bo
         Ecosystem::Npm => Ok(Box::new(NpmRegistry::new(registry_base))),
         Ecosystem::Cargo => Ok(Box::new(CratesIoRegistry::new(registry_base))),
         Ecosystem::PyPi => Ok(Box::new(PyPIRegistry::new(registry_base))),
-        Ecosystem::Aur => Err(anyhow::anyhow!(
-            "AUR reviews are not supported yet: the AUR adapter is still under construction"
-        )),
+        Ecosystem::Aur => Ok(Box::new(AurRegistry::new(registry_base))),
     }
 }
 
@@ -74,9 +73,14 @@ pub fn evaluate_package(
             store,
             policy,
         ),
-        Ecosystem::Aur => Err(anyhow::anyhow!(
-            "AUR reviews are not supported yet: the AUR adapter is still under construction"
-        )),
+        Ecosystem::Aur => evaluate_with_registry::<AurRegistry, crate::version::AurVersionInfo>(
+            AurRegistry::new(registry_base),
+            name,
+            version_str,
+            registry_base,
+            store,
+            policy,
+        ),
     }
 }
 
@@ -246,6 +250,19 @@ fn evaluate_with_registry<R: Registry, V: VersionInfo>(
         Ecosystem::Aur => None,
     };
 
+    let author_changed = {
+        let target_author = registry.release_author(&target_pkg);
+        let baseline_author = baseline_res
+            .resolution
+            .package()
+            .and_then(|p| registry.release_author(p));
+        // Unknown authorship on either side is "no signal", never a finding.
+        matches!(
+            (baseline_author, target_author),
+            (Some(base), Some(target)) if base != target
+        )
+    };
+
     let verdict = evaluate_with_trust(
         &target_pkg.name,
         ecosystem,
@@ -254,6 +271,7 @@ fn evaluate_with_registry<R: Registry, V: VersionInfo>(
         is_unreviewed,
         baseline_res.prior_release_yanked,
         baseline_res.target_release_yanked,
+        author_changed,
         policy,
         Some(&advisories),
         provenance.as_ref(),
@@ -280,7 +298,8 @@ fn extract_for_ecosystem(
 
 /// Locate and parse the package manifest inside an extracted release tree.
 /// Cargo `.crate` archives additionally must unpack to exactly one top-level
-/// directory named `{canonical-name}-{version}`.
+/// directory named `{canonical-name}-{version}`; AUR archives are the repo
+/// root itself (PKGBUILD + .SRCINFO + patches, no pkgbase subdirectory).
 fn prepare_extracted_root(
     temp_root: &std::path::Path,
     ecosystem: Ecosystem,
@@ -297,10 +316,17 @@ fn prepare_extracted_root(
         Ecosystem::Npm => read_package_json(&package_json_path(&root))?,
         Ecosystem::Cargo => read_packed_cargo_toml(&root.join("Cargo.toml"))?.manifest_view(),
         Ecosystem::Aur => {
-            return Err(crate::error::BluelineError::Manifest(
-                canonical_name.to_string(),
-                "AUR manifest handling is not wired yet".into(),
-            ));
+            for required in ["PKGBUILD", ".SRCINFO"] {
+                if !root.join(required).is_file() {
+                    return Err(crate::error::BluelineError::Manifest(
+                        canonical_name.to_string(),
+                        format!(
+                            "AUR archive is missing `{required}` at its root; refusing to review"
+                        ),
+                    ));
+                }
+            }
+            read_aur_srcinfo(&root.join(".SRCINFO"))?
         }
         Ecosystem::PyPi => {
             let candidate = root.join("METADATA");

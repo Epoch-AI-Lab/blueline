@@ -73,6 +73,7 @@ impl JsonRpcError {
 pub fn run_stdio(
     registry_base: &str,
     index_base: &str,
+    aur_base: &str,
     policy_path: Option<&Path>,
 ) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
@@ -125,6 +126,7 @@ pub fn run_stdio(
             request.params,
             registry_base,
             index_base,
+            aur_base,
             &store,
             &policy,
         ) {
@@ -156,6 +158,7 @@ fn handle_request(
     params: Option<serde_json::Value>,
     registry_base: &str,
     index_base: &str,
+    aur_base: &str,
     store: &BaselineStore,
     policy: &Policy,
 ) -> Result<serde_json::Value, JsonRpcError> {
@@ -187,7 +190,7 @@ fn handle_request(
                             },
                             "ecosystem": {
                                 "type": "string",
-                                "enum": ["npm", "cargo"],
+                                "enum": ["npm", "cargo", "pypi", "aur"],
                                 "default": "npm",
                                 "description": "Package ecosystem. npm reviews use dist-tags/semver; cargo reviews use the crates.io sparse index and refuse installs."
                             }
@@ -211,7 +214,7 @@ fn handle_request(
                             },
                             "ecosystem": {
                                 "type": "string",
-                                "enum": ["npm", "cargo"],
+                                "enum": ["npm", "cargo", "pypi", "aur"],
                                 "default": "npm",
                                 "description": "Package ecosystem to scope the baseline lookup."
                             }
@@ -231,7 +234,7 @@ fn handle_request(
                             },
                             "ecosystem": {
                                 "type": "string",
-                                "enum": ["npm", "cargo"],
+                                "enum": ["npm", "cargo", "pypi", "aur"],
                                 "default": "npm",
                                 "description": "Package ecosystem to review against."
                             }
@@ -251,7 +254,15 @@ fn handle_request(
                 .ok_or_else(|| JsonRpcError::invalid_params("missing tool name in tools/call"))?;
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
-            execute_tool(tool_name, &args, registry_base, index_base, store, policy)
+            execute_tool(
+                tool_name,
+                &args,
+                registry_base,
+                index_base,
+                aur_base,
+                store,
+                policy,
+            )
         }
 
         other => Err(JsonRpcError::method_not_found(other)),
@@ -270,8 +281,10 @@ fn parse_ecosystem(args: &serde_json::Value) -> Result<Ecosystem, JsonRpcError> 
             match s {
                 "npm" => Ok(Ecosystem::Npm),
                 "cargo" => Ok(Ecosystem::Cargo),
+                "pypi" => Ok(Ecosystem::PyPi),
+                "aur" => Ok(Ecosystem::Aur),
                 other => Err(JsonRpcError::invalid_params(format!(
-                    "unknown ecosystem `{other}`; expected npm or cargo"
+                    "unknown ecosystem `{other}`; expected npm, cargo, pypi, or aur"
                 ))),
             }
         }
@@ -283,6 +296,7 @@ fn execute_tool(
     args: &serde_json::Value,
     registry_base: &str,
     index_base: &str,
+    aur_base: &str,
     store: &BaselineStore,
     policy: &Policy,
 ) -> Result<serde_json::Value, JsonRpcError> {
@@ -290,16 +304,8 @@ fn execute_tool(
     let base = match ecosystem {
         Ecosystem::Npm => registry_base,
         Ecosystem::Cargo => index_base,
-        Ecosystem::PyPi => {
-            return Err(JsonRpcError::invalid_params(
-                "pypi reviews are not available yet",
-            ));
-        }
-        Ecosystem::Aur => {
-            return Err(JsonRpcError::invalid_params(
-                "aur reviews are not available yet",
-            ));
-        }
+        Ecosystem::PyPi => registry_base,
+        Ecosystem::Aur => aur_base,
     };
 
     match name {
@@ -449,6 +455,7 @@ mod tests {
             None,
             "https://registry.npmjs.org",
             "https://index.crates.io",
+            "https://aur.archlinux.org",
             &store,
             &policy,
         )
@@ -466,6 +473,7 @@ mod tests {
             None,
             "https://registry.npmjs.org",
             "https://index.crates.io",
+            "https://aur.archlinux.org",
             &store,
             &policy,
         )
@@ -484,6 +492,7 @@ mod tests {
             None,
             "https://registry.npmjs.org",
             "https://index.crates.io",
+            "https://aur.archlinux.org",
             &store,
             &policy,
         )
@@ -517,6 +526,7 @@ mod tests {
             None,
             "https://registry.npmjs.org",
             "https://index.crates.io",
+            "https://aur.archlinux.org",
             &store,
             &policy,
         )
@@ -535,6 +545,7 @@ mod tests {
             Some(json!({"name": "check_known_clean", "arguments": {}})),
             "https://registry.npmjs.org",
             "https://index.crates.io",
+            "https://aur.archlinux.org",
             &store,
             &policy,
         )
@@ -552,16 +563,18 @@ mod tests {
             "tools/call",
             Some(json!({
                 "name": "review_install",
-                "arguments": {"package": "serde@1.0.210", "ecosystem": "pypi"}
+                "arguments": {"package": "serde@1.0.210", "ecosystem": "rubygems"}
             })),
             "https://registry.npmjs.org",
             "https://index.crates.io",
+            "https://aur.archlinux.org",
             &store,
             &policy,
         )
         .unwrap_err();
         assert_eq!(err.code, -32602);
         assert!(err.message.contains("unknown ecosystem"));
+        assert!(err.message.contains("expected npm, cargo, pypi, or aur"));
     }
 
     #[test]
@@ -575,6 +588,7 @@ mod tests {
         let err = handle_request(
             "tools/call",
             Some(json!({"name": "review_install", "arguments": {"package": "x@1.0.0"}})),
+            "http://127.0.0.1:1",
             "http://127.0.0.1:1",
             "http://127.0.0.1:1",
             &store,
@@ -591,11 +605,30 @@ mod tests {
             })),
             "http://127.0.0.1:1",
             "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
             &store,
             &policy,
         )
         .unwrap_err();
         assert_eq!(err.code, -32603);
+
+        // AUR is accepted and routed to the aur base: the failure is the
+        // network side, not invalid params.
+        let err = handle_request(
+            "tools/call",
+            Some(json!({
+                "name": "inspect_diff",
+                "arguments": {"package": "yay@12.4.2-1", "ecosystem": "aur"}
+            })),
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+            &store,
+            &policy,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, -32603);
+        assert!(err.message.contains("review error for `yay@12.4.2-1`"));
     }
 
     #[test]

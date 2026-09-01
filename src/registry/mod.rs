@@ -216,6 +216,14 @@ pub trait Registry {
     /// The registry's default version for a package (npm: `dist-tags.latest`,
     /// falling back to the highest stable release), if any exist.
     fn default_version(&self, name: &str) -> Result<Option<String>, BluelineError>;
+
+    /// The publishing identity of one resolved release, when the registry
+    /// exposes it per release (AUR: the commit author email). Registries
+    /// without per-release authorship return `None`, which the trust engine
+    /// treats as "unknown" rather than as a signal.
+    fn release_author(&self, _pkg: &Package) -> Option<String> {
+        None
+    }
 }
 
 #[cfg(test)]

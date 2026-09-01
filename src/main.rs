@@ -35,6 +35,13 @@ fn run() -> anyhow::Result<()> {
             }
         }
     };
+    // The MCP server routes each ecosystem to its own base; AUR shares the
+    // CLI's derivation (`--registry` override, else the AUR base URL).
+    let aur_base = if cli.registry != "https://registry.npmjs.org" {
+        cli.registry.clone()
+    } else {
+        "https://aur.archlinux.org".to_string()
+    };
     match cli.command {
         cli::Command::Review { pkg, output, yes } => review::run(
             &pkg,
@@ -68,6 +75,8 @@ fn run() -> anyhow::Result<()> {
             fail_on,
             output_file.as_deref(),
         ),
-        cli::Command::Mcp => mcp::run_stdio(&cli.registry, &cli.index, cli.policy.as_deref()),
+        cli::Command::Mcp => {
+            mcp::run_stdio(&cli.registry, &cli.index, &aur_base, cli.policy.as_deref())
+        }
     }
 }
