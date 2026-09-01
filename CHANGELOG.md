@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- AUR foundation (`--ecosystem aur`): `Ecosystem::Aur` plumbed through the
+  store, policy, CLI, and MCP ecosystem keys; `AurVersionInfo` implementing
+  the `VersionInfo` seam as a faithful port of libalpm's `vercmp` (validated
+  against pacman's `vercmptest.sh` vectors, separator-run and
+  alpha-segment semantics included) with strict fail-closed parsing and a
+  fuzz target; and an AUR RPC v5 metadata client on the shared `http_util`
+  plumbing (name grammar validation, query encoding, bounded reads,
+  fail-closed response shape checks, verbatim name comparison,
+  pkgname → pkgbase resolution). `blueline install` refuses AUR packages
+  (building a PKGBUILD executes its shell script); `review` and `ci` fail
+  closed until the AUR adapter PR lands.
+
 ### Changed
 
 - Push-to-main mutation testing now mutates only the lines of the pushed

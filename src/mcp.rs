@@ -295,6 +295,11 @@ fn execute_tool(
                 "pypi reviews are not available yet",
             ));
         }
+        Ecosystem::Aur => {
+            return Err(JsonRpcError::invalid_params(
+                "aur reviews are not available yet",
+            ));
+        }
     };
 
     match name {

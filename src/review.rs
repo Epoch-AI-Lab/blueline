@@ -28,6 +28,9 @@ fn make_registry(ecosystem: Ecosystem, registry_base: &str) -> anyhow::Result<Bo
         Ecosystem::Npm => Ok(Box::new(NpmRegistry::new(registry_base))),
         Ecosystem::Cargo => Ok(Box::new(CratesIoRegistry::new(registry_base))),
         Ecosystem::PyPi => Ok(Box::new(PyPIRegistry::new(registry_base))),
+        Ecosystem::Aur => Err(anyhow::anyhow!(
+            "AUR reviews are not supported yet: the AUR adapter is still under construction"
+        )),
     }
 }
 
@@ -71,6 +74,9 @@ pub fn evaluate_package(
             store,
             policy,
         ),
+        Ecosystem::Aur => Err(anyhow::anyhow!(
+            "AUR reviews are not supported yet: the AUR adapter is still under construction"
+        )),
     }
 }
 
@@ -237,6 +243,7 @@ fn evaluate_with_registry<R: Registry, V: VersionInfo>(
             ))
         }
         Ecosystem::Cargo => None,
+        Ecosystem::Aur => None,
     };
 
     let verdict = evaluate_with_trust(
@@ -289,6 +296,12 @@ fn prepare_extracted_root(
     let manifest = match ecosystem {
         Ecosystem::Npm => read_package_json(&package_json_path(&root))?,
         Ecosystem::Cargo => read_packed_cargo_toml(&root.join("Cargo.toml"))?.manifest_view(),
+        Ecosystem::Aur => {
+            return Err(crate::error::BluelineError::Manifest(
+                canonical_name.to_string(),
+                "AUR manifest handling is not wired yet".into(),
+            ));
+        }
         Ecosystem::PyPi => {
             let candidate = root.join("METADATA");
             let mut deps = std::collections::BTreeMap::new();
@@ -463,6 +476,14 @@ pub fn install(
             "blueline install refuses PyPI packages: installing a Python sdist executes arbitrary \
              build code and wheels may contain installer hooks; review it instead with \
              `blueline review <package>==<version> --ecosystem pypi`."
+        );
+        std::process::exit(2);
+    }
+    if ecosystem == Ecosystem::Aur {
+        eprintln!(
+            "blueline install refuses AUR packages: building a package executes its PKGBUILD \
+             shell script, which blueline cannot sandbox. Review it instead with \
+             `blueline review <package>@<version> --ecosystem aur`."
         );
         std::process::exit(2);
     }

@@ -48,6 +48,7 @@ pub enum EcosystemArg {
     Npm,
     Cargo,
     Pypi,
+    Aur,
 }
 
 impl From<EcosystemArg> for crate::registry::Ecosystem {
@@ -56,6 +57,7 @@ impl From<EcosystemArg> for crate::registry::Ecosystem {
             EcosystemArg::Npm => crate::registry::Ecosystem::Npm,
             EcosystemArg::Cargo => crate::registry::Ecosystem::Cargo,
             EcosystemArg::Pypi => crate::registry::Ecosystem::PyPi,
+            EcosystemArg::Aur => crate::registry::Ecosystem::Aur,
         }
     }
 }

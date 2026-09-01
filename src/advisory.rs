@@ -106,11 +106,14 @@ pub(crate) struct OsvDatabaseSpecific {
 
 /// OSV.dev ecosystem identifier for a blueline ecosystem. Exact casing is
 /// dictated by the OSV schema (`CratesIO` and `PyPI` are not snake_case).
+/// The AUR has no OSV coverage; the value is unreachable until the AUR
+/// adapter wires advisory handling explicitly.
 fn osv_ecosystem(ecosystem: Ecosystem) -> &'static str {
     match ecosystem {
         Ecosystem::Npm => "npm",
         Ecosystem::Cargo => "CratesIO",
         Ecosystem::PyPi => "PyPI",
+        Ecosystem::Aur => "AUR",
     }
 }
 

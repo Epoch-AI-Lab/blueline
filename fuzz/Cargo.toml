@@ -31,3 +31,9 @@ name = "pypi_version"
 path = "fuzz_targets/pypi_version.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "aur_version"
+path = "fuzz_targets/aur_version.rs"
+test = false
+doc = false

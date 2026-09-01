@@ -27,6 +27,13 @@ fn run() -> anyhow::Result<()> {
                 "https://pypi.org".to_string()
             }
         }
+        blueline::registry::Ecosystem::Aur => {
+            if cli.registry != "https://registry.npmjs.org" {
+                cli.registry.clone()
+            } else {
+                "https://aur.archlinux.org".to_string()
+            }
+        }
     };
     match cli.command {
         cli::Command::Review { pkg, output, yes } => review::run(

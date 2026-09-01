@@ -93,6 +93,12 @@ pub fn run(
     fail_on_override: Option<VerdictBand>,
     output_file: Option<&Path>,
 ) -> anyhow::Result<()> {
+    if ecosystem == Ecosystem::Aur {
+        return Err(anyhow::anyhow!(
+            "AUR CI scanning is not supported yet: there is no AUR lockfile format to diff"
+        ));
+    }
+
     let policy = Policy::load_or_default(policy_path)?;
     let store = BaselineStore::open()?;
 

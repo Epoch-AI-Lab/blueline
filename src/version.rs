@@ -509,6 +509,248 @@ fn parse_suffix_label(s: &str, labels: &[(&str, PreKind)]) -> Option<(usize, Pre
     Some((end, kind.clone(), n))
 }
 
+/// Arch `epoch:pkgver-pkgrel` version (libalpm `vercmp` grammar). Ordering is
+/// a faithful port of pacman's `_alpm_pkg_vercmp`, validated against the
+/// vectors in pacman's `test/util/vercmptest.sh`.
+#[derive(Clone, Debug)]
+pub struct AurVersionInfo {
+    epoch: u64,
+    pkgver: String,
+    pkgrel: Option<u64>,
+}
+
+impl AurVersionInfo {
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub fn pkgver(&self) -> &str {
+        &self.pkgver
+    }
+
+    pub fn pkgrel(&self) -> Option<u64> {
+        self.pkgrel
+    }
+}
+
+/// Byte-exact port of libalpm's `rpmvercmp`: alternating alphanumeric
+/// segments, separator-run-length tiebreak, numeric segments compared by
+/// zero-stripped length then lexicographic order, and libalpm's rule that a
+/// remaining alpha segment never beats an exhausted side.
+fn rpmvercmp(a: &str, b: &str) -> Ordering {
+    if a == b {
+        return Ordering::Equal;
+    }
+    let (ab, bb) = (a.as_bytes(), b.as_bytes());
+    let (mut one, mut two) = (0usize, 0usize);
+    let (mut prev_one, mut prev_two) = (0usize, 0usize);
+
+    while one < ab.len() && two < bb.len() {
+        while one < ab.len() && !ab[one].is_ascii_alphanumeric() {
+            one += 1;
+        }
+        while two < bb.len() && !bb[two].is_ascii_alphanumeric() {
+            two += 1;
+        }
+        if one >= ab.len() || two >= bb.len() {
+            break;
+        }
+        let sep1 = one - prev_one;
+        let sep2 = two - prev_two;
+        if sep1 != sep2 {
+            return sep1.cmp(&sep2);
+        }
+
+        let isnum = ab[one].is_ascii_digit();
+        let (start1, start2) = (one, two);
+        let (mut end1, mut end2) = (one, two);
+        if isnum {
+            while end1 < ab.len() && ab[end1].is_ascii_digit() {
+                end1 += 1;
+            }
+            while end2 < bb.len() && bb[end2].is_ascii_digit() {
+                end2 += 1;
+            }
+        } else {
+            while end1 < ab.len() && ab[end1].is_ascii_alphabetic() {
+                end1 += 1;
+            }
+            while end2 < bb.len() && bb[end2].is_ascii_alphabetic() {
+                end2 += 1;
+            }
+        }
+        let seg1 = &ab[start1..end1];
+        let seg2 = &bb[start2..end2];
+        if seg2.is_empty() {
+            return if isnum {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            };
+        }
+        if isnum {
+            let d1 = strip_leading_zeros(seg1);
+            let d2 = strip_leading_zeros(seg2);
+            if d1.len() != d2.len() {
+                return d1.len().cmp(&d2.len());
+            }
+            if d1 != d2 {
+                return d1.cmp(d2);
+            }
+        } else if seg1 != seg2 {
+            return seg1.cmp(seg2);
+        }
+
+        one = end1;
+        two = end2;
+        prev_one = one;
+        prev_two = two;
+    }
+
+    if one >= ab.len() && two >= bb.len() {
+        return Ordering::Equal;
+    }
+    let one_rem = one < ab.len();
+    let two_rem = two < bb.len();
+    let one_alpha = one_rem && ab[one].is_ascii_alphabetic();
+    let two_alpha = two_rem && bb[two].is_ascii_alphabetic();
+    if (!one_rem && !two_alpha) || one_alpha {
+        Ordering::Less
+    } else {
+        Ordering::Greater
+    }
+}
+
+fn strip_leading_zeros(seg: &[u8]) -> &[u8] {
+    let first_nz = seg.iter().take_while(|&&c| c == b'0').count();
+    &seg[first_nz..]
+}
+
+impl AurVersionInfo {
+    fn split_evr(raw: &str) -> Result<(u64, &str, Option<u64>), BluelineError> {
+        let err = |msg: &str| {
+            BluelineError::InvalidPackageSpec(format!("`{raw}`: invalid AUR version: {msg}"))
+        };
+        if raw.len() > 256 {
+            return Err(err("version string exceeds maximum length of 256"));
+        }
+        if raw.chars().any(|c| c.is_whitespace()) {
+            return Err(err("whitespace is not allowed"));
+        }
+        let (epoch_str, rest) = match raw.split_once(':') {
+            Some((e, r)) => (e, r),
+            None => ("", raw),
+        };
+        if raw.matches(':').count() > 1 {
+            return Err(err("multiple `:`"));
+        }
+        let epoch = if epoch_str.is_empty() {
+            0
+        } else {
+            if !epoch_str.chars().all(|c| c.is_ascii_digit()) {
+                return Err(err("epoch must be digits"));
+            }
+            epoch_str
+                .parse::<u64>()
+                .map_err(|_| err("epoch overflow"))?
+        };
+        if rest.is_empty() {
+            return Err(err("empty pkgver"));
+        }
+        let (pkgver, pkgrel_str) = match rest.split_once('-') {
+            Some((v, r)) => (v, Some(r)),
+            None => (rest, None),
+        };
+        if pkgrel_str.is_some_and(|r| r.is_empty() || !r.chars().all(|c| c.is_ascii_digit())) {
+            return Err(err("pkgrel must be non-empty digits"));
+        }
+        let pkgrel = pkgrel_str
+            .map(|r| r.parse::<u64>().map_err(|_| err("pkgrel overflow")))
+            .transpose()?;
+        Self::validate_pkgver(raw, pkgver)?;
+        Ok((epoch, pkgver, pkgrel))
+    }
+
+    fn validate_pkgver(raw: &str, pkgver: &str) -> Result<(), BluelineError> {
+        let err = |msg: &str| {
+            BluelineError::InvalidPackageSpec(format!("`{raw}`: invalid AUR version: {msg}"))
+        };
+        let bytes = pkgver.as_bytes();
+        if bytes.is_empty() {
+            return Err(err("empty pkgver"));
+        }
+        if !bytes[0].is_ascii_alphanumeric() || !bytes[bytes.len() - 1].is_ascii_alphanumeric() {
+            return Err(err("pkgver must start and end alphanumeric"));
+        }
+        if !pkgver
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+        {
+            return Err(err("pkgver may only contain alphanumerics, `.` and `_`"));
+        }
+        if pkgver.contains("..") {
+            return Err(err("empty pkgver segment"));
+        }
+        Ok(())
+    }
+}
+
+impl PartialEq for AurVersionInfo {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for AurVersionInfo {}
+
+impl PartialOrd for AurVersionInfo {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for AurVersionInfo {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.epoch
+            .cmp(&other.epoch)
+            .then_with(|| rpmvercmp(&self.pkgver, &other.pkgver))
+            // libalpm compares pkgrel only when both sides carry one.
+            .then_with(|| match (self.pkgrel, other.pkgrel) {
+                (Some(a), Some(b)) => a.cmp(&b),
+                _ => Ordering::Equal,
+            })
+    }
+}
+
+impl VersionInfo for AurVersionInfo {
+    fn parse(raw: &str) -> Result<Self, BluelineError> {
+        let (epoch, pkgver, pkgrel) = Self::split_evr(raw)?;
+        Ok(AurVersionInfo {
+            epoch,
+            pkgver: pkgver.to_string(),
+            pkgrel,
+        })
+    }
+
+    fn canonical(&self) -> String {
+        let mut out = String::new();
+        if self.epoch != 0 {
+            out.push_str(&self.epoch.to_string());
+            out.push(':');
+        }
+        out.push_str(&self.pkgver);
+        if let Some(r) = self.pkgrel {
+            out.push('-');
+            out.push_str(&r.to_string());
+        }
+        out
+    }
+
+    fn is_prerelease(&self) -> bool {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -911,5 +1153,180 @@ mod tests {
         assert!(Pep440Version::parse("1.0+a__b").is_err());
         assert!(Pep440Version::parse("1.0+a--b").is_err());
         assert!(Pep440Version::parse("1.0+a._b").is_err());
+    }
+
+    fn av(s: &str) -> AurVersionInfo {
+        AurVersionInfo::parse(s).unwrap_or_else(|e| panic!("parse {s:?} failed: {e}"))
+    }
+
+    /// The vectors from pacman's `test/util/vercmptest.sh`: expected is the
+    /// vercmp(first, second) result — 0 equal, 1 first newer, -1 second newer.
+    /// Mirror cases are asserted too, exactly as the upstream script does.
+    #[test]
+    fn aur_versions_match_pacman_vercmptest_vectors() {
+        let vectors: &[(&str, &str, i32)] = &[
+            // all similar length, no pkgrel
+            ("1.5.0", "1.5.0", 0),
+            ("1.5.1", "1.5.0", 1),
+            // mixed length
+            ("1.5.1", "1.5", 1),
+            // with pkgrel, simple
+            ("1.5.0-1", "1.5.0-1", 0),
+            ("1.5.0-1", "1.5.0-2", -1),
+            ("1.5.0-1", "1.5.1-1", -1),
+            ("1.5.0-2", "1.5.1-1", -1),
+            // with pkgrel, mixed lengths
+            ("1.5-1", "1.5.1-1", -1),
+            ("1.5-2", "1.5.1-1", -1),
+            ("1.5-2", "1.5.1-2", -1),
+            // mixed pkgrel inclusion
+            ("1.5", "1.5-1", 0),
+            ("1.5-1", "1.5", 0),
+            ("1.1-1", "1.1", 0),
+            ("1.0-1", "1.1", -1),
+            ("1.1-1", "1.0", 1),
+            // alphanumeric versions
+            ("1.5b-1", "1.5-1", -1),
+            ("1.5b", "1.5", -1),
+            ("1.5b-1", "1.5", -1),
+            ("1.5b", "1.5.1", -1),
+            // from the manpage
+            ("1.0a", "1.0alpha", -1),
+            ("1.0alpha", "1.0b", -1),
+            ("1.0b", "1.0beta", -1),
+            ("1.0beta", "1.0rc", -1),
+            ("1.0rc", "1.0", -1),
+            // alpha-dotted versions
+            ("1.5.a", "1.5", 1),
+            ("1.5.b", "1.5.a", 1),
+            ("1.5.1", "1.5.b", 1),
+            // alpha dots and dashes
+            ("1.5.b-1", "1.5.b", 0),
+            ("1.5-1", "1.5.b", -1),
+            // same/similar content, differing separators
+            ("2.0", "2_0", 0),
+            ("2.0_a", "2_0.a", 0),
+            ("2.0a", "2.0.a", -1),
+            ("2___a", "2_a", 1),
+            // epoch included version comparisons
+            ("0:1.0", "0:1.0", 0),
+            ("0:1.0", "0:1.1", -1),
+            ("1:1.0", "0:1.0", 1),
+            ("1:1.0", "0:1.1", 1),
+            ("1:1.0", "2:1.1", -1),
+            // epoch + sometimes present pkgrel
+            ("1:1.0", "0:1.0-1", 1),
+            ("1:1.0-1", "0:1.1-1", 1),
+            // epoch included on one version
+            ("0:1.0", "1.0", 0),
+            ("0:1.0", "1.1", -1),
+            ("0:1.1", "1.0", 1),
+            ("1:1.0", "1.0", 1),
+            ("1:1.0", "1.1", 1),
+            ("1:1.1", "1.1", 1),
+        ];
+        for (a, b, expected) in vectors {
+            let (va, vb) = (av(a), av(b));
+            let got = match va.cmp(&vb) {
+                Ordering::Less => -1,
+                Ordering::Equal => 0,
+                Ordering::Greater => 1,
+            };
+            assert_eq!(got, *expected, "vercmp({a}, {b})");
+            let mirrored = match vb.cmp(&va) {
+                Ordering::Less => -1,
+                Ordering::Equal => 0,
+                Ordering::Greater => 1,
+            };
+            assert_eq!(mirrored, -*expected, "vercmp({b}, {a}) mirror");
+        }
+    }
+
+    #[test]
+    fn aur_versions_sorted_order() {
+        let versions = vec![
+            "1.0-1", "1.0-2", "1.0.1-1", "1.1-1", "1.5b-1", "1.5-1", "1.5.a-1", "1.5.b-1",
+            "1.5.1-1", "1:1.0-1",
+        ];
+        let parsed: Vec<AurVersionInfo> = versions.iter().map(|s| av(s)).collect();
+        for i in 0..parsed.len() {
+            for j in i + 1..parsed.len() {
+                assert!(
+                    parsed[i] < parsed[j],
+                    "{} should be < {}",
+                    versions[i],
+                    versions[j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn aur_version_parse_fails_closed() {
+        let invalid = vec![
+            "",
+            " ",
+            " 1.0-1",
+            "1.0-1 ",
+            "1:2:3",
+            "1:",
+            "x:1.0-1",
+            "-1.0",
+            "1.0-",
+            "1.0--1",
+            "1.0-1-2",
+            "1..0",
+            ".1.0",
+            "1.0.",
+            "_1.0",
+            "1.0_",
+            "1.0+1",
+            "1.0~1",
+            "1 0",
+            "1.0-1a",
+            "1.0- 1",
+            "٩:1.0",
+            "99999999999999999999999999999:1.0",
+            "1.0-99999999999999999999999999999",
+        ];
+        for s in invalid {
+            assert!(AurVersionInfo::parse(s).is_err(), "expected invalid: {s:?}");
+        }
+    }
+
+    #[test]
+    fn aur_version_canonical_round_trips() {
+        for s in ["1.0-1", "1:2.0-3", "0.9.9.r101.g1a2b3c-1", "2_0.a", "1.5"] {
+            assert_eq!(av(s).canonical(), s);
+        }
+        assert_eq!(av("0:1.0").canonical(), "1.0");
+        assert_eq!(av("00:1.0").canonical(), "1.0");
+        assert_eq!(av(":1.0").canonical(), "1.0");
+    }
+
+    #[test]
+    fn aur_version_accessors() {
+        let v = av("2:1.0-3");
+        assert_eq!(v.epoch(), 2);
+        assert_eq!(v.pkgver(), "1.0");
+        assert_eq!(v.pkgrel(), Some(3));
+        assert_eq!(av("1.5").pkgrel(), None);
+    }
+
+    #[test]
+    fn aur_version_not_prerelease_and_baseline_eligible() {
+        assert!(!av("1.0-1").is_prerelease());
+        assert!(av("1.0-1").baseline_eligible_for(&av("2.0-1")));
+        assert!(!av("2.0-1").baseline_eligible_for(&av("1.0-1")));
+        assert!(!av("2.0-1").baseline_eligible_for(&av("2.0-1")));
+    }
+
+    #[test]
+    fn aur_version_long_numeric_segments_do_not_overflow() {
+        let big = format!("1.{}-1", "9".repeat(40));
+        let bigger = format!("1.{}-1", "9".repeat(41));
+        assert!(av(&big) < av(&bigger));
+        let padded = format!("1.0{}-1", "9".repeat(40));
+        assert_eq!(av(&big), av(&padded));
     }
 }
