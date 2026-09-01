@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Blueline Architecture — Internal Design Document</title>
-<meta name="description" content="Blueline architecture: release-diff review desk for the package install line. Rust core + Node shim, local heuristic verdict engine, npm-only v1.">
+<meta name="description" content="Blueline architecture: release-diff review desk for the package install line. Rust core + Node shim, local heuristic verdict engine, npm / crates.io / PyPI adapters.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,100..900;1,9..144,100..900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -248,7 +248,7 @@ details[open].appx summary::before{content:"−"}
 
     <p><b>Node shim (<span class="k">@blueline/cli</span>).</b> A tiny npm package. Its <span class="k">bin</span> is a JS launcher that resolves/installs the platform-specific Rust binary (via per-platform optional deps <span class="k">@blueline/binary-{linux,darwin,win}-{x64,arm64}</span>) and <span class="k">exec</span>s it. Rust does all heavy lifting; Node only provides the <span class="k">npx</span> ergonomics and PATH registration. The Rust binary is also directly installable (<span class="k">cargo install</span> / direct download) for non-Node environments.</p>
 
-    <p><b><span class="k">Registry</span> trait.</b> npm is the only implementation now, but the trait (<span class="k">fetch_manifest</span>, <span class="k">fetch_tarball</span>, <span class="k">list_versions</span>) exists from commit 1 so PyPI/cargo plug in later without refactoring the engine.</p>
+    <p><b><span class="k">Registry</span> trait.</b> The trait (<span class="k">fetch_manifest</span>, <span class="k">fetch_tarball</span>, <span class="k">list_versions</span>) existed from commit 1 so PyPI/cargo could plug in later without refactoring the engine. As of v0.3.0 there are three implementations: npm, crates.io (sparse index), and PyPI (Simple API), sharing SSRF-guarded HTTP plumbing in <span class="k">http_util.rs</span>.</p>
   </section>
 
   <section id="decisions">
@@ -266,7 +266,7 @@ details[open].appx summary::before{content:"−"}
         <tbody>
           <tr><td data-h="#"><span class="vh">#</span>D1</td><td data-h="Decision"><span class="vh">Decision</span>Rust core + Node shim</td><td data-h="Rationale"><span class="vh">Rationale</span>Security-critical path in a memory-safe, single-binary language; Node only for <span class="k">npx</span> ergonomics.</td></tr>
           <tr><td data-h="#"><span class="vh">#</span>D2</td><td data-h="Decision"><span class="vh">Decision</span>Local deterministic heuristic first</td><td data-h="Rationale"><span class="vh">Rationale</span>Transparent, auditable, offline. Hosted ML <em>refines</em> score when token present — never required. Keeps "the wedge stays open" honest.</td></tr>
-          <tr><td data-h="#"><span class="vh">#</span>D3</td><td data-h="Decision"><span class="vh">Decision</span>npm-only, <span class="k">Registry</span> trait seam</td><td data-h="Rationale"><span class="vh">Rationale</span>Deepen one registry; avoid speculative multi-registry code now.</td></tr>
+          <tr><td data-h="#"><span class="vh">#</span>D3</td><td data-h="Decision"><span class="vh">Decision</span>npm-only, <span class="k">Registry</span> trait seam</td><td data-h="Rationale"><span class="vh">Rationale</span>Deepen one registry; avoid speculative multi-registry code now. Superseded in v0.3.0: the seam paid off — crates.io and PyPI adapters shipped without an engine refactor.</td></tr>
           <tr><td data-h="#"><span class="vh">#</span>D4</td><td data-h="Decision"><span class="vh">Decision</span>Read-only sandbox extraction</td><td data-h="Rationale"><span class="vh">Rationale</span>Core safety invariant. Tarball never executed; only bytes read.</td></tr>
           <tr><td data-h="#"><span class="vh">#</span>D5</td><td data-h="Decision"><span class="vh">Decision</span>Baseline = last known-clean version</td><td data-h="Rationale"><span class="vh">Rationale</span>Source: locally installed version in <span class="k">node_modules</span> → else previous version in registry list (neutral verdict on first sighting). Overrides persisted in SQLite.</td></tr>
           <tr><td data-h="#"><span class="vh">#</span>D6</td><td data-h="Decision"><span class="vh">Decision</span>Revocation = OSV + GitHub Advisory cache</td><td data-h="Rationale"><span class="vh">Rationale</span>Reuse the open vulnerability corpus; paid tier adds human-verified recall (hosted index).</td></tr>

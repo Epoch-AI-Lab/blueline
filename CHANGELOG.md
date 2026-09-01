@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Push-to-main mutation testing now mutates only the lines of the pushed
+  commit (`git diff HEAD~1..HEAD` fed to `cargo mutants --in-diff`) instead of
+  re-running the full trust-boundary file set on every merge, spread across a
+  16-shard matrix.
+- The MCP stdio server no longer prints an stderr note when it receives the
+  client's `notifications/initialized` message.
+
+### Fixed
+
+- Release workflow smoke gate invokes the shipped binary with
+  `--policy blueline.toml --output json --yes` and asserts on the presence of
+  the `integrity` field, matching the current CLI flags and the 0.3.0
+  canonical digest display (the old grep for `"integrity":"verified` could
+  never match).
+
 ## [0.3.0] - 2026-08-31
 
 ### Added
