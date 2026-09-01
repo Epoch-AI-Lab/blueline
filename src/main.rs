@@ -14,12 +14,12 @@ fn main() {
 fn run() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
     let ecosystem = cli.ecosystem.into();
-    let registry_base = cli::registry_base_for(ecosystem, &cli.registry, &cli.index);
+    let bases = cli::RegistryBases::from_flags(&cli.registry, &cli.index);
     match cli.command {
         cli::Command::Review { pkg, output, yes } => review::run(
             &pkg,
             ecosystem,
-            &registry_base,
+            bases.for_ecosystem(ecosystem),
             output,
             cli.policy.as_deref(),
             yes,
@@ -27,7 +27,7 @@ fn run() -> anyhow::Result<()> {
         cli::Command::Install { pkg, npm_args, yes } => review::install(
             &pkg,
             ecosystem,
-            &registry_base,
+            bases.for_ecosystem(ecosystem),
             &npm_args,
             cli.policy.as_deref(),
             yes,
@@ -41,27 +41,13 @@ fn run() -> anyhow::Result<()> {
         } => ci::run(
             &base,
             &lockfile,
-            &registry_base,
+            bases.for_ecosystem(ecosystem),
             ecosystem,
             cli.policy.as_deref(),
             format.to_ci_format(),
             fail_on,
             output_file.as_deref(),
         ),
-        cli::Command::Mcp => mcp::run_stdio(
-            &cli.registry,
-            &cli.index,
-            &cli::registry_base_for(
-                blueline::registry::Ecosystem::PyPi,
-                &cli.registry,
-                &cli.index,
-            ),
-            &cli::registry_base_for(
-                blueline::registry::Ecosystem::Aur,
-                &cli.registry,
-                &cli.index,
-            ),
-            cli.policy.as_deref(),
-        ),
+        cli::Command::Mcp => mcp::run_stdio(&bases, cli.policy.as_deref()),
     }
 }

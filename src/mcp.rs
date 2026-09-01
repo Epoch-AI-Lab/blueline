@@ -71,10 +71,7 @@ impl JsonRpcError {
 }
 
 pub fn run_stdio(
-    registry_base: &str,
-    index_base: &str,
-    pypi_base: &str,
-    aur_base: &str,
+    bases: &crate::cli::RegistryBases,
     policy_path: Option<&Path>,
 ) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
@@ -122,16 +119,7 @@ pub fn run_stdio(
         }
 
         let id = request.id.unwrap_or(serde_json::Value::Null);
-        let resp = match handle_request(
-            &request.method,
-            request.params,
-            registry_base,
-            index_base,
-            pypi_base,
-            aur_base,
-            &store,
-            &policy,
-        ) {
+        let resp = match handle_request(&request.method, request.params, bases, &store, &policy) {
             Ok(result) => JsonRpcResponse {
                 jsonrpc: "2.0",
                 id,
@@ -158,10 +146,7 @@ pub fn run_stdio(
 fn handle_request(
     method: &str,
     params: Option<serde_json::Value>,
-    registry_base: &str,
-    index_base: &str,
-    pypi_base: &str,
-    aur_base: &str,
+    bases: &crate::cli::RegistryBases,
     store: &BaselineStore,
     policy: &Policy,
 ) -> Result<serde_json::Value, JsonRpcError> {
@@ -257,16 +242,7 @@ fn handle_request(
                 .ok_or_else(|| JsonRpcError::invalid_params("missing tool name in tools/call"))?;
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
-            execute_tool(
-                tool_name,
-                &args,
-                registry_base,
-                index_base,
-                pypi_base,
-                aur_base,
-                store,
-                policy,
-            )
+            execute_tool(tool_name, &args, bases, store, policy)
         }
 
         other => Err(JsonRpcError::method_not_found(other)),
@@ -298,20 +274,12 @@ fn parse_ecosystem(args: &serde_json::Value) -> Result<Ecosystem, JsonRpcError> 
 fn execute_tool(
     name: &str,
     args: &serde_json::Value,
-    registry_base: &str,
-    index_base: &str,
-    pypi_base: &str,
-    aur_base: &str,
+    bases: &crate::cli::RegistryBases,
     store: &BaselineStore,
     policy: &Policy,
 ) -> Result<serde_json::Value, JsonRpcError> {
     let ecosystem = parse_ecosystem(args)?;
-    let base = match ecosystem {
-        Ecosystem::Npm => registry_base,
-        Ecosystem::Cargo => index_base,
-        Ecosystem::PyPi => pypi_base,
-        Ecosystem::Aur => aur_base,
-    };
+    let base = bases.for_ecosystem(ecosystem);
 
     match name {
         "review_install" => {
@@ -449,23 +417,23 @@ fn execute_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::RegistryBases;
+
+    fn test_bases() -> RegistryBases {
+        RegistryBases {
+            npm: "https://registry.npmjs.org".into(),
+            cargo: "https://index.crates.io".into(),
+            pypi: "https://pypi.org".into(),
+            aur: "https://aur.archlinux.org".into(),
+        }
+    }
 
     #[test]
     fn handles_ping_request() {
         let temp = tempfile::tempdir().unwrap();
         let store = BaselineStore::open_at(&temp.path().join("store.db")).unwrap();
         let policy = Policy::default();
-        let resp = handle_request(
-            "ping",
-            None,
-            "https://registry.npmjs.org",
-            "https://index.crates.io",
-            "https://pypi.org",
-            "https://aur.archlinux.org",
-            &store,
-            &policy,
-        )
-        .unwrap();
+        let resp = handle_request("ping", None, &test_bases(), &store, &policy).unwrap();
         assert_eq!(resp, json!({}));
     }
 
@@ -474,17 +442,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = BaselineStore::open_at(&temp.path().join("store.db")).unwrap();
         let policy = Policy::default();
-        let resp = handle_request(
-            "initialize",
-            None,
-            "https://registry.npmjs.org",
-            "https://index.crates.io",
-            "https://pypi.org",
-            "https://aur.archlinux.org",
-            &store,
-            &policy,
-        )
-        .unwrap();
+        let resp = handle_request("initialize", None, &test_bases(), &store, &policy).unwrap();
         assert_eq!(resp.get("protocolVersion").unwrap(), "2024-11-05");
         assert!(resp.get("capabilities").is_some());
     }
@@ -494,17 +452,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = BaselineStore::open_at(&temp.path().join("store.db")).unwrap();
         let policy = Policy::default();
-        let resp = handle_request(
-            "tools/list",
-            None,
-            "https://registry.npmjs.org",
-            "https://index.crates.io",
-            "https://pypi.org",
-            "https://aur.archlinux.org",
-            &store,
-            &policy,
-        )
-        .unwrap();
+        let resp = handle_request("tools/list", None, &test_bases(), &store, &policy).unwrap();
         let tools = resp.get("tools").and_then(|t| t.as_array()).unwrap();
         assert_eq!(tools.len(), 3);
         assert!(
@@ -529,17 +477,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = BaselineStore::open_at(&temp.path().join("store.db")).unwrap();
         let policy = Policy::default();
-        let err = handle_request(
-            "nonexistent_method",
-            None,
-            "https://registry.npmjs.org",
-            "https://index.crates.io",
-            "https://pypi.org",
-            "https://aur.archlinux.org",
-            &store,
-            &policy,
-        )
-        .unwrap_err();
+        let err =
+            handle_request("nonexistent_method", None, &test_bases(), &store, &policy).unwrap_err();
         assert_eq!(err.code, -32601);
         assert!(err.message.contains("Method not found"));
     }
@@ -552,10 +491,7 @@ mod tests {
         let err = handle_request(
             "tools/call",
             Some(json!({"name": "check_known_clean", "arguments": {}})),
-            "https://registry.npmjs.org",
-            "https://index.crates.io",
-            "https://pypi.org",
-            "https://aur.archlinux.org",
+            &test_bases(),
             &store,
             &policy,
         )
@@ -575,10 +511,7 @@ mod tests {
                 "name": "review_install",
                 "arguments": {"package": "serde@1.0.210", "ecosystem": "rubygems"}
             })),
-            "https://registry.npmjs.org",
-            "https://index.crates.io",
-            "https://pypi.org",
-            "https://aur.archlinux.org",
+            &test_bases(),
             &store,
             &policy,
         )
@@ -593,16 +526,19 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = BaselineStore::open_at(&temp.path().join("store.db")).unwrap();
         let policy = Policy::default();
+        let unreachable = RegistryBases {
+            npm: "http://127.0.0.1:1".into(),
+            cargo: "http://127.0.0.1:1".into(),
+            pypi: "http://127.0.0.1:1".into(),
+            aur: "http://127.0.0.1:1".into(),
+        };
 
         // Default (no ecosystem) routes to the npm base; the request fails on
         // the network side, not with invalid params.
         let err = handle_request(
             "tools/call",
             Some(json!({"name": "review_install", "arguments": {"package": "x@1.0.0"}})),
-            "http://127.0.0.1:1",
-            "http://127.0.0.1:1",
-            "http://127.0.0.1:1",
-            "http://127.0.0.1:1",
+            &unreachable,
             &store,
             &policy,
         )
@@ -615,10 +551,7 @@ mod tests {
                 "name": "inspect_diff",
                 "arguments": {"package": "serde@1.0.210", "ecosystem": "cargo"}
             })),
-            "http://127.0.0.1:1",
-            "http://127.0.0.1:1",
-            "http://127.0.0.1:1",
-            "http://127.0.0.1:1",
+            &unreachable,
             &store,
             &policy,
         )
@@ -633,10 +566,7 @@ mod tests {
                 "name": "inspect_diff",
                 "arguments": {"package": "yay@12.4.2-1", "ecosystem": "aur"}
             })),
-            "http://127.0.0.1:1",
-            "http://127.0.0.1:1",
-            "http://127.0.0.1:1",
-            "http://127.0.0.1:1",
+            &unreachable,
             &store,
             &policy,
         )
