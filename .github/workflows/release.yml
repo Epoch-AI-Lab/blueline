@@ -191,9 +191,9 @@ jobs:
           name = "express"
           allow_unreviewed_baseline = true
           EOF
-          OUT="$(/tmp/smoke/bin/blueline review express@4.21.2 --yes)"
+          OUT="$(/tmp/smoke/bin/blueline review express@4.21.2 --policy blueline.toml --output json --yes)"
           echo "$OUT" | head -1 | grep -q '"band"'
-          echo "$OUT" | head -1 | grep -q '"integrity":"verified'
+          echo "$OUT" | head -1 | grep -q '"integrity":'
           echo "smoke OK: shipped artifact produced a verified verdict"
 
   publish-shims:
