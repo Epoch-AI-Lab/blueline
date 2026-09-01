@@ -434,4 +434,32 @@ mod tests {
         assert!(!res2.target_release_yanked);
         assert!(!res2.prior_release_yanked);
     }
+
+    #[test]
+    fn baseline_display_summary_formats_all_variants() {
+        let local = BaselineResolution::LocalApproved(crate::registry::Package {
+            name: "pkg".to_string(),
+            version: "1.0.0".to_string(),
+            tarball_url: "https://example.com/pkg-1.0.0.tgz".to_string(),
+            integrity: None,
+        });
+        assert_eq!(local.display_summary(), "1.0.0 (approved locally)");
+
+        let reg = BaselineResolution::RegistryPredecessor(crate::registry::Package {
+            name: "pkg".to_string(),
+            version: "0.9.0".to_string(),
+            tarball_url: "https://example.com/pkg-0.9.0.tgz".to_string(),
+            integrity: None,
+        });
+        assert_eq!(
+            reg.display_summary(),
+            "0.9.0 (registry predecessor; unreviewed)"
+        );
+
+        let first = BaselineResolution::FirstSighting;
+        assert_eq!(
+            first.display_summary(),
+            "none (first sighting / initial release)"
+        );
+    }
 }

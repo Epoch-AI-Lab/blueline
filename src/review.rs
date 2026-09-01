@@ -961,6 +961,11 @@ mod tests {
         assert!(parse_spec("pkg == 1.0.0").is_err());
         assert!(parse_spec("pkg==not-a-version!").is_err());
         assert!(parse_spec("pkg@not-a-version!").is_err());
+        assert!(parse_spec("@1.0.0").is_err());
+        assert!(parse_spec("pkg@").is_err());
+        assert!(parse_spec("==1.0.0").is_err());
+        assert!(parse_spec("pkg==").is_err());
+        assert!(parse_spec("").is_err());
 
         // parse_spec with PEP 440 prerelease (valid PEP 440, invalid semver)
         assert_eq!(
