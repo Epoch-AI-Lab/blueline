@@ -116,9 +116,6 @@ pub fn run_stdio(
 
         // Notifications don't require responses
         if request.id.is_none() {
-            if request.method == "notifications/initialized" {
-                eprintln!("blueline-mcp: client initialized notification received");
-            }
             continue;
         }
 
@@ -581,7 +578,6 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.code, -32603);
 
-        // Explicit cargo routes to the index base; same internal-error shape.
         let err = handle_request(
             "tools/call",
             Some(json!({
@@ -595,5 +591,13 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code, -32603);
+    }
+
+    #[test]
+    fn jsonrpc_error_constructors_have_spec_codes() {
+        assert_eq!(JsonRpcError::parse_error("bad json").code, -32700);
+        assert_eq!(JsonRpcError::method_not_found("unknown").code, -32601);
+        assert_eq!(JsonRpcError::invalid_params("bad param").code, -32602);
+        assert_eq!(JsonRpcError::internal_error("fail").code, -32603);
     }
 }

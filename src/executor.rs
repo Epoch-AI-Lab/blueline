@@ -1,14 +1,10 @@
 use std::process::{Command, Stdio};
 
-/// Executes `npm install --ignore-scripts --registry <registry> [extra_args...] -- <pkg>`.
-///
-/// Delegates to `$npm_execpath` if set (e.g. when invoked through `npm` or `npx`),
-/// otherwise defaults to `npm` on PATH.
-pub fn install_with_ignore_scripts(
+pub fn build_install_command(
     pkg: &str,
     registry_base: &str,
     extra_args: &[String],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Command> {
     validate_extra_args(extra_args)?;
 
     let mut cmd = match std::env::var("npm_execpath") {
@@ -44,8 +40,22 @@ pub fn install_with_ignore_scripts(
         .arg(registry_base)
         .args(extra_args)
         .arg("--")
-        .arg(pkg.trim())
-        .stdin(Stdio::inherit())
+        .arg(pkg.trim());
+
+    Ok(cmd)
+}
+
+/// Executes `npm install --ignore-scripts --registry <registry> [extra_args...] -- <pkg>`.
+///
+/// Delegates to `$npm_execpath` if set (e.g. when invoked through `npm` or `npx`),
+/// otherwise defaults to `npm` on PATH.
+pub fn install_with_ignore_scripts(
+    pkg: &str,
+    registry_base: &str,
+    extra_args: &[String],
+) -> anyhow::Result<()> {
+    let mut cmd = build_install_command(pkg, registry_base, extra_args)?;
+    cmd.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
@@ -357,6 +367,27 @@ mod tests {
                 };
                 prop_assert!(validate_extra_args(&args).is_err());
             }
+        }
+
+        #[test]
+        fn build_install_command_constructs_proper_args() {
+            let cmd =
+                build_install_command("express@4.21.2", "https://registry.npmjs.org", &[]).unwrap();
+            let args: Vec<String> = cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(
+                args,
+                vec![
+                    "install",
+                    "--ignore-scripts",
+                    "--registry",
+                    "https://registry.npmjs.org",
+                    "--",
+                    "express@4.21.2"
+                ]
+            );
         }
     }
 }

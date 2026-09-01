@@ -196,7 +196,7 @@ jobs:
 
   # Sharded across 16 parallel runners for push to main.
   mutants:
-    name: Mutation testing (all, shard ${{ matrix.shard }}/16)
+    name: Mutation testing (push diff, shard ${{ matrix.shard }}/16)
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [test]
@@ -210,13 +210,17 @@ jobs:
       RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-mutants
-      - name: Mutate the trust boundary
+      - name: Diff against previous commit
+        run: git diff HEAD~1..HEAD -- > push.diff
+      - name: Mutate the changed lines
         run: |
-          cargo mutants --shard ${{ matrix.shard }}/16 \
+          cargo mutants --in-diff push.diff --shard ${{ matrix.shard }}/16 \
             --file src/extract.rs --file src/manifest.rs --file src/registry/npm.rs \
             --file src/registry/pypi.rs --file src/wheel_extract.rs --file src/baseline.rs \
             --file src/version.rs --file src/review.rs --file src/store.rs \
