@@ -1349,7 +1349,9 @@ mod tests {
         let reg = fx.registry();
 
         // In-cap newest version resolves fine.
-        assert!(reg.resolve("long", "0.0.200-1").is_ok());
+        if let Err(e) = reg.resolve("long", "0.0.200-1") {
+            panic!("in-cap newest version must resolve: {e:#}");
+        }
 
         // The oldest commit fell outside the 200-commit walk: fail closed
         // and state the truncation instead of pretending the version is gone.
