@@ -725,11 +725,69 @@ std = []
     }
 
     #[test]
+    fn srcinfo_byte_cap_boundary_is_exact() {
+        // Padded to exactly the byte cap; the cap itself must parse.
+        let mut raw = String::from("pkgbase = demo\n\tpkgver = 1.0\n\tx = ");
+        raw.push_str(&"p".repeat(SRCINFO_MAX_BYTES as usize - raw.len() - 13));
+        raw.push_str("\n\tpkgrel = 1\n");
+        assert_eq!(raw.len() as u64, SRCINFO_MAX_BYTES);
+        assert_eq!(parse_aur_srcinfo(&raw).unwrap().version, "1.0-1");
+
+        let err = parse_aur_srcinfo(&format!("{raw}x"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exceeds cap"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn srcinfo_line_cap_boundary_is_exact() {
+        let mut raw = String::from("pkgbase = demo\n\tpkgver = 1.0\n\tpkgrel = 1\n");
+        for _ in 3..MAX_SRCINFO_LINES {
+            raw.push_str("\tx = 1\n");
+        }
+        assert_eq!(raw.lines().count(), MAX_SRCINFO_LINES);
+        assert_eq!(parse_aur_srcinfo(&raw).unwrap().version, "1.0-1");
+    }
+
+    #[test]
+    fn srcinfo_errors_carry_one_based_line_numbers() {
+        let err = parse_aur_srcinfo("junk = 1\n\tpkgver = 1.0-1\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("line 1:"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn srcinfo_key_grammar_accepts_underscores_and_rejects_empty() {
+        assert!(split_srcinfo_pair("make_depends = git", 1).is_ok());
+        let err = split_srcinfo_pair(" = git", 1).unwrap_err().to_string();
+        assert!(err.contains("invalid key"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn read_aur_srcinfo_reports_missing_files() {
         let dir = tempfile::tempdir().unwrap();
         assert!(matches!(
             read_aur_srcinfo(&dir.path().join(".SRCINFO")),
             Err(BluelineError::Manifest(_, _))
         ));
+    }
+
+    #[test]
+    fn read_aur_srcinfo_byte_cap_boundary_is_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".SRCINFO");
+        // Exactly at the cap; the final byte completes `pkgrel`, so a
+        // truncated read cannot silently succeed.
+        let mut exact = String::from("pkgbase = demo\n\tpkgver = 1.0\n\tx = ");
+        exact.push_str(&"p".repeat(SRCINFO_MAX_BYTES as usize - exact.len() - 12));
+        exact.push_str("\n\tpkgrel = 1");
+        assert_eq!(exact.len() as u64, SRCINFO_MAX_BYTES);
+        fs::write(&path, &exact).unwrap();
+        assert_eq!(read_aur_srcinfo(&path).unwrap().version, "1.0-1");
+
+        fs::write(&path, format!("{exact}x")).unwrap();
+        let err = read_aur_srcinfo(&path).unwrap_err().to_string();
+        assert!(err.contains("exceeds cap"), "unexpected error: {err}");
     }
 }

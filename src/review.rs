@@ -1056,4 +1056,36 @@ mod tests {
         );
         assert!(res.is_ok());
     }
+
+    #[test]
+    fn prepare_extracted_root_requires_aur_archive_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = prepare_extracted_root(dir.path(), Ecosystem::Aur, "demo", "1.0-1")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("missing `PKGBUILD`"),
+            "unexpected error: {err}"
+        );
+
+        std::fs::write(dir.path().join("PKGBUILD"), "pkgname=demo\n").unwrap();
+        let err = prepare_extracted_root(dir.path(), Ecosystem::Aur, "demo", "1.0-1")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("missing `.SRCINFO`"),
+            "unexpected error: {err}"
+        );
+
+        std::fs::write(
+            dir.path().join(".SRCINFO"),
+            "pkgbase = demo\n\tpkgver = 1.0\n\tpkgrel = 1\n",
+        )
+        .unwrap();
+        let (root, manifest) =
+            prepare_extracted_root(dir.path(), Ecosystem::Aur, "demo", "1.0-1").unwrap();
+        assert_eq!(root, dir.path());
+        assert_eq!(manifest.name, "demo");
+        assert_eq!(manifest.version, "1.0-1");
+    }
 }
