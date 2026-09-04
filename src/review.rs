@@ -753,7 +753,7 @@ fn offer_baseline_approval_with_reader(
 /// `<name>@<version>` → (name, version). Scoped names (`@scope/pkg@1.0.0`)
 /// split from the right so the scope's leading `@` stays with the name.
 /// PyPI alias `name==version` is also accepted.
-pub fn parse_spec(spec: &str) -> anyhow::Result<(String, String)> {
+pub fn parse_spec(spec: &str, ecosystem: Ecosystem) -> anyhow::Result<(String, String)> {
     let (name, version) = if let Some((n, v)) = spec.split_once("==") {
         (n, v)
     } else {
@@ -777,9 +777,11 @@ pub fn parse_spec(spec: &str) -> anyhow::Result<(String, String)> {
     if !name_valid {
         return Err(crate::error::BluelineError::InvalidPackageSpec(spec.to_string()).into());
     }
-    let version_valid = semver::Version::parse(version).is_ok()
-        || crate::version::Pep440Version::parse(version).is_ok()
-        || crate::version::AurVersionInfo::parse(version).is_ok();
+    let version_valid = match ecosystem {
+        Ecosystem::Npm | Ecosystem::Cargo => semver::Version::parse(version).is_ok(),
+        Ecosystem::PyPi => crate::version::Pep440Version::parse(version).is_ok(),
+        Ecosystem::Aur => crate::version::AurVersionInfo::parse(version).is_ok(),
+    };
     if !version_valid {
         return Err(crate::error::BluelineError::InvalidPackageSpec(spec.to_string()).into());
     }
@@ -798,7 +800,7 @@ fn parse_spec_flexible(spec: &str, registry: &dyn Registry) -> anyhow::Result<(S
         };
 
     if has_version_sep {
-        parse_spec(spec)
+        parse_spec(spec, registry.ecosystem())
     } else {
         let name = spec.trim();
         if name.is_empty() {
@@ -830,7 +832,7 @@ mod tests {
     #[test]
     fn parses_plain_spec() {
         assert_eq!(
-            parse_spec("express@4.21.2").unwrap(),
+            parse_spec("express@4.21.2", Ecosystem::Npm).unwrap(),
             ("express".into(), "4.21.2".into())
         );
     }
@@ -838,19 +840,19 @@ mod tests {
     #[test]
     fn parses_scoped_spec() {
         assert_eq!(
-            parse_spec("@scope/pkg@1.2.3").unwrap(),
+            parse_spec("@scope/pkg@1.2.3", Ecosystem::Npm).unwrap(),
             ("@scope/pkg".into(), "1.2.3".into())
         );
     }
 
     #[test]
     fn rejects_missing_at() {
-        assert!(parse_spec("express").is_err());
+        assert!(parse_spec("express", Ecosystem::Npm).is_err());
     }
 
     #[test]
     fn rejects_bad_semver() {
-        assert!(parse_spec("express@latest").is_err());
+        assert!(parse_spec("express@latest", Ecosystem::Npm).is_err());
     }
 
     #[test]
@@ -950,11 +952,11 @@ mod tests {
     #[test]
     fn parse_spec_accepts_pypi_double_equals() {
         assert_eq!(
-            parse_spec("requests==2.28.1").unwrap(),
+            parse_spec("requests==2.28.1", Ecosystem::PyPi).unwrap(),
             ("requests".into(), "2.28.1".into())
         );
         assert_eq!(
-            parse_spec("my-package==1.0a1").unwrap(),
+            parse_spec("my-package==1.0a1", Ecosystem::PyPi).unwrap(),
             ("my-package".into(), "1.0a1".into())
         );
     }
@@ -1005,24 +1007,24 @@ mod tests {
         );
 
         // parse_spec bracket / space / bad version rejection
-        assert!(parse_spec("pkg[extra]==1.0.0").is_err());
-        assert!(parse_spec("pkg==1.0.0[extra]").is_err());
-        assert!(parse_spec("pkg == 1.0.0").is_err());
-        assert!(parse_spec("pkg==not-a-version!").is_err());
-        assert!(parse_spec("pkg@not-a-version!").is_err());
-        assert!(parse_spec("@1.0.0").is_err());
-        assert!(parse_spec("pkg@").is_err());
-        assert!(parse_spec("==1.0.0").is_err());
-        assert!(parse_spec("pkg==").is_err());
-        assert!(parse_spec("").is_err());
+        assert!(parse_spec("pkg[extra]==1.0.0", Ecosystem::PyPi).is_err());
+        assert!(parse_spec("pkg==1.0.0[extra]", Ecosystem::PyPi).is_err());
+        assert!(parse_spec("pkg == 1.0.0", Ecosystem::PyPi).is_err());
+        assert!(parse_spec("pkg==not-a-version!", Ecosystem::PyPi).is_err());
+        assert!(parse_spec("pkg@not-a-version!", Ecosystem::Npm).is_err());
+        assert!(parse_spec("@1.0.0", Ecosystem::Npm).is_err());
+        assert!(parse_spec("pkg@", Ecosystem::Npm).is_err());
+        assert!(parse_spec("==1.0.0", Ecosystem::PyPi).is_err());
+        assert!(parse_spec("pkg==", Ecosystem::PyPi).is_err());
+        assert!(parse_spec("", Ecosystem::Npm).is_err());
 
         // parse_spec with PEP 440 prerelease (valid PEP 440, invalid semver)
         assert_eq!(
-            parse_spec("pkg==1.0.0a1").unwrap(),
+            parse_spec("pkg==1.0.0a1", Ecosystem::PyPi).unwrap(),
             ("pkg".into(), "1.0.0a1".into())
         );
         assert_eq!(
-            parse_spec("pkg@1.0.0a1").unwrap(),
+            parse_spec("pkg@1.0.0a1", Ecosystem::PyPi).unwrap(),
             ("pkg".into(), "1.0.0a1".into())
         );
 

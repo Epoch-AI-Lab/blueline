@@ -288,7 +288,7 @@ fn execute_tool(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| JsonRpcError::invalid_params("missing `package` argument"))?;
 
-            let (pkg_name, version) = parse_spec(pkg_spec).map_err(|e| {
+            let (pkg_name, version) = parse_spec(pkg_spec, ecosystem).map_err(|e| {
                 JsonRpcError::invalid_params(format!("invalid package spec `{pkg_spec}`: {e}"))
             })?;
 
@@ -401,7 +401,7 @@ fn execute_tool(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| JsonRpcError::invalid_params("missing `package` argument"))?;
 
-            let (pkg_name, version) = parse_spec(pkg_spec).map_err(|e| {
+            let (pkg_name, version) = parse_spec(pkg_spec, ecosystem).map_err(|e| {
                 JsonRpcError::invalid_params(format!("invalid package spec `{pkg_spec}`: {e}"))
             })?;
 
