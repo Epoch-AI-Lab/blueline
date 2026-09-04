@@ -778,7 +778,8 @@ pub fn parse_spec(spec: &str) -> anyhow::Result<(String, String)> {
         return Err(crate::error::BluelineError::InvalidPackageSpec(spec.to_string()).into());
     }
     let version_valid = semver::Version::parse(version).is_ok()
-        || crate::version::Pep440Version::parse(version).is_ok();
+        || crate::version::Pep440Version::parse(version).is_ok()
+        || crate::version::AurVersionInfo::parse(version).is_ok();
     if !version_valid {
         return Err(crate::error::BluelineError::InvalidPackageSpec(spec.to_string()).into());
     }
