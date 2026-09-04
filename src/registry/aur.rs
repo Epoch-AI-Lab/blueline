@@ -316,9 +316,26 @@ fn git_output(
     let stderr = stderr_reader
         .join()
         .map_err(|_| BluelineError::Network("git stderr reader panicked".to_string()))?;
+    let stdout_over_cap = out.len() as u64 > max_stdout;
+    let stderr_over_cap = stderr.len() as u64 > MAX_GIT_STDERR_BYTES;
+    if stdout_over_cap || stderr_over_cap {
+        let _ = child.kill();
+    }
     let status = child
         .wait()
         .map_err(|e| BluelineError::Network(format!("waiting for git: {e}")))?;
+    if stdout_over_cap {
+        return Err(BluelineError::ExtractionLimit(format!(
+            "git {} output exceeds cap of {max_stdout} bytes",
+            git_verb(args)
+        )));
+    }
+    if stderr_over_cap {
+        return Err(BluelineError::ExtractionLimit(format!(
+            "git {} stderr exceeds cap of {MAX_GIT_STDERR_BYTES} bytes",
+            git_verb(args)
+        )));
+    }
     if !status.success() {
         let detail = String::from_utf8_lossy(&stderr);
         return Err(BluelineError::Network(format!(
@@ -326,12 +343,6 @@ fn git_output(
             git_verb(args),
             status,
             detail.trim()
-        )));
-    }
-    if out.len() as u64 > max_stdout {
-        return Err(BluelineError::ExtractionLimit(format!(
-            "git {} output exceeds cap of {max_stdout} bytes",
-            git_verb(args)
         )));
     }
     Ok(out)
