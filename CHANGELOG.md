@@ -61,6 +61,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The MCP `check_known_clean` AUR arm compares the requested version against
+  stored clean versions with libalpm vercmp equality instead of canonical
+  strings, so grammar-accepted spellings of an approved release (pkgrel-less
+  `12.4.2`, epoch-explicit `0:12.4.2-1`) now report `isClean: true` against a
+  stored `12.4.2-1` instead of a false negative; an unparseable AUR version is
+  now an `invalid params` error rather than a guaranteed not-clean.
 - Release workflow smoke gate invokes the shipped binary with
   `--policy blueline.toml --output json --yes` and asserts on the presence of
   the `integrity` field, matching the current CLI flags and the 0.3.0
