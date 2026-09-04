@@ -581,6 +581,50 @@ fn install_blocks_unapproved_in_non_interactive_mode() {
 }
 
 #[test]
+fn install_yes_fails_closed_on_non_low_risk() {
+    let tarball = make_tarball();
+    let integrity = sha512_b64(&tarball);
+    let fixture = spawn_fixture(move |base| packument(base, "4.21.2", &integrity), tarball);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let log_file = temp_dir.path().join("npm_args.log");
+    let mock_npm = temp_dir.path().join("mock-npm.sh");
+    std::fs::write(
+        &mock_npm,
+        format!(
+            "#!/bin/sh\necho \"$@\" > \"{}\"\nexit 0\n",
+            log_file.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&mock_npm, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let data_dir = tempfile::tempdir().unwrap();
+    blueline()
+        .args([
+            "install",
+            "express@4.21.2",
+            "--registry",
+            &fixture.base,
+            "--yes",
+        ])
+        .env("BLUELINE_DATA_DIR", data_dir.path())
+        .env("npm_execpath", mock_npm.to_str().unwrap())
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("Cannot auto-approve"))
+        .stderr(predicate::str::contains("installation blocked"));
+
+    assert!(
+        !log_file.exists(),
+        "npm must never run when --yes refuses a non-LOW risk verdict"
+    );
+}
+#[test]
 fn node_shim_launches_binary_via_override() {
     let bin_path = assert_cmd::cargo::cargo_bin("blueline");
     let launcher_path =
