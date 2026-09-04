@@ -144,8 +144,9 @@ fn evaluate_with_registry<R: Registry, V: VersionInfo>(
 
     store.record_verified(ecosystem, &target_pkg.name, &target_pkg.version, &checksum)?;
 
-    let baseline_res: BaselineSelection = resolve_baseline(name, &target_ver, &registry, store)
-        .map_err(|e| anyhow::anyhow!("baseline resolution: {e}"))?;
+    let baseline_res: BaselineSelection =
+        resolve_baseline(&target_pkg.name, &target_ver, &registry, store)
+            .map_err(|e| anyhow::anyhow!("baseline resolution: {e}"))?;
 
     let delta = if let Some(base_pkg) = baseline_res.resolution.package() {
         let base_tarball = registry.fetch_tarball(base_pkg)?;
@@ -421,11 +422,11 @@ pub fn run(
 
     if yes {
         if verdict.band == crate::verdict::VerdictBand::Low {
-            store.mark_clean(ecosystem, &name, &version_str, &checksum)?;
+            store.mark_clean(ecosystem, &verdict.name, &verdict.target_version, &checksum)?;
             let _ = store.record_audit_log(
                 ecosystem,
-                &name,
-                &version_str,
+                &verdict.name,
+                &verdict.target_version,
                 &checksum.to_display(),
                 "approve_auto_yes",
                 0,
@@ -459,8 +460,8 @@ pub fn run(
         interactive_prompt(
             &store,
             ecosystem,
-            &name,
-            &version_str,
+            &verdict.name,
+            &verdict.target_version,
             &checksum,
             &delta,
             unreviewed_baseline.as_ref(),
@@ -533,11 +534,11 @@ pub fn install(
     let is_interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let approved = if yes {
         if verdict.band == crate::verdict::VerdictBand::Low {
-            store.mark_clean(ecosystem, &name, &version_str, &checksum)?;
+            store.mark_clean(ecosystem, &verdict.name, &verdict.target_version, &checksum)?;
             let _ = store.record_audit_log(
                 ecosystem,
-                &name,
-                &version_str,
+                &verdict.name,
+                &verdict.target_version,
                 &checksum.to_display(),
                 "approve_auto_yes",
                 0,
@@ -564,8 +565,8 @@ pub fn install(
         interactive_prompt(
             &store,
             ecosystem,
-            &name,
-            &version_str,
+            &verdict.name,
+            &verdict.target_version,
             &checksum,
             &delta,
             unreviewed_baseline.as_ref(),
