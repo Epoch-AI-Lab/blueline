@@ -369,11 +369,15 @@ fn execute_tool(
                     let rows = store
                         .list_clean_versions::<AurVersionInfo>(ecosystem, pkg_name)
                         .map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
+                    // Compare with vercmp equality (libalpm treats a missing
+                    // pkgrel as equal to its `-1` sibling), not canonical
+                    // strings, so grammar-accepted spellings like `12.4.2`
+                    // or `0:12.4.2-1` match the stored `12.4.2-1`.
+                    let input = AurVersionInfo::parse(version).map_err(|e| {
+                        JsonRpcError::invalid_params(format!("invalid version `{version}`: {e}"))
+                    })?;
                     let strs: Vec<String> = rows.iter().map(|(v, _)| v.canonical()).collect();
-                    let input = AurVersionInfo::parse(version)
-                        .map(|v| v.canonical())
-                        .unwrap_or_else(|_| version.to_string());
-                    (strs.iter().any(|s| s == &input), strs)
+                    (rows.iter().any(|(v, _)| *v == input), strs)
                 }
             };
 
@@ -713,6 +717,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resp.get("isClean").unwrap(), &json!(false));
+
+        // vercmp-equal spellings of the stored `12.4.2-1` report clean:
+        // the pkgrel-less `12.4.2` and the epoch-explicit `0:12.4.2-1`
+        // compare equal under libalpm rules even though their canonical
+        // strings differ from the stored row.
+        let resp = handle_request(
+            "tools/call",
+            Some(json!({
+                "name": "check_known_clean",
+                "arguments": {"name": "yay", "version": "12.4.2", "ecosystem": "aur"}
+            })),
+            &test_bases(),
+            &store,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(resp.get("isClean").unwrap(), &json!(true));
+
+        let resp = handle_request(
+            "tools/call",
+            Some(json!({
+                "name": "check_known_clean",
+                "arguments": {"name": "yay", "version": "0:12.4.2-1", "ecosystem": "aur"}
+            })),
+            &test_bases(),
+            &store,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(resp.get("isClean").unwrap(), &json!(true));
     }
 
     #[test]
