@@ -343,13 +343,39 @@ fn execute_tool(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| JsonRpcError::invalid_params("missing `version` argument"))?;
 
-            let clean_versions = store
-                .list_clean_versions::<semver::Version>(ecosystem, pkg_name)
-                .map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
-
-            let is_clean = clean_versions.iter().any(|(v, _)| v.to_string() == version);
-            let clean_version_strings: Vec<String> =
-                clean_versions.iter().map(|(v, _)| v.to_string()).collect();
+            use crate::version::{AurVersionInfo, Pep440Version, VersionInfo};
+            let (is_clean, clean_version_strings): (bool, Vec<String>) = match ecosystem {
+                Ecosystem::Npm | Ecosystem::Cargo => {
+                    let rows = store
+                        .list_clean_versions::<semver::Version>(ecosystem, pkg_name)
+                        .map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
+                    let strs: Vec<String> = rows.iter().map(|(v, _)| v.canonical()).collect();
+                    let input = semver::Version::parse(version)
+                        .map(|v| v.canonical())
+                        .unwrap_or_else(|_| version.to_string());
+                    (strs.iter().any(|s| s == &input), strs)
+                }
+                Ecosystem::PyPi => {
+                    let rows = store
+                        .list_clean_versions::<Pep440Version>(ecosystem, pkg_name)
+                        .map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
+                    let strs: Vec<String> = rows.iter().map(|(v, _)| v.canonical()).collect();
+                    let input = Pep440Version::parse(version)
+                        .map(|v| v.canonical())
+                        .unwrap_or_else(|_| version.to_string());
+                    (strs.iter().any(|s| s == &input), strs)
+                }
+                Ecosystem::Aur => {
+                    let rows = store
+                        .list_clean_versions::<AurVersionInfo>(ecosystem, pkg_name)
+                        .map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
+                    let strs: Vec<String> = rows.iter().map(|(v, _)| v.canonical()).collect();
+                    let input = AurVersionInfo::parse(version)
+                        .map(|v| v.canonical())
+                        .unwrap_or_else(|_| version.to_string());
+                    (strs.iter().any(|s| s == &input), strs)
+                }
+            };
 
             let name = crate::render::sanitize_single_line(pkg_name);
             let ver = crate::render::sanitize_single_line(version);
