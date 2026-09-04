@@ -604,7 +604,16 @@ impl AurRegistry {
         let clone_url = self.clone_url(&pkgbase);
         let repo = self.temp_repo()?;
         self.clone_repo(&clone_url, repo.path())?;
-        let (commits, _truncated) = commit_history(repo.path(), MAX_HISTORY_COMMITS)?;
+        let (commits, truncated) = commit_history(repo.path(), MAX_HISTORY_COMMITS)?;
+        if truncated {
+            return Err(BluelineError::Manifest(
+                pkgbase,
+                format!(
+                    "history walk stopped at the {MAX_HISTORY_COMMITS} newest commits, \
+                     so older releases are outside the window and the review fails closed"
+                ),
+            ));
+        }
 
         let mut seen: Vec<(AurVersionInfo, Release)> = Vec::new();
         let mut skipped = 0usize;
@@ -1372,9 +1381,12 @@ mod tests {
             "truncation must be stated: {err}"
         );
 
-        // list_releases does not error on truncation; it sees only the cap.
-        let releases = reg.list_releases("long").unwrap();
-        assert_eq!(releases.len(), 200);
+        // list_releases fails closed on truncation like resolve does.
+        let err = reg.list_releases("long").unwrap_err().to_string();
+        assert!(
+            err.contains("200 newest commits"),
+            "truncation must be stated: {err}"
+        );
     }
 
     #[test]
