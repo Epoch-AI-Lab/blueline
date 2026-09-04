@@ -602,6 +602,120 @@ mod tests {
     }
 
     #[test]
+    fn check_known_clean_reports_true_only_for_marked_version() {
+        use crate::registry::{Checksum, ChecksumAlg};
+        use sha2::{Digest, Sha512};
+        fn ck(tag: &str) -> Checksum {
+            let mut hasher = Sha512::new();
+            hasher.update(tag.as_bytes());
+            Checksum {
+                alg: ChecksumAlg::Sha512,
+                value_hex: format!("{:x}", hasher.finalize()),
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&temp.path().join("store.db")).unwrap();
+        let policy = Policy::default();
+        store
+            .record_verified(Ecosystem::Npm, "express", "4.21.2", &ck("npm"))
+            .unwrap();
+        store
+            .mark_clean(Ecosystem::Npm, "express", "4.21.2", &ck("npm"))
+            .unwrap();
+        store
+            .record_verified(Ecosystem::PyPi, "requests", "2.28.1", &ck("pypi"))
+            .unwrap();
+        store
+            .mark_clean(Ecosystem::PyPi, "requests", "2.28.1", &ck("pypi"))
+            .unwrap();
+        store
+            .record_verified(Ecosystem::Aur, "yay", "12.4.2-1", &ck("aur"))
+            .unwrap();
+        store
+            .mark_clean(Ecosystem::Aur, "yay", "12.4.2-1", &ck("aur"))
+            .unwrap();
+
+        let resp = handle_request(
+            "tools/call",
+            Some(json!({
+                "name": "check_known_clean",
+                "arguments": {"name": "express", "version": "4.21.2"}
+            })),
+            &test_bases(),
+            &store,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(resp.get("isClean").unwrap(), &json!(true));
+
+        let resp = handle_request(
+            "tools/call",
+            Some(json!({
+                "name": "check_known_clean",
+                "arguments": {"name": "express", "version": "4.21.3"}
+            })),
+            &test_bases(),
+            &store,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(resp.get("isClean").unwrap(), &json!(false));
+
+        let resp = handle_request(
+            "tools/call",
+            Some(json!({
+                "name": "check_known_clean",
+                "arguments": {"name": "requests", "version": "2.28.1", "ecosystem": "pypi"}
+            })),
+            &test_bases(),
+            &store,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(resp.get("isClean").unwrap(), &json!(true));
+
+        let resp = handle_request(
+            "tools/call",
+            Some(json!({
+                "name": "check_known_clean",
+                "arguments": {"name": "requests", "version": "2.28.2", "ecosystem": "pypi"}
+            })),
+            &test_bases(),
+            &store,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(resp.get("isClean").unwrap(), &json!(false));
+
+        let resp = handle_request(
+            "tools/call",
+            Some(json!({
+                "name": "check_known_clean",
+                "arguments": {"name": "yay", "version": "12.4.2-1", "ecosystem": "aur"}
+            })),
+            &test_bases(),
+            &store,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(resp.get("isClean").unwrap(), &json!(true));
+
+        let resp = handle_request(
+            "tools/call",
+            Some(json!({
+                "name": "check_known_clean",
+                "arguments": {"name": "yay", "version": "12.4.2-2", "ecosystem": "aur"}
+            })),
+            &test_bases(),
+            &store,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(resp.get("isClean").unwrap(), &json!(false));
+    }
+
+    #[test]
     fn jsonrpc_error_constructors_have_spec_codes() {
         assert_eq!(JsonRpcError::parse_error("bad json").code, -32700);
         assert_eq!(JsonRpcError::method_not_found("unknown").code, -32601);
