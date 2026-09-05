@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- PKGBUILD static heuristics (`src/pkgbuild.rs`, AUR reviews only): a
+  hand-rolled tokenizer with quote-aware lexing (`$'...'` ANSI-C, line
+  continuations, word-boundary comments), multi-pass variable folding,
+  indexed and associative array writes, brace expansion, and fail-closed
+  bounds (1 MiB, 64k lines, no new dependencies, nothing executed). Rules
+  R11-R23 fire as verdict findings: R13 pipe-to-shell, R14 eval family, and
+  R18 homoglyph at HIGH; R12 source drift, R15 true indirection, R16 command
+  substitution in metadata, R19 validpgpkeys change, and R20 install/hook
+  change at MEDIUM; R11 checksum SKIP, R17 build-time network, R21 unpinned
+  VCS, R22 conditional guards, and R23 npm delivery at INFO after the benign
+  corpus (137 real AUR PKGBUILDs in `tests/fixtures/pkgbuild_benign/`)
+  showed each fires on legitimate packages. Baseline pair rules (R12, R19)
+  run when a baseline exists; unparseable PKGBUILDs fail closed at HIGH;
+  every card carries the scope disclosure that downloaded upstream sources
+  are not reviewed. Fuzz target `fuzz/fuzz_targets/pkgbuild_tokenizer.rs`.
 - AUR registry adapter (`blueline --ecosystem aur review <pkg>@<pkgver-pkgrel>`):
   a git-history-backed `AurRegistry` on the RPC v5 client — pkgname → pkgbase
   mapping, full-history clone of `{base}/{pkgbase}.git` through the system
