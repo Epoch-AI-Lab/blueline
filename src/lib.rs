@@ -12,6 +12,7 @@ pub mod heuristic;
 pub mod lockfile;
 pub mod manifest;
 pub mod mcp;
+pub mod pkgbuild;
 pub mod policy;
 pub mod provenance;
 pub mod registry;

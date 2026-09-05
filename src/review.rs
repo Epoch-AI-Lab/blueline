@@ -148,7 +148,7 @@ fn evaluate_with_registry<R: Registry, V: VersionInfo>(
         resolve_baseline(&target_pkg.name, &target_ver, &registry, store)
             .map_err(|e| anyhow::anyhow!("baseline resolution: {e}"))?;
 
-    let delta = if let Some(base_pkg) = baseline_res.resolution.package() {
+    let (delta, base_pkgbuild) = if let Some(base_pkg) = baseline_res.resolution.package() {
         let base_tarball = registry.fetch_tarball(base_pkg)?;
         let base_temp =
             tempfile::tempdir().map_err(|e| anyhow::anyhow!("creating temp dir: {e}"))?;
@@ -179,23 +179,30 @@ fn evaluate_with_registry<R: Registry, V: VersionInfo>(
             )
         })?;
 
-        compute_delta(
+        let delta = compute_delta(
             Some(&base_root),
             Some(&base_manifest),
             Some(&base_pkg.version),
             &target_root,
             &target_manifest,
             &target_pkg.version,
-        )?
+        )?;
+        let base_pkgbuild = (ecosystem == Ecosystem::Aur)
+            .then(|| std::fs::read_to_string(base_root.join("PKGBUILD")).ok())
+            .flatten();
+        (delta, base_pkgbuild)
     } else {
-        compute_delta(
+        (
+            compute_delta(
+                None,
+                None,
+                None,
+                &target_root,
+                &target_manifest,
+                &target_pkg.version,
+            )?,
             None,
-            None,
-            None,
-            &target_root,
-            &target_manifest,
-            &target_pkg.version,
-        )?
+        )
     };
 
     let is_unreviewed = matches!(
@@ -264,7 +271,7 @@ fn evaluate_with_registry<R: Registry, V: VersionInfo>(
         )
     };
 
-    let verdict = evaluate_with_trust(
+    let mut verdict = evaluate_with_trust(
         &target_pkg.name,
         ecosystem,
         &checksum.to_display(),
@@ -277,6 +284,14 @@ fn evaluate_with_registry<R: Registry, V: VersionInfo>(
         Some(&advisories),
         provenance.as_ref(),
     );
+
+    if ecosystem == Ecosystem::Aur {
+        verdict.findings.extend(crate::pkgbuild::review_roots(
+            &target_root,
+            base_pkgbuild.as_deref(),
+            &delta,
+        ));
+    }
 
     Ok((verdict, delta, checksum, unreviewed_baseline))
 }
