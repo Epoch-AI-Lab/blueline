@@ -135,7 +135,7 @@ Rulings:
 ## Status
 
 - [x] PR1 feat/aur-foundation
-- [ ] PR2 feat/aur-adapter
+- [x] PR2 feat/aur-adapter
 - [ ] PR3 feat/pkgbuild-heuristics
 - [ ] PR4 feat/aur-integration
 

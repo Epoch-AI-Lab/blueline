@@ -5,8 +5,9 @@ use crate::cli::{Output, OutputFormat};
 use crate::diff::compute_delta;
 use crate::extract::{ExtractionLimits, safe_extract};
 use crate::heuristic::evaluate_with_trust;
-use crate::manifest::{read_package_json, read_packed_cargo_toml};
+use crate::manifest::{read_aur_srcinfo, read_package_json, read_packed_cargo_toml};
 use crate::policy::Policy;
+use crate::registry::aur::AurRegistry;
 use crate::registry::cratesio::CratesIoRegistry;
 use crate::registry::npm::NpmRegistry;
 use crate::registry::pypi::PyPIRegistry;
@@ -28,9 +29,7 @@ fn make_registry(ecosystem: Ecosystem, registry_base: &str) -> anyhow::Result<Bo
         Ecosystem::Npm => Ok(Box::new(NpmRegistry::new(registry_base))),
         Ecosystem::Cargo => Ok(Box::new(CratesIoRegistry::new(registry_base))),
         Ecosystem::PyPi => Ok(Box::new(PyPIRegistry::new(registry_base))),
-        Ecosystem::Aur => Err(anyhow::anyhow!(
-            "AUR reviews are not supported yet: the AUR adapter is still under construction"
-        )),
+        Ecosystem::Aur => Ok(Box::new(AurRegistry::new(registry_base))),
     }
 }
 
@@ -74,9 +73,14 @@ pub fn evaluate_package(
             store,
             policy,
         ),
-        Ecosystem::Aur => Err(anyhow::anyhow!(
-            "AUR reviews are not supported yet: the AUR adapter is still under construction"
-        )),
+        Ecosystem::Aur => evaluate_with_registry::<AurRegistry, crate::version::AurVersionInfo>(
+            AurRegistry::new(registry_base),
+            name,
+            version_str,
+            registry_base,
+            store,
+            policy,
+        ),
     }
 }
 
@@ -140,8 +144,9 @@ fn evaluate_with_registry<R: Registry, V: VersionInfo>(
 
     store.record_verified(ecosystem, &target_pkg.name, &target_pkg.version, &checksum)?;
 
-    let baseline_res: BaselineSelection = resolve_baseline(name, &target_ver, &registry, store)
-        .map_err(|e| anyhow::anyhow!("baseline resolution: {e}"))?;
+    let baseline_res: BaselineSelection =
+        resolve_baseline(&target_pkg.name, &target_ver, &registry, store)
+            .map_err(|e| anyhow::anyhow!("baseline resolution: {e}"))?;
 
     let delta = if let Some(base_pkg) = baseline_res.resolution.package() {
         let base_tarball = registry.fetch_tarball(base_pkg)?;
@@ -246,6 +251,19 @@ fn evaluate_with_registry<R: Registry, V: VersionInfo>(
         Ecosystem::Aur => None,
     };
 
+    let author_changed = {
+        let target_author = registry.release_author(&target_pkg);
+        let baseline_author = baseline_res
+            .resolution
+            .package()
+            .and_then(|p| registry.release_author(p));
+        // Unknown authorship on either side is "no signal", never a finding.
+        matches!(
+            (baseline_author, target_author),
+            (Some(base), Some(target)) if base != target
+        )
+    };
+
     let verdict = evaluate_with_trust(
         &target_pkg.name,
         ecosystem,
@@ -254,6 +272,7 @@ fn evaluate_with_registry<R: Registry, V: VersionInfo>(
         is_unreviewed,
         baseline_res.prior_release_yanked,
         baseline_res.target_release_yanked,
+        author_changed,
         policy,
         Some(&advisories),
         provenance.as_ref(),
@@ -280,7 +299,8 @@ fn extract_for_ecosystem(
 
 /// Locate and parse the package manifest inside an extracted release tree.
 /// Cargo `.crate` archives additionally must unpack to exactly one top-level
-/// directory named `{canonical-name}-{version}`.
+/// directory named `{canonical-name}-{version}`; AUR archives are the repo
+/// root itself (PKGBUILD + .SRCINFO + patches, no pkgbase subdirectory).
 fn prepare_extracted_root(
     temp_root: &std::path::Path,
     ecosystem: Ecosystem,
@@ -297,10 +317,17 @@ fn prepare_extracted_root(
         Ecosystem::Npm => read_package_json(&package_json_path(&root))?,
         Ecosystem::Cargo => read_packed_cargo_toml(&root.join("Cargo.toml"))?.manifest_view(),
         Ecosystem::Aur => {
-            return Err(crate::error::BluelineError::Manifest(
-                canonical_name.to_string(),
-                "AUR manifest handling is not wired yet".into(),
-            ));
+            for required in ["PKGBUILD", ".SRCINFO"] {
+                if !root.join(required).is_file() {
+                    return Err(crate::error::BluelineError::Manifest(
+                        canonical_name.to_string(),
+                        format!(
+                            "AUR archive is missing `{required}` at its root; refusing to review"
+                        ),
+                    ));
+                }
+            }
+            read_aur_srcinfo(&root.join(".SRCINFO"))?
         }
         Ecosystem::PyPi => {
             let candidate = root.join("METADATA");
@@ -395,11 +422,11 @@ pub fn run(
 
     if yes {
         if verdict.band == crate::verdict::VerdictBand::Low {
-            store.mark_clean(ecosystem, &name, &version_str, &checksum)?;
+            store.mark_clean(ecosystem, &verdict.name, &verdict.target_version, &checksum)?;
             let _ = store.record_audit_log(
                 ecosystem,
-                &name,
-                &version_str,
+                &verdict.name,
+                &verdict.target_version,
                 &checksum.to_display(),
                 "approve_auto_yes",
                 0,
@@ -433,8 +460,8 @@ pub fn run(
         interactive_prompt(
             &store,
             ecosystem,
-            &name,
-            &version_str,
+            &verdict.name,
+            &verdict.target_version,
             &checksum,
             &delta,
             unreviewed_baseline.as_ref(),
@@ -507,11 +534,11 @@ pub fn install(
     let is_interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let approved = if yes {
         if verdict.band == crate::verdict::VerdictBand::Low {
-            store.mark_clean(ecosystem, &name, &version_str, &checksum)?;
+            store.mark_clean(ecosystem, &verdict.name, &verdict.target_version, &checksum)?;
             let _ = store.record_audit_log(
                 ecosystem,
-                &name,
-                &version_str,
+                &verdict.name,
+                &verdict.target_version,
                 &checksum.to_display(),
                 "approve_auto_yes",
                 0,
@@ -538,8 +565,8 @@ pub fn install(
         interactive_prompt(
             &store,
             ecosystem,
-            &name,
-            &version_str,
+            &verdict.name,
+            &verdict.target_version,
             &checksum,
             &delta,
             unreviewed_baseline.as_ref(),
@@ -726,7 +753,7 @@ fn offer_baseline_approval_with_reader(
 /// `<name>@<version>` → (name, version). Scoped names (`@scope/pkg@1.0.0`)
 /// split from the right so the scope's leading `@` stays with the name.
 /// PyPI alias `name==version` is also accepted.
-pub fn parse_spec(spec: &str) -> anyhow::Result<(String, String)> {
+pub fn parse_spec(spec: &str, ecosystem: Ecosystem) -> anyhow::Result<(String, String)> {
     let (name, version) = if let Some((n, v)) = spec.split_once("==") {
         (n, v)
     } else {
@@ -750,8 +777,11 @@ pub fn parse_spec(spec: &str) -> anyhow::Result<(String, String)> {
     if !name_valid {
         return Err(crate::error::BluelineError::InvalidPackageSpec(spec.to_string()).into());
     }
-    let version_valid = semver::Version::parse(version).is_ok()
-        || crate::version::Pep440Version::parse(version).is_ok();
+    let version_valid = match ecosystem {
+        Ecosystem::Npm | Ecosystem::Cargo => semver::Version::parse(version).is_ok(),
+        Ecosystem::PyPi => crate::version::Pep440Version::parse(version).is_ok(),
+        Ecosystem::Aur => crate::version::AurVersionInfo::parse(version).is_ok(),
+    };
     if !version_valid {
         return Err(crate::error::BluelineError::InvalidPackageSpec(spec.to_string()).into());
     }
@@ -770,7 +800,7 @@ fn parse_spec_flexible(spec: &str, registry: &dyn Registry) -> anyhow::Result<(S
         };
 
     if has_version_sep {
-        parse_spec(spec)
+        parse_spec(spec, registry.ecosystem())
     } else {
         let name = spec.trim();
         if name.is_empty() {
@@ -802,7 +832,7 @@ mod tests {
     #[test]
     fn parses_plain_spec() {
         assert_eq!(
-            parse_spec("express@4.21.2").unwrap(),
+            parse_spec("express@4.21.2", Ecosystem::Npm).unwrap(),
             ("express".into(), "4.21.2".into())
         );
     }
@@ -810,19 +840,19 @@ mod tests {
     #[test]
     fn parses_scoped_spec() {
         assert_eq!(
-            parse_spec("@scope/pkg@1.2.3").unwrap(),
+            parse_spec("@scope/pkg@1.2.3", Ecosystem::Npm).unwrap(),
             ("@scope/pkg".into(), "1.2.3".into())
         );
     }
 
     #[test]
     fn rejects_missing_at() {
-        assert!(parse_spec("express").is_err());
+        assert!(parse_spec("express", Ecosystem::Npm).is_err());
     }
 
     #[test]
     fn rejects_bad_semver() {
-        assert!(parse_spec("express@latest").is_err());
+        assert!(parse_spec("express@latest", Ecosystem::Npm).is_err());
     }
 
     #[test]
@@ -922,11 +952,11 @@ mod tests {
     #[test]
     fn parse_spec_accepts_pypi_double_equals() {
         assert_eq!(
-            parse_spec("requests==2.28.1").unwrap(),
+            parse_spec("requests==2.28.1", Ecosystem::PyPi).unwrap(),
             ("requests".into(), "2.28.1".into())
         );
         assert_eq!(
-            parse_spec("my-package==1.0a1").unwrap(),
+            parse_spec("my-package==1.0a1", Ecosystem::PyPi).unwrap(),
             ("my-package".into(), "1.0a1".into())
         );
     }
@@ -977,24 +1007,24 @@ mod tests {
         );
 
         // parse_spec bracket / space / bad version rejection
-        assert!(parse_spec("pkg[extra]==1.0.0").is_err());
-        assert!(parse_spec("pkg==1.0.0[extra]").is_err());
-        assert!(parse_spec("pkg == 1.0.0").is_err());
-        assert!(parse_spec("pkg==not-a-version!").is_err());
-        assert!(parse_spec("pkg@not-a-version!").is_err());
-        assert!(parse_spec("@1.0.0").is_err());
-        assert!(parse_spec("pkg@").is_err());
-        assert!(parse_spec("==1.0.0").is_err());
-        assert!(parse_spec("pkg==").is_err());
-        assert!(parse_spec("").is_err());
+        assert!(parse_spec("pkg[extra]==1.0.0", Ecosystem::PyPi).is_err());
+        assert!(parse_spec("pkg==1.0.0[extra]", Ecosystem::PyPi).is_err());
+        assert!(parse_spec("pkg == 1.0.0", Ecosystem::PyPi).is_err());
+        assert!(parse_spec("pkg==not-a-version!", Ecosystem::PyPi).is_err());
+        assert!(parse_spec("pkg@not-a-version!", Ecosystem::Npm).is_err());
+        assert!(parse_spec("@1.0.0", Ecosystem::Npm).is_err());
+        assert!(parse_spec("pkg@", Ecosystem::Npm).is_err());
+        assert!(parse_spec("==1.0.0", Ecosystem::PyPi).is_err());
+        assert!(parse_spec("pkg==", Ecosystem::PyPi).is_err());
+        assert!(parse_spec("", Ecosystem::Npm).is_err());
 
         // parse_spec with PEP 440 prerelease (valid PEP 440, invalid semver)
         assert_eq!(
-            parse_spec("pkg==1.0.0a1").unwrap(),
+            parse_spec("pkg==1.0.0a1", Ecosystem::PyPi).unwrap(),
             ("pkg".into(), "1.0.0a1".into())
         );
         assert_eq!(
-            parse_spec("pkg@1.0.0a1").unwrap(),
+            parse_spec("pkg@1.0.0a1", Ecosystem::PyPi).unwrap(),
             ("pkg".into(), "1.0.0a1".into())
         );
 
@@ -1029,5 +1059,37 @@ mod tests {
             "https://example.com/pkg-1.0.0.tar.gz",
         );
         assert!(res.is_ok());
+    }
+
+    #[test]
+    fn prepare_extracted_root_requires_aur_archive_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = prepare_extracted_root(dir.path(), Ecosystem::Aur, "demo", "1.0-1")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("missing `PKGBUILD`"),
+            "unexpected error: {err}"
+        );
+
+        std::fs::write(dir.path().join("PKGBUILD"), "pkgname=demo\n").unwrap();
+        let err = prepare_extracted_root(dir.path(), Ecosystem::Aur, "demo", "1.0-1")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("missing `.SRCINFO`"),
+            "unexpected error: {err}"
+        );
+
+        std::fs::write(
+            dir.path().join(".SRCINFO"),
+            "pkgbase = demo\n\tpkgver = 1.0\n\tpkgrel = 1\n",
+        )
+        .unwrap();
+        let (root, manifest) =
+            prepare_extracted_root(dir.path(), Ecosystem::Aur, "demo", "1.0-1").unwrap();
+        assert_eq!(root, dir.path());
+        assert_eq!(manifest.name, "demo");
+        assert_eq!(manifest.version, "1.0-1");
     }
 }

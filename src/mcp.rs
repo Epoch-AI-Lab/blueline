@@ -71,8 +71,7 @@ impl JsonRpcError {
 }
 
 pub fn run_stdio(
-    registry_base: &str,
-    index_base: &str,
+    bases: &crate::cli::RegistryBases,
     policy_path: Option<&Path>,
 ) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
@@ -120,14 +119,7 @@ pub fn run_stdio(
         }
 
         let id = request.id.unwrap_or(serde_json::Value::Null);
-        let resp = match handle_request(
-            &request.method,
-            request.params,
-            registry_base,
-            index_base,
-            &store,
-            &policy,
-        ) {
+        let resp = match handle_request(&request.method, request.params, bases, &store, &policy) {
             Ok(result) => JsonRpcResponse {
                 jsonrpc: "2.0",
                 id,
@@ -154,8 +146,7 @@ pub fn run_stdio(
 fn handle_request(
     method: &str,
     params: Option<serde_json::Value>,
-    registry_base: &str,
-    index_base: &str,
+    bases: &crate::cli::RegistryBases,
     store: &BaselineStore,
     policy: &Policy,
 ) -> Result<serde_json::Value, JsonRpcError> {
@@ -187,7 +178,7 @@ fn handle_request(
                             },
                             "ecosystem": {
                                 "type": "string",
-                                "enum": ["npm", "cargo"],
+                                "enum": ["npm", "cargo", "pypi", "aur"],
                                 "default": "npm",
                                 "description": "Package ecosystem. npm reviews use dist-tags/semver; cargo reviews use the crates.io sparse index and refuse installs."
                             }
@@ -211,7 +202,7 @@ fn handle_request(
                             },
                             "ecosystem": {
                                 "type": "string",
-                                "enum": ["npm", "cargo"],
+                                "enum": ["npm", "cargo", "pypi", "aur"],
                                 "default": "npm",
                                 "description": "Package ecosystem to scope the baseline lookup."
                             }
@@ -231,7 +222,7 @@ fn handle_request(
                             },
                             "ecosystem": {
                                 "type": "string",
-                                "enum": ["npm", "cargo"],
+                                "enum": ["npm", "cargo", "pypi", "aur"],
                                 "default": "npm",
                                 "description": "Package ecosystem to review against."
                             }
@@ -251,7 +242,7 @@ fn handle_request(
                 .ok_or_else(|| JsonRpcError::invalid_params("missing tool name in tools/call"))?;
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
-            execute_tool(tool_name, &args, registry_base, index_base, store, policy)
+            execute_tool(tool_name, &args, bases, store, policy)
         }
 
         other => Err(JsonRpcError::method_not_found(other)),
@@ -270,8 +261,10 @@ fn parse_ecosystem(args: &serde_json::Value) -> Result<Ecosystem, JsonRpcError> 
             match s {
                 "npm" => Ok(Ecosystem::Npm),
                 "cargo" => Ok(Ecosystem::Cargo),
+                "pypi" => Ok(Ecosystem::PyPi),
+                "aur" => Ok(Ecosystem::Aur),
                 other => Err(JsonRpcError::invalid_params(format!(
-                    "unknown ecosystem `{other}`; expected npm or cargo"
+                    "unknown ecosystem `{other}`; expected npm, cargo, pypi, or aur"
                 ))),
             }
         }
@@ -281,26 +274,12 @@ fn parse_ecosystem(args: &serde_json::Value) -> Result<Ecosystem, JsonRpcError> 
 fn execute_tool(
     name: &str,
     args: &serde_json::Value,
-    registry_base: &str,
-    index_base: &str,
+    bases: &crate::cli::RegistryBases,
     store: &BaselineStore,
     policy: &Policy,
 ) -> Result<serde_json::Value, JsonRpcError> {
     let ecosystem = parse_ecosystem(args)?;
-    let base = match ecosystem {
-        Ecosystem::Npm => registry_base,
-        Ecosystem::Cargo => index_base,
-        Ecosystem::PyPi => {
-            return Err(JsonRpcError::invalid_params(
-                "pypi reviews are not available yet",
-            ));
-        }
-        Ecosystem::Aur => {
-            return Err(JsonRpcError::invalid_params(
-                "aur reviews are not available yet",
-            ));
-        }
-    };
+    let base = bases.for_ecosystem(ecosystem);
 
     match name {
         "review_install" => {
@@ -309,7 +288,7 @@ fn execute_tool(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| JsonRpcError::invalid_params("missing `package` argument"))?;
 
-            let (pkg_name, version) = parse_spec(pkg_spec).map_err(|e| {
+            let (pkg_name, version) = parse_spec(pkg_spec, ecosystem).map_err(|e| {
                 JsonRpcError::invalid_params(format!("invalid package spec `{pkg_spec}`: {e}"))
             })?;
 
@@ -364,13 +343,43 @@ fn execute_tool(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| JsonRpcError::invalid_params("missing `version` argument"))?;
 
-            let clean_versions = store
-                .list_clean_versions::<semver::Version>(ecosystem, pkg_name)
-                .map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
-
-            let is_clean = clean_versions.iter().any(|(v, _)| v.to_string() == version);
-            let clean_version_strings: Vec<String> =
-                clean_versions.iter().map(|(v, _)| v.to_string()).collect();
+            use crate::version::{AurVersionInfo, Pep440Version, VersionInfo};
+            let (is_clean, clean_version_strings): (bool, Vec<String>) = match ecosystem {
+                Ecosystem::Npm | Ecosystem::Cargo => {
+                    let rows = store
+                        .list_clean_versions::<semver::Version>(ecosystem, pkg_name)
+                        .map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
+                    let strs: Vec<String> = rows.iter().map(|(v, _)| v.canonical()).collect();
+                    let input = semver::Version::parse(version)
+                        .map(|v| v.canonical())
+                        .unwrap_or_else(|_| version.to_string());
+                    (strs.iter().any(|s| s == &input), strs)
+                }
+                Ecosystem::PyPi => {
+                    let rows = store
+                        .list_clean_versions::<Pep440Version>(ecosystem, pkg_name)
+                        .map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
+                    let strs: Vec<String> = rows.iter().map(|(v, _)| v.canonical()).collect();
+                    let input = Pep440Version::parse(version)
+                        .map(|v| v.canonical())
+                        .unwrap_or_else(|_| version.to_string());
+                    (strs.iter().any(|s| s == &input), strs)
+                }
+                Ecosystem::Aur => {
+                    let rows = store
+                        .list_clean_versions::<AurVersionInfo>(ecosystem, pkg_name)
+                        .map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
+                    // Compare with vercmp equality (libalpm treats a missing
+                    // pkgrel as equal to its `-1` sibling), not canonical
+                    // strings, so grammar-accepted spellings like `12.4.2`
+                    // or `0:12.4.2-1` match the stored `12.4.2-1`.
+                    let input = AurVersionInfo::parse(version).map_err(|e| {
+                        JsonRpcError::invalid_params(format!("invalid version `{version}`: {e}"))
+                    })?;
+                    let strs: Vec<String> = rows.iter().map(|(v, _)| v.canonical()).collect();
+                    (rows.iter().any(|(v, _)| *v == input), strs)
+                }
+            };
 
             let name = crate::render::sanitize_single_line(pkg_name);
             let ver = crate::render::sanitize_single_line(version);
@@ -396,7 +405,7 @@ fn execute_tool(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| JsonRpcError::invalid_params("missing `package` argument"))?;
 
-            let (pkg_name, version) = parse_spec(pkg_spec).map_err(|e| {
+            let (pkg_name, version) = parse_spec(pkg_spec, ecosystem).map_err(|e| {
                 JsonRpcError::invalid_params(format!("invalid package spec `{pkg_spec}`: {e}"))
             })?;
 
@@ -438,21 +447,23 @@ fn execute_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::RegistryBases;
+
+    fn test_bases() -> RegistryBases {
+        RegistryBases {
+            npm: "https://registry.npmjs.org".into(),
+            cargo: "https://index.crates.io".into(),
+            pypi: "https://pypi.org".into(),
+            aur: "https://aur.archlinux.org".into(),
+        }
+    }
 
     #[test]
     fn handles_ping_request() {
         let temp = tempfile::tempdir().unwrap();
         let store = BaselineStore::open_at(&temp.path().join("store.db")).unwrap();
         let policy = Policy::default();
-        let resp = handle_request(
-            "ping",
-            None,
-            "https://registry.npmjs.org",
-            "https://index.crates.io",
-            &store,
-            &policy,
-        )
-        .unwrap();
+        let resp = handle_request("ping", None, &test_bases(), &store, &policy).unwrap();
         assert_eq!(resp, json!({}));
     }
 
@@ -461,15 +472,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = BaselineStore::open_at(&temp.path().join("store.db")).unwrap();
         let policy = Policy::default();
-        let resp = handle_request(
-            "initialize",
-            None,
-            "https://registry.npmjs.org",
-            "https://index.crates.io",
-            &store,
-            &policy,
-        )
-        .unwrap();
+        let resp = handle_request("initialize", None, &test_bases(), &store, &policy).unwrap();
         assert_eq!(resp.get("protocolVersion").unwrap(), "2024-11-05");
         assert!(resp.get("capabilities").is_some());
     }
@@ -479,15 +482,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = BaselineStore::open_at(&temp.path().join("store.db")).unwrap();
         let policy = Policy::default();
-        let resp = handle_request(
-            "tools/list",
-            None,
-            "https://registry.npmjs.org",
-            "https://index.crates.io",
-            &store,
-            &policy,
-        )
-        .unwrap();
+        let resp = handle_request("tools/list", None, &test_bases(), &store, &policy).unwrap();
         let tools = resp.get("tools").and_then(|t| t.as_array()).unwrap();
         assert_eq!(tools.len(), 3);
         assert!(
@@ -512,15 +507,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = BaselineStore::open_at(&temp.path().join("store.db")).unwrap();
         let policy = Policy::default();
-        let err = handle_request(
-            "nonexistent_method",
-            None,
-            "https://registry.npmjs.org",
-            "https://index.crates.io",
-            &store,
-            &policy,
-        )
-        .unwrap_err();
+        let err =
+            handle_request("nonexistent_method", None, &test_bases(), &store, &policy).unwrap_err();
         assert_eq!(err.code, -32601);
         assert!(err.message.contains("Method not found"));
     }
@@ -533,8 +521,7 @@ mod tests {
         let err = handle_request(
             "tools/call",
             Some(json!({"name": "check_known_clean", "arguments": {}})),
-            "https://registry.npmjs.org",
-            "https://index.crates.io",
+            &test_bases(),
             &store,
             &policy,
         )
@@ -552,16 +539,16 @@ mod tests {
             "tools/call",
             Some(json!({
                 "name": "review_install",
-                "arguments": {"package": "serde@1.0.210", "ecosystem": "pypi"}
+                "arguments": {"package": "serde@1.0.210", "ecosystem": "rubygems"}
             })),
-            "https://registry.npmjs.org",
-            "https://index.crates.io",
+            &test_bases(),
             &store,
             &policy,
         )
         .unwrap_err();
         assert_eq!(err.code, -32602);
         assert!(err.message.contains("unknown ecosystem"));
+        assert!(err.message.contains("expected npm, cargo, pypi, or aur"));
     }
 
     #[test]
@@ -569,14 +556,19 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = BaselineStore::open_at(&temp.path().join("store.db")).unwrap();
         let policy = Policy::default();
+        let unreachable = RegistryBases {
+            npm: "http://127.0.0.1:1".into(),
+            cargo: "http://127.0.0.1:1".into(),
+            pypi: "http://127.0.0.1:1".into(),
+            aur: "http://127.0.0.1:1".into(),
+        };
 
         // Default (no ecosystem) routes to the npm base; the request fails on
         // the network side, not with invalid params.
         let err = handle_request(
             "tools/call",
             Some(json!({"name": "review_install", "arguments": {"package": "x@1.0.0"}})),
-            "http://127.0.0.1:1",
-            "http://127.0.0.1:1",
+            &unreachable,
             &store,
             &policy,
         )
@@ -589,13 +581,172 @@ mod tests {
                 "name": "inspect_diff",
                 "arguments": {"package": "serde@1.0.210", "ecosystem": "cargo"}
             })),
-            "http://127.0.0.1:1",
-            "http://127.0.0.1:1",
+            &unreachable,
             &store,
             &policy,
         )
         .unwrap_err();
         assert_eq!(err.code, -32603);
+
+        // AUR is accepted and routed to the aur base: the failure is the
+        // network side, not invalid params.
+        let err = handle_request(
+            "tools/call",
+            Some(json!({
+                "name": "inspect_diff",
+                "arguments": {"package": "yay@12.4.2-1", "ecosystem": "aur"}
+            })),
+            &unreachable,
+            &store,
+            &policy,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, -32603);
+        assert!(err.message.contains("review error for `yay@12.4.2-1`"));
+    }
+
+    #[test]
+    fn check_known_clean_reports_true_only_for_marked_version() {
+        use crate::registry::{Checksum, ChecksumAlg};
+        use sha2::{Digest, Sha512};
+        fn ck(tag: &str) -> Checksum {
+            let mut hasher = Sha512::new();
+            hasher.update(tag.as_bytes());
+            Checksum {
+                alg: ChecksumAlg::Sha512,
+                value_hex: format!("{:x}", hasher.finalize()),
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&temp.path().join("store.db")).unwrap();
+        let policy = Policy::default();
+        store
+            .record_verified(Ecosystem::Npm, "express", "4.21.2", &ck("npm"))
+            .unwrap();
+        store
+            .mark_clean(Ecosystem::Npm, "express", "4.21.2", &ck("npm"))
+            .unwrap();
+        store
+            .record_verified(Ecosystem::PyPi, "requests", "2.28.1", &ck("pypi"))
+            .unwrap();
+        store
+            .mark_clean(Ecosystem::PyPi, "requests", "2.28.1", &ck("pypi"))
+            .unwrap();
+        store
+            .record_verified(Ecosystem::Aur, "yay", "12.4.2-1", &ck("aur"))
+            .unwrap();
+        store
+            .mark_clean(Ecosystem::Aur, "yay", "12.4.2-1", &ck("aur"))
+            .unwrap();
+
+        let resp = handle_request(
+            "tools/call",
+            Some(json!({
+                "name": "check_known_clean",
+                "arguments": {"name": "express", "version": "4.21.2"}
+            })),
+            &test_bases(),
+            &store,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(resp.get("isClean").unwrap(), &json!(true));
+
+        let resp = handle_request(
+            "tools/call",
+            Some(json!({
+                "name": "check_known_clean",
+                "arguments": {"name": "express", "version": "4.21.3"}
+            })),
+            &test_bases(),
+            &store,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(resp.get("isClean").unwrap(), &json!(false));
+
+        let resp = handle_request(
+            "tools/call",
+            Some(json!({
+                "name": "check_known_clean",
+                "arguments": {"name": "requests", "version": "2.28.1", "ecosystem": "pypi"}
+            })),
+            &test_bases(),
+            &store,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(resp.get("isClean").unwrap(), &json!(true));
+
+        let resp = handle_request(
+            "tools/call",
+            Some(json!({
+                "name": "check_known_clean",
+                "arguments": {"name": "requests", "version": "2.28.2", "ecosystem": "pypi"}
+            })),
+            &test_bases(),
+            &store,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(resp.get("isClean").unwrap(), &json!(false));
+
+        let resp = handle_request(
+            "tools/call",
+            Some(json!({
+                "name": "check_known_clean",
+                "arguments": {"name": "yay", "version": "12.4.2-1", "ecosystem": "aur"}
+            })),
+            &test_bases(),
+            &store,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(resp.get("isClean").unwrap(), &json!(true));
+
+        let resp = handle_request(
+            "tools/call",
+            Some(json!({
+                "name": "check_known_clean",
+                "arguments": {"name": "yay", "version": "12.4.2-2", "ecosystem": "aur"}
+            })),
+            &test_bases(),
+            &store,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(resp.get("isClean").unwrap(), &json!(false));
+
+        // vercmp-equal spellings of the stored `12.4.2-1` report clean:
+        // the pkgrel-less `12.4.2` and the epoch-explicit `0:12.4.2-1`
+        // compare equal under libalpm rules even though their canonical
+        // strings differ from the stored row.
+        let resp = handle_request(
+            "tools/call",
+            Some(json!({
+                "name": "check_known_clean",
+                "arguments": {"name": "yay", "version": "12.4.2", "ecosystem": "aur"}
+            })),
+            &test_bases(),
+            &store,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(resp.get("isClean").unwrap(), &json!(true));
+
+        let resp = handle_request(
+            "tools/call",
+            Some(json!({
+                "name": "check_known_clean",
+                "arguments": {"name": "yay", "version": "0:12.4.2-1", "ecosystem": "aur"}
+            })),
+            &test_bases(),
+            &store,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(resp.get("isClean").unwrap(), &json!(true));
     }
 
     #[test]

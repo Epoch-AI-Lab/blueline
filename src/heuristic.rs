@@ -40,6 +40,7 @@ pub fn evaluate_with_policy(
         is_unreviewed_baseline,
         false,
         false,
+        false,
         policy,
         None,
         None,
@@ -55,6 +56,7 @@ pub fn evaluate_with_trust(
     is_unreviewed_baseline: bool,
     prior_release_yanked: bool,
     target_release_yanked: bool,
+    author_changed: bool,
     policy: &Policy,
     advisories: Option<&AdvisoryReport>,
     provenance: Option<&ProvenanceReport>,
@@ -511,6 +513,23 @@ pub fn evaluate_with_trust(
             title: format!("Target release `{}` was yanked", delta.target_version),
             description: format!(
                 "The target release `{}` is marked as yanked on the registry. Yanked releases are often withdrawn due to critical bugs or security compromises.",
+                delta.target_version
+            ),
+        });
+    }
+
+    // R10: Release authored by a different identity than the baseline (AUR
+    // maintainer transition — the Atomic-Arch adoption signal)
+    if author_changed {
+        findings.push(Finding {
+            rule_id: "R10_MAINTAINER_TRANSITION".into(),
+            severity: VerdictBand::Medium,
+            title: format!(
+                "Release `{}` was authored by a different identity than the approved baseline",
+                delta.target_version
+            ),
+            description: format!(
+                "The release `{}` was authored by a different identity than the release the baseline was approved against. On the AUR a maintainer transition (especially an orphaned package being adopted) is the primary adoption signal of the Atomic-Arch campaign, where new maintainers pushed backdoored PKGBUILDs. Note: the AUR author email is self-declared, so a matching identity is not proof of the same person.",
                 delta.target_version
             ),
         });
@@ -2565,6 +2584,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             &Policy::default(),
             Some(&adv),
             None,
@@ -2623,6 +2643,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             &Policy::default(),
             Some(&adv),
             None,
@@ -2665,6 +2686,7 @@ mod tests {
             Ecosystem::Npm,
             "verified (sha512)",
             &delta,
+            false,
             false,
             false,
             false,
@@ -2715,6 +2737,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             &policy,
             None,
             Some(&prov_missing),
@@ -2751,6 +2774,7 @@ mod tests {
             Ecosystem::Npm,
             "verified (sha512)",
             &delta,
+            false,
             false,
             false,
             false,
@@ -3076,6 +3100,7 @@ mod tests {
             false,
             true,
             false,
+            false,
             &Policy::default(),
             None,
             None,
@@ -3106,6 +3131,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             &Policy::default(),
             None,
             None,
@@ -3135,6 +3161,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             &Policy::default(),
             None,
             None,
@@ -3147,5 +3174,60 @@ mod tests {
         );
         assert_eq!(verdict.band, VerdictBand::Low);
         assert_eq!(verdict.ecosystem, Ecosystem::Cargo);
+    }
+
+    #[test]
+    fn flags_maintainer_transition_as_medium() {
+        let delta = yanked_delta();
+        let verdict = evaluate_with_trust(
+            "test-pkg",
+            Ecosystem::Aur,
+            "sha256:abc",
+            &delta,
+            false,
+            false,
+            false,
+            true,
+            &Policy::default(),
+            None,
+            None,
+        );
+        let r10 = verdict
+            .findings
+            .iter()
+            .find(|f| f.rule_id == "R10_MAINTAINER_TRANSITION");
+        assert!(
+            r10.is_some(),
+            "expected R10 finding, got {:?}",
+            verdict.findings
+        );
+        assert_eq!(r10.unwrap().severity, VerdictBand::Medium);
+        assert_eq!(verdict.risk_score, 10);
+        assert_eq!(verdict.band, VerdictBand::Medium);
+    }
+
+    #[test]
+    fn no_maintainer_transition_finding_when_author_is_unchanged_or_unknown() {
+        let delta = yanked_delta();
+        let verdict = evaluate_with_trust(
+            "test-pkg",
+            Ecosystem::Aur,
+            "sha256:abc",
+            &delta,
+            false,
+            false,
+            false,
+            false,
+            &Policy::default(),
+            None,
+            None,
+        );
+        assert!(
+            !verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "R10_MAINTAINER_TRANSITION")
+        );
+        assert_eq!(verdict.band, VerdictBand::Low);
     }
 }

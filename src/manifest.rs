@@ -5,6 +5,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::error::BluelineError;
+use crate::version::VersionInfo;
 
 /// Cap on the extracted package.json before parsing (untrusted input).
 const MAX_MANIFEST_BYTES: u64 = 10 * 1024 * 1024;
@@ -198,6 +199,210 @@ pub fn read_packed_cargo_toml(path: &Path) -> Result<PackedCargoToml, BluelineEr
     }
     toml::from_str(&raw)
         .map_err(|e| BluelineError::Manifest(display_path, format!("invalid TOML: {e}")))
+}
+
+/// Byte cap on `.SRCINFO` files before parsing (untrusted input).
+pub const SRCINFO_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Line cap on `.SRCINFO` files; a generated `.SRCINFO` never approaches this.
+const MAX_SRCINFO_LINES: usize = 64 * 1024;
+
+/// Static parse of a generated `.SRCINFO` (the output of
+/// `makepkg --printsrcinfo`, never produced by executing a PKGBUILD here).
+/// Only `key = value` lines, blank separators, and the unindented
+/// `pkgbase =` / `pkgname =` section headers of the generated format are
+/// accepted; everything else fails closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SrcInfo {
+    pub pkgbase: String,
+    /// Validated `epoch:pkgver-pkgrel` identity in canonical form.
+    pub version: String,
+    /// `depends` + `makedepends` merged across all sections: dep name →
+    /// the full dependency expression as written.
+    pub deps: BTreeMap<String, String>,
+}
+
+pub fn read_aur_srcinfo(path: &Path) -> Result<PackageJson, BluelineError> {
+    use std::io::Read;
+    let display_path = path.display().to_string();
+    let file = fs::File::open(path)
+        .map_err(|e| BluelineError::Manifest(display_path.clone(), format!("cannot open: {e}")))?;
+    let mut bytes = Vec::new();
+    file.take(SRCINFO_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| BluelineError::Manifest(display_path.clone(), format!("cannot read: {e}")))?;
+    if bytes.len() as u64 > SRCINFO_MAX_BYTES {
+        return Err(BluelineError::Manifest(
+            display_path,
+            format!(".SRCINFO exceeds cap of {SRCINFO_MAX_BYTES} bytes"),
+        ));
+    }
+    let raw = String::from_utf8(bytes).map_err(|_| {
+        BluelineError::Manifest(display_path.clone(), ".SRCINFO is not valid UTF-8".into())
+    })?;
+    let src = parse_aur_srcinfo(&raw).map_err(|mut e| {
+        if let BluelineError::Manifest(_, msg) = &mut e {
+            *msg = format!("{display_path}: {msg}");
+        }
+        e
+    })?;
+    Ok(PackageJson {
+        name: src.pkgbase,
+        version: src.version,
+        dependencies: src.deps,
+        ..Default::default()
+    })
+}
+
+/// Parse `.SRCINFO` content as untrusted text. The PKGBUILD is never sourced
+/// and `makepkg` is never invoked; this reader understands only the flat
+/// generated key-value shape.
+pub fn parse_aur_srcinfo(raw: &str) -> Result<SrcInfo, BluelineError> {
+    if raw.len() as u64 > SRCINFO_MAX_BYTES {
+        return Err(BluelineError::Manifest(
+            ".SRCINFO".to_string(),
+            format!("exceeds cap of {SRCINFO_MAX_BYTES} bytes"),
+        ));
+    }
+    let line_count = raw.lines().count();
+    if line_count > MAX_SRCINFO_LINES {
+        return Err(BluelineError::Manifest(
+            ".SRCINFO".to_string(),
+            format!("exceeds cap of {MAX_SRCINFO_LINES} lines"),
+        ));
+    }
+
+    let mut pkgbase: Option<String> = None;
+    let mut pkgver: Option<String> = None;
+    let mut pkgrel: Option<String> = None;
+    let mut epoch: Option<String> = None;
+    let mut deps: BTreeMap<String, String> = BTreeMap::new();
+
+    for (idx, line) in raw.lines().enumerate() {
+        let lineno = idx + 1;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let indented = line.starts_with(' ') || line.starts_with('\t');
+        let (key, value) = split_srcinfo_pair(line, lineno)?;
+        if !indented {
+            // Unindented lines are section headers in the generated format.
+            match key.as_str() {
+                "pkgbase" => {
+                    if pkgbase.is_some() {
+                        return Err(BluelineError::Manifest(
+                            ".SRCINFO".to_string(),
+                            format!("line {lineno}: duplicate pkgbase section"),
+                        ));
+                    }
+                    if !crate::registry::aur::validate_aur_name(&value) {
+                        return Err(BluelineError::Manifest(
+                            ".SRCINFO".to_string(),
+                            format!("line {lineno}: invalid pkgbase `{value}`"),
+                        ));
+                    }
+                    pkgbase = Some(value);
+                }
+                "pkgname" => {
+                    if !crate::registry::aur::validate_aur_name(&value) {
+                        return Err(BluelineError::Manifest(
+                            ".SRCINFO".to_string(),
+                            format!("line {lineno}: invalid pkgname `{value}`"),
+                        ));
+                    }
+                }
+                other => {
+                    return Err(BluelineError::Manifest(
+                        ".SRCINFO".to_string(),
+                        format!("line {lineno}: unexpected unindented key `{other}`"),
+                    ));
+                }
+            }
+            continue;
+        }
+        match key.as_str() {
+            "pkgver" | "pkgrel" | "epoch" => {
+                let slot = match key.as_str() {
+                    "pkgver" => &mut pkgver,
+                    "pkgrel" => &mut pkgrel,
+                    _ => &mut epoch,
+                };
+                if slot.is_some() {
+                    return Err(BluelineError::Manifest(
+                        ".SRCINFO".to_string(),
+                        format!("line {lineno}: duplicate `{}` key", key),
+                    ));
+                }
+                *slot = Some(value);
+            }
+            "depends" | "makedepends" => {
+                let name = dep_name(&value).ok_or_else(|| {
+                    BluelineError::Manifest(
+                        ".SRCINFO".to_string(),
+                        format!("line {lineno}: dependency `{value}` has no package name"),
+                    )
+                })?;
+                deps.insert(name, value);
+            }
+            _ => {}
+        }
+    }
+
+    let pkgbase = pkgbase.ok_or_else(|| {
+        BluelineError::Manifest(".SRCINFO".to_string(), "no pkgbase section".to_string())
+    })?;
+    let pkgver = pkgver.ok_or_else(|| {
+        BluelineError::Manifest(".SRCINFO".to_string(), "missing pkgver".to_string())
+    })?;
+    let raw_version = match (epoch.as_deref(), pkgrel.as_deref()) {
+        (Some(e), Some(r)) => format!("{e}:{pkgver}-{r}"),
+        (Some(e), None) => format!("{e}:{pkgver}"),
+        (None, Some(r)) => format!("{pkgver}-{r}"),
+        (None, None) => pkgver,
+    };
+    let version = crate::version::AurVersionInfo::parse(&raw_version)
+        .map_err(|e| {
+            BluelineError::Manifest(
+                ".SRCINFO".to_string(),
+                format!("invalid pkgver/pkgrel/epoch: {e}"),
+            )
+        })?
+        .canonical();
+
+    Ok(SrcInfo {
+        pkgbase,
+        version,
+        deps,
+    })
+}
+
+/// Split a `.SRCINFO` line into its `key = value` pair. The generated format
+/// uses a single ` = ` separator; anything else fails closed.
+fn split_srcinfo_pair(line: &str, lineno: usize) -> Result<(String, String), BluelineError> {
+    let fail = |msg: String| {
+        BluelineError::Manifest(".SRCINFO".to_string(), format!("line {lineno}: {msg}"))
+    };
+    let body = line.trim_start();
+    let (key, value) = body
+        .split_once('=')
+        .ok_or_else(|| fail(format!("expected `key = value`, got `{}`", line.trim_end())))?;
+    let key = key.trim();
+    if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(fail(format!("invalid key `{key}`")));
+    }
+    Ok((key.to_string(), value.trim().to_string()))
+}
+
+/// The package name of an AUR dependency expression
+/// (`go>=1.21`, `sqlite3`, `mesa=24.0`): everything before the first
+/// version-relation character.
+fn dep_name(dep: &str) -> Option<String> {
+    let name = dep.split(['<', '>', '=']).next()?.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -423,5 +628,166 @@ std = []
     fn missing_cargo_toml_errors() {
         let dir = tempfile::tempdir().unwrap();
         assert!(read_packed_cargo_toml(&dir.path().join("nope.toml")).is_err());
+    }
+
+    fn sample_srcinfo() -> String {
+        "pkgbase = yay\n\tpkgdesc = Yet another yogurt\n\tpkgver = 12.4.2\n\tpkgrel = 1\n\tarch = x86_64\n\tdepends = go>=1.21\n\tdepends = pacman\n\tmakedepends = git\n\npkgname = yay\n\tdepends = pacman>=6.1\n\tlicense = GPL3\n".to_string()
+    }
+
+    #[test]
+    fn parses_srcinfo_version_and_merged_deps() {
+        let src = parse_aur_srcinfo(&sample_srcinfo()).unwrap();
+        assert_eq!(src.pkgbase, "yay");
+        assert_eq!(src.version, "12.4.2-1");
+        assert_eq!(src.deps.len(), 3);
+        assert_eq!(src.deps["go"], "go>=1.21");
+        assert_eq!(src.deps["pacman"], "pacman>=6.1");
+        assert_eq!(src.deps["git"], "git");
+
+        let view = read_aur_srcinfo_view(&sample_srcinfo());
+        assert_eq!(view.name, "yay");
+        assert_eq!(view.version, "12.4.2-1");
+        assert_eq!(view.dependencies.len(), 3);
+    }
+
+    fn read_aur_srcinfo_view(raw: &str) -> PackageJson {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".SRCINFO");
+        fs::write(&path, raw).unwrap();
+        read_aur_srcinfo(&path).unwrap()
+    }
+
+    #[test]
+    fn srcinfo_epoch_is_part_of_the_identity() {
+        let raw = "pkgbase = demo\n\tpkgver = 1.0\n\tpkgrel = 2\n\tepoch = 3\n";
+        let src = parse_aur_srcinfo(raw).unwrap();
+        assert_eq!(src.version, "3:1.0-2");
+    }
+
+    #[test]
+    fn srcinfo_without_pkgrel_parses() {
+        let raw = "pkgbase = demo\n\tpkgver = 1.0\n";
+        assert_eq!(parse_aur_srcinfo(raw).unwrap().version, "1.0");
+    }
+
+    #[test]
+    fn srcinfo_fails_closed_on_missing_required_keys() {
+        assert!(parse_aur_srcinfo("pkgver = 1.0\n").is_err());
+        assert!(parse_aur_srcinfo("pkgbase = demo\n").is_err());
+        assert!(parse_aur_srcinfo("").is_err());
+    }
+
+    #[test]
+    fn srcinfo_fails_closed_on_duplicate_pkgbase_and_keys() {
+        let dup_base = "pkgbase = demo\n\tpkgver = 1.0-1\npkgbase = demo\n";
+        assert!(
+            parse_aur_srcinfo(dup_base)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate pkgbase")
+        );
+
+        let dup_ver = "pkgbase = demo\n\tpkgver = 1.0-1\n\tpkgver = 2.0-1\n";
+        assert!(parse_aur_srcinfo(dup_ver).is_err());
+    }
+
+    #[test]
+    fn srcinfo_fails_closed_on_unrecognized_shapes() {
+        // Not a key = value line at all.
+        assert!(parse_aur_srcinfo("pkgbase = demo\n\tbroken\n").is_err());
+        // Comments are not part of the generated format.
+        assert!(parse_aur_srcinfo("# comment\npkgbase = demo\n\tpkgver = 1.0-1\n").is_err());
+        // Unindented keys other than pkgbase/pkgname are not generated output.
+        assert!(parse_aur_srcinfo("pkgbase = demo\npkgver = 1.0-1\n").is_err());
+        // Invalid names in section headers.
+        assert!(parse_aur_srcinfo("pkgbase = ../evil\n\tpkgver = 1.0-1\n").is_err());
+        // Garbage pkgver is rejected through the version grammar.
+        assert!(parse_aur_srcinfo("pkgbase = demo\n\tpkgver = not/valid-1\n").is_err());
+        // Empty key or empty dependency name.
+        assert!(parse_aur_srcinfo("pkgbase = demo\n\t = 1.0-1\n").is_err());
+        assert!(parse_aur_srcinfo("pkgbase = demo\n\tdepends = >=1.0\n").is_err());
+    }
+
+    #[test]
+    fn srcinfo_fails_closed_over_line_cap() {
+        let raw = format!(
+            "pkgbase = demo\n\tpkgver = 1.0-1\n{}",
+            "x = y\n".repeat(64 * 1024)
+        );
+        let err = parse_aur_srcinfo(&raw).unwrap_err().to_string();
+        assert!(err.contains("65536 lines"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn srcinfo_fails_closed_over_byte_cap() {
+        let raw = " ".repeat(SRCINFO_MAX_BYTES as usize + 1);
+        assert!(parse_aur_srcinfo(&raw).is_err());
+    }
+
+    #[test]
+    fn srcinfo_byte_cap_boundary_is_exact() {
+        // Padded to exactly the byte cap; the cap itself must parse.
+        let mut raw = String::from("pkgbase = demo\n\tpkgver = 1.0\n\tx = ");
+        raw.push_str(&"p".repeat(SRCINFO_MAX_BYTES as usize - raw.len() - 13));
+        raw.push_str("\n\tpkgrel = 1\n");
+        assert_eq!(raw.len() as u64, SRCINFO_MAX_BYTES);
+        assert_eq!(parse_aur_srcinfo(&raw).unwrap().version, "1.0-1");
+
+        let err = parse_aur_srcinfo(&format!("{raw}x"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exceeds cap"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn srcinfo_line_cap_boundary_is_exact() {
+        let mut raw = String::from("pkgbase = demo\n\tpkgver = 1.0\n\tpkgrel = 1\n");
+        for _ in 3..MAX_SRCINFO_LINES {
+            raw.push_str("\tx = 1\n");
+        }
+        assert_eq!(raw.lines().count(), MAX_SRCINFO_LINES);
+        assert_eq!(parse_aur_srcinfo(&raw).unwrap().version, "1.0-1");
+    }
+
+    #[test]
+    fn srcinfo_errors_carry_one_based_line_numbers() {
+        let err = parse_aur_srcinfo("junk = 1\n\tpkgver = 1.0-1\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("line 1:"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn srcinfo_key_grammar_accepts_underscores_and_rejects_empty() {
+        assert!(split_srcinfo_pair("make_depends = git", 1).is_ok());
+        let err = split_srcinfo_pair(" = git", 1).unwrap_err().to_string();
+        assert!(err.contains("invalid key"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn read_aur_srcinfo_reports_missing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            read_aur_srcinfo(&dir.path().join(".SRCINFO")),
+            Err(BluelineError::Manifest(_, _))
+        ));
+    }
+
+    #[test]
+    fn read_aur_srcinfo_byte_cap_boundary_is_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".SRCINFO");
+        // Exactly at the cap; the final byte completes `pkgrel`, so a
+        // truncated read cannot silently succeed.
+        let mut exact = String::from("pkgbase = demo\n\tpkgver = 1.0\n\tx = ");
+        exact.push_str(&"p".repeat(SRCINFO_MAX_BYTES as usize - exact.len() - 12));
+        exact.push_str("\n\tpkgrel = 1");
+        assert_eq!(exact.len() as u64, SRCINFO_MAX_BYTES);
+        fs::write(&path, &exact).unwrap();
+        assert_eq!(read_aur_srcinfo(&path).unwrap().version, "1.0-1");
+
+        fs::write(&path, format!("{exact}x")).unwrap();
+        let err = read_aur_srcinfo(&path).unwrap_err().to_string();
+        assert!(err.contains("exceeds cap"), "unexpected error: {err}");
     }
 }
