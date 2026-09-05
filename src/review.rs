@@ -187,9 +187,14 @@ fn evaluate_with_registry<R: Registry, V: VersionInfo>(
             &target_manifest,
             &target_pkg.version,
         )?;
-        let base_pkgbuild = (ecosystem == Ecosystem::Aur)
-            .then(|| std::fs::read_to_string(base_root.join("PKGBUILD")).ok())
-            .flatten();
+        let base_pkgbuild = if ecosystem == Ecosystem::Aur {
+            match std::fs::read_to_string(base_root.join("PKGBUILD")) {
+                Ok(text) => Some(text),
+                Err(_) => Some(String::new()),
+            }
+        } else {
+            None
+        };
         (delta, base_pkgbuild)
     } else {
         (
@@ -286,11 +291,20 @@ fn evaluate_with_registry<R: Registry, V: VersionInfo>(
     );
 
     if ecosystem == Ecosystem::Aur {
-        verdict.findings.extend(crate::pkgbuild::review_roots(
-            &target_root,
-            base_pkgbuild.as_deref(),
-            &delta,
-        ));
+        if matches!(base_pkgbuild.as_deref(), Some("")) {
+            verdict.findings.push(crate::verdict::Finding {
+                rule_id: "R00_BASELINE_UNREADABLE".to_string(),
+                severity: crate::verdict::VerdictBand::Low,
+                title: "Baseline PKGBUILD unreadable".to_string(),
+                description: "baseline PKGBUILD could not be read; pair rules skipped".to_string(),
+            });
+        }
+        let base_text = match base_pkgbuild.as_deref() {
+            Some("") | None if baseline_res.resolution.package().is_some() => None,
+            text => text,
+        };
+        let extra = crate::pkgbuild::review_roots(&target_root, base_text, &delta);
+        crate::heuristic::apply_extra_findings(&mut verdict, extra, policy);
     }
 
     Ok((verdict, delta, checksum, unreviewed_baseline))

