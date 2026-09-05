@@ -299,9 +299,12 @@ fn evaluate_with_registry<R: Registry, V: VersionInfo>(
                 description: "baseline PKGBUILD could not be read; pair rules skipped".to_string(),
             });
         }
+        // `None` is first sighting (no baseline package); `Some("")` is an
+        // unreadable baseline file, already surfaced above. Both skip pair
+        // rules; anything else diffs.
         let base_text = match base_pkgbuild.as_deref() {
-            Some("") | None if baseline_res.resolution.package().is_some() => None,
-            text => text,
+            None | Some("") => None,
+            Some(text) => Some(text),
         };
         let extra = crate::pkgbuild::review_roots(&target_root, base_text, &delta);
         crate::heuristic::apply_extra_findings(&mut verdict, extra, policy);

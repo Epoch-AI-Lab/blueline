@@ -146,6 +146,66 @@ fn spawn_aur_review_fixture() -> AurReviewFixture {
     }
 }
 
+/// Single-commit variant: reviewing 1.0-1 has no baseline, so pair
+/// rules must stay silent while target checks and disclosure still run.
+fn spawn_aur_first_sighting_fixture() -> AurReviewFixture {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    fixture_git(&work, &["init", "--quiet", "-b", "master"]);
+    fixture_git(&work, &["config", "user.email", "alice@example.com"]);
+    fixture_git(&work, &["config", "user.name", "Fixture"]);
+    fixture_git(&work, &["config", "commit.gpgsign", "false"]);
+    write_fixture_pkg(&work, "1.0", "AAA");
+    fixture_git(&work, &["add", "-A"]);
+    fixture_git(&work, &["commit", "--quiet", "-m", "demopkg 1.0-1"]);
+    let bare = dir.path().join("demopkg.git");
+    fixture_git(
+        dir.path(),
+        &[
+            "clone",
+            "--quiet",
+            "--bare",
+            work.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+    );
+    fixture_git(&bare, &["update-server-info"]);
+
+    let rpc = serde_json::json!({
+        "version": 5,
+        "type": "multiinfo",
+        "resultcount": 1,
+        "results": [{
+            "ID": 1,
+            "Name": "demopkg",
+            "PackageBaseID": 1,
+            "PackageBase": "demopkg",
+            "Version": "1.0-1",
+            "Description": "fixture",
+            "Maintainer": "alice"
+        }]
+    })
+    .to_string();
+    let rpc = Arc::new(rpc);
+    let bare = Arc::new(bare);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let handle = std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let rpc = rpc.clone();
+            let bare = bare.clone();
+            std::thread::spawn(move || serve_aur(&mut stream, &rpc, &bare));
+        }
+    });
+    AurReviewFixture {
+        base,
+        _server: handle,
+        _dir: dir,
+    }
+}
+
 fn serve_aur(stream: &mut TcpStream, rpc: &str, bare: &Path) {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 2048];
@@ -233,6 +293,38 @@ fn aur_review_surfaces_pkgbuild_findings() {
         rule_present(&json, "R00_PKGBUILD_SCOPE"),
         "AUR review must carry pkgbuild findings: {json}"
     );
+}
+
+/// Pins first-sighting behavior: no baseline means no pair findings, but
+/// target checks and the scope disclosure still run.
+#[test]
+fn aur_first_sighting_skips_pair_rules() {
+    let fixture = spawn_aur_first_sighting_fixture();
+    let data_dir = tempfile::tempdir().unwrap();
+    let output = Command::cargo_bin("blueline")
+        .unwrap()
+        .env("BLUELINE_DATA_DIR", data_dir.path())
+        .args([
+            "--ecosystem",
+            "aur",
+            "--registry",
+            &fixture.base,
+            "review",
+            "demopkg@1.0-1",
+            "--output",
+            "json",
+            "--yes",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output).unwrap()).expect("valid json");
+    assert!(rule_present(&json, "R00_PKGBUILD_SCOPE"));
+    assert!(!rule_present(&json, "R19_VALIDPGPKEYS_CHANGE"));
+    assert!(!rule_present(&json, "R12_SOURCE_URL_DRIFT"));
 }
 
 /// Pins baseline PKGBUILD capture: without it the R12/R19 pair rules starve.
