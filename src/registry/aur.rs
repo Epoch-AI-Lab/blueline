@@ -221,13 +221,21 @@ impl AurRpc {
 }
 
 /// How far back the git history walk may go, per the AUR night-run ruling.
-/// Truncation is always surfaced in errors, never silent.
+/// Truncation is always surfaced in errors, never silent. The clone itself is
+/// shallow at cap + 1 commits so remote bandwidth, disk, and wall-clock use
+/// share the same bound; the extra commit is what keeps `truncated`
+/// detectable inside a shallow clone (`rev-list --count` sees cap + 1).
 pub const MAX_HISTORY_COMMITS: usize = 200;
 
 /// Cap on captured `git` stderr (error messages) and on tiny plumbing
 /// outputs (rev-list counts, cat-file kinds, author emails).
 const MAX_GIT_STDERR_BYTES: u64 = 4096;
 const MAX_GIT_SMALL_OUTPUT_BYTES: u64 = 64 * 1024;
+
+/// Wall-clock limit for any single `git` invocation, mirroring the RPC
+/// client's overall timeout: a remote that connects but never transfers must
+/// not hang the review forever.
+const GIT_TIMEOUT_SECS: u64 = 120;
 
 /// One commit from the history walk: 40-hex hash plus committer timestamp.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,7 +287,9 @@ fn git_spawn_error(e: &std::io::Error) -> BluelineError {
 
 /// Run the system `git` with fixed argv (never a shell), capture stdout
 /// capped at `max_stdout` bytes, and fail closed on any nonzero exit. Stderr
-/// is drained on a thread so a chatty child cannot deadlock the pipes.
+/// and stdout are drained on threads so a chatty child cannot deadlock the
+/// pipes, and the child is killed if it exceeds `GIT_TIMEOUT_SECS` — a
+/// remote that connects but never transfers must not hang the review.
 fn git_output(
     dir: Option<&Path>,
     args: &[&str],
@@ -308,29 +318,51 @@ fn git_output(
         .stdout
         .take()
         .ok_or_else(|| BluelineError::Network("git stdout pipe unavailable".to_string()))?;
-    let mut out = Vec::new();
-    stdout_pipe
-        .take(max_stdout + 1)
-        .read_to_end(&mut out)
-        .map_err(|e| BluelineError::Network(format!("reading git output: {e}")))?;
+    let stdout_reader = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let read_ok = stdout_pipe
+            .take(max_stdout + 1)
+            .read_to_end(&mut out)
+            .is_ok();
+        (read_ok, out)
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(GIT_TIMEOUT_SECS);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(BluelineError::Network(format!(
+                        "git {} timed out after {GIT_TIMEOUT_SECS}s and was killed",
+                        git_verb(args)
+                    )));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => return Err(BluelineError::Network(format!("waiting for git: {e}"))),
+        }
+    };
     let stderr = stderr_reader
         .join()
         .map_err(|_| BluelineError::Network("git stderr reader panicked".to_string()))?;
-    let stdout_over_cap = out.len() as u64 > max_stdout;
-    let stderr_over_cap = stderr.len() as u64 > MAX_GIT_STDERR_BYTES;
-    if stdout_over_cap || stderr_over_cap {
-        let _ = child.kill();
+    let (stdout_ok, out) = stdout_reader
+        .join()
+        .map_err(|_| BluelineError::Network("git stdout reader panicked".to_string()))?;
+    if !stdout_ok {
+        return Err(BluelineError::Network(format!(
+            "reading git {} output failed",
+            git_verb(args)
+        )));
     }
-    let status = child
-        .wait()
-        .map_err(|e| BluelineError::Network(format!("waiting for git: {e}")))?;
-    if stdout_over_cap {
+    if out.len() as u64 > max_stdout {
         return Err(BluelineError::ExtractionLimit(format!(
             "git {} output exceeds cap of {max_stdout} bytes",
             git_verb(args)
         )));
     }
-    if stderr_over_cap {
+    if stderr.len() as u64 > MAX_GIT_STDERR_BYTES {
         return Err(BluelineError::ExtractionLimit(format!(
             "git {} stderr exceeds cap of {MAX_GIT_STDERR_BYTES} bytes",
             git_verb(args)
@@ -485,9 +517,18 @@ impl AurRegistry {
 
     fn clone_repo(&self, url: &str, dest: &Path) -> Result<(), BluelineError> {
         let dest_str = dest.display().to_string();
+        let depth = (MAX_HISTORY_COMMITS + 1).to_string();
         git_output(
             None,
-            &["clone", "--quiet", url, &dest_str],
+            &[
+                "clone",
+                "--quiet",
+                "--depth",
+                &depth,
+                "--single-branch",
+                url,
+                &dest_str,
+            ],
             MAX_GIT_SMALL_OUTPUT_BYTES,
         )?;
         Ok(())
@@ -568,8 +609,32 @@ impl AurRegistry {
         })
     }
 
+    /// The only clone URLs this adapter produces are `{git_base}/{pkgbase}.git`
+    /// for a validated pkgbase; the verify boundary refuses anything else
+    /// rather than aiming `git clone` at an attacker-chosen scheme, host, or
+    /// local path. Returns the pkgbase the URL pins.
+    fn pin_clone_url(&self, clone_url: &str) -> Result<String, BluelineError> {
+        let fail = |msg: String| {
+            BluelineError::Verification(format!(
+                "AUR clone url `{clone_url}`: {msg} (configured base `{}`)",
+                self.git_base
+            ))
+        };
+        let rest = clone_url
+            .strip_prefix(&format!("{}/", self.git_base))
+            .ok_or_else(|| fail("not under the configured base".to_string()))?;
+        let pkgbase = rest
+            .strip_suffix(".git")
+            .ok_or_else(|| fail("does not name `{pkgbase}.git`".to_string()))?;
+        if !validate_aur_name(pkgbase) {
+            return Err(fail(format!("invalid package base `{pkgbase}`")));
+        }
+        Ok(pkgbase.to_string())
+    }
+
     fn fetch_verified(&self, pkg: &Package) -> Result<Vec<u8>, BluelineError> {
         let (clone_url, commit) = parse_git_tarball_url(&pkg.tarball_url)?;
+        self.pin_clone_url(&clone_url)?;
         let repo = self.temp_repo()?;
         self.clone_repo(&clone_url, repo.path())?;
         verify_commit_exists(repo.path(), &commit)?;
@@ -1434,5 +1499,44 @@ mod tests {
         assert!(parse_git_tarball_url("git+https://aur/x.git").is_err());
         assert!(parse_git_tarball_url("git+https://aur/x.git#nothex").is_err());
         assert!(parse_git_tarball_url("git+#0123456789abcdef0123456789abcdef01234567").is_err());
+    }
+
+    #[test]
+    fn fetch_verified_pins_clone_urls_to_the_configured_base() {
+        let fx = spawn_git_fixture();
+        let reg = fx.registry();
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let integrity = Checksum {
+            alg: ChecksumAlg::Sha256,
+            value_hex: "ab".repeat(32),
+        };
+        let pkg = |url: String| Package {
+            name: "yay".to_string(),
+            version: "1.0-1".to_string(),
+            tarball_url: url,
+            integrity: Some(integrity.clone()),
+        };
+
+        for url in [
+            format!("git+https://evil.example/yay.git#{hash}"),
+            format!("git+/tmp/evil/yay.git#{hash}"),
+            format!("git+{}/yay#{}", fx.fixtures.display(), hash),
+            format!("git+{}/../evil.git#{}", fx.fixtures.display(), hash),
+        ] {
+            let err = reg
+                .fetch_verified(&pkg(url.clone()))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("clone url"),
+                "url {url} must be refused at the pin: {err}"
+            );
+        }
+
+        // Under the base the pin passes; with no such repo the failure is
+        // the clone itself, not the pin.
+        let url = format!("git+{}/nosuchpkg.git#{}", fx.fixtures.display(), hash);
+        let err = reg.fetch_verified(&pkg(url)).unwrap_err().to_string();
+        assert!(err.contains("git clone failed"), "unexpected error: {err}");
     }
 }

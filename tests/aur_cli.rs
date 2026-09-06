@@ -81,7 +81,9 @@ fn write_fixture_pkg(repo: &Path, pkgver: &str, keys: &str) {
 }
 
 /// Offline end-to-end AUR review: loopback RPC plus a bare git repo served
-/// over dumb HTTP from the same base (one `--registry`). Two commits,
+/// over smart HTTP (`git upload-pack --stateless-rpc`, the protocol real AUR
+/// uses — shallow clones are impossible over dumb HTTP) from the same base
+/// (one `--registry`). Two commits,
 /// 1.0-1 then 1.1-1, differing only in `validpgpkeys`, so reviewing 1.1-1
 /// must surface the R19 pair finding on top of the R07 unreviewed-baseline
 /// finding and the R00 scope disclosure.
@@ -206,49 +208,125 @@ fn spawn_aur_first_sighting_fixture() -> AurReviewFixture {
     }
 }
 
-fn serve_aur(stream: &mut TcpStream, rpc: &str, bare: &Path) {
+/// Read one HTTP request off the stream: headers through the blank line,
+/// then the full `Content-Length` body. Returns (body offset, buffer).
+fn read_http_request(stream: &mut TcpStream) -> Option<(usize, Vec<u8>)> {
     let mut buf = Vec::new();
-    let mut tmp = [0u8; 2048];
-    loop {
-        match stream.read(&mut tmp) {
-            Ok(0) | Err(_) => return,
-            Ok(n) => {
-                buf.extend_from_slice(&tmp[..n]);
-                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-                if buf.len() > 65_536 {
-                    return;
-                }
-            }
+    let mut tmp = [0u8; 4096];
+    let head_end = loop {
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
         }
+        if buf.len() > 65_536 {
+            return None;
+        }
+        let n = stream.read(&mut tmp).ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    };
+    let headers = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+    let content_length: usize = headers
+        .lines()
+        .find_map(|l| l.strip_prefix("content-length:"))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    while buf.len() < head_end + content_length {
+        let n = stream.read(&mut tmp).ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&tmp[..n]);
     }
-    let req = String::from_utf8_lossy(&buf);
-    let path = req
+    Some((head_end, buf))
+}
+
+/// One stateless `git upload-pack` round: feed the request body on stdin,
+/// return the response bytes. `--advertise-refs` serves the info/refs GET.
+fn upload_pack(bare: &Path, advertise: bool, body: &[u8]) -> Option<Vec<u8>> {
+    let mut args = vec!["upload-pack", "--stateless-rpc"];
+    if advertise {
+        args.push("--advertise-refs");
+    }
+    let mut child = std::process::Command::new("git")
+        .args(&args)
+        .arg(".")
+        .current_dir(bare)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    child.stdin.take()?.write_all(body).ok()?;
+    let out = child.wait_with_output().ok()?;
+    out.status.success().then_some(out.stdout)
+}
+
+fn serve_aur(stream: &mut TcpStream, rpc: &str, bare: &Path) {
+    let Some((head_end, req)) = read_http_request(stream) else {
+        return;
+    };
+    let request = String::from_utf8_lossy(&req);
+    let path = request
         .lines()
         .next()
         .and_then(|l| l.split_whitespace().nth(1))
-        .unwrap_or("/");
-    let (status, ctype, body) = if path.starts_with("/rpc/v5/info") {
+        .unwrap_or("/")
+        .to_string();
+    let is_gzip = request[..head_end]
+        .to_ascii_lowercase()
+        .contains("content-encoding: gzip");
+    let body = req[head_end..].to_vec();
+    let (status, ctype, out) = if path.starts_with("/rpc/v5/info") {
         ("200 OK", "application/json", rpc.as_bytes().to_vec())
-    } else if let Some(rel) = path
-        .split('?')
-        .next()
-        .and_then(|p| p.strip_prefix("/demopkg.git/"))
-    {
-        match std::fs::read(bare.join(rel)) {
-            Ok(bytes) => ("200 OK", "application/octet-stream", bytes),
-            Err(_) => ("404 Not Found", "text/plain", b"nope".to_vec()),
+    } else if path.split('?').next() == Some("/demopkg.git/info/refs") {
+        match upload_pack(bare, true, b"") {
+            Some(adv) => {
+                // Smart-HTTP advertisement: the service pkt-line the client
+                // expects before upload-pack's ref advertisement.
+                let mut body = b"001e# service=git-upload-pack\n0000".to_vec();
+                body.extend_from_slice(&adv);
+                (
+                    "200 OK",
+                    "application/x-git-upload-pack-advertisement",
+                    body,
+                )
+            }
+            None => (
+                "500 Internal Server Error",
+                "text/plain",
+                b"upload-pack failed".to_vec(),
+            ),
+        }
+    } else if path == "/demopkg.git/git-upload-pack" {
+        let mut body = body;
+        if is_gzip {
+            let mut plain = Vec::new();
+            if std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&body[..]), &mut plain)
+                .is_err()
+            {
+                return;
+            }
+            body = plain;
+        }
+        match upload_pack(bare, false, &body) {
+            Some(out) => ("200 OK", "application/x-git-upload-pack", out),
+            None => (
+                "500 Internal Server Error",
+                "text/plain",
+                b"upload-pack failed".to_vec(),
+            ),
         }
     } else {
         ("404 Not Found", "text/plain", b"nope".to_vec())
     };
     let head = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
+        out.len()
     );
     let _ = stream.write_all(head.as_bytes());
-    let _ = stream.write_all(&body);
+    let _ = stream.write_all(&out);
 }
 
 fn review_json(fixture: &AurReviewFixture) -> serde_json::Value {

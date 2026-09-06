@@ -26,9 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   are not reviewed. Fuzz target `fuzz/fuzz_targets/pkgbuild_tokenizer.rs`.
 - AUR registry adapter (`blueline --ecosystem aur review <pkg>@<pkgver-pkgrel>`):
   a git-history-backed `AurRegistry` on the RPC v5 client — pkgname → pkgbase
-  mapping, full-history clone of `{base}/{pkgbase}.git` through the system
-  `git` binary (argv-only, never a shell, capped output reads, any git failure
-  fails closed), a 200-commit-bounded history walk that states truncation and
+  mapping, shallow clone (history cap + 1) of `{base}/{pkgbase}.git` through
+  the system `git` binary (argv-only, never a shell, capped output reads,
+  120s wall-clock kill per git invocation, clone urls pinned to the
+  configured base at the verify boundary, any git failure fails closed), a
+  200-commit-bounded history walk that states truncation and
   refuses to resolve when the cap could hide the requested version, per-commit
   static `.SRCINFO` parsing (PKGBUILDs are never sourced or executed and
   `makepkg` is never invoked), newest-commit-wins version identity under
