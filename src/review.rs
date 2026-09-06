@@ -359,7 +359,17 @@ fn prepare_extracted_root(
                     ));
                 }
             }
-            read_aur_srcinfo(&root.join(".SRCINFO"))?
+            let manifest = read_aur_srcinfo(&root.join(".SRCINFO"))?;
+            if manifest.name != canonical_name {
+                return Err(crate::error::BluelineError::Manifest(
+                    canonical_name.to_string(),
+                    format!(
+                        "AUR archive declares pkgbase `{}` but the review resolved `{canonical_name}`; refusing to review",
+                        manifest.name
+                    ),
+                ));
+            }
+            manifest
         }
         Ecosystem::PyPi => {
             let candidate = root.join("METADATA");
@@ -1113,6 +1123,21 @@ mod tests {
             "unexpected error: {err}"
         );
 
+        let dir2 = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir2.path().join("PKGBUILD")).unwrap();
+        std::fs::write(
+            dir2.path().join(".SRCINFO"),
+            "pkgbase = demo\n\tpkgver = 1.0\n\tpkgrel = 1\n",
+        )
+        .unwrap();
+        let err = prepare_extracted_root(dir2.path(), Ecosystem::Aur, "demo", "1.0-1")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("missing `PKGBUILD`"),
+            "unexpected error: {err}"
+        );
+
         std::fs::write(
             dir.path().join(".SRCINFO"),
             "pkgbase = demo\n\tpkgver = 1.0\n\tpkgrel = 1\n",
@@ -1123,5 +1148,25 @@ mod tests {
         assert_eq!(root, dir.path());
         assert_eq!(manifest.name, "demo");
         assert_eq!(manifest.version, "1.0-1");
+    }
+
+    #[test]
+    fn prepare_extracted_root_refuses_aur_pkgbase_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("PKGBUILD"), "pkgname=other\n").unwrap();
+        std::fs::write(
+            dir.path().join(".SRCINFO"),
+            "pkgbase = other\n\tpkgver = 1.0\n\tpkgrel = 1\n",
+        )
+        .unwrap();
+        let err = prepare_extracted_root(dir.path(), Ecosystem::Aur, "demo", "1.0-1")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "AUR archive declares pkgbase `other` but the review resolved `demo`; refusing to review"
+            ),
+            "unexpected error: {err}"
+        );
     }
 }
