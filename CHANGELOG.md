@@ -78,6 +78,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- AUR review hardening from the adapter review follow-up: per-commit
+  `.SRCINFO` reads distinguish content failures (missing, oversized,
+  non-UTF-8, malformed — counted as skips) from git plumbing failures
+  (propagated fail-closed, so object corruption can no longer masquerade as
+  "no parseable .SRCINFO"); `Package.version` now stores the pinned commit's
+  canonical version instead of the user's spelling, so vercmp aliases like
+  `1.1.0-01` resolve to identical store keys and displayed identities; the
+  extracted `.SRCINFO`'s declared `pkgbase` is cross-checked against the
+  resolved package base at the review boundary; `list_versions` keeps the
+  adapter's vercmp ordering instead of re-sorting with semver prerelease
+  rules; new tests pin the deterministic equal-timestamp hash tiebreak, the
+  split-package pkgname → pkgbase path, directory-not-file refusals, and the
+  pkgbase mismatch refusal.
 - The MCP `check_known_clean` AUR arm compares the requested version against
   stored clean versions with libalpm vercmp equality instead of canonical
   strings, so grammar-accepted spellings of an approved release (pkgrel-less
