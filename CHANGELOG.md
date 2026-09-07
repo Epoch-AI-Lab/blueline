@@ -97,6 +97,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `12.4.2`, epoch-explicit `0:12.4.2-1`) now report `isClean: true` against a
   stored `12.4.2-1` instead of a false negative; an unparseable AUR version is
   now an `invalid params` error rather than a guaranteed not-clean.
+- AUR review follow-up fixes: R05 no longer runs the semver leg on AUR
+  versions (two-component `1.0-1` spellings are normal, validated with
+  `AurVersionInfo` instead); split-package pkgnames fail closed with a
+  pointer to review the pkgbase explicitly instead of silently swapping
+  identity; `release_author` pins the clone URL and verifies the commit
+  before reading the author email; R13 spots spaceless pipes (`curl x|bash`)
+  and fetcher pipes into `python`/`perl`/`ruby`/`php`.
 - Release workflow smoke gate invokes the shipped binary with
   `--policy blueline.toml --output json --yes` and asserts on the presence of
   the `integrity` field, matching the current CLI flags and the 0.3.0

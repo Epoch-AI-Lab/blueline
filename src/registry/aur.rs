@@ -584,6 +584,11 @@ impl AurRegistry {
             .rpc
             .pkgbase(name)
             .map_err(|e| with_aur_context(e, name))?;
+        if pkgbase != name {
+            return Err(BluelineError::InvalidPackageSpec(format!(
+                "`{name}` is part of split package base `{pkgbase}`; review `{pkgbase}@{version}` instead so the verdict and baseline cannot silently change identity"
+            )));
+        }
         let clone_url = self.clone_url(&pkgbase);
         let repo = self.temp_repo()?;
         self.clone_repo(&clone_url, repo.path())?;
@@ -686,6 +691,11 @@ impl AurRegistry {
             .rpc
             .pkgbase(name)
             .map_err(|e| with_aur_context(e, name))?;
+        if pkgbase != name {
+            return Err(BluelineError::InvalidPackageSpec(format!(
+                "`{name}` is part of split package base `{pkgbase}`; review `{pkgbase}` instead so the verdict and baseline cannot silently change identity"
+            )));
+        }
         let clone_url = self.clone_url(&pkgbase);
         let repo = self.temp_repo()?;
         self.clone_repo(&clone_url, repo.path())?;
@@ -782,8 +792,10 @@ impl Registry for AurRegistry {
     /// identity). Failures degrade to `None` = "unknown" by design.
     fn release_author(&self, pkg: &Package) -> Option<String> {
         let (clone_url, commit) = parse_git_tarball_url(&pkg.tarball_url).ok()?;
+        self.pin_clone_url(&clone_url).ok()?;
         let repo = self.temp_repo().ok()?;
         self.clone_repo(&clone_url, repo.path()).ok()?;
+        verify_commit_exists(repo.path(), &commit).ok()?;
         let text = git_text(
             Some(repo.path()),
             &["log", "-1", "--format=%ae", &commit],
@@ -1671,7 +1683,12 @@ mod tests {
             RegistryLimits::default(),
         );
 
-        let pkg = reg.resolve("demopkg", "2.0-1").unwrap();
+        let err = reg.resolve("demopkg", "2.0-1").unwrap_err().to_string();
+        assert!(
+            err.contains("demopkg-base@2.0-1"),
+            "split pkgname must fail closed with a pkgbase pointer, got: {err}"
+        );
+        let pkg = reg.resolve("demopkg-base", "2.0-1").unwrap();
         assert_eq!(pkg.name, "demopkg-base");
         assert_eq!(pkg.version, "2.0-1");
         assert!(
