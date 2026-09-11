@@ -6,6 +6,8 @@ use crate::version::{AurVersionInfo, VersionInfo};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use ureq::Agent;
@@ -237,6 +239,11 @@ const MAX_GIT_SMALL_OUTPUT_BYTES: u64 = 64 * 1024;
 /// not hang the review forever.
 const GIT_TIMEOUT_SECS: u64 = 120;
 
+/// How long a `git` invocation that has exited may keep its transport
+/// children (`git-remote-https`, `ssh`, …) holding the output pipes before
+/// blueline refuses to wait any longer.
+const GIT_STREAM_GRACE_SECS: u64 = 5;
+
 /// One commit from the history walk: 40-hex hash plus committer timestamp.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CommitMeta {
@@ -287,44 +294,54 @@ fn git_spawn_error(e: &std::io::Error) -> BluelineError {
 
 /// Run the system `git` with fixed argv (never a shell), capture stdout
 /// capped at `max_stdout` bytes, and fail closed on any nonzero exit. Stderr
-/// and stdout are drained on threads so a chatty child cannot deadlock the
-/// pipes, and the child is killed if it exceeds `GIT_TIMEOUT_SECS` — a
-/// remote that connects but never transfers must not hang the review.
+/// and stdout are drained on detached threads so a chatty child cannot
+/// deadlock the pipes, and the child is killed if it exceeds
+/// `GIT_TIMEOUT_SECS` — a remote that connects but never transfers must not
+/// hang the review. `git` runs in its own process group, and because its
+/// transport children (`git-remote-https`, `ssh`, …) inherit the pipes and
+/// can outlive it, results are received with a bounded wait instead of a
+/// `join`: a transport that holds the pipes open must not hang the caller.
 fn git_output(
     dir: Option<&Path>,
     args: &[&str],
     max_stdout: u64,
 ) -> Result<Vec<u8>, BluelineError> {
-    let mut child = Command::new("git")
-        .args(args)
+    let mut cmd = Command::new("git");
+    cmd.args(args)
         .current_dir(dir.unwrap_or(Path::new(".")))
+        // Error-message classification elsewhere matches git's English
+        // wording, so the locale must not translate it.
+        .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| git_spawn_error(&e))?;
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let mut child = cmd.spawn().map_err(|e| git_spawn_error(&e))?;
     let stderr_pipe = child
         .stderr
         .take()
         .ok_or_else(|| BluelineError::Network("git stderr pipe unavailable".to_string()))?;
-    let stderr_reader = std::thread::spawn(move || {
+    let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = stderr_pipe
             .take(MAX_GIT_STDERR_BYTES + 1)
             .read_to_end(&mut buf);
-        buf
+        let _ = stderr_tx.send(buf);
     });
     let stdout_pipe = child
         .stdout
         .take()
         .ok_or_else(|| BluelineError::Network("git stdout pipe unavailable".to_string()))?;
-    let stdout_reader = std::thread::spawn(move || {
+    let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut out = Vec::new();
         let read_ok = stdout_pipe
             .take(max_stdout + 1)
             .read_to_end(&mut out)
             .is_ok();
-        (read_ok, out)
+        let _ = stdout_tx.send((read_ok, out));
     });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(GIT_TIMEOUT_SECS);
     let status = loop {
@@ -344,12 +361,26 @@ fn git_output(
             Err(e) => return Err(BluelineError::Network(format!("waiting for git: {e}"))),
         }
     };
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| BluelineError::Network("git stderr reader panicked".to_string()))?;
-    let (stdout_ok, out) = stdout_reader
-        .join()
-        .map_err(|_| BluelineError::Network("git stdout reader panicked".to_string()))?;
+    fn drained<T>(
+        rx: std::sync::mpsc::Receiver<T>,
+        what: &str,
+        verb: &str,
+    ) -> Result<T, BluelineError> {
+        match rx.recv_timeout(std::time::Duration::from_secs(GIT_STREAM_GRACE_SECS)) {
+            Ok(buf) => Ok(buf),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                Err(BluelineError::Network(format!(
+                    "git {verb} exited but its transport still holds the {what} pipe after \
+                 {GIT_STREAM_GRACE_SECS}s; refusing to wait"
+                )))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(BluelineError::Network(
+                format!("git {what} reader panicked"),
+            )),
+        }
+    }
+    let stderr = drained(stderr_rx, "stderr", git_verb(args))?;
+    let (stdout_ok, out) = drained(stdout_rx, "stdout", git_verb(args))?;
     if !stdout_ok {
         return Err(BluelineError::Network(format!(
             "reading git {} output failed",

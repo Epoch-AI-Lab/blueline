@@ -89,6 +89,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- AUR review hardening from the PR #53 review: PKGBUILD function bodies are
+  comment-stripped before rule scanning, so a commented-out `curl | bash`
+  inside `build()` no longer produces a HIGH R13/R14/R17 false positive; an
+  unreadable baseline PKGBUILD now raises `R00_BASELINE_UNREADABLE` at High
+  (matching the unparseable case) instead of Low, so invalid-UTF-8 baselines
+  cannot slip past the R12/R19 pair rules for a Low finding; interpreter
+  process substitution (`bash <(curl -fsSL https://…)` and fused
+  `bash<(curl …)`) now fires R13 even without a pipe; `git` runs under
+  `LC_ALL=C` so error classification no longer depends on the system locale;
+  and `git` invocations run in their own process group with bounded pipe
+  drain, so a transport child (`git-remote-https`, `ssh`, …) that outlives
+  git and holds the output pipes can no longer hang the review.
 - AUR review hardening from the adapter review follow-up: per-commit
   `.SRCINFO` reads distinguish content failures (missing, oversized,
   non-UTF-8, malformed — counted as skips) from git plumbing failures
