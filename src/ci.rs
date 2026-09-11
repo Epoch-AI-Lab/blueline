@@ -1228,10 +1228,12 @@ mod tests {
             fail_on: None,
             ecosystem: Ecosystem::Aur,
         };
-        // `paru` vanishes from head: reported as removed, never evaluated.
+        // `prs` vanishes from head: reported as removed, never evaluated.
+        // Three base pins against two head pins so deleting the `!` in the
+        // filter (counting pins present in both) yields 2, not 1.
         let report = evaluate_aur_ci_diff(
+            "yay@1.0-1\nparu@2.0-1\nprs@3.0-1\n",
             "yay@1.0-1\nparu@2.0-1\n",
-            "yay@1.0-1\n",
             &ctx,
             &store,
             &policy,
@@ -1239,7 +1241,7 @@ mod tests {
         .unwrap();
         assert_eq!(report.removed_count, 1);
         assert_eq!(report.total_evaluated, 0);
-        assert_eq!(report.unchanged_count, 1);
+        assert_eq!(report.unchanged_count, 2);
     }
 
     #[test]
