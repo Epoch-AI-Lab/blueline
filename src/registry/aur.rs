@@ -5,11 +5,13 @@ use crate::registry::{Checksum, ChecksumAlg, Ecosystem, Package, Registry, Relea
 use crate::version::{AurVersionInfo, VersionInfo};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, PoisonError};
 use ureq::Agent;
 
 const USER_AGENT: &str = concat!("blueline/", env!("CARGO_PKG_VERSION"));
@@ -243,6 +245,10 @@ const GIT_TIMEOUT_SECS: u64 = 120;
 /// children (`git-remote-https`, `ssh`, …) holding the output pipes before
 /// blueline refuses to wait any longer.
 const GIT_STREAM_GRACE_SECS: u64 = 5;
+
+/// Upper bound on pkgbase clones held for reuse within one review run; the
+/// whole cache is dropped when it overflows, bounding temp disk usage.
+const MAX_CACHED_CLONES: usize = 8;
 
 /// One commit from the history walk: 40-hex hash plus committer timestamp.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -544,6 +550,12 @@ pub struct AurRegistry {
     rpc: AurRpc,
     git_base: String,
     limits: RegistryLimits,
+    /// Shallow clones reused across the read-only history operations of one
+    /// pkgbase (resolve walk, releases walk, author lookup). Keyed by the
+    /// full clone url, so packages can never share a repo. `fetch_verified`
+    /// deliberately does not use this cache: its re-clone exists so the
+    /// archive bytes are a second, independent sample from the remote.
+    clone_cache: Mutex<HashMap<String, tempfile::TempDir>>,
 }
 
 impl AurRegistry {
@@ -559,6 +571,7 @@ impl AurRegistry {
             rpc: AurRpc::with_limits(rpc_base, limits),
             git_base: git_base.trim_end_matches('/').to_string(),
             limits,
+            clone_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -602,6 +615,27 @@ impl AurRegistry {
         tempfile::tempdir().map_err(|e| BluelineError::Network(format!("creating temp dir: {e}")))
     }
 
+    /// Clone `url` once and return the repo path, reusing a prior clone of
+    /// the same url. Read-only git operations (rev-list, show, log, archive)
+    /// run against the returned path.
+    fn cached_repo(&self, url: &str) -> Result<PathBuf, BluelineError> {
+        let mut cache = self
+            .clone_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(repo) = cache.get(url) {
+            return Ok(repo.path().to_path_buf());
+        }
+        if cache.len() >= MAX_CACHED_CLONES {
+            cache.clear();
+        }
+        let repo = self.temp_repo()?;
+        self.clone_repo(url, repo.path())?;
+        let path = repo.path().to_path_buf();
+        cache.insert(url.to_string(), repo);
+        Ok(path)
+    }
+
     fn resolve_package(&self, name: &str, version: &str) -> Result<Package, BluelineError> {
         if !validate_aur_name(name) {
             return Err(BluelineError::InvalidPackageSpec(format!(
@@ -621,14 +655,13 @@ impl AurRegistry {
             )));
         }
         let clone_url = self.clone_url(&pkgbase);
-        let repo = self.temp_repo()?;
-        self.clone_repo(&clone_url, repo.path())?;
-        let (commits, truncated) = commit_history(repo.path(), MAX_HISTORY_COMMITS)?;
+        let repo_path = self.cached_repo(&clone_url)?;
+        let (commits, truncated) = commit_history(&repo_path, MAX_HISTORY_COMMITS)?;
 
         let mut skipped = 0usize;
         let mut matched: Option<(&CommitMeta, AurVersionInfo)> = None;
         for c in &commits {
-            match commit_version(repo.path(), &c.hash)? {
+            match commit_version(&repo_path, &c.hash)? {
                 Some(v) if v == target => {
                     matched = Some((c, v));
                     break;
@@ -652,7 +685,7 @@ impl AurRegistry {
             BluelineError::Manifest(pkgbase.clone(), msg)
         })?;
 
-        let bytes = self.archive_bytes(repo.path(), &commit.hash)?;
+        let bytes = self.archive_bytes(&repo_path, &commit.hash)?;
         let checksum = Checksum {
             alg: ChecksumAlg::Sha256,
             value_hex: sha256_hex(&bytes),
@@ -728,9 +761,8 @@ impl AurRegistry {
             )));
         }
         let clone_url = self.clone_url(&pkgbase);
-        let repo = self.temp_repo()?;
-        self.clone_repo(&clone_url, repo.path())?;
-        let (commits, truncated) = commit_history(repo.path(), MAX_HISTORY_COMMITS)?;
+        let repo_path = self.cached_repo(&clone_url)?;
+        let (commits, truncated) = commit_history(&repo_path, MAX_HISTORY_COMMITS)?;
         if truncated {
             return Err(BluelineError::Manifest(
                 pkgbase,
@@ -744,7 +776,7 @@ impl AurRegistry {
         let mut seen: Vec<(AurVersionInfo, Release)> = Vec::new();
         let mut skipped = 0usize;
         for c in &commits {
-            match commit_version(repo.path(), &c.hash)? {
+            match commit_version(&repo_path, &c.hash)? {
                 Some(v) => {
                     // Commits are newest-first; keep the newest commit per
                     // distinct version for an accurate publish time.
@@ -824,11 +856,10 @@ impl Registry for AurRegistry {
     fn release_author(&self, pkg: &Package) -> Option<String> {
         let (clone_url, commit) = parse_git_tarball_url(&pkg.tarball_url).ok()?;
         self.pin_clone_url(&clone_url).ok()?;
-        let repo = self.temp_repo().ok()?;
-        self.clone_repo(&clone_url, repo.path()).ok()?;
-        verify_commit_exists(repo.path(), &commit).ok()?;
+        let repo_path = self.cached_repo(&clone_url).ok()?;
+        verify_commit_exists(&repo_path, &commit).ok()?;
         let text = git_text(
-            Some(repo.path()),
+            Some(&repo_path),
             &["log", "-1", "--format=%ae", &commit],
             MAX_GIT_SMALL_OUTPUT_BYTES,
         )
@@ -1384,6 +1415,27 @@ mod tests {
             !dest.path().join("yay").exists(),
             "git archive emits files at the root, not under a pkgbase dir"
         );
+    }
+
+    #[test]
+    fn cached_repo_reuses_one_clone_per_url_and_drops_overflow() {
+        let fx = spawn_git_fixture();
+        init_fixture_repo(&fx.fixtures, "yay");
+        let reg = fx.registry();
+        let url = reg.clone_url("yay");
+        let first = reg.cached_repo(&url).unwrap();
+        let second = reg.cached_repo(&url).unwrap();
+        assert_eq!(first, second, "same url must reuse the same clone");
+
+        // Overflowing the cache drops every entry, so the next call for the
+        // same url clones again into a fresh directory (old dir deleted).
+        for i in 0..MAX_CACHED_CLONES {
+            let name = format!("filler{i}");
+            init_fixture_repo(&fx.fixtures, &name);
+            reg.cached_repo(&reg.clone_url(&name)).unwrap();
+        }
+        assert!(reg.cached_repo(&url).unwrap() != first);
+        assert!(!first.exists(), "evicted clone must be deleted");
     }
 
     #[test]

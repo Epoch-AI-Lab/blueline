@@ -39,6 +39,7 @@ pub struct CiReport {
     pub lockfile_path: String,
     pub total_evaluated: usize,
     pub unchanged_count: usize,
+    pub removed_count: usize,
     pub max_band: VerdictBand,
     pub passed: bool,
     pub items: Vec<CiReviewItem>,
@@ -358,6 +359,7 @@ pub fn evaluate_lockfile_diff(
         lockfile_path: ctx.lockfile_path.to_string(),
         total_evaluated: items.len(),
         unchanged_count: delta.unchanged_count,
+        removed_count: delta.removed.len(),
         max_band,
         passed,
         items,
@@ -395,6 +397,10 @@ fn evaluate_aur_ci_diff(
             _ => unchanged_count += 1,
         }
     }
+    let removed_count = base_pkgs
+        .keys()
+        .filter(|name| !head_pkgs.contains_key(*name))
+        .count();
 
     check_evaluation_budget(added, upgraded, policy.ci.max_evaluations)?;
 
@@ -429,6 +435,7 @@ fn evaluate_aur_ci_diff(
         lockfile_path: ctx.lockfile_path.to_string(),
         total_evaluated: items.len(),
         unchanged_count,
+        removed_count,
         max_band,
         passed,
         items,
@@ -504,10 +511,11 @@ pub fn render_markdown_summary(report: &CiReport) -> String {
     let mut out = String::new();
     out.push_str("## 🛡️ Blueline CI Security Review\n\n");
     out.push_str(&format!(
-        "**Base Ref:** `{}` · **Evaluated Packages:** {} · **Unchanged:** {}\n\n",
+        "**Base Ref:** `{}` · **Evaluated Packages:** {} · **Unchanged:** {} · **Removed:** {}\n\n",
         escape_markdown_cell(&report.base_ref),
         report.total_evaluated,
-        report.unchanged_count
+        report.unchanged_count,
+        report.removed_count
     ));
 
     if report.items.is_empty() {
@@ -573,6 +581,7 @@ pub fn render_text_summary_to_string(report: &CiReport) -> String {
     ));
     out.push_str(&format!("Evaluated:         {}\n", report.total_evaluated));
     out.push_str(&format!("Unchanged:         {}\n", report.unchanged_count));
+    out.push_str(&format!("Removed:           {}\n", report.removed_count));
     out.push_str(&format!("Max Risk Band:     {}\n", report.max_band));
     out.push_str(&format!(
         "Status:            {}\n",
@@ -786,6 +795,7 @@ mod tests {
             lockfile_path: "package-lock.json".to_string(),
             total_evaluated: 1,
             unchanged_count: 5,
+            removed_count: 0,
             max_band: VerdictBand::Block,
             passed: false,
             items: vec![CiReviewItem {
@@ -832,6 +842,7 @@ mod tests {
             lockfile_path: "package-lock.json".to_string(),
             total_evaluated: 1,
             unchanged_count: 0,
+            removed_count: 0,
             max_band: VerdictBand::Block,
             passed: false,
             items: vec![CiReviewItem {
@@ -877,6 +888,7 @@ mod tests {
             lockfile_path: "package-lock.json".to_string(),
             total_evaluated: 1,
             unchanged_count: 5,
+            removed_count: 0,
             max_band: VerdictBand::Low,
             passed: true,
             items: vec![CiReviewItem {
@@ -918,6 +930,7 @@ mod tests {
             lockfile_path: "package-lock.json".to_string(),
             total_evaluated: 1,
             unchanged_count: 3,
+            removed_count: 0,
             max_band: VerdictBand::Low,
             passed: true,
             items: vec![],
@@ -935,6 +948,7 @@ mod tests {
             lockfile_path: "package-lock.json".to_string(),
             total_evaluated: 1,
             unchanged_count: 0,
+            removed_count: 0,
             max_band: VerdictBand::High,
             passed: false,
             items: vec![CiReviewItem {
@@ -985,6 +999,7 @@ mod tests {
             lockfile_path: "package-lock.json".to_string(),
             total_evaluated: 1,
             unchanged_count: 0,
+            removed_count: 0,
             max_band: VerdictBand::High,
             passed: false,
             items: vec![CiReviewItem {
@@ -1199,6 +1214,32 @@ mod tests {
         .unwrap();
         assert_eq!(report.unchanged_count, 2);
         assert_eq!(report.total_evaluated, 0);
+    }
+
+    #[test]
+    fn aur_ci_diff_counts_removed_pins() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
+        let policy = Policy::load_or_default(None).unwrap();
+        let ctx = CiContext {
+            base_ref: "HEAD",
+            lockfile_path: "aur.lock",
+            registry_base: "http://127.0.0.1:9",
+            fail_on: None,
+            ecosystem: Ecosystem::Aur,
+        };
+        // `paru` vanishes from head: reported as removed, never evaluated.
+        let report = evaluate_aur_ci_diff(
+            "yay@1.0-1\nparu@2.0-1\n",
+            "yay@1.0-1\n",
+            &ctx,
+            &store,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(report.removed_count, 1);
+        assert_eq!(report.total_evaluated, 0);
+        assert_eq!(report.unchanged_count, 1);
     }
 
     #[test]

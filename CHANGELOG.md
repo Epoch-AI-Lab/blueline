@@ -86,6 +86,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   16-shard matrix.
 - The MCP stdio server no longer prints an stderr note when it receives the
   client's `notifications/initialized` message.
+- AUR adapter resource use: one shallow clone per pkgbase is now reused
+  across the read-only history operations of a review (resolve walk,
+  releases walk, author lookup), halving the clones each evaluation
+  performs; the cache is keyed by the full clone url and capped, and
+  `fetch_verified` still re-clones so its archive bytes remain a second,
+  independent sample from the remote. AUR CI reports now carry a
+  `removed_count` (rendered in the text and markdown summaries) so pins
+  deleted from the pin file are visible instead of silently dropped.
+  PKGBUILD `$'...'` `\xHH` and octal escapes now decode as raw bytes the
+  way bash emits them (`\xc3\xa9` is `é`, not `Ã©`), with non-UTF-8 byte
+  sequences becoming U+FFFD and over-one-byte octal escapes failing closed.
 
 ### Fixed
 

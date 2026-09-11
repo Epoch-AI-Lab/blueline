@@ -89,29 +89,34 @@ fn valid_name(name: &str) -> bool {
     }
 }
 
+/// Decode a bash `$'...'` ANSI-C quoted body. `\xHH` and `\NNN` octal
+/// escapes emit raw bytes (as bash does), so the buffer is built as bytes
+/// and lossily converted at the end; byte sequences that are not UTF-8
+/// become U+FFFD, which cannot match any rule keyword.
 fn decode_ansi_c(body: &str) -> Result<String, BluelineError> {
-    let mut out = String::new();
+    let mut out: Vec<u8> = Vec::new();
     let mut chars = body.chars();
     while let Some(ch) = chars.next() {
         if ch != '\\' {
-            out.push(ch);
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
             continue;
         }
         let esc = chars
             .next()
             .ok_or_else(|| pkgbuild_err("dangling backslash in $'...' literal".to_string()))?;
         match esc {
-            'n' => out.push('\n'),
-            't' => out.push('\t'),
-            'r' => out.push('\r'),
-            'a' => out.push('\x07'),
-            'b' => out.push('\x08'),
-            'f' => out.push('\x0C'),
-            'v' => out.push('\x0B'),
-            '\\' => out.push('\\'),
-            '\'' => out.push('\''),
-            '"' => out.push('"'),
-            'e' | 'E' => out.push('\x1B'),
+            'n' => out.push(b'\n'),
+            't' => out.push(b'\t'),
+            'r' => out.push(b'\r'),
+            'a' => out.push(0x07),
+            'b' => out.push(0x08),
+            'f' => out.push(0x0C),
+            'v' => out.push(0x0B),
+            '\\' => out.push(b'\\'),
+            '\'' => out.push(b'\''),
+            '"' => out.push(b'"'),
+            'e' | 'E' => out.push(0x1B),
             'x' => {
                 let hex: String = chars.by_ref().take(2).collect();
                 if hex.len() != 2 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -119,7 +124,7 @@ fn decode_ansi_c(body: &str) -> Result<String, BluelineError> {
                 }
                 let byte = u8::from_str_radix(&hex, 16)
                     .map_err(|_| pkgbuild_err("bad hex".to_string()))?;
-                out.push(byte as char);
+                out.push(byte);
             }
             'u' => {
                 let hex: String = chars.by_ref().take(4).collect();
@@ -128,10 +133,10 @@ fn decode_ansi_c(body: &str) -> Result<String, BluelineError> {
                 }
                 let cp = u32::from_str_radix(&hex, 16)
                     .map_err(|_| pkgbuild_err("bad unicode".to_string()))?;
-                out.push(
-                    char::from_u32(cp)
-                        .ok_or_else(|| pkgbuild_err("bad unicode scalar".to_string()))?,
-                );
+                let ch = char::from_u32(cp)
+                    .ok_or_else(|| pkgbuild_err("bad unicode scalar".to_string()))?;
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
             }
             '0'..='7' => {
                 let mut oct = String::from(esc);
@@ -144,12 +149,14 @@ fn decode_ansi_c(body: &str) -> Result<String, BluelineError> {
                         _ => break,
                     }
                 }
-                let cp = u32::from_str_radix(&oct, 8)
+                let byte_val = u32::from_str_radix(&oct, 8)
                     .map_err(|_| pkgbuild_err("bad octal".to_string()))?;
-                out.push(
-                    char::from_u32(cp)
-                        .ok_or_else(|| pkgbuild_err("bad octal scalar".to_string()))?,
-                );
+                if byte_val > u8::MAX as u32 {
+                    return Err(pkgbuild_err(format!(
+                        "octal escape `\\{oct}` exceeds one byte in $'...' literal"
+                    )));
+                }
+                out.push(byte_val as u8);
             }
             other => {
                 return Err(pkgbuild_err(format!(
@@ -158,7 +165,7 @@ fn decode_ansi_c(body: &str) -> Result<String, BluelineError> {
             }
         }
     }
-    Ok(out)
+    Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
 fn find_matching(input: &str, start: usize, open: char, close: char) -> Option<usize> {
@@ -2400,6 +2407,32 @@ mod tests {
     #[test]
     fn bad_ansi_c_escape_fails_closed() {
         assert!(parse_pkgbuild("msg=$'a\\xZZ'\n").is_err());
+    }
+
+    #[test]
+    fn ansi_c_hex_escapes_emit_bytes_not_latin1_chars() {
+        // bash emits $'\xc3\xa9' as the two UTF-8 bytes of `é`, not `Ã©`.
+        let folded = parse_pkgbuild("msg=$'\\xc3\\xa9'\n").unwrap();
+        assert_eq!(known(&folded, "msg").as_deref(), Some("é"));
+        // Octal escapes are bytes too: \303\251 is `é`.
+        let folded = parse_pkgbuild("msg=$'\\303\\251'\n").unwrap();
+        assert_eq!(known(&folded, "msg").as_deref(), Some("é"));
+        // ASCII byte escapes still fold to rule-matchable words.
+        let folded = parse_pkgbuild("cmd=$'\\x63url' -s https://x\n").unwrap();
+        assert_eq!(known(&folded, "cmd").as_deref(), Some("curl -s https://x"));
+    }
+
+    #[test]
+    fn ansi_c_non_utf8_bytes_survive_as_replacement_chars() {
+        // A byte sequence that is not valid UTF-8 must not fail the parse;
+        // U+FFFD cannot match any rule keyword.
+        let folded = parse_pkgbuild("msg=$'\\xff\\xfe'\n").unwrap();
+        assert_eq!(known(&folded, "msg").as_deref(), Some("\u{FFFD}\u{FFFD}"));
+    }
+
+    #[test]
+    fn ansi_c_octal_above_one_byte_fails_closed() {
+        assert!(parse_pkgbuild("msg=$'\\400'\n").is_err());
     }
 
     #[test]
