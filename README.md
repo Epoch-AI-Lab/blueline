@@ -97,7 +97,7 @@ function AURPreInstall(packages)
   for _, pkg in ipairs(packages) do
     local ok = os.execute(
       "blueline --ecosystem aur review "
-        .. pkg .. " --yes --policy blueline.toml"
+        .. string.format("%q", pkg) .. " --yes --policy blueline.toml"
     )
     if ok ~= 0 then return 1 end
   end

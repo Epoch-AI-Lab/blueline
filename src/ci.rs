@@ -68,6 +68,7 @@ fn is_pypi_lockfile(ecosystem: Ecosystem, lockfile_path: &Path) -> bool {
 /// Bounds for the AUR CI file: one `pkgbase@pkgver-pkgrel` per line.
 const MAX_AUR_CI_LINES: usize = 4096;
 const MAX_AUR_CI_LINE_BYTES: usize = 512;
+const MAX_AUR_CI_FILE_BYTES: usize = MAX_AUR_CI_LINES * MAX_AUR_CI_LINE_BYTES;
 
 /// Parse an AUR CI file into `pkgbase -> version`. Blank lines and `#`
 /// comments are skipped; everything else must be exactly one valid
@@ -75,6 +76,9 @@ const MAX_AUR_CI_LINE_BYTES: usize = 512;
 /// offending line number. A repeated pkgbase with a different version fails
 /// closed so the file cannot state two pins for one package.
 fn parse_aur_ci_lines(content: &str) -> anyhow::Result<BTreeMap<String, String>> {
+    if content.len() > MAX_AUR_CI_FILE_BYTES {
+        anyhow::bail!("AUR CI file exceeds {MAX_AUR_CI_FILE_BYTES} bytes");
+    }
     let mut map = BTreeMap::new();
     for (idx, raw) in content.lines().enumerate() {
         let lineno = idx + 1;
@@ -1112,6 +1116,63 @@ mod tests {
         assert!(err.to_string().contains("line 1"), "{err}");
         let err = parse_aur_ci_lines("yay@1.0-1\nyay@2.0-1\n").unwrap_err();
         assert!(err.to_string().contains("twice"), "{err}");
+    }
+
+    #[test]
+    fn aur_ci_file_enforces_line_and_total_caps() {
+        let overlong = format!("{}@1.0-1\n", "y".repeat(MAX_AUR_CI_LINE_BYTES));
+        let err = parse_aur_ci_lines(&overlong).unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
+        let at_cap = format!("{}@1.0-1\n", "Y".repeat(MAX_AUR_CI_LINE_BYTES - 6));
+        let err = parse_aur_ci_lines(&at_cap).unwrap_err();
+        assert!(err.to_string().contains("invalid pkgbase"), "{err}");
+        let huge = "#".repeat(MAX_AUR_CI_FILE_BYTES + 1);
+        let err = parse_aur_ci_lines(&huge).unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
+        let chunk = format!("{}\n", "#".repeat(511));
+        assert_eq!(chunk.len(), 512);
+        let full = chunk.repeat(MAX_AUR_CI_LINES);
+        assert_eq!(full.len(), MAX_AUR_CI_FILE_BYTES);
+        assert!(parse_aur_ci_lines(&full).is_ok());
+    }
+
+    #[test]
+    fn aur_ci_file_enforces_entry_cap() {
+        let mut pins = String::new();
+        for i in 0..MAX_AUR_CI_LINES {
+            pins.push_str(&format!("pkg{i:04}@1.0-1\n"));
+        }
+        assert_eq!(parse_aur_ci_lines(&pins).unwrap().len(), MAX_AUR_CI_LINES);
+        pins.push_str("one-more@1.0-1\n");
+        let err = parse_aur_ci_lines(&pins).unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
+    }
+
+    #[test]
+    fn aur_ci_diff_enforces_evaluation_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
+        let mut policy = Policy::default();
+        policy.ci.max_evaluations = 1;
+        let ctx = CiContext {
+            base_ref: "HEAD",
+            lockfile_path: "aur.lock",
+            registry_base: "http://127.0.0.1:9",
+            fail_on: None,
+            ecosystem: Ecosystem::Aur,
+        };
+        let err =
+            evaluate_aur_ci_diff("", "yay@1.0-1\nparu@2.0-1\n", &ctx, &store, &policy).unwrap_err();
+        assert!(err.to_string().contains("maximum configured"), "{err}");
+        let err = evaluate_aur_ci_diff(
+            "yay@1.0-1\nparu@2.0-1\n",
+            "yay@2.0-1\nparu@2.1-1\n",
+            &ctx,
+            &store,
+            &policy,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("maximum configured"), "{err}");
     }
 
     #[test]
