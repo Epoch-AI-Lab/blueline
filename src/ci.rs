@@ -1176,6 +1176,32 @@ mod tests {
     }
 
     #[test]
+    fn aur_ci_diff_counts_unchanged_pins() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
+        let policy = Policy::load_or_default(None).unwrap();
+        let ctx = CiContext {
+            base_ref: "HEAD",
+            lockfile_path: "aur.lock",
+            registry_base: "http://127.0.0.1:9",
+            fail_on: None,
+            ecosystem: Ecosystem::Aur,
+        };
+        // Base and head share the same pins: both take the unchanged arm and
+        // evals stays empty, so evaluate_package and the network are untouched.
+        let report = evaluate_aur_ci_diff(
+            "yay@1.0-1\nparu@2.0-1\n",
+            "yay@1.0-1\nparu@2.0-1\n",
+            &ctx,
+            &store,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(report.unchanged_count, 2);
+        assert_eq!(report.total_evaluated, 0);
+    }
+
+    #[test]
     fn cargo_dispatch_by_filename_or_ecosystem() {
         // Kills the || → && mutant at evaluate_lockfile_diff:142.
         // Either condition alone must select the Cargo parser.
