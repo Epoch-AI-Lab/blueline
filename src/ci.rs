@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -8,10 +9,12 @@ use serde::{Deserialize, Serialize};
 use crate::lockfile::{compute_delta_from_maps, compute_lockfile_delta};
 use crate::policy::Policy;
 use crate::registry::Ecosystem;
+use crate::registry::aur::validate_aur_name;
 use crate::render::{sanitize_single_line, sanitize_terminal};
 use crate::review::evaluate_package;
 use crate::store::BaselineStore;
 use crate::verdict::{Verdict, VerdictBand};
+use crate::version::{AurVersionInfo, VersionInfo};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CiOutputFormat {
@@ -62,6 +65,51 @@ fn is_pypi_lockfile(ecosystem: Ecosystem, lockfile_path: &Path) -> bool {
         })
 }
 
+/// Bounds for the AUR CI file: one `pkgbase@pkgver-pkgrel` per line.
+const MAX_AUR_CI_LINES: usize = 4096;
+const MAX_AUR_CI_LINE_BYTES: usize = 512;
+
+/// Parse an AUR CI file into `pkgbase -> version`. Blank lines and `#`
+/// comments are skipped; everything else must be exactly one valid
+/// `pkgbase@pkgver-pkgrel` entry or the whole file fails closed with the
+/// offending line number. A repeated pkgbase with a different version fails
+/// closed so the file cannot state two pins for one package.
+fn parse_aur_ci_lines(content: &str) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut map = BTreeMap::new();
+    for (idx, raw) in content.lines().enumerate() {
+        let lineno = idx + 1;
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.len() > MAX_AUR_CI_LINE_BYTES {
+            anyhow::bail!("AUR CI file line {lineno} exceeds {MAX_AUR_CI_LINE_BYTES} bytes");
+        }
+        if map.len() >= MAX_AUR_CI_LINES {
+            anyhow::bail!("AUR CI file exceeds {MAX_AUR_CI_LINES} entries");
+        }
+        let Some((name, version)) = line.split_once('@') else {
+            anyhow::bail!("AUR CI file line {lineno} must be `pkgbase@pkgver-pkgrel`");
+        };
+        if !validate_aur_name(name) {
+            anyhow::bail!("AUR CI file line {lineno} has an invalid pkgbase `{name}`");
+        }
+        if AurVersionInfo::parse(version).is_err() {
+            anyhow::bail!("AUR CI file line {lineno} has an invalid version `{version}`");
+        }
+        match map.get(name) {
+            Some(prev) if prev != version => {
+                anyhow::bail!("AUR CI file pins `{name}` twice with different versions");
+            }
+            Some(_) => continue,
+            None => {
+                map.insert(name.to_string(), version.to_string());
+            }
+        }
+    }
+    Ok(map)
+}
+
 fn check_evaluation_budget(added: usize, upgraded: usize, max: usize) -> anyhow::Result<usize> {
     let total = added + upgraded;
     if total > max {
@@ -93,12 +141,6 @@ pub fn run(
     fail_on_override: Option<VerdictBand>,
     output_file: Option<&Path>,
 ) -> anyhow::Result<()> {
-    if ecosystem == Ecosystem::Aur {
-        return Err(anyhow::anyhow!(
-            "AUR CI scanning is not supported yet: there is no AUR lockfile format to diff"
-        ));
-    }
-
     let policy = Policy::load_or_default(policy_path)?;
     let store = BaselineStore::open()?;
 
@@ -116,7 +158,8 @@ pub fn run(
 
     let is_cargo = is_cargo_lockfile(ecosystem, lockfile_path);
     let is_pypi = is_pypi_lockfile(ecosystem, lockfile_path);
-    let base_content = extract_base_lockfile(base_ref, lockfile_path, is_cargo, is_pypi)?;
+    let is_aur = ecosystem == Ecosystem::Aur;
+    let base_content = extract_base_lockfile(base_ref, lockfile_path, is_cargo, is_pypi, is_aur)?;
 
     let lockfile_str = lockfile_path.display().to_string();
     let ctx = CiContext {
@@ -178,6 +221,10 @@ pub fn evaluate_lockfile_diff(
     store: &BaselineStore,
     policy: &Policy,
 ) -> anyhow::Result<CiReport> {
+    if ctx.ecosystem == Ecosystem::Aur {
+        return evaluate_aur_ci_diff(base_content, head_content, ctx, store, policy);
+    }
+
     let is_cargo = is_cargo_lockfile(ctx.ecosystem, Path::new(ctx.lockfile_path));
     let is_pypi = is_pypi_lockfile(ctx.ecosystem, Path::new(ctx.lockfile_path));
 
@@ -313,11 +360,83 @@ pub fn evaluate_lockfile_diff(
     })
 }
 
+/// Review the AUR CI file diff: every added or version-changed pkgbase gets
+/// a full `evaluate_package` review. Removed entries need no review.
+/// The stored integrity for each item is the sha256 of the pinned commit's
+/// `git archive` bytes, so the audit trail stays bound to the commit hash.
+fn evaluate_aur_ci_diff(
+    base_content: &str,
+    head_content: &str,
+    ctx: &CiContext<'_>,
+    store: &BaselineStore,
+    policy: &Policy,
+) -> anyhow::Result<CiReport> {
+    let base_pkgs = parse_aur_ci_lines(base_content)?;
+    let head_pkgs = parse_aur_ci_lines(head_content)?;
+
+    let mut added = 0usize;
+    let mut upgraded = 0usize;
+    let mut unchanged_count = 0usize;
+    let mut evals: Vec<(String, Option<String>, String)> = Vec::new();
+    for (name, new_version) in &head_pkgs {
+        match base_pkgs.get(name) {
+            None => {
+                added += 1;
+                evals.push((name.clone(), None, new_version.clone()));
+            }
+            Some(old) if old != new_version => {
+                upgraded += 1;
+                evals.push((name.clone(), Some(old.clone()), new_version.clone()));
+            }
+            _ => unchanged_count += 1,
+        }
+    }
+
+    check_evaluation_budget(added, upgraded, policy.ci.max_evaluations)?;
+
+    let mut items = Vec::new();
+    let mut max_band = VerdictBand::Low;
+    for (name, old_version, new_version) in evals {
+        let (verdict, _, _, _) = evaluate_package(
+            &name,
+            &new_version,
+            ctx.ecosystem,
+            ctx.registry_base,
+            store,
+            policy,
+        )?;
+        max_band = update_max_band(max_band, verdict.band);
+        items.push(CiReviewItem {
+            name,
+            old_version,
+            new_version,
+            is_dev: false,
+            verdict,
+        });
+    }
+
+    let fail_threshold = ctx
+        .fail_on
+        .unwrap_or_else(|| parse_band_str(&policy.ci.fail_on).unwrap_or(VerdictBand::High));
+    let passed = band_passes(max_band, fail_threshold);
+
+    Ok(CiReport {
+        base_ref: ctx.base_ref.to_string(),
+        lockfile_path: ctx.lockfile_path.to_string(),
+        total_evaluated: items.len(),
+        unchanged_count,
+        max_band,
+        passed,
+        items,
+    })
+}
+
 fn extract_base_lockfile(
     base_ref: &str,
     lockfile_path: &Path,
     is_cargo: bool,
     is_pypi: bool,
+    is_aur: bool,
 ) -> anyhow::Result<String> {
     let trimmed_ref = base_ref.trim();
     if trimmed_ref.starts_with('-') || trimmed_ref.is_empty() {
@@ -336,7 +455,7 @@ fn extract_base_lockfile(
             if is_cargo {
                 return Ok("version = 4\n".to_string());
             }
-            if is_pypi {
+            if is_pypi || is_aur {
                 return Ok(String::new());
             }
             return Ok(r#"{"lockfileVersion": 3, "packages": {}}"#.to_string());
@@ -635,17 +754,24 @@ mod tests {
             Path::new("package-lock.json"),
             false,
             false,
+            false,
         )
         .unwrap_err();
         assert!(err.to_string().contains("cannot start with '-'"));
 
-        let err_ws_flag =
-            extract_base_lockfile("  --evil", Path::new("package-lock.json"), false, false)
-                .unwrap_err();
+        let err_ws_flag = extract_base_lockfile(
+            "  --evil",
+            Path::new("package-lock.json"),
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
         assert!(err_ws_flag.to_string().contains("cannot start with '-'"));
 
         let err_empty =
-            extract_base_lockfile("  ", Path::new("package-lock.json"), false, false).unwrap_err();
+            extract_base_lockfile("  ", Path::new("package-lock.json"), false, false, false)
+                .unwrap_err();
         assert!(err_empty.to_string().contains("or be empty"));
     }
 
@@ -910,11 +1036,13 @@ mod tests {
             Path::new("package-lock.json"),
             false,
             false,
+            false,
         );
         assert!(res.is_err());
         let res_nonexistent = extract_base_lockfile(
             "nonexistent_ref_123456789",
             Path::new("package-lock.json"),
+            false,
             false,
             false,
         );
@@ -928,6 +1056,7 @@ mod tests {
             Path::new("Cargo.lock.missing-for-test-xyz"),
             true,
             false,
+            false,
         )
         .unwrap();
         assert_eq!(cargo_empty, "version = 4\n");
@@ -935,6 +1064,7 @@ mod tests {
         let npm_empty = extract_base_lockfile(
             "HEAD",
             Path::new("package-lock.missing-for-test-xyz"),
+            false,
             false,
             false,
         )
@@ -946,10 +1076,42 @@ mod tests {
             Path::new("requirements.missing-for-test-xyz.txt"),
             false,
             true,
+            false,
         )
         .unwrap();
         assert_eq!(pypi_empty, "");
         assert!(crate::lockfile::parse_requirements_txt_packages(&pypi_empty).is_ok());
+        let aur_empty = extract_base_lockfile(
+            "HEAD",
+            Path::new("aur.missing-for-test-xyz.lock"),
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(aur_empty, "");
+        assert!(parse_aur_ci_lines(&aur_empty).is_ok());
+    }
+
+    #[test]
+    fn aur_ci_file_parses_pins_and_skips_comments() {
+        let map = parse_aur_ci_lines("# pinned AUR set\nyay@12.4.2-1\n\nparu@2.0.4-1\n").unwrap();
+        assert_eq!(map.get("yay").map(String::as_str), Some("12.4.2-1"));
+        assert_eq!(map.get("paru").map(String::as_str), Some("2.0.4-1"));
+        let same = parse_aur_ci_lines("yay@12.4.2-1\nyay@12.4.2-1\n").unwrap();
+        assert_eq!(same.len(), 1);
+    }
+
+    #[test]
+    fn aur_ci_file_fails_closed_with_line_numbers() {
+        let err = parse_aur_ci_lines("yay@12.4.2-1\nnot a pin\n").unwrap_err();
+        assert!(err.to_string().contains("line 2"), "{err}");
+        let err = parse_aur_ci_lines("YAY@12.4.2-1\n").unwrap_err();
+        assert!(err.to_string().contains("line 1"), "{err}");
+        let err = parse_aur_ci_lines("yay@not-a-version!\n").unwrap_err();
+        assert!(err.to_string().contains("line 1"), "{err}");
+        let err = parse_aur_ci_lines("yay@1.0-1\nyay@2.0-1\n").unwrap_err();
+        assert!(err.to_string().contains("twice"), "{err}");
     }
 
     #[test]

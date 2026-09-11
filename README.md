@@ -47,7 +47,7 @@ If a release exceeds risk thresholds, Blueline blocks the install and halts the 
 
 ## Project status
 
-- [x] Multi-registry support: npm, crates.io (`--ecosystem cargo`), and PyPI (`--ecosystem pypi`)
+- [x] Multi-registry support: npm, crates.io (`--ecosystem cargo`), PyPI (`--ecosystem pypi`), and AUR (`--ecosystem aur`, review-only)
 - [x] Sandboxed archive extraction with path traversal, symlink, and decompression bomb guards
 - [x] Package manifest parsing, cryptographic integrity (SHA-256 / SHA-512), and PEP 740 / SLSA provenance
 - [x] SQLite store for verified baseline releases and audit logging
@@ -69,6 +69,58 @@ cd blueline
 cargo build --release
 ./target/release/blueline review express@4.21.2
 ```
+
+## AUR
+
+Blueline reviews AUR packages but never builds them: `blueline install`
+refuses `--ecosystem aur` because building a PKGBUILD runs its shell code.
+Review with blueline, build with yay or paru.
+
+```bash
+blueline --ecosystem aur review yay@12.4.2-1
+```
+
+Threat model, plainly stated: the review covers the repo scripts only.
+Downloaded upstream sources listed in `source=()` are not reviewed, and the
+build step executes the PKGBUILD. Every AUR card carries that scope
+disclosure. The stored approval is bound to the reviewed commit: the audit
+log keeps the sha256 of the pinned commit's archive bytes, so a history
+rewrite never passes as the same approval.
+
+### yay gate hook
+
+yay v13 runs `AURPreInstall` Lua hooks before building. Drop this in your
+yay config to block the build unless blueline approves the version:
+
+```lua
+function AURPreInstall(packages)
+  for _, pkg in ipairs(packages) do
+    local ok = os.execute(
+      "blueline --ecosystem aur review "
+        .. pkg .. " --yes --policy blueline.toml"
+    )
+    if ok ~= 0 then return 1 end
+  end
+  return 0
+end
+```
+
+Timing note: the review pins the newest commit for that version at review
+time, while yay builds its own download. Re-run the review right before the
+build and treat any version drift as a re-review signal.
+
+### AUR in CI
+
+`blueline ci` accepts a pin file with one `pkgbase@pkgver-pkgrel` per line,
+blank lines and `#` comments allowed. Pipe your own tooling over
+`pacman -Qqm` to produce it:
+
+```bash
+blueline --ecosystem aur ci --lockfile aur.lock --base origin/main
+```
+
+Policy rules take `ecosystem = "aur"` to scope allows and blocks to AUR,
+or omit it to match every ecosystem.
 
 ## Contributors
 

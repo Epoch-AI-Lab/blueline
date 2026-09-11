@@ -1,6 +1,6 @@
 //! End-to-end AUR CLI surface tests. `install` refuses AUR before any
 //! network use (building a PKGBUILD executes its shell script), and `ci`
-//! rejects the ecosystem (no AUR lockfile format exists to diff). Adapter
+//! accepts a pin file of `pkgbase@pkgver-pkgrel` lines to diff. Adapter
 //! behavior lives in `src/registry/aur.rs` unit tests and
 //! `tests/aur_adapter.rs`.
 
@@ -25,22 +25,61 @@ fn install_refuses_aur_before_any_network_use() {
         .stderr(predicate::str::contains("executes its PKGBUILD"));
 }
 
+fn init_aur_ci_repo(dir: &Path, head_content: &str) {
+    fixture_git(dir, &["init", "--quiet", "-b", "main"]);
+    fixture_git(dir, &["config", "user.email", "alice@example.com"]);
+    fixture_git(dir, &["config", "user.name", "Fixture"]);
+    fixture_git(dir, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(dir.join("aur.lock"), "demopkg@1.0-1\n").unwrap();
+    fixture_git(dir, &["add", "-A"]);
+    fixture_git(dir, &["commit", "--quiet", "-m", "base pins"]);
+    std::fs::write(dir.join("aur.lock"), head_content).unwrap();
+}
+
 #[test]
-fn ci_rejects_aur_ecosystem() {
+fn ci_aur_passes_when_pins_are_unchanged() {
+    let repo = tempfile::tempdir().unwrap();
+    init_aur_ci_repo(repo.path(), "demopkg@1.0-1\n");
     let isolated = tempfile::tempdir().unwrap();
     Command::cargo_bin("blueline")
         .unwrap()
+        .current_dir(repo.path())
         .env("BLUELINE_DATA_DIR", isolated.path())
         .args([
             "--ecosystem",
             "aur",
             "ci",
             "--lockfile",
-            "package-lock.json",
+            "aur.lock",
+            "--base",
+            "HEAD",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("PASSED"));
+}
+
+#[test]
+fn ci_aur_rejects_malformed_pin_file() {
+    let repo = tempfile::tempdir().unwrap();
+    init_aur_ci_repo(repo.path(), "demopkg@1.0-1\nnot a pin\n");
+    let isolated = tempfile::tempdir().unwrap();
+    Command::cargo_bin("blueline")
+        .unwrap()
+        .current_dir(repo.path())
+        .env("BLUELINE_DATA_DIR", isolated.path())
+        .args([
+            "--ecosystem",
+            "aur",
+            "ci",
+            "--lockfile",
+            "aur.lock",
+            "--base",
+            "HEAD",
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("AUR CI scanning is not supported"));
+        .stderr(predicate::str::contains("line 2"));
 }
 
 struct AurReviewFixture {
