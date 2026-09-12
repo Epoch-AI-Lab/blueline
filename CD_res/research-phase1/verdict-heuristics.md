@@ -364,8 +364,8 @@ D5/D6 and the rule set say.
   `prisma` / `@prisma/engines` (downloads platform engine binaries), and `core-js` (a
   funding banner that only writes a file and reads env vars)
   ([RFC 0054](https://github.com/npm/rfcs/blob/main/accepted/0054-make-scripts-install-opt-in.md),
-  [npm-script-lens demo report](https://github.com/Booyak101/npm-script-lens),
-  [dev.to walkthrough](https://dev.to/booyak101/npm-v12-stopped-running-install-scripts-which-ones-do-you-approve-a-real-audit-walkthrough-b1l)).
+  [npm-script-lens demo report](https://github.com/Booyaka101/npm-script-lens),
+  [dev.to walkthrough](https://dev.to/booyaka101/npm-v12-stopped-running-install-scripts-which-ones-do-you-approve-a-real-audit-walkthrough-b1l)).
 - A concrete capability classification that separates them (from npm-script-lens, which
   statically analyzes scripts and their require-chains):
   - HIGH: spawns processes (child_process, execa, node-gyp, unresolved binaries) or runs
@@ -374,7 +374,7 @@ D5/D6 and the rule set say.
   - MEDIUM: network access without exec;
   - LOW: filesystem writes or process.env reads only;
   - SAFE: none
-  ([npm-script-lens](https://github.com/Booyak101/npm-script-lens)).
+  ([npm-script-lens](https://github.com/Booyaka101/npm-script-lens)).
 
 ### What malicious install scripts look like
 
@@ -733,8 +733,8 @@ Bands (score only; BLOCK latch wins regardless):
 - npm install-scripts command docs (v12): https://docs.npmjs.com/cli/v12/commands/npm-install-scripts/
 - pnpm supply chain security: https://pnpm.io/supply-chain-security
 - bun lifecycle docs: https://bun.com/docs/pm/lifecycle
-- npm-script-lens: https://github.com/Booyak101/npm-script-lens
-- npm v12 audit walkthrough (dev.to): https://dev.to/booyak101/npm-v12-stopped-running-install-scripts-which-ones-do-you-approve-a-real-audit-walkthrough-b1l
+- npm-script-lens: https://github.com/Booyaka101/npm-script-lens
+- npm v12 audit walkthrough (dev.to): https://dev.to/booyaka101/npm-v12-stopped-running-install-scripts-which-ones-do-you-approve-a-real-audit-walkthrough-b1l
 - Latch paper: https://ldklab.github.io/assets/papers/asiaccs22-latch.pdf
 - Weak Links in the npm Supply Chain (ICSE 2022): https://patricegodefroid.github.io/public_psfiles/icse2022.pdf
 - Amalfi (ICSE 2022): https://dl.acm.org/doi/10.1145/3510003.3510104
