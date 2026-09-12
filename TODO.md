@@ -389,7 +389,9 @@ Slices (each independently green, small commits, CHANGELOG entry per slice):
   through an installed shim blocked unapproved and ran approved, Claude
   Code + Cursor hook payloads denied/allowed with agent identities in the
   audit log)
-- [ ] Campaign 3: recall / revocation index
+- [x] Campaign 3: recall / revocation index (slices: recall-service,
+  fold-in; use-it: e2e serve/sync/block, staleness disclosure and
+  escalation, curation export pinned in tests/recall_cli.rs)
 - [ ] Campaign 4: dogfood & distribution
 
 Mark each campaign's box `[x]` in the same branch when it lands.
