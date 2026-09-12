@@ -57,6 +57,26 @@ pub struct SyncedSnapshot {
     pub snapshot: Snapshot,
 }
 
+/// Per-process snapshot cache: reviews evaluate many packages (CI, recursive
+/// children) and re-validating the snapshot per lookup is wasted work. The
+/// cache is keyed by modification timestamp so a re-sync in the same
+/// process is picked up.
+static SNAPSHOT_CACHE: std::sync::OnceLock<(std::time::SystemTime, Option<SyncedSnapshot>)> =
+    std::sync::OnceLock::new();
+
+fn cached_load(path: &Path) -> Result<Option<SyncedSnapshot>, BluelineError> {
+    let mtime = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .unwrap_or(std::time::UNIX_EPOCH);
+    match SNAPSHOT_CACHE.get() {
+        Some((cached_at, cached)) if *cached_at == mtime => return Ok(cached.clone()),
+        _ => {}
+    }
+    let loaded = load_at(path)?;
+    let _ = SNAPSHOT_CACHE.set((mtime, loaded.clone()));
+    Ok(loaded)
+}
+
 /// Injectable reader used by `load` and tests: missing file is an absent
 /// index, anything present is parsed and validated fail closed.
 pub(crate) fn load_at(path: &Path) -> Result<Option<SyncedSnapshot>, BluelineError> {
@@ -198,7 +218,7 @@ impl SyncedSnapshot {
     /// error; the caller must treat that as "no index" WITH disclosure,
     /// never as trusted.
     pub fn load() -> Result<Option<Self>, BluelineError> {
-        load_at(&snapshot_path()?)
+        cached_load(&snapshot_path()?)
     }
 
     /// Epoch seconds past the snapshot's fetch time (client-side staleness).
@@ -288,7 +308,7 @@ pub fn sync(url: &str) -> anyhow::Result<SyncedSnapshot> {
         std::fs::create_dir_all(parent)
             .map_err(|e| anyhow::anyhow!("creating {}: {e}", parent.display()))?;
     }
-    let tmp = path.with_extension("json.tmp");
+    let tmp = path.with_extension(format!("json.tmp-{}", std::process::id()));
     std::fs::write(&tmp, serde_json::to_string_pretty(&synced)?)
         .map_err(|e| anyhow::anyhow!("writing {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, &path)
@@ -323,6 +343,8 @@ pub fn serve(port: u16, index: &Path) -> anyhow::Result<()> {
         let Ok(mut stream) = stream else { continue };
         let bytes = bytes.clone();
         std::thread::spawn(move || {
+            let _ = stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(HTTP_READ_TIMEOUT_SECS)));
             let mut buf = [0u8; 2048];
             let n = stream.read(&mut buf).unwrap_or(0);
             let req = String::from_utf8_lossy(&buf[..n]);

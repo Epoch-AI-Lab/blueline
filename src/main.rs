@@ -59,10 +59,9 @@ fn run() -> anyhow::Result<()> {
             cli::RecallAction::Sync { url } => {
                 let synced = recall::sync(&url)?;
                 println!(
-                    "synced recall snapshot: sequence {}, {} revocations, fetched {}s ago (0)",
+                    "synced recall snapshot: sequence {}, {} revocations",
                     synced.snapshot.sequence,
-                    synced.snapshot.revocations.len(),
-                    synced.age_secs()
+                    synced.snapshot.revocations.len()
                 );
                 Ok(())
             }
