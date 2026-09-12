@@ -479,6 +479,10 @@ Slices (each independently green, small commits, CHANGELOG entry per slice):
 - [x] Campaign 3: recall / revocation index (slices: recall-service,
   fold-in; use-it: e2e serve/sync/block, staleness disclosure and
   escalation, curation export pinned in tests/recall_cli.rs)
-- [ ] Campaign 4: dogfood & distribution
+- [x] Campaign 4: dogfood & distribution (platform matrix filled,
+  crates.io/homebrew/AUR configs in-repo, SLSA attestation wired;
+  publish pending human confirmation per the goal; use-it: blueline ci
+  PASSED on own Cargo.lock and package-lock.json, agent review of
+  serde_json@1.0.151 LOW, npx launcher cold start verified)
 
 Mark each campaign's box `[x]` in the same branch when it lands.
