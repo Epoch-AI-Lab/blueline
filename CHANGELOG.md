@@ -9,10 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Install-reference extraction (`src/install_ref.rs`), the scanning layer for
+  recursive review: static detection of package-manager invocations that
+  resolve another install at install/build time — npm lifecycle scripts
+  (`preinstall`/`install`/`postinstall`/`prepare`/kin) invoking
+  `npm`/`npx`/`pnpm`/`yarn`/`bun`/`pip` with a named spec, PKGBUILD npm/bun
+  delivery specs exposed by the new `pkgbuild::npm_delivery_refs`, and wheel
+  `.data/scripts` payloads. Each reference records its manager, origin, raw
+  spec, whether the spec is exactly pinned, and whether it was statically
+  parseable (dynamic shell payloads are disclosed unparseable, never
+  guessed). Nothing executes or fetches — pure parsing of already-extracted
+  bytes, bounded per line, with non-UTF-8 `.data/scripts` files surfaced as
+  unparseable references instead of silently skipped.
+
 - AUR integration (`feat/aur-integration`): `blueline --ecosystem aur ci
   --lockfile aur.lock` reviews added and version-changed pins from a file of
   one `pkgbase@pkgver-pkgrel` per line (blank lines and `#` comments
-  skipped, malformed lines and double pins fail closed with line numbers,
   4096-entry cap, base read via `git show` like other ecosystems); a yay v13
   `AURPreInstall` Lua hook recipe in the README gating the build on
   `blueline review --yes`, with the re-review-on-drift timing note;

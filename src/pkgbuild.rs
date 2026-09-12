@@ -2000,10 +2000,19 @@ fn check_r14(folded: &FoldedPkgbuild) -> Vec<PkgFinding> {
     Vec::new()
 }
 
-fn check_r23(folded: &FoldedPkgbuild) -> Vec<PkgFinding> {
+struct R23Hit {
+    function: String,
+    line: String,
+    spec: String,
+    verb: Option<String>,
+    manager_word: String,
+}
+
+fn scan_r23(folded: &FoldedPkgbuild) -> Vec<R23Hit> {
     let bodies = shell_bodies(folded);
     let managers = ["npm", "bun"];
     let verbs = ["install", "ci", "add", "exec", "run", "x", "dlx"];
+    let mut hits = Vec::new();
     for (name, body) in &bodies {
         let resolved = fold_body_vars(body, folded);
         for line in resolved.lines() {
@@ -2012,29 +2021,106 @@ fn check_r23(folded: &FoldedPkgbuild) -> Vec<PkgFinding> {
             let words: Vec<&str> = lower.split_whitespace().collect();
             for window in words.windows(2) {
                 if managers.contains(&window[0]) && verbs.contains(&window[1]) {
-                    // INFO until tuned: source-built electron apps (joplin,
-                    // bitwarden-cli, insomnia) genuinely run npm install.
-                    // True signal, but ubiquitous in its niche.
                     let short: String = line.trim().chars().take(120).collect();
                     let spec = words.get(2).unwrap_or(&"");
-                    return vec![PkgFinding {
-                        rule_id: "R23_NPM_DELIVERY".to_string(),
-                        severity: VerdictBand::Low,
-                        evidence: format!("{name}(): {short} (spec: {spec})"),
-                    }];
+                    hits.push(R23Hit {
+                        function: (*name).to_string(),
+                        line: short,
+                        spec: (*spec).to_string(),
+                        verb: Some(window[1].to_string()),
+                        manager_word: window[0].to_string(),
+                    });
                 }
             }
-            if lower.split_whitespace().any(|word| word == "npx") {
+            if let Some(pos) = words.iter().position(|word| *word == "npx") {
                 let short: String = line.trim().chars().take(120).collect();
-                return vec![PkgFinding {
-                    rule_id: "R23_NPM_DELIVERY".to_string(),
-                    severity: VerdictBand::Low,
-                    evidence: format!("{name}(): {short}"),
-                }];
+                let spec = first_positional_word(&words[pos + 1..]);
+                hits.push(R23Hit {
+                    function: (*name).to_string(),
+                    line: short,
+                    spec,
+                    verb: None,
+                    manager_word: "npx".to_string(),
+                });
             }
         }
     }
-    Vec::new()
+    hits
+}
+
+/// First non-flag word after `npx`, or empty when none is statically
+/// resolvable (dynamic payloads surface as an unparseable reference).
+fn first_positional_word(words: &[&str]) -> String {
+    for word in words {
+        if word.starts_with('-') {
+            continue;
+        }
+        if word.contains('$')
+            || word.contains('`')
+            || word.contains('(')
+            || word.contains('*')
+            || word.contains('?')
+        {
+            return String::new();
+        }
+        return (*word).to_string();
+    }
+    String::new()
+}
+
+fn check_r23(folded: &FoldedPkgbuild) -> Vec<PkgFinding> {
+    scan_r23(folded)
+        .into_iter()
+        .map(|hit| {
+            // INFO until tuned: source-built electron apps (joplin,
+            // bitwarden-cli, insomnia) genuinely run npm install.
+            // True signal, but ubiquitous in its niche.
+            let evidence = if hit.spec.is_empty() {
+                format!("{}(): {}", hit.function, hit.line)
+            } else {
+                format!("{}(): {} (spec: {})", hit.function, hit.line, hit.spec)
+            };
+            PkgFinding {
+                rule_id: "R23_NPM_DELIVERY".to_string(),
+                severity: VerdictBand::Low,
+                evidence,
+            }
+        })
+        .collect()
+}
+
+/// Install references (npm/bun delivery) statically resolvable from the
+/// given PKGBUILD, for the recursive review pass. Only invocations that
+/// install or execute a NAMED package produce a reference — `npm run`
+/// targets a local script and `npm ci` the manifest's own dependencies.
+/// A PKGBUILD that fails static parsing yields no references here; the
+/// HIGH `R00_PKGBUILD_UNPARSEABLE` finding already fails that review shut.
+pub fn npm_delivery_refs(content: &str) -> Vec<crate::install_ref::InstallRef> {
+    let Ok(folded) = parse_pkgbuild(content) else {
+        return Vec::new();
+    };
+    scan_r23(&folded)
+        .into_iter()
+        .filter_map(|hit| {
+            let manager = match hit.manager_word.as_str() {
+                "bun" => crate::install_ref::RefManager::Bun,
+                "npx" => crate::install_ref::RefManager::Npx,
+                _ => crate::install_ref::RefManager::Npm,
+            };
+            let install_verb = hit.verb.is_none()
+                || matches!(
+                    hit.verb.as_deref(),
+                    Some("install" | "i" | "add" | "exec" | "x" | "dlx")
+                );
+            if !install_verb || hit.spec.is_empty() || hit.spec.starts_with('-') {
+                return None;
+            }
+            let origin = crate::install_ref::RefOrigin::Pkgbuild {
+                function: hit.function,
+            };
+            Some(crate::install_ref::raw_ref(origin, manager, &hit.spec))
+        })
+        .collect()
 }
 
 fn check_r15(folded: &FoldedPkgbuild) -> Vec<PkgFinding> {
@@ -2731,6 +2817,50 @@ mod tests {
     fn r23_quiet_on_comment_only() {
         let findings = findings_for("pkgdesc='a pack'\n# npm install\nbuild() {\n make\n}\n");
         assert!(!has_rule(&findings, "R23_NPM_DELIVERY"));
+    }
+
+    #[test]
+    fn npm_delivery_refs_capture_named_specs() {
+        let refs = npm_delivery_refs(
+            "build() {\n  npm install atomic-lockfile minimist\n  bun install js-digest@1.0.0\n}\n",
+        );
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].spec, "atomic-lockfile");
+        assert_eq!(refs[0].manager, crate::install_ref::RefManager::Npm);
+        assert!(!refs[0].pinned);
+        assert_eq!(refs[1].spec, "js-digest@1.0.0");
+        assert_eq!(refs[1].manager, crate::install_ref::RefManager::Bun);
+        assert!(refs[1].pinned);
+        assert!(refs.iter().all(|r| matches!(
+            r.origin,
+            crate::install_ref::RefOrigin::Pkgbuild { ref function } if function == "build"
+        )));
+    }
+
+    #[test]
+    fn npm_delivery_refs_exclude_local_invocations() {
+        // `npm run build` targets a local script, `npm ci` the manifest's
+        // own deps, flags are not specs: none is a resolvable reference.
+        let refs = npm_delivery_refs(
+            "build() {\n  npm run build\n  npm ci\n  npm install --save-dev\n}\n",
+        );
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn npm_delivery_refs_carry_npx_spec() {
+        let refs = npm_delivery_refs("package() {\n  npx esbuild@0.21.0 --version\n}\n");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].manager, crate::install_ref::RefManager::Npx);
+        assert_eq!(refs[0].spec, "esbuild@0.21.0");
+    }
+
+    #[test]
+    fn npm_delivery_refs_unparseable_pkgbuild_is_empty() {
+        // Static parse fails (over the byte cap) — no refs, and the HIGH
+        // R00 finding in review_roots already fails that review shut.
+        let oversized = "build() {\n  npm install x\n}\n".repeat(60_000);
+        assert!(npm_delivery_refs(&oversized).is_empty());
     }
 
     #[test]
