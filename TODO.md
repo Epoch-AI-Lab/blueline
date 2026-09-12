@@ -295,6 +295,57 @@ Slices:
 - Slice 3 `recipes`: README/Claude/Cursor/Codex recipes with the honest
   bypass list; user-level-settings warning; use-it pass.
 
+### Campaign 3 — recall / revocation index (research brief)
+
+Motivation, verified against the OSV API docs and the OpenSSF/GitHub lag
+data from the Campaign 1 research: OSV/GHSA classify new malware on the
+order of ~3 days (28-day NVD median), which is exactly the window the
+TanStack worm used. A curated, human-verified revocation index that a team
+controls closes that gap WITHOUT the hosted paid tier (D6): the service and
+the client ship in-repo, run end-to-end locally, and the curation workflow
+starts from blueline's own audit log.
+
+Rulings (locked, no re-litigating):
+
+1. LOCAL-FIRST and self-hostable: `blueline recall serve --port N
+   --index <revocations.json>` serves a curated snapshot over a minimal
+   std-only HTTP server (no new dependency); `blueline recall sync --url
+   <base>` fetches it; `blueline recall export-candidates` turns the local
+   audit log (holds, blocks, refusals) into a candidates file a human
+   curates by hand. No hosted deployment, no tokens, no paid tier.
+2. The synced snapshot lives in a JSON FILE under the data directory —
+   NOT in the SQLite store. store.rs is untouched (the ask-first
+   guardrail holds; a schema migration is not needed for a cache that is
+   rebuilt wholesale on every sync). The snapshot is validated fail
+   closed on every load: schema version, entry caps, per-ecosystem name
+   grammar reuse, valid versions, sane timestamps; anything off → the
+   index is treated as absent WITH a disclosure, never as trusted.
+3. Snapshot format: `{schema, generated_at, sequence, revocations:
+   [{ecosystem, name, versions: [...] | all_versions, reason, id}]}`,
+   sequence + generated_at for staleness and monotonic sync checks (a
+   sync that would move the sequence BACKWARD is refused — fail closed).
+4. Fold-in: hits surface through the EXISTING advisory engine — a
+   revocation hit is an advisory item with `is_malware: true`, which the
+   heuristic already maps to R09_ADVISORY_MALWARE (BLOCK, D7: CLI, CI and
+   MCP inherit). Staleness is its own rule `R28_RECALL_STALE` (MEDIUM
+   disclosure by default; policy `recall.block_on_stale` escalates to
+   BLOCK). Policy `[recall]`: `max_age_hours` (default 48) and
+   `block_on_stale` (default false). A missing snapshot is not stale —
+   it is simply absent (no index installed), and says nothing on the
+   card beyond absence.
+5. Client fetches are bounded (size cap, entry cap) and the server is
+   read-only over loopback-friendly defaults; the curated index file is
+   the single source of truth and the served bytes are exactly the file
+   bytes (no server-side mutation).
+
+Slices:
+
+- Slice 1 `recall-service`: snapshot format + fail-closed validation +
+  sync client + serve + export-candidates, unit and integration tests.
+- Slice 2 `fold-in`: advisory fold-in + staleness policy + card/JSON
+  disclosure + use-it pass (serve locally, seed a human-verified
+  revocation, sync, hit → BLOCK; stale → disclosed; sync-down → explicit).
+
 ### Campaign 1 — recursive review (research brief)
 
 Motivation, verified against the TanStack postmortem, the Unit42 writeup,
