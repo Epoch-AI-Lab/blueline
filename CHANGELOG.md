@@ -139,34 +139,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (building a PKGBUILD executes its shell script); `review` and `ci` fail
   closed until the AUR adapter PR lands.
 
-### Fixed
-
-- Agent-gate hardening from the campaign review: every gate error path now
-  DENIES instead of exiting 1 (hook hosts treat non-2 exits as
-  non-blocking, so a hostile stdin payload sized to break the UTF-8 read,
-  a corrupt store, or an unreadable policy previously let the command run
-  ungated); gate-managed installs route to their own registries (`cargo
-  install` → crates.io, `yay`/`paru -S` → the AUR, `pip` → PyPI — the
-  wrong-registry routing previously reviewed an npm namesake); and the
-  scanner + gate close the silent-allow shapes: `pip install -r/-e/-c`
-  (non-registry sources), `npx --package=<pkg>`, `npm exec`/`npm x`/`bun x`
-  (which execute packages exactly like npx), and manager tokens hidden
-  behind quoting or backslash escapes. Oversized hook stdin is refused, a
-  missing-real-binary or hostile-character install path refuses shim
-  creation, real binaries are checked for the exec bit, each manager's
-  shim passes only its own registry override, `pip3` ships as a shim
-  target, and gate denials are audited.
-- The gate scanner finds verbs behind leading global flags
-  (`npm --no-fund install evil` was a silent allow), denies npm registry
-  and config overrides in gated installs (`--registry=`, `--userconfig`,
-  `--tag=`, `npm_config_*` env assignments, `npm config set registry` —
-  reviewing one registry while installing from another), discloses
-  dynamic `--package` values as unparseable markers instead of dropping
-  them behind decoy positionals, and stops scanning at shell comments.
-- The README hook recipes pin `BLUELINE_POLICY` for the hook environment
-  (a repo's committed blueline.toml otherwise governs hooks fired with the
-  repository as cwd) and disclose the remaining bypass surface.
-
 ### Changed
 
 - The policy loader honors `BLUELINE_POLICY` (an absolute path) ahead of
@@ -198,49 +170,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- AUR review hardening from the PR #53 review: PKGBUILD function bodies are
-  comment-stripped before rule scanning, so a commented-out `curl | bash`
-  inside `build()` no longer produces a HIGH R13/R14/R17 false positive; an
-  unreadable baseline PKGBUILD now raises `R00_BASELINE_UNREADABLE` at High
-  (matching the unparseable case) instead of Low, so invalid-UTF-8 baselines
-  cannot slip past the R12/R19 pair rules for a Low finding; interpreter
-  process substitution (`bash <(curl -fsSL https://…)` and fused
-  `bash<(curl …)`) now fires R13 even without a pipe; `git` runs under
-  `LC_ALL=C` so error classification no longer depends on the system locale;
-  and `git` invocations run in their own process group with bounded pipe
-  drain, so a transport child (`git-remote-https`, `ssh`, …) that outlives
-  git and holds the output pipes can no longer hang the review.
-- AUR review hardening from the adapter review follow-up: per-commit
-  `.SRCINFO` reads distinguish content failures (missing, oversized,
-  non-UTF-8, malformed — counted as skips) from git plumbing failures
-  (propagated fail-closed, so object corruption can no longer masquerade as
-  "no parseable .SRCINFO"); `Package.version` now stores the pinned commit's
-  canonical version instead of the user's spelling, so vercmp aliases like
-  `1.1.0-01` resolve to identical store keys and displayed identities; the
-  extracted `.SRCINFO`'s declared `pkgbase` is cross-checked against the
-  resolved package base at the review boundary; `list_versions` keeps the
-  adapter's vercmp ordering instead of re-sorting with semver prerelease
-  rules; new tests pin the deterministic equal-timestamp hash tiebreak, the
-  split-package pkgname → pkgbase path, directory-not-file refusals, and the
-  pkgbase mismatch refusal.
-- The MCP `check_known_clean` AUR arm compares the requested version against
-  stored clean versions with libalpm vercmp equality instead of canonical
-  strings, so grammar-accepted spellings of an approved release (pkgrel-less
-  `12.4.2`, epoch-explicit `0:12.4.2-1`) now report `isClean: true` against a
-  stored `12.4.2-1` instead of a false negative; an unparseable AUR version is
-  now an `invalid params` error rather than a guaranteed not-clean.
-- AUR review follow-up fixes: R05 no longer runs the semver leg on AUR
-  versions (two-component `1.0-1` spellings are normal, validated with
-  `AurVersionInfo` instead); split-package pkgnames fail closed with a
-  pointer to review the pkgbase explicitly instead of silently swapping
-  identity; `release_author` pins the clone URL and verifies the commit
-  before reading the author email; R13 spots spaceless pipes (`curl x|bash`)
-  and fetcher pipes into `python`/`perl`/`ruby`/`php`.
-- Release workflow smoke gate invokes the shipped binary with
-  `--policy blueline.toml --output json --yes` and asserts on the presence of
-  the `integrity` field, matching the current CLI flags and the 0.3.0
-  canonical digest display (the old grep for `"integrity":"verified` could
-  never match).
+- Agent-gate hardening from the campaign review: every gate error path now
+  DENIES instead of exiting 1 (hook hosts treat non-2 exits as
+  non-blocking, so a hostile stdin payload sized to break the UTF-8 read,
+  a corrupt store, or an unreadable policy previously let the command run
+  ungated); gate-managed installs route to their own registries (`cargo
+  install` → crates.io, `yay`/`paru -S` → the AUR, `pip` → PyPI — the
+  wrong-registry routing previously reviewed an npm namesake); and the
+  scanner + gate close the silent-allow shapes: `pip install -r/-e/-c`
+  (non-registry sources), `npx --package=<pkg>`, `npm exec`/`npm x`/`bun x`
+  (which execute packages exactly like npx), and manager tokens hidden
+  behind quoting or backslash escapes. Oversized hook stdin is refused, a
+  missing-real-binary or hostile-character install path refuses shim
+  creation, real binaries are checked for the exec bit, each manager's
+  shim passes only its own registry override, `pip3` ships as a shim
+  target, and gate denials are audited.
+- The gate scanner finds verbs behind leading global flags
+  (`npm --no-fund install evil` was a silent allow), denies npm registry
+  and config overrides in gated installs (`--registry=`, `--userconfig`,
+  `--tag=`, `npm_config_*` env assignments, `npm config set registry` —
+  reviewing one registry while installing from another), discloses
+  dynamic `--package` values as unparseable markers instead of dropping
+  them behind decoy positionals, and stops scanning at shell comments.
+- The README hook recipes pin `BLUELINE_POLICY` for the hook environment
+  (a repo's committed blueline.toml otherwise governs hooks fired with the
+  repository as cwd) and disclose the remaining bypass surface.
 
 ## [0.3.0] - 2026-08-31
 
