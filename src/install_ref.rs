@@ -14,6 +14,8 @@
 
 use std::path::Path;
 
+use crate::version::VersionInfo;
+
 use crate::diff::Delta;
 use crate::manifest::PackageJson;
 
@@ -51,6 +53,9 @@ pub enum RefManager {
     Bun,
     Bunx,
     Pip,
+    Cargo,
+    Yay,
+    Paru,
 }
 
 impl RefManager {
@@ -63,6 +68,9 @@ impl RefManager {
             RefManager::Bun => "bun",
             RefManager::Bunx => "bunx",
             RefManager::Pip => "pip",
+            RefManager::Cargo => "cargo",
+            RefManager::Yay => "yay",
+            RefManager::Paru => "paru",
         }
     }
 }
@@ -102,6 +110,8 @@ impl InstallRef {
         match self.manager {
             RefManager::Pip if valid_py_name(name) => Some((name, version)),
             RefManager::Pip => None,
+            RefManager::Yay | RefManager::Paru if valid_aur_name(name) => Some((name, version)),
+            RefManager::Yay | RefManager::Paru => None,
             _ if valid_npm_name(name) => Some((name, version)),
             _ => None,
         }
@@ -113,6 +123,11 @@ impl InstallRef {
 /// version part (`pkg@`, `requests==`) reads as unpinned, not broken.
 fn split_spec(manager: RefManager, spec: &str) -> Option<(&str, Option<&str>)> {
     match manager {
+        RefManager::Yay | RefManager::Paru => match spec.split_once('=') {
+            Some((n, v)) if !n.is_empty() && !v.is_empty() => Some((n, Some(v))),
+            Some(_) => Some((spec, None)),
+            None => Some((spec, None)),
+        },
         RefManager::Pip => match spec.split_once("==") {
             Some((n, v)) if !v.is_empty() => Some((n, Some(v))),
             Some((n, _)) => Some((n, None)),
@@ -157,6 +172,15 @@ fn plain_npm_segment(seg: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.'))
 }
 
+/// AUR pkgbase grammar: printable ASCII name characters, no separators.
+fn valid_aur_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-' | '@'))
+}
+
 fn valid_py_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 214
@@ -197,6 +221,9 @@ fn version_is_exact(manager: RefManager, version: &str) -> bool {
     }
     match manager {
         RefManager::Pip => version.chars().next().is_some_and(|c| c.is_ascii_digit()),
+        RefManager::Yay | RefManager::Paru => {
+            crate::version::AurVersionInfo::parse(version).is_ok()
+        }
         _ => semver::Version::parse(version).is_ok(),
     }
 }
@@ -291,6 +318,9 @@ fn scan_words(toks: &[Tok]) -> Vec<(RefManager, String)> {
             "bun" => RefManager::Bun,
             "bunx" => RefManager::Bunx,
             "pip" | "pip3" => RefManager::Pip,
+            "cargo" => RefManager::Cargo,
+            "yay" => RefManager::Yay,
+            "paru" => RefManager::Paru,
             _ => continue,
         };
         if toks[i].ends_command || toks[i].is_separator {
@@ -301,10 +331,13 @@ fn scan_words(toks: &[Tok]) -> Vec<(RefManager, String)> {
             (RefManager::Npx, _) | (RefManager::Bunx, _) => Some(i + 1),
             (RefManager::Pip, Some("install" | "i")) => Some(i + 2),
             (RefManager::Pnpm, Some("dlx")) | (RefManager::Yarn, Some("dlx")) => Some(i + 2),
+            (RefManager::Cargo, Some("install")) => Some(i + 2),
             (
                 RefManager::Npm | RefManager::Pnpm | RefManager::Yarn | RefManager::Bun,
                 Some("install" | "i" | "add"),
             ) => Some(i + 2),
+            // yay/paru -S: the verb is a flag; combined forms (-Syu) count.
+            (RefManager::Yay | RefManager::Paru, Some(v)) if v.starts_with("-s") => Some(i + 2),
             _ => None,
         };
         let Some(start) = starts_command else {

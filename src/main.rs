@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use blueline::{agent, ci, cli, mcp, review};
+use blueline::{agent, ci, cli, mcp, review, shim};
 
 use clap::Parser;
 
@@ -54,6 +54,12 @@ fn run() -> anyhow::Result<()> {
                 &bases,
                 cli.policy.as_deref(),
             ),
+        },
+        cli::Command::Shim { action } => match action {
+            cli::ShimAction::Install { managers, dir } => shim::install(&managers, dir.as_deref()),
+            cli::ShimAction::Uninstall { managers, dir } => {
+                shim::uninstall(&managers, dir.as_deref())
+            }
         },
     }
 }

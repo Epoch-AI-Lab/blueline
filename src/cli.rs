@@ -185,6 +185,36 @@ pub enum Command {
         #[command(subcommand)]
         action: AgentAction,
     },
+
+    /// Install or remove PATH shims that route package managers through blueline
+    Shim {
+        #[command(subcommand)]
+        action: ShimAction,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum ShimAction {
+    /// Write fail-closed shims that gate installs through `blueline agent gate`
+    Install {
+        /// Managers to shim: npm, npx, pip, cargo, yay, paru
+        #[arg(value_delimiter = ' ')]
+        managers: Vec<String>,
+
+        /// Target directory (default: the blueline data directory)
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+    },
+    /// Remove previously installed shims
+    Uninstall {
+        /// Managers to unshim
+        #[arg(value_delimiter = ' ')]
+        managers: Vec<String>,
+
+        /// Target directory (default: the blueline data directory)
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]

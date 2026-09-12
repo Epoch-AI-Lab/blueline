@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- PATH-shim routing (`blueline shim install|uninstall <npm|npx|pip|cargo|yay|paru>
+  [--dir <path>]`): generated bash shims that rebuild the invocation and
+  route it through `blueline agent gate` before the real package manager
+  (resolved on PATH at install time, excluding the shim directory) runs.
+  Fail closed everywhere — blueline missing, errored, or refusing means the
+  install does not run, and a missing real binary refuses shim creation.
+  The scanner gained `cargo install`, and `yay`/`paru -S` operands
+  (AUR-grammar specs with `name=version` pinning), so all six managers are
+  reviewed through one grammar; pip flags that name non-registry sources
+  (`-r`, `-e`, `--constraint`, …) are refused with a pointer to
+  `blueline ci`. `BLUELINE_REGISTRY` and `BLUELINE_POLICY` environment
+  variables scope a shimmed shell to a mirror and a project policy.
 - Agent-native enforcement (`blueline agent`): `agent review <pkg>` gives
   autonomous agents a policy-bound, never-interactive gate — single-line
   JSON verdict on stdout (the D7 schema, recursive reviews included),
