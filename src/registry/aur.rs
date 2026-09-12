@@ -435,22 +435,42 @@ fn commit_history(repo: &Path, cap: usize) -> Result<(Vec<CommitMeta>, bool), Bl
     Ok((commits, truncated))
 }
 
-/// Static `.SRCINFO` version of one commit. A commit whose `.SRCINFO` is
-/// missing, oversized, malformed, or carries an unparseable version yields
-/// `None` (counted as a skip by the callers — VCS packages mutate pkgver
-/// dynamically). Plumbing failures of `git rev-list`/`git log` never reach
-/// this function; a `git show` failure here is per-commit, not repo-wide.
-fn commit_version(repo: &Path, hash: &str) -> Option<AurVersionInfo> {
+/// Static `.SRCINFO` version of one commit. Content failures are per-commit
+/// skips (`Ok(None)`, counted as skipped by the callers): the blob is absent
+/// (VCS packages mutate pkgver dynamically and may drop the file), exceeds
+/// the `SRCINFO_MAX_BYTES` cap, is not UTF-8, is malformed, or carries an
+/// unparseable version. Everything else propagates fail-closed: a `git show`
+/// failure on an intact commit is only a skip when git's own stderr says the
+/// path "does not exist", and a `cat-file -t` failure or a non-commit kind
+/// propagates, so a corrupt or unreadable object cannot masquerade as "no
+/// parseable .SRCINFO".
+fn commit_version(repo: &Path, hash: &str) -> Result<Option<AurVersionInfo>, BluelineError> {
     let spec = format!("{hash}:.SRCINFO");
-    let raw = git_text(
+    let out = match git_output(
         Some(repo),
         &["show", &spec],
         crate::manifest::SRCINFO_MAX_BYTES,
-    )
-    .ok()?;
-    parse_aur_srcinfo(&raw)
+    ) {
+        Ok(out) => out,
+        Err(BluelineError::ExtractionLimit(_)) => return Ok(None),
+        Err(e) => {
+            let kind = git_text(Some(repo), &["cat-file", "-t", hash], 256)?;
+            if kind.trim() != "commit" {
+                return Err(e);
+            }
+            if !e.to_string().contains("does not exist") {
+                return Err(e);
+            }
+            return Ok(None);
+        }
+    };
+    let raw = match String::from_utf8(out) {
+        Ok(raw) => raw,
+        Err(_) => return Ok(None),
+    };
+    Ok(parse_aur_srcinfo(&raw)
         .ok()
-        .and_then(|s| AurVersionInfo::parse(&s.version).ok())
+        .and_then(|s| AurVersionInfo::parse(&s.version).ok()))
 }
 
 fn verify_commit_exists(repo: &Path, hash: &str) -> Result<(), BluelineError> {
@@ -564,24 +584,29 @@ impl AurRegistry {
             .rpc
             .pkgbase(name)
             .map_err(|e| with_aur_context(e, name))?;
+        if pkgbase != name {
+            return Err(BluelineError::InvalidPackageSpec(format!(
+                "`{name}` is part of split package base `{pkgbase}`; review `{pkgbase}@{version}` instead so the verdict and baseline cannot silently change identity"
+            )));
+        }
         let clone_url = self.clone_url(&pkgbase);
         let repo = self.temp_repo()?;
         self.clone_repo(&clone_url, repo.path())?;
         let (commits, truncated) = commit_history(repo.path(), MAX_HISTORY_COMMITS)?;
 
         let mut skipped = 0usize;
-        let mut matched: Option<&CommitMeta> = None;
+        let mut matched: Option<(&CommitMeta, AurVersionInfo)> = None;
         for c in &commits {
-            match commit_version(repo.path(), &c.hash) {
+            match commit_version(repo.path(), &c.hash)? {
                 Some(v) if v == target => {
-                    matched = Some(c);
+                    matched = Some((c, v));
                     break;
                 }
                 Some(_) => {}
                 None => skipped += 1,
             }
         }
-        let commit = matched.ok_or_else(|| {
+        let (commit, matched_version) = matched.ok_or_else(|| {
             let mut msg = format!(
                 "version `{version}` not found in the git history of `{pkgbase}` \
                  (checked {} commits, {skipped} without a parseable .SRCINFO)",
@@ -603,7 +628,7 @@ impl AurRegistry {
         };
         Ok(Package {
             name: pkgbase,
-            version: version.to_string(),
+            version: matched_version.canonical(),
             tarball_url: format!("git+{clone_url}#{}", commit.hash),
             integrity: Some(checksum),
         })
@@ -666,6 +691,11 @@ impl AurRegistry {
             .rpc
             .pkgbase(name)
             .map_err(|e| with_aur_context(e, name))?;
+        if pkgbase != name {
+            return Err(BluelineError::InvalidPackageSpec(format!(
+                "`{name}` is part of split package base `{pkgbase}`; review `{pkgbase}` instead so the verdict and baseline cannot silently change identity"
+            )));
+        }
         let clone_url = self.clone_url(&pkgbase);
         let repo = self.temp_repo()?;
         self.clone_repo(&clone_url, repo.path())?;
@@ -683,7 +713,7 @@ impl AurRegistry {
         let mut seen: Vec<(AurVersionInfo, Release)> = Vec::new();
         let mut skipped = 0usize;
         for c in &commits {
-            match commit_version(repo.path(), &c.hash) {
+            match commit_version(repo.path(), &c.hash)? {
                 Some(v) => {
                     // Commits are newest-first; keep the newest commit per
                     // distinct version for an accurate publish time.
@@ -729,7 +759,15 @@ impl Registry for AurRegistry {
     }
 
     fn list_versions(&self, name: &str) -> Result<Vec<semver::Version>, BluelineError> {
-        let mut v: Vec<semver::Version> = self
+        // list_releases already orders ascending by the adapter's vercmp;
+        // keep that order instead of re-sorting. Once releases_sorted's dedup
+        // has collapsed vercmp-equal spellings, semver and vercmp order agree
+        // for everything that survives, so the old semver re-sort was a
+        // latent inconsistency rather than an observable bug; not re-sorting
+        // pins the order as a regression net. The semver mapping is lossy:
+        // two-component pkgvers like "1.0-1" cannot be represented and are
+        // dropped.
+        Ok(self
             .list_releases(name)?
             .into_iter()
             .filter_map(|r| {
@@ -739,9 +777,7 @@ impl Registry for AurRegistry {
                         .and_then(|p| semver::Version::parse(&p.canonical()).ok())
                 })
             })
-            .collect();
-        v.sort();
-        Ok(v)
+            .collect())
     }
 
     fn list_releases(&self, name: &str) -> Result<Vec<Release>, BluelineError> {
@@ -756,8 +792,10 @@ impl Registry for AurRegistry {
     /// identity). Failures degrade to `None` = "unknown" by design.
     fn release_author(&self, pkg: &Package) -> Option<String> {
         let (clone_url, commit) = parse_git_tarball_url(&pkg.tarball_url).ok()?;
+        self.pin_clone_url(&clone_url).ok()?;
         let repo = self.temp_repo().ok()?;
         self.clone_repo(&clone_url, repo.path()).ok()?;
+        verify_commit_exists(repo.path(), &commit).ok()?;
         let text = git_text(
             Some(repo.path()),
             &["log", "-1", "--format=%ae", &commit],
@@ -1135,7 +1173,12 @@ mod tests {
         .unwrap();
         std::fs::write(
             repo.join(".SRCINFO"),
-            format!("pkgbase = {pkgbase}\n\tpkgver = {pkgver}\n\tpkgrel = {pkgrel}\n"),
+            // An empty pkgrel omits the line, yielding a pkgrel-less version.
+            if pkgrel.is_empty() {
+                format!("pkgbase = {pkgbase}\n\tpkgver = {pkgver}\n")
+            } else {
+                format!("pkgbase = {pkgbase}\n\tpkgver = {pkgver}\n\tpkgrel = {pkgrel}\n")
+            },
         )
         .unwrap();
         git_run(repo, &["add", "-A"]);
@@ -1225,6 +1268,17 @@ mod tests {
         assert_eq!(
             pkg.integrity.as_ref().unwrap().alg,
             crate::registry::ChecksumAlg::Sha256
+        );
+    }
+
+    #[test]
+    fn resolve_stores_the_canonical_spelling_of_the_matched_version() {
+        let (fx, _repo) = spawn_versioned_fixture();
+        let reg = fx.registry();
+        let pkg = reg.resolve("yay", "1.1.0-01").unwrap();
+        assert_eq!(
+            pkg.version, "1.1.0-1",
+            "stored version must be the archive's own canonical form: {pkg:?}"
         );
     }
 
@@ -1418,6 +1472,106 @@ mod tests {
     }
 
     #[test]
+    fn oversized_srcinfo_is_a_per_commit_skip_not_a_repo_error() {
+        let fx = spawn_git_fixture();
+        let repo = init_fixture_repo(&fx.fixtures, "oversize");
+        commit_pkg(&repo, "oversize", "1.0.0", "1", TS_BASE, "a@example.com");
+        // HEAD's .SRCINFO is far beyond the size cap: a content-class
+        // failure, so that commit is skipped and the walk carries on.
+        std::fs::write(
+            repo.join(".SRCINFO"),
+            format!(
+                "pkgbase = oversize\n\tpkgver = 2.0.0\n\tpkgrel = 1\n# pad\n{}\n",
+                "x".repeat(crate::manifest::SRCINFO_MAX_BYTES as usize + 1)
+            ),
+        )
+        .unwrap();
+        git_run(&repo, &["add", "-A"]);
+        let date = format!("@{} +0000", TS_BASE + 10);
+        let out = Command::new("git")
+            .args(["commit", "--quiet", "-m", "oversize 2.0.0"])
+            .env("GIT_AUTHOR_DATE", &date)
+            .env("GIT_COMMITTER_DATE", &date)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "oversize commit failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let reg = fx.registry();
+
+        let releases = reg.list_releases("oversize").unwrap();
+        let versions: Vec<&str> = releases.iter().map(|r| r.version.as_str()).collect();
+        assert_eq!(versions, ["1.0.0-1"]);
+
+        let err = reg.resolve("oversize", "2.0.0-1").unwrap_err().to_string();
+        assert!(
+            err.contains("not found in the git history"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains("1 without a parseable .SRCINFO"),
+            "skipped count must include the oversized commit: {err}"
+        );
+    }
+
+    #[test]
+    fn list_versions_keeps_list_releases_vercmp_order_and_drops_unmappable() {
+        let fx = spawn_git_fixture();
+        let repo = init_fixture_repo(&fx.fixtures, "orderflip");
+        commit_pkg(&repo, "orderflip", "1.0", "1", TS_BASE, "a@example.com");
+        commit_pkg(
+            &repo,
+            "orderflip",
+            "1.2.0",
+            "1",
+            TS_BASE + 1,
+            "a@example.com",
+        );
+        commit_pkg(
+            &repo,
+            "orderflip",
+            "1.2.0",
+            "2",
+            TS_BASE + 2,
+            "a@example.com",
+        );
+        let reg = fx.registry();
+
+        let releases = reg.list_releases("orderflip").unwrap();
+        let release_versions: Vec<&str> = releases.iter().map(|r| r.version.as_str()).collect();
+        assert_eq!(release_versions, ["1.0-1", "1.2.0-1", "1.2.0-2"]);
+
+        // The two-component pkgver "1.0-1" has no semver representation and
+        // is dropped; the rest must come back in list_releases' vercmp
+        // ascending order, not re-sorted by semver's prerelease rules.
+        let versions = reg.list_versions("orderflip").unwrap();
+        let got: Vec<String> = versions.iter().map(|v| v.to_string()).collect();
+        assert_eq!(got, ["1.2.0-1", "1.2.0-2"]);
+    }
+
+    #[test]
+    fn vercmp_equal_version_aliases_collapse_to_the_newest_commit() {
+        let fx = spawn_git_fixture();
+        let repo = init_fixture_repo(&fx.fixtures, "alias");
+        commit_pkg(&repo, "alias", "1.1.0", "1", TS_BASE, "a@example.com");
+        // The adapter's vercmp treats a pkgrel-less version as equal to its
+        // pkgrel-bearing alias ("1.5" == "1.5-1"), so both commits expose the
+        // same version and the newest commit's spelling wins.
+        commit_pkg(&repo, "alias", "1.1.0", "", TS_BASE + 1, "a@example.com");
+        let reg = fx.registry();
+        let releases = reg.list_releases("alias").unwrap();
+        let versions: Vec<&str> = releases.iter().map(|r| r.version.as_str()).collect();
+        assert_eq!(versions, ["1.1.0"]);
+        assert_eq!(
+            reg.default_version("alias").unwrap().as_deref(),
+            Some("1.1.0")
+        );
+    }
+
+    #[test]
     fn history_walk_caps_at_200_commits_and_states_truncation() {
         let fx = spawn_git_fixture();
         let repo = init_fixture_repo(&fx.fixtures, "long");
@@ -1464,6 +1618,86 @@ mod tests {
         );
         let err = reg.resolve("yay", "1.0.0-1").unwrap_err().to_string();
         assert!(err.contains("git clone failed"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn commit_history_tiebreaks_equal_timestamps_toward_the_greater_hash() {
+        let fx = spawn_git_fixture();
+        let repo = init_fixture_repo(&fx.fixtures, "tiebreak");
+        let first = commit_pkg(&repo, "tiebreak", "3.3.3", "1", TS_BASE, "a@example.com");
+        // Vary the tree so the second same-timestamp commit is not empty.
+        std::fs::write(repo.join("changelog"), "tiebreak\n").unwrap();
+        let second = commit_pkg(&repo, "tiebreak", "3.3.3", "1", TS_BASE, "a@example.com");
+        assert_ne!(first, second);
+        let (older, newer) = if first < second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+
+        let (commits, truncated) = commit_history(&repo, MAX_HISTORY_COMMITS).unwrap();
+        assert!(!truncated);
+        assert_eq!(commits.len(), 2);
+        assert_eq!(
+            commits[0].hash, newer,
+            "deterministic tiebreak must pick the lexicographically greater hash"
+        );
+        assert_eq!(commits[1].hash, older);
+
+        let reg = fx.registry();
+        let pkg = reg.resolve("tiebreak", "3.3.3-1").unwrap();
+        assert_eq!(pkg.tarball_url.rsplit('#').next().unwrap(), newer);
+    }
+
+    #[test]
+    fn resolve_split_package_targets_the_package_base_repo_and_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixtures = dir.path().join("fixtures");
+        std::fs::create_dir_all(&fixtures).unwrap();
+        let server = MockAurServer::spawn(|path| {
+            if let Some(name) = path.strip_prefix("/rpc/v5/info?arg%5B%5D=") {
+                let name = name.split('&').next().unwrap_or("");
+                let base = if name == "demopkg" {
+                    "demopkg-base"
+                } else {
+                    name
+                };
+                let info = serde_json::json!({
+                    "ID": 1,
+                    "Name": name,
+                    "PackageBaseID": 1,
+                    "PackageBase": base,
+                    "Version": "2.0-1",
+                    "Maintainer": "someone"
+                });
+                (200, "application/json".into(), rpc_body(info))
+            } else {
+                (404, "text/plain".into(), b"nope".to_vec())
+            }
+        });
+        let repo = init_fixture_repo(&fixtures, "demopkg-base");
+        commit_pkg(&repo, "demopkg-base", "2.0", "1", TS_BASE, "a@example.com");
+        let reg = AurRegistry::with_bases(
+            &server.base,
+            fixtures.to_str().unwrap(),
+            RegistryLimits::default(),
+        );
+
+        let err = reg.resolve("demopkg", "2.0-1").unwrap_err().to_string();
+        assert!(
+            err.contains("demopkg-base@2.0-1"),
+            "split pkgname must fail closed with a pkgbase pointer, got: {err}"
+        );
+        let pkg = reg.resolve("demopkg-base", "2.0-1").unwrap();
+        assert_eq!(pkg.name, "demopkg-base");
+        assert_eq!(pkg.version, "2.0-1");
+        assert!(
+            pkg.tarball_url.contains("/demopkg-base.git#"),
+            "unexpected url {}",
+            pkg.tarball_url
+        );
+        let bytes = reg.fetch_tarball(&pkg).unwrap();
+        assert_eq!(&bytes[..2], &[0x1f, 0x8b], "archive must be gzip tar");
     }
 
     #[test]
