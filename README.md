@@ -128,6 +128,105 @@ blueline --ecosystem aur ci --lockfile aur.lock --base origin/main
 Policy rules take `ecosystem = "aur"` to scope allows and blocks to AUR,
 or omit it to match every ecosystem.
 
+## Agent enforcement
+
+Autonomous agents install dependencies without reading them. Blueline ships
+three enforcement surfaces, one per trust boundary:
+
+- **`blueline agent review <pkg>`** — the agent's own call. Non-interactive
+  and policy-bound: a single-line JSON verdict on stdout, exit `0` when the
+  policy approves, `2` when it refuses, `1` on error. It never prompts and
+  never marks a baseline clean — an agent can learn the verdict, not grant
+  trust. Every decision lands in the local audit log as
+  `agent:<identity>` (Claude Code, Cursor, or Codex CLI detected from the
+  process environment; env names only, never values).
+- **`blueline agent gate`** — the hook binding. It polices one command line
+  (`--command "<cmd>"`, or the hook payload on stdin — Claude Code
+  `PreToolUse` and Cursor `beforeShellExecution` shapes are both accepted),
+  reviews every package the command names with the recursive engine, and
+  answers with exit codes or the product's native decision JSON.
+
+### Claude Code hook
+
+Drop this in **user-level** `~/.claude/settings.json` (not the repo —
+repo-committable hook config is itself an attack vector):
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "blueline agent gate --format claude"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The gate reads the tool-call JSON from stdin, scans the command with the
+same parser the review engine uses, reviews the named packages, and denies
+with `exit 2` (Claude Code's documented contract for policy hooks). A
+dynamic target like `npm install $(cat deps.txt)` is denied — fail closed.
+
+### Cursor hook
+
+`.cursor/hooks.json` (project) or `~/.cursor/hooks.json` (user):
+
+```json
+{
+  "version": 1,
+  "hooks": {
+    "beforeShellExecution": [
+      {
+        "command": "blueline agent gate --format cursor",
+        "timeout": 60,
+        "failClosed": true
+      }
+    ]
+  }
+}
+```
+
+### Codex CLI
+
+Codex has no hook process; its execpolicy is prefix-based and cannot run a
+reviewer. The honest recipe is advisory: mark install verbs as `prompt` in
+`~/.codex/rules/*.rules` and instruct the agent to route installs through
+`blueline agent review` (or run them inside a blueline-shimmed shell):
+
+```python
+prefix_rule(pattern = ["npm", "install"], decision = "prompt",
+            justification = "installs must be reviewed by blueline")
+```
+
+### PATH shims (interactive-terminal backstop)
+
+```bash
+blueline shim install npm npx pip cargo yay paru
+export PATH="$HOME/.local/share/blueline/shims:$PATH"
+```
+
+Each shim rebuilds the invocation, runs it through `blueline agent gate`,
+and only then execs the real package manager (resolved on PATH at install
+time). If blueline errors or refuses, the install does not run. Scope a
+shell with `BLUELINE_REGISTRY=<mirror>` and `BLUELINE_POLICY=<blueline.toml>`.
+
+**What shims cannot stop** — stated plainly, because a gate that overstates
+its coverage is security theater: absolute binary paths (`/usr/bin/npm`),
+`command npm`, `env -i`, direct `node .../npm-cli.js` invocation, npx
+resolving from an existing `node_modules/.bin`, PATH reordering, and edits
+to repo-committable hook config. Shims are defense-in-depth for the
+terminal; hooks are the agent boundary; `blueline ci` polices the manifest
+and lockfile where the real authority lives. Unpinned specs are reviewed at
+their current default version — re-review before the install if the window
+matters.
+
 ## Contributors
 
 See [CONTRIBUTORS.md](./CONTRIBUTORS.md) for maintainers, contributors, and details on how to get involved.
