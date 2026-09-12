@@ -4,6 +4,13 @@
 //! github:orphan-commit → prepare` and Atomic Arch `npm install
 //! atomic-lockfile` lane). Pure scanning of already-extracted bytes —
 //! nothing here executes, fetches, or resolves anything.
+//!
+//! Best-effort by nature: obfuscated invocations (`\npm`, `env npm`,
+//! indirection through variables the scanner cannot resolve) are layered
+//! under the existing diff/PKGBUILD heuristic rules, not replaced by this
+//! scanner. Everything the scanner CAN see statically, it must surface —
+//! including invocations whose target is dynamic, which are disclosed as
+//! unparseable references rather than skipped or guessed.
 
 use std::path::Path;
 
@@ -11,6 +18,28 @@ use crate::diff::Delta;
 use crate::manifest::PackageJson;
 
 const MAX_SCAN_LINE_BYTES: usize = 4096;
+
+/// Flags that swallow the following token as their value; without this the
+/// value would misread as a package spec (`npm install --registry
+/// https://x evil` must yield exactly `evil`).
+const CONSUME_VALUE_FLAGS: &[&str] = &[
+    "-r",
+    "--requirement",
+    "-c",
+    "--constraint",
+    "-e",
+    "--editable",
+    "-t",
+    "--target",
+    "--prefix",
+    "--registry",
+    "--cache",
+    "--tag",
+    "--userconfig",
+    "--globalconfig",
+    "--proxy",
+    "--https-proxy",
+];
 
 /// A package manager whose invocation was found inside a reviewed payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,9 +77,10 @@ pub enum RefOrigin {
 
 /// One machine-resolved install reference. `pinned` means the spec carries
 /// an exact version; `parseable` is false when the spec is dynamic
-/// (shell expansion, wildcards, metacharacters) — the reference exists but
-/// its target cannot be resolved statically, which downstream review treats
-/// as its own finding, never as a guess.
+/// (shell expansion, wildcards, metacharacters) or the invocation's target
+/// could not be read at all (oversized line, unreadable file) — the
+/// reference exists but its target cannot be resolved statically, which
+/// downstream review treats as its own finding, never as a guess.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallRef {
     pub origin: RefOrigin,
@@ -62,38 +92,39 @@ pub struct InstallRef {
 
 impl InstallRef {
     /// Registry-installable spec (`name`, `name@version`, `name==version`,
-    /// scoped npm names). Anything else — git/URL specs, ranges, dynamic
-    /// payloads — is surfaced but not recursively resolvable.
+    /// scoped npm names). Anything else — git/URL specs, dynamic payloads —
+    /// is surfaced but not recursively resolvable.
     pub fn registry_spec(&self) -> Option<(&str, Option<&str>)> {
         if !self.parseable || self.spec.is_empty() {
             return None;
         }
+        let (name, version) = split_spec(self.manager, &self.spec)?;
         match self.manager {
-            RefManager::Pip => {
-                let (name, version) = match self.spec.split_once("==") {
-                    Some((n, v)) => (n, Some(v)),
-                    None => (self.spec.as_str(), None),
-                };
-                if valid_py_name(name) {
-                    Some((name, version))
-                } else {
-                    None
-                }
-            }
-            _ => {
-                let (name, version) = match self.spec.rsplit_once('@') {
-                    // A leading `@` with no second separator is a bare scoped
-                    // name (`@scope/pkg`), not a version split.
-                    Some((n, v)) if !n.is_empty() && !n.ends_with('@') => (n, Some(v)),
-                    _ => (self.spec.as_str(), None),
-                };
-                if valid_npm_name(name) {
-                    Some((name, version))
-                } else {
-                    None
-                }
-            }
+            RefManager::Pip if valid_py_name(name) => Some((name, version)),
+            RefManager::Pip => None,
+            _ if valid_npm_name(name) => Some((name, version)),
+            _ => None,
         }
+    }
+}
+
+/// Split `name==version` (pip) or `name@version` (npm-like) into parts.
+/// A bare scoped name (`@scope/pkg`) is a name with no version; an empty
+/// version part (`pkg@`, `requests==`) reads as unpinned, not broken.
+fn split_spec(manager: RefManager, spec: &str) -> Option<(&str, Option<&str>)> {
+    match manager {
+        RefManager::Pip => match spec.split_once("==") {
+            Some((n, v)) if !v.is_empty() => Some((n, Some(v))),
+            Some((n, _)) => Some((n, None)),
+            None => Some((spec, None)),
+        },
+        _ => match spec.rsplit_once('@') {
+            Some((n, v)) if !n.is_empty() && !n.ends_with('@') && !v.is_empty() => {
+                Some((n, Some(v)))
+            }
+            Some((n, _)) if !n.is_empty() => Some((n, None)),
+            _ => Some((spec, None)),
+        },
     }
 }
 
@@ -139,9 +170,6 @@ fn has_dynamic_syntax(token: &str) -> bool {
                 | '}'
                 | '<'
                 | '>'
-                | '|'
-                | '&'
-                | ';'
                 | '*'
                 | '?'
                 | '['
@@ -155,10 +183,6 @@ fn has_dynamic_syntax(token: &str) -> bool {
     })
 }
 
-fn clean_token(token: &str) -> &str {
-    token.trim_end_matches([',', ';'])
-}
-
 fn version_is_exact(manager: RefManager, version: &str) -> bool {
     if version.is_empty() {
         return false;
@@ -167,82 +191,6 @@ fn version_is_exact(manager: RefManager, version: &str) -> bool {
         RefManager::Pip => version.chars().next().is_some_and(|c| c.is_ascii_digit()),
         _ => semver::Version::parse(version).is_ok(),
     }
-}
-
-/// Extract (manager, spec) pairs from one line of shell-like text. Words
-/// are matched case-insensitively against package-manager invocation
-/// shapes; the first positional argument after the verb is the spec. An
-/// empty spec string means the invocation exists but its target is
-/// dynamic/unparseable.
-fn scan_words(words: &[&str]) -> Vec<(RefManager, String)> {
-    let mut refs = Vec::new();
-    for i in 0..words.len() {
-        let w = clean_token(words[i]);
-        let next = words.get(i + 1).map(|w| clean_token(w));
-        let manager = match w {
-            "npm" => RefManager::Npm,
-            "npx" => RefManager::Npx,
-            "pnpm" => RefManager::Pnpm,
-            "yarn" => RefManager::Yarn,
-            "bun" => RefManager::Bun,
-            "bunx" => RefManager::Bunx,
-            "pip" | "pip3" => RefManager::Pip,
-            _ => continue,
-        };
-        let spec = match manager {
-            RefManager::Npx | RefManager::Bunx => first_positional(&words[i + 1..]),
-            RefManager::Pip => {
-                if matches!(next, Some("install" | "i")) {
-                    first_positional(&words[i + 2..])
-                } else {
-                    continue;
-                }
-            }
-            RefManager::Pnpm | RefManager::Yarn if next == Some("dlx") => {
-                first_positional(&words[i + 2..])
-            }
-            RefManager::Npm | RefManager::Pnpm | RefManager::Yarn | RefManager::Bun
-                if matches!(next, Some("install" | "i" | "add")) =>
-            {
-                first_positional(&words[i + 2..])
-            }
-            _ => continue,
-        };
-        // `npm install` with no positional argument installs the manifest's
-        // own declared dependencies — reviewed by R04, not an external ref.
-        if let Some(spec) = spec {
-            refs.push((manager, spec));
-        }
-    }
-    refs
-}
-
-/// First positional (non-flag) token after a verb, or `Some("")` when the
-/// next positional token exists but is dynamic/unparseable.
-fn first_positional(words: &[&str]) -> Option<String> {
-    for word in words {
-        let token = clean_token(word);
-        if token.is_empty() {
-            continue;
-        }
-        if token.starts_with('-') {
-            continue;
-        }
-        // A shell separator ends the command; nothing positional follows.
-        if matches!(
-            token,
-            "&&" | "||" | "|" | ";" | "&" | "\n" | "echo" | "exit"
-        ) {
-            return None;
-        }
-        if has_dynamic_syntax(token) {
-            // The invocation exists and names a target we cannot resolve
-            // statically; the empty spec is disclosed, never guessed.
-            return Some(String::new());
-        }
-        return Some(token.to_string());
-    }
-    None
 }
 
 /// Build a reference from a raw spec token captured by a scanner. A spec
@@ -258,14 +206,8 @@ pub fn raw_ref(origin: RefOrigin, manager: RefManager, spec: &str) -> InstallRef
             parseable: false,
         };
     }
-    let version = match manager {
-        RefManager::Pip => spec.split_once("==").map(|(_, v)| v),
-        _ => match spec.rsplit_once('@') {
-            Some((n, v)) if !n.is_empty() => Some(v),
-            _ => None,
-        },
-    };
-    let pinned = version
+    let pinned = split_spec(manager, spec)
+        .and_then(|(_, v)| v)
         .map(|v| version_is_exact(manager, v))
         .unwrap_or(false);
     InstallRef {
@@ -277,9 +219,158 @@ pub fn raw_ref(origin: RefOrigin, manager: RefManager, spec: &str) -> InstallRef
     }
 }
 
+/// One whitespace-separated word, lowercased for matching and kept raw for
+/// spec capture. Trailing `;`/`&`/`|` belong to shell grammar, not the
+/// token: they end the command and are stripped from the word. A word that
+/// is ONLY shell grammar (`&&`, `|`, `;`) is a separator.
+struct Tok {
+    lower: String,
+    raw: String,
+    ends_command: bool,
+    is_separator: bool,
+}
+
+fn strip_token(word: &str) -> (String, bool, bool) {
+    let core = word.trim_end_matches([';', '&', '|']);
+    let ends_command = core.len() != word.len();
+    let core = core.trim_end_matches(',').to_string();
+    let is_separator = core.is_empty() && ends_command;
+    (core, ends_command, is_separator)
+}
+
+/// Scan one line of shell-like text for package-manager invocations.
+/// Matching is case-insensitive; specs are captured from the raw casing.
+/// Returns (manager, spec) pairs; an empty spec string marks an invocation
+/// whose target is dynamic/unparseable. Only invocations naming a target
+/// are reported — a bare `npm install` resolves the manifest's own declared
+/// dependencies, which the R04 dependency rules already review.
+pub fn scan_line(line: &str) -> Vec<(RefManager, String)> {
+    let lower = line.to_lowercase();
+    let lower_words: Vec<&str> = lower.split_whitespace().collect();
+    let raw_words: Vec<&str> = line.split_whitespace().collect();
+    // Lowercasing can change word count for exotic unicode; fall back to
+    // lowercased specs rather than indexing raw words out of alignment.
+    let toks: Vec<Tok> = lower_words
+        .iter()
+        .enumerate()
+        .map(|(i, lw)| {
+            let raw = if raw_words.len() == lower_words.len() {
+                raw_words[i]
+            } else {
+                lw
+            };
+            let (lower, ends_command, is_separator) = strip_token(lw);
+            let (raw, _, _) = strip_token(raw);
+            Tok {
+                lower,
+                raw,
+                ends_command,
+                is_separator,
+            }
+        })
+        .collect();
+    scan_words(&toks)
+}
+
+fn scan_words(toks: &[Tok]) -> Vec<(RefManager, String)> {
+    let mut refs = Vec::new();
+    for i in 0..toks.len() {
+        let manager = match toks[i].lower.as_str() {
+            "npm" => RefManager::Npm,
+            "npx" => RefManager::Npx,
+            "pnpm" => RefManager::Pnpm,
+            "yarn" => RefManager::Yarn,
+            "bun" => RefManager::Bun,
+            "bunx" => RefManager::Bunx,
+            "pip" | "pip3" => RefManager::Pip,
+            _ => continue,
+        };
+        if toks[i].ends_command || toks[i].is_separator {
+            continue;
+        }
+        let verb = toks.get(i + 1);
+        let starts_command = match (manager, verb.map(|t| t.lower.as_str())) {
+            (RefManager::Npx, _) | (RefManager::Bunx, _) => Some(i + 1),
+            (RefManager::Pip, Some("install" | "i")) => Some(i + 2),
+            (RefManager::Pnpm, Some("dlx")) | (RefManager::Yarn, Some("dlx")) => Some(i + 2),
+            (
+                RefManager::Npm | RefManager::Pnpm | RefManager::Yarn | RefManager::Bun,
+                Some("install" | "i" | "add"),
+            ) => Some(i + 2),
+            _ => None,
+        };
+        let Some(start) = starts_command else {
+            continue;
+        };
+        if verb.is_some_and(|t| t.ends_command) {
+            continue;
+        }
+        // npx/bunx run ONE package; the remaining tokens are its args.
+        let take_all = !matches!(manager, RefManager::Npx | RefManager::Bunx);
+        let mut specs = positionals(&toks[start..], manager, take_all);
+        if take_all {
+            refs.extend(specs.drain(..).map(|s| (manager, s)));
+        } else if let Some(s) = specs.into_iter().next() {
+            refs.push((manager, s));
+        }
+    }
+    refs
+}
+
+/// Positional package specs after a manager verb. `take_all` collects
+/// every spec an install-style verb names (`npm install a b`); otherwise
+/// only the first is taken. Token handling: flags are skipped (value-
+/// consuming flags also skip their value), a shell separator or
+/// command-ending token ends the scan, a dynamic token yields the
+/// empty-string marker, a plausible package spec is captured, and
+/// flag-value noise that is neither dynamic nor a plausible spec is
+/// dropped.
+fn positionals(toks: &[Tok], manager: RefManager, take_all: bool) -> Vec<String> {
+    let mut specs = Vec::new();
+    let mut skip_value = false;
+    for t in toks {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if t.is_separator {
+            break;
+        }
+        if t.lower.is_empty() {
+            continue;
+        }
+        if t.lower.starts_with('-') {
+            if CONSUME_VALUE_FLAGS.contains(&t.lower.as_str()) {
+                skip_value = true;
+            }
+        } else if has_dynamic_syntax(&t.raw) {
+            // One unparseable marker per invocation, even when the hostile
+            // line carries several dynamic tokens back to back.
+            if specs.last().map(String::is_empty) != Some(true) {
+                specs.push(String::new());
+            }
+        } else if plausible_spec(manager, &t.raw) {
+            specs.push(t.raw.clone());
+        }
+        if specs.len() == if take_all { usize::MAX } else { 1 } || t.ends_command {
+            break;
+        }
+    }
+    specs
+}
+
+fn plausible_spec(manager: RefManager, token: &str) -> bool {
+    let name = split_spec(manager, token).map(|(n, _)| n).unwrap_or(token);
+    match manager {
+        RefManager::Pip => valid_py_name(name),
+        _ => valid_npm_name(name),
+    }
+}
+
 /// Install references inside an npm package's lifecycle scripts. Only the
 /// scripts that run during a plain `npm install` are scanned — a reference
-/// in `test` or `lint` never executes on the install line.
+/// in `test` or `lint` never executes on the install line. An oversized
+/// line is disclosed as an unparseable reference, never skipped silently.
 pub fn from_npm_lifecycle(manifest: &PackageJson) -> Vec<InstallRef> {
     let mut refs = Vec::new();
     for script_name in manifest.lifecycle_scripts() {
@@ -287,17 +378,10 @@ pub fn from_npm_lifecycle(manifest: &PackageJson) -> Vec<InstallRef> {
             continue;
         };
         for line in body.lines() {
-            if line.len() > MAX_SCAN_LINE_BYTES {
-                continue;
-            }
-            let lower = line.to_lowercase();
-            let words: Vec<&str> = lower.split_whitespace().collect();
-            for (manager, spec) in scan_words(&words) {
-                let origin = RefOrigin::NpmLifecycle {
-                    script: script_name.clone(),
-                };
-                refs.push(raw_ref(origin, manager, &spec));
-            }
+            let origin = RefOrigin::NpmLifecycle {
+                script: script_name.clone(),
+            };
+            refs.extend(scan_text_line(line, &origin));
         }
     }
     refs
@@ -305,18 +389,17 @@ pub fn from_npm_lifecycle(manifest: &PackageJson) -> Vec<InstallRef> {
 
 /// Install references inside wheel `.data/scripts` payloads, which ship
 /// onto PATH and run with the user's privileges. Scan is delta-driven and
-/// bounded: only text files listed in the delta under a `.data/scripts/`
-/// directory, each capped at `MAX_SCAN_LINE_BYTES` per line. A script file
-/// that cannot be read as UTF-8 is disclosed as an unparseable reference
-/// rather than silently skipped.
+/// bounded: only files listed in the delta under a `.data/scripts/`
+/// directory. A script that cannot be read as UTF-8 is disclosed as an
+/// unparseable reference rather than silently skipped.
 pub fn from_wheel_data_scripts(root: &Path, delta: &Delta) -> Vec<InstallRef> {
     let mut refs = Vec::new();
-    let mut changed = delta
+    let changed = delta
         .files_added
         .iter()
         .chain(delta.files_modified.iter())
         .filter(|f| f.relative_path.contains(".data/scripts/"));
-    for change in changed.by_ref() {
+    for change in changed {
         let path = change.relative_path.clone();
         let origin = RefOrigin::WheelDataScript { path: path.clone() };
         let text = match std::fs::read_to_string(root.join(&path)) {
@@ -327,18 +410,23 @@ pub fn from_wheel_data_scripts(root: &Path, delta: &Delta) -> Vec<InstallRef> {
             }
         };
         for line in text.lines() {
-            if line.len() > MAX_SCAN_LINE_BYTES {
-                continue;
-            }
-            let lower = line.to_lowercase();
-            let words: Vec<&str> = lower.split_whitespace().collect();
-            for (manager, spec) in scan_words(&words) {
-                let origin = RefOrigin::WheelDataScript { path: path.clone() };
-                refs.push(raw_ref(origin, manager, &spec));
-            }
+            refs.extend(scan_text_line(line, &origin));
         }
     }
     refs
+}
+
+fn scan_text_line(line: &str, origin: &RefOrigin) -> Vec<InstallRef> {
+    if line.len() > MAX_SCAN_LINE_BYTES {
+        // The invocation surface exists but cannot be scanned safely;
+        // disclose it as unparseable instead of scanning blind or
+        // skipping silently.
+        return vec![raw_ref(origin.clone(), RefManager::Npm, "")];
+    }
+    scan_line(line)
+        .into_iter()
+        .map(|(manager, spec)| raw_ref(origin.clone(), manager, &spec))
+        .collect()
 }
 
 #[cfg(test)]
@@ -393,6 +481,32 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_flags_before_spec_are_skipped() {
+        let refs = npm_refs("postinstall", "npm install --save-exact left-pad@1.0.0");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].spec, "left-pad@1.0.0");
+        assert!(refs[0].pinned);
+    }
+
+    #[test]
+    fn lifecycle_value_flags_swallow_their_argument() {
+        let refs = npm_refs(
+            "postinstall",
+            "npm install --registry https://registry.npmjs.org evil-pkg",
+        );
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].spec, "evil-pkg");
+    }
+
+    #[test]
+    fn lifecycle_every_named_spec_is_captured() {
+        let refs = npm_refs("postinstall", "npm install atomic-lockfile minimist chalk");
+        assert_eq!(refs.len(), 3);
+        let specs: Vec<_> = refs.iter().map(|r| r.spec.as_str()).collect();
+        assert_eq!(specs, ["atomic-lockfile", "minimist", "chalk"]);
+    }
+
+    #[test]
     fn lifecycle_npx_and_bunx() {
         let refs = npm_refs("prepare", "npx cypress@13.0.0 install && bunx esbuild");
         assert_eq!(refs.len(), 2);
@@ -400,6 +514,13 @@ mod tests {
         assert_eq!(refs[0].spec, "cypress@13.0.0");
         assert_eq!(refs[1].manager, RefManager::Bunx);
         assert_eq!(refs[1].spec, "esbuild");
+    }
+
+    #[test]
+    fn lifecycle_npx_takes_only_first_positional() {
+        let refs = npm_refs("postinstall", "npx cypress install --force");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].spec, "cypress");
     }
 
     #[test]
@@ -429,9 +550,33 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_install_stops_at_shell_separator() {
+        assert!(npm_refs("postinstall", "npm install && echo done").is_empty());
+        assert!(npm_refs("postinstall", "npm install; exit 0").is_empty());
+    }
+
+    #[test]
     fn non_lifecycle_scripts_are_ignored() {
         assert!(npm_refs("test", "npm install something").is_empty());
         assert!(npm_refs("lint", "npx eslint .").is_empty());
+    }
+
+    #[test]
+    fn lifecycle_invocation_is_case_insensitive() {
+        let refs = npm_refs("postinstall", "NPM Install atomic-lockfile");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].spec, "atomic-lockfile");
+    }
+
+    #[test]
+    fn lifecycle_oversized_line_is_disclosed_unparseable() {
+        let padded = format!("{} && npm install evil", "x".repeat(4200));
+        let refs = npm_refs("postinstall", &format!("npm install ok\n{padded}"));
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].spec, "ok");
+        assert!(refs[0].parseable);
+        assert!(!refs[1].parseable);
+        assert_eq!(refs[1].spec, "");
     }
 
     #[test]
@@ -440,6 +585,16 @@ mod tests {
         assert_eq!(refs.len(), 1);
         assert!(!refs[0].pinned);
         assert_eq!(refs[0].registry_spec(), Some(("left-pad", Some("^1.3.0"))));
+    }
+
+    #[test]
+    fn empty_version_part_reads_unpinned_not_broken() {
+        let refs = npm_refs("postinstall", "npm install pkg@");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].registry_spec(), Some(("pkg", None)));
+        let refs = npm_refs("postinstall", "pip install requests==");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].registry_spec(), Some(("requests", None)));
     }
 
     #[test]
@@ -468,6 +623,48 @@ mod tests {
         assert_eq!(r.spec, "requests==2.31.0");
         assert!(r.pinned);
         assert_eq!(r.registry_spec(), Some(("requests", Some("2.31.0"))));
+        assert_eq!(
+            r.origin,
+            RefOrigin::WheelDataScript {
+                path: path.to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn wheel_scanner_scans_modified_files_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = "pkg-1.0.data/scripts/setup-deps";
+        std::fs::create_dir_all(dir.path().join("pkg-1.0.data/scripts")).unwrap();
+        std::fs::write(dir.path().join(path), "pip install requests==2.31.0\n").unwrap();
+        let delta = crate::diff::Delta {
+            baseline_version: None,
+            target_version: "1.0.0".into(),
+            files_modified: vec![crate::diff::FileChange {
+                relative_path: path.to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let refs = from_wheel_data_scripts(dir.path(), &delta);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].spec, "requests==2.31.0");
+    }
+
+    #[test]
+    fn pip_requirement_files_are_not_package_specs() {
+        let refs = npm_refs("postinstall", "pip install -r requirements.txt");
+        assert!(refs.is_empty());
+        let refs = npm_refs("postinstall", "pip install -e .");
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn pip_non_digit_version_is_unpinned() {
+        let refs = npm_refs("postinstall", "pip install pkg==beta1");
+        assert_eq!(refs.len(), 1);
+        assert!(!refs[0].pinned);
+        assert_eq!(refs[0].registry_spec(), Some(("pkg", Some("beta1"))));
     }
 
     #[test]
@@ -534,15 +731,22 @@ mod tests {
     }
 
     #[test]
+    fn comma_and_semicolon_tail_is_trimmed() {
+        let refs = npm_refs("postinstall", "npm install pkg,");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].spec, "pkg");
+    }
+
+    #[test]
     fn pnpm_dlx_and_pip3_shapes() {
-        let words: Vec<&str> = "pnpm dlx malcontent && pip3 install evil-pkg"
-            .split_whitespace()
-            .collect();
-        let refs = scan_words(&words);
+        let refs = npm_refs(
+            "postinstall",
+            "pnpm dlx malcontent && pip3 install evil-pkg",
+        );
         assert_eq!(refs.len(), 2);
-        assert_eq!(refs[0].0, RefManager::Pnpm);
-        assert_eq!(refs[0].1, "malcontent");
-        assert_eq!(refs[1].0, RefManager::Pip);
-        assert_eq!(refs[1].1, "evil-pkg");
+        assert_eq!(refs[0].manager, RefManager::Pnpm);
+        assert_eq!(refs[0].spec, "malcontent");
+        assert_eq!(refs[1].manager, RefManager::Pip);
+        assert_eq!(refs[1].spec, "evil-pkg");
     }
 }

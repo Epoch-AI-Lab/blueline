@@ -2004,14 +2004,12 @@ struct R23Hit {
     function: String,
     line: String,
     spec: String,
-    verb: Option<String>,
-    manager_word: String,
 }
 
 fn scan_r23(folded: &FoldedPkgbuild) -> Vec<R23Hit> {
     let bodies = shell_bodies(folded);
     let managers = ["npm", "bun"];
-    let verbs = ["install", "ci", "add", "exec", "run", "x", "dlx"];
+    let verbs = ["install", "i", "ci", "add", "exec", "run", "x", "dlx"];
     let mut hits = Vec::new();
     for (name, body) in &bodies {
         let resolved = fold_body_vars(body, folded);
@@ -2027,20 +2025,15 @@ fn scan_r23(folded: &FoldedPkgbuild) -> Vec<R23Hit> {
                         function: (*name).to_string(),
                         line: short,
                         spec: (*spec).to_string(),
-                        verb: Some(window[1].to_string()),
-                        manager_word: window[0].to_string(),
                     });
                 }
             }
-            if let Some(pos) = words.iter().position(|word| *word == "npx") {
+            if words.contains(&"npx") {
                 let short: String = line.trim().chars().take(120).collect();
-                let spec = first_positional_word(&words[pos + 1..]);
                 hits.push(R23Hit {
                     function: (*name).to_string(),
                     line: short,
-                    spec,
-                    verb: None,
-                    manager_word: "npx".to_string(),
+                    spec: String::new(),
                 });
             }
         }
@@ -2048,79 +2041,57 @@ fn scan_r23(folded: &FoldedPkgbuild) -> Vec<R23Hit> {
     hits
 }
 
-/// First non-flag word after `npx`, or empty when none is statically
-/// resolvable (dynamic payloads surface as an unparseable reference).
-fn first_positional_word(words: &[&str]) -> String {
-    for word in words {
-        if word.starts_with('-') {
-            continue;
-        }
-        if word.contains('$')
-            || word.contains('`')
-            || word.contains('(')
-            || word.contains('*')
-            || word.contains('?')
-        {
-            return String::new();
-        }
-        return (*word).to_string();
-    }
-    String::new()
-}
-
 fn check_r23(folded: &FoldedPkgbuild) -> Vec<PkgFinding> {
-    scan_r23(folded)
-        .into_iter()
-        .map(|hit| {
-            // INFO until tuned: source-built electron apps (joplin,
-            // bitwarden-cli, insomnia) genuinely run npm install.
-            // True signal, but ubiquitous in its niche.
-            let evidence = if hit.spec.is_empty() {
-                format!("{}(): {}", hit.function, hit.line)
-            } else {
-                format!("{}(): {} (spec: {})", hit.function, hit.line, hit.spec)
-            };
-            PkgFinding {
+    let mut findings = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for hit in scan_r23(folded) {
+        // INFO until tuned: source-built electron apps (joplin,
+        // bitwarden-cli, insomnia) genuinely run npm install.
+        // True signal, but ubiquitous in its niche.
+        let evidence = if hit.spec.is_empty() {
+            format!("{}(): {}", hit.function, hit.line)
+        } else {
+            format!("{}(): {} (spec: {})", hit.function, hit.line, hit.spec)
+        };
+        if seen.insert(evidence.clone()) {
+            findings.push(PkgFinding {
                 rule_id: "R23_NPM_DELIVERY".to_string(),
                 severity: VerdictBand::Low,
                 evidence,
-            }
-        })
-        .collect()
+            });
+        }
+    }
+    findings
 }
 
 /// Install references (npm/bun delivery) statically resolvable from the
-/// given PKGBUILD, for the recursive review pass. Only invocations that
-/// install or execute a NAMED package produce a reference — `npm run`
-/// targets a local script and `npm ci` the manifest's own dependencies.
-/// A PKGBUILD that fails static parsing yields no references here; the
-/// HIGH `R00_PKGBUILD_UNPARSEABLE` finding already fails that review shut.
+/// given PKGBUILD, for the recursive review pass. The shared
+/// `install_ref` scanner classifies verbs, flags, and dynamic payloads;
+/// `npm run` (a local script) and `npm ci` (the manifest's own deps) yield
+/// no reference. A PKGBUILD that fails static parsing yields no references
+/// here; the HIGH `R00_PKGBUILD_UNPARSEABLE` finding already fails that
+/// review shut.
 pub fn npm_delivery_refs(content: &str) -> Vec<crate::install_ref::InstallRef> {
     let Ok(folded) = parse_pkgbuild(content) else {
         return Vec::new();
     };
-    scan_r23(&folded)
-        .into_iter()
-        .filter_map(|hit| {
-            let manager = match hit.manager_word.as_str() {
-                "bun" => crate::install_ref::RefManager::Bun,
-                "npx" => crate::install_ref::RefManager::Npx,
-                _ => crate::install_ref::RefManager::Npm,
-            };
-            let install_verb = hit.verb.is_none()
-                || matches!(
-                    hit.verb.as_deref(),
-                    Some("install" | "i" | "add" | "exec" | "x" | "dlx")
-                );
-            if !install_verb || hit.spec.is_empty() || hit.spec.starts_with('-') {
-                return None;
+    let mut refs = Vec::new();
+    for (name, body) in shell_bodies(&folded) {
+        let resolved = fold_body_vars(body, &folded);
+        for line in resolved.lines() {
+            let norm = normalize_body_line(line);
+            for (manager, spec) in crate::install_ref::scan_line(&norm) {
+                refs.push(crate::install_ref::raw_ref(
+                    crate::install_ref::RefOrigin::Pkgbuild {
+                        function: name.to_string(),
+                    },
+                    manager,
+                    &spec,
+                ));
             }
-            let origin = crate::install_ref::RefOrigin::Pkgbuild {
-                function: hit.function,
-            };
-            Some(crate::install_ref::raw_ref(origin, manager, &hit.spec))
-        })
-        .collect()
+        }
+    }
+    refs
 }
 
 fn check_r15(folded: &FoldedPkgbuild) -> Vec<PkgFinding> {
@@ -2824,13 +2795,14 @@ mod tests {
         let refs = npm_delivery_refs(
             "build() {\n  npm install atomic-lockfile minimist\n  bun install js-digest@1.0.0\n}\n",
         );
-        assert_eq!(refs.len(), 2);
+        assert_eq!(refs.len(), 3);
         assert_eq!(refs[0].spec, "atomic-lockfile");
         assert_eq!(refs[0].manager, crate::install_ref::RefManager::Npm);
         assert!(!refs[0].pinned);
-        assert_eq!(refs[1].spec, "js-digest@1.0.0");
-        assert_eq!(refs[1].manager, crate::install_ref::RefManager::Bun);
-        assert!(refs[1].pinned);
+        assert_eq!(refs[1].spec, "minimist");
+        assert_eq!(refs[2].spec, "js-digest@1.0.0");
+        assert_eq!(refs[2].manager, crate::install_ref::RefManager::Bun);
+        assert!(refs[2].pinned);
         assert!(refs.iter().all(|r| matches!(
             r.origin,
             crate::install_ref::RefOrigin::Pkgbuild { ref function } if function == "build"
@@ -2845,6 +2817,17 @@ mod tests {
             "build() {\n  npm run build\n  npm ci\n  npm install --save-dev\n}\n",
         );
         assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn npm_delivery_refs_accept_short_verbs_and_flags() {
+        let refs = npm_delivery_refs(
+            "build() {\n  npm i alpha\n  bun add beta\n  npm install --save gamma\n}\n",
+        );
+        assert_eq!(refs.len(), 3);
+        assert_eq!(refs[0].spec, "alpha");
+        assert_eq!(refs[1].spec, "beta");
+        assert_eq!(refs[2].spec, "gamma");
     }
 
     #[test]

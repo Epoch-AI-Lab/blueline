@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - AUR integration (`feat/aur-integration`): `blueline --ecosystem aur ci
   --lockfile aur.lock` reviews added and version-changed pins from a file of
   one `pkgbase@pkgver-pkgrel` per line (blank lines and `#` comments
+  skipped, malformed lines and double pins fail closed with line numbers,
   4096-entry cap, base read via `git show` like other ecosystems); a yay v13
   `AURPreInstall` Lua hook recipe in the README gating the build on
   `blueline review --yes`, with the re-review-on-drift timing note;
