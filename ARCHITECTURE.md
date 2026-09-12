@@ -70,9 +70,11 @@ The Rust binary is also directly installable (`cargo install` / direct download)
 for non-Node environments.
 
 ### `Registry` trait
-npm is the only implementation now, but the trait
-(`fetch_manifest`, `fetch_tarball`, `list_versions`) exists from commit 1 so
-PyPI/cargo plug in later without refactoring the engine.
+Four implementations ship behind it now: npm, crates.io, PyPI, and a
+review-only AUR adapter (git history over the system `git` binary, static
+PKGBUILD parsing, never executed). The trait (`list_releases`,
+`default_version`, integrity-typed fetch) exists from commit 1 so each
+registry plugged in later without refactoring the engine.
 
 ### Extraction & untrusted-input safety
 Every tarball and registry response is fully untrusted. The `extract` stage enforces:
@@ -101,7 +103,7 @@ Every tarball and registry response is fully untrusted. The `extract` stage enfo
 |----|-----------------------------------------------------|---------------------------------------------------------------------------|
 | D1 | Rust core + Node shim                               | Security-critical path in a memory-safe, single-binary language; Node only for `npx` ergonomics. |
 | D2 | Local deterministic heuristic first                 | Transparent, auditable, offline. Hosted ML *refines* score when token present — never required. Keeps "the wedge stays open" honest. |
-| D3 | npm-only, `Registry` trait seam                     | Deepen one registry; avoid speculative multi-registry code now.           |
+| D3 | One registry deep, `Registry` trait seam, then four | Deepen one registry first; avoid speculative multi-registry code. npm, crates.io, PyPI, and review-only AUR now share the seam. |
 | D4 | Read-only sandbox extraction + integrity verify     | Core safety invariant. Verify sha512/signature *before* extract; bound size/entry/FD; reject symlinks/special files; Landlock-sandbox the step. Package code never runs. |
 | D5 | Baseline = last known-clean version                 | Source: locally installed version in `node_modules` → else previous version in registry list (neutral verdict on first sighting). Overrides persisted in SQLite. |
 | D6 | Revocation = OSV + GitHub Advisory cache            | Reuse the open vulnerability corpus; paid tier adds human-verified recall (hosted index). |
