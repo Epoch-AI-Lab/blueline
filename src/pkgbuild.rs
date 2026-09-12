@@ -2056,7 +2056,7 @@ fn check_r23(folded: &FoldedPkgbuild) -> Vec<PkgFinding> {
         if seen.insert(evidence.clone()) {
             findings.push(PkgFinding {
                 rule_id: "R23_NPM_DELIVERY".to_string(),
-                severity: VerdictBand::Low,
+                severity: VerdictBand::Medium,
                 evidence,
             });
         }

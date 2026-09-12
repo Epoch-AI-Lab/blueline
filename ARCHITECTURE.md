@@ -42,6 +42,9 @@ and any `postinstall`/`preinstall` script is surfaced for a *separate* human dec
 │                     approval overrides, policy                │
 │  extract         ── verify hash → bounded sandbox extract    │
 │  diff            ── file-level + line-level (similar crate)   │
+│  install_ref     ── scan payload for referenced installs      │
+│  recursive       ── re-review referenced installs: depth caps,│
+│                     cycle detection, roll-up                  │
 │  heuristic       ── rule engine → risk score → verdict        │
 │  revocation      ── OSV / GitHub Advisory cache + hosted idx  │
 │  provenance      ── sigstore/SLSA attestation *surfaced*,     │

@@ -22,12 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   unresolvable, or dynamic; HIGH for non-registry git/URL/path specs, which
   are not recursively reviewed), cap overruns as `R25_RECURSION_DEPTH` and
   cycles as `R26_RECURSION_CYCLE` (both HIGH, fail closed), and a child
-  finding at or above `recursion.child_block_band` (default `high`) rolls
-  up into the parent verdict as `R27_SECOND_ORDER` — a HIGH finding in a
+  finding at or above `recursion.child_block_band` (default HIGH) rolls up
+  into the parent verdict as `R27_SECOND_ORDER` — a HIGH finding in a
   referenced package can BLOCK the parent. The JSON verdict schema grows a
   `recursive` array of child reviews (delivery chain, band, score,
   findings), so the CLI, CI reports, and the MCP `structuredVerdict` all
-  carry the second-order results from the single source of truth.
+  carry the second-order results from the single source of truth; the
+  review card renders each child's delivery chain and worst findings.
 - Install-reference extraction (`src/install_ref.rs`), the scanning layer for
   recursive review: static detection of package-manager invocations that
   resolve another install at install/build time — npm lifecycle scripts
@@ -112,6 +113,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- `R23_NPM_DELIVERY` graduates from INFO to MEDIUM: recursive review now
+  resolves and reviews the npm/bun packages a PKGBUILD delivery line names,
+  so the delivery line is a true second-order signal. The three
+  benign-corpus fixtures that fire it (joplin, bitwarden-cli, insomnia) are
+  pinned as documented true positives in the corpus gate.
 - Push-to-main mutation testing now mutates only the lines of the pushed
   commit (`git diff HEAD~1..HEAD` fed to `cargo mutants --in-diff`) instead of
   re-running the full trust-boundary file set on every merge, spread across a

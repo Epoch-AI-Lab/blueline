@@ -35,7 +35,7 @@ pub struct Finding {
     pub description: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DiffSummary {
     pub files_added: usize,
     pub files_removed: usize,

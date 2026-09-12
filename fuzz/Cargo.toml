@@ -43,3 +43,9 @@ name = "pkgbuild_tokenizer"
 path = "fuzz_targets/pkgbuild_tokenizer.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "install_ref_scan"
+path = "fuzz_targets/install_ref_scan.rs"
+test = false
+doc = false
