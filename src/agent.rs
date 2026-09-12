@@ -173,18 +173,30 @@ fn decide(
     policy_path: Option<&std::path::Path>,
 ) -> anyhow::Result<GateDecision> {
     let policy = Policy::load_or_default(policy_path)?;
+    // Shapes the token scanner cannot resolve are hard denials: pip flags
+    // that name or redirect non-registry sources, and manager tokens hidden
+    // behind quoting, escapes, or command substitution.
+    let mut reasons: Vec<String> = install_ref::gate_hard_denies(command)
+        .into_iter()
+        .map(|detail| format!("unreviewable invocation shape: {detail}"))
+        .collect();
     let refs = install_ref::scan_line(command);
     if refs.is_empty() {
+        if reasons.is_empty() {
+            return Ok(GateDecision {
+                allow: true,
+                reason: "no named package-manager install found in the command; the manifest's \
+                         dependencies are policed by `blueline ci`"
+                    .to_string(),
+            });
+        }
         return Ok(GateDecision {
-            allow: true,
-            reason: "no named package-manager install found in the command; the manifest's \
-                     dependencies are policed by `blueline ci`"
-                .to_string(),
+            allow: false,
+            reason: deny_reason(&reasons),
         });
     }
     let store = BaselineStore::open()?;
     let mut ctx = ReviewContext::new(&policy, bases.clone());
-    let mut reasons: Vec<String> = Vec::new();
     for (manager, spec) in &refs {
         let label = format!("{} install of `{spec}`", manager.label());
         // An invocation whose target is dynamic or unreadable cannot be

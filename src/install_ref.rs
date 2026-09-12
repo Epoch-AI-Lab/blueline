@@ -376,6 +376,8 @@ const PACKAGE_NAMING_FLAGS: [&str; 2] = ["--package", "-p"];
 fn positionals(toks: &[Tok], manager: RefManager, take_all: bool) -> Vec<String> {
     let mut specs = Vec::new();
     let mut skip_value = false;
+    let mut pending_package = false;
+    let mut saw_package_flag = false;
     for t in toks {
         if skip_value {
             skip_value = false;
@@ -387,13 +389,32 @@ fn positionals(toks: &[Tok], manager: RefManager, take_all: bool) -> Vec<String>
         if t.lower.is_empty() {
             continue;
         }
+        if pending_package {
+            pending_package = false;
+            // `npx --package <pkg>` names the package with a space; capture
+            // it rather than swallowing it as a flag value. Once a package
+            // is named by flag, later positionals are the COMMAND to run,
+            // not more packages.
+            saw_package_flag = true;
+            if !has_dynamic_syntax(&t.raw) {
+                specs.push(t.raw.clone());
+                if !take_all {
+                    break;
+                }
+            }
+            continue;
+        }
         if t.lower.starts_with('-') {
-            if manager == RefManager::Npx || manager == RefManager::Bunx {
+            if matches!(
+                manager,
+                RefManager::Npx | RefManager::Bunx | RefManager::Npm
+            ) {
                 let lower = t.lower.as_str();
                 if let Some(value) = PACKAGE_NAMING_FLAGS
                     .iter()
                     .find_map(|f| lower.strip_prefix(&format!("{f}=")))
                 {
+                    saw_package_flag = true;
                     specs.push(value.to_string());
                     if !take_all {
                         break;
@@ -401,7 +422,7 @@ fn positionals(toks: &[Tok], manager: RefManager, take_all: bool) -> Vec<String>
                     continue;
                 }
                 if PACKAGE_NAMING_FLAGS.contains(&lower) {
-                    skip_value = true;
+                    pending_package = true;
                     continue;
                 }
             }
@@ -419,6 +440,9 @@ fn positionals(toks: &[Tok], manager: RefManager, take_all: bool) -> Vec<String>
             // captured so the review can disclose them as unresolvable to
             // any registry, never silently dropped as flag-value noise.
             specs.push(t.raw.clone());
+        } else if saw_package_flag {
+            // Positionals after a named package are the command's args.
+            break;
         } else if plausible_spec(manager, &t.raw) {
             specs.push(t.raw.clone());
         }
@@ -534,11 +558,11 @@ pub fn gate_hard_denies(line: &str) -> Vec<String> {
     const MANAGERS: [&str; 7] = ["npm", "npx", "pnpm", "yarn", "bun", "pip", "pip3"];
     for word in &lower_words {
         let bare = word
-            .trim_start_matches(['\\', '"', '\''])
-            .trim_end_matches(['"', '\'']);
+            .trim_start_matches(['\\', '"', '\'', '`', '$', '(', '{'])
+            .trim_end_matches(['"', '\'', '`', ')', '}', ';', ',']);
         if bare != word && MANAGERS.contains(&bare) {
             denies.push(format!(
-                "package manager token hidden behind quoting or an escape: `{word}`"
+                "package manager token hidden behind quoting, an escape, or substitution: `{word}`"
             ));
         }
     }
@@ -562,15 +586,19 @@ fn pip_non_registry_shape(line: &str) -> Option<String> {
         if words[i] != "pip" && words[i] != "pip3" {
             continue;
         }
-        for window in words[i + 1..].windows(2) {
-            if window[0] == "install" || window[0] == "i" {
-                if DANGEROUS.contains(&window[1]) {
-                    return Some(format!(
-                        "pip {flag} names or redirects non-registry sources",
-                        flag = window[1]
-                    ));
-                }
-                break;
+        // Anywhere after `pip install`, any dangerous flag is a hard deny —
+        // flags between install and the danger, or after a package name,
+        // must not dilute the signal.
+        let mut in_install = false;
+        for word in &words[i + 1..] {
+            if *word == "install" || *word == "i" {
+                in_install = true;
+                continue;
+            }
+            if in_install && DANGEROUS.contains(word) {
+                return Some(format!(
+                    "pip {word} names or redirects non-registry sources"
+                ));
             }
         }
     }
@@ -907,12 +935,29 @@ mod tests {
         let refs = scan_line("npx --package=evil-pkg serve");
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].1, "evil-pkg");
+        // The space form must capture the value, not swallow it.
+        let refs = scan_line("npx --package evil-pkg");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].1, "evil-pkg");
+        let refs = scan_line("npm exec --package=evil-pkg -- ls");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].1, "evil-pkg");
         let refs = scan_line("npm exec evil-pkg -- --flag");
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].1, "evil-pkg");
         let refs = scan_line("bun x malcontent");
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].1, "malcontent");
+    }
+
+    #[test]
+    fn gate_hard_denies_survive_flag_ordering_and_substitution() {
+        assert!(gate_hard_denies("pip install --quiet -r requirements.txt").len() == 1);
+        assert!(gate_hard_denies("pip install pkg -r other.txt").len() == 1);
+        assert!(gate_hard_denies("echo $(npm install evil-pkg)").len() == 1);
+        assert!(gate_hard_denies("echo `npm install evil-pkg`").len() == 1);
+        // A substitution that names no manager stays the scanner's business.
+        assert!(gate_hard_denies("echo $(date) && npm install ok-pkg").is_empty());
     }
 
     #[test]

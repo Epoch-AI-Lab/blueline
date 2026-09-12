@@ -83,7 +83,7 @@ done
         blueline = blueline.display(),
         real = real.display(),
     );
-    if manager == "pip" {
+    if manager == "pip" || manager == "pip3" {
         script.push_str(
             r#"
 # pip flags that name non-registry sources (-r, -e, --constraint, ...) are
