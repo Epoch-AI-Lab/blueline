@@ -1,0 +1,26 @@
+# Maintainer: Kriday Dave <kriday@epochailab.example>
+# Blueline reviews this file with its own PKGBUILD heuristics before it
+# ever lands on the AUR; sources are pinned to the signed GitHub tag.
+pkgname=blueline
+pkgver=0.3.0
+pkgrel=1
+pkgdesc="Release-diff review desk for the package install line"
+arch=('x86_64' 'aarch64')
+url="https://github.com/Epoch-AI-Lab/blueline"
+license=('MIT')
+makedepends=('cargo' 'git')
+source=("${pkgname}-${pkgver}.tar.gz::https://github.com/Epoch-AI-Lab/blueline/archive/refs/tags/v${pkgver}.tar.gz")
+sha256sums=('FILL_AT_RELEASE')
+options=(!lto)
+
+build() {
+  cd "${pkgname}-${pkgver}"
+  export CARGO_TARGET_DIR="${srcdir}/target"
+  cargo build --locked --release
+}
+
+package() {
+  cd "${pkgname}-${pkgver}"
+  install -Dm755 "${srcdir}/target/release/blueline" "${pkgdir}/usr/bin/blueline"
+  install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}
