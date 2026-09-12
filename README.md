@@ -238,6 +238,23 @@ defense-in-depth for the terminal; hooks are the agent boundary;
 lives. Unpinned specs are reviewed at their current default version —
 re-review before the install if the window matters.
 
+## Distribution
+
+The CLI ships through npm (`@bluelinecli/cli`, `npx blueline`) with the
+native binary delivered via platform packages for linux (x64 glibc/musl,
+arm64), macOS (x64, arm64), and Windows (x64, arm64). Release binaries
+carry SLSA build-provenance attestations
+(`actions/attest-build-provenance`) and a `SHA256SUMS` manifest; npm
+publishes use `--provenance`. Packaging configs for the other channels
+live in-repo: `packaging/homebrew/blueline.rb` (source build via cargo)
+and `packaging/aur/` (PKGBUILD + .SRCINFO pinned to the signed GitHub
+tag — reviewed with blueline's own PKGBUILD heuristics before it lands on
+the AUR). Publishing to any registry is a manual, human-confirmed step.
+
+We eat our own dog food: CI runs `blueline ci` against this repo's own
+`package-lock.json` and `Cargo.lock` on every PR, and dependency deltas
+are reviewed with the same verdicts customers get.
+
 ## Contributors
 
 See [CONTRIBUTORS.md](./CONTRIBUTORS.md) for maintainers, contributors, and details on how to get involved.
