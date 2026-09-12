@@ -383,7 +383,12 @@ Slices (each independently green, small commits, CHANGELOG entry per slice):
   engine, rollup-render, use-it e2e; reviewers PASS; use-it: real binary
   BLOCKed the adversarial A→B chain and live AUR webtorrent-desktop review
   rendered R23 at MEDIUM)
-- [ ] Campaign 2: agent-native enforcement
+- [x] Campaign 2: agent-native enforcement (slices: agent-mode, shims,
+  recipes; review loop fixed gate fail-open P1s — error-deny, per-registry
+  routing, flag/override/comment scanner shapes; use-it: real npm install
+  through an installed shim blocked unapproved and ran approved, Claude
+  Code + Cursor hook payloads denied/allowed with agent identities in the
+  audit log)
 - [ ] Campaign 3: recall / revocation index
 - [ ] Campaign 4: dogfood & distribution
 
