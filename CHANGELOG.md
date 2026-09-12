@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- AUR integration (`feat/aur-integration`): `blueline --ecosystem aur ci
+  --lockfile aur.lock` reviews added and version-changed pins from a file of
+  one `pkgbase@pkgver-pkgrel` per line (blank lines and `#` comments
+  skipped, malformed lines and double pins fail closed with line numbers,
+  4096-entry cap, base read via `git show` like other ecosystems); a yay v13
+  `AURPreInstall` Lua hook recipe in the README gating the build on
+  `blueline review --yes`, with the re-review-on-drift timing note;
+  `ecosystem = "aur"` policy scoping through the existing generic matcher;
+  and README threat-model copy stating the repo-scripts-only scope, the
+  review-with-blueline-build-with-yay flow, and the commit-bound audit
+  integrity.
 - PKGBUILD static heuristics (`src/pkgbuild.rs`, AUR reviews only): a
   hand-rolled tokenizer with quote-aware lexing (`$'...'` ANSI-C, line
   continuations, word-boundary comments), multi-pass variable folding,
@@ -75,9 +86,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   16-shard matrix.
 - The MCP stdio server no longer prints an stderr note when it receives the
   client's `notifications/initialized` message.
+- AUR adapter resource use: one shallow clone per pkgbase is now reused
+  across the read-only history operations of a review (resolve walk,
+  releases walk, author lookup), halving the clones each evaluation
+  performs; the cache is keyed by the full clone url and capped, and
+  `fetch_verified` still re-clones so its archive bytes remain a second,
+  independent sample from the remote. AUR CI reports now carry a
+  `removed_count` (rendered in the text and markdown summaries) so pins
+  deleted from the pin file are visible instead of silently dropped.
+  PKGBUILD `$'...'` `\xHH` and octal escapes now decode as raw bytes the
+  way bash emits them (`\xc3\xa9` is `é`, not `Ã©`), with non-UTF-8 byte
+  sequences becoming U+FFFD and over-one-byte octal escapes failing closed.
 
 ### Fixed
 
+- AUR review hardening from the PR #53 review: PKGBUILD function bodies are
+  comment-stripped before rule scanning, so a commented-out `curl | bash`
+  inside `build()` no longer produces a HIGH R13/R14/R17 false positive; an
+  unreadable baseline PKGBUILD now raises `R00_BASELINE_UNREADABLE` at High
+  (matching the unparseable case) instead of Low, so invalid-UTF-8 baselines
+  cannot slip past the R12/R19 pair rules for a Low finding; interpreter
+  process substitution (`bash <(curl -fsSL https://…)` and fused
+  `bash<(curl …)`) now fires R13 even without a pipe; `git` runs under
+  `LC_ALL=C` so error classification no longer depends on the system locale;
+  and `git` invocations run in their own process group with bounded pipe
+  drain, so a transport child (`git-remote-https`, `ssh`, …) that outlives
+  git and holds the output pipes can no longer hang the review.
 - AUR review hardening from the adapter review follow-up: per-commit
   `.SRCINFO` reads distinguish content failures (missing, oversized,
   non-UTF-8, malformed — counted as skips) from git plumbing failures

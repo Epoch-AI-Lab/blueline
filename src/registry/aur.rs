@@ -5,9 +5,13 @@ use crate::registry::{Checksum, ChecksumAlg, Ecosystem, Package, Registry, Relea
 use crate::version::{AurVersionInfo, VersionInfo};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::io::Read;
-use std::path::Path;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, PoisonError};
 use ureq::Agent;
 
 const USER_AGENT: &str = concat!("blueline/", env!("CARGO_PKG_VERSION"));
@@ -237,6 +241,15 @@ const MAX_GIT_SMALL_OUTPUT_BYTES: u64 = 64 * 1024;
 /// not hang the review forever.
 const GIT_TIMEOUT_SECS: u64 = 120;
 
+/// How long a `git` invocation that has exited may keep its transport
+/// children (`git-remote-https`, `ssh`, …) holding the output pipes before
+/// blueline refuses to wait any longer.
+const GIT_STREAM_GRACE_SECS: u64 = 5;
+
+/// Upper bound on pkgbase clones held for reuse within one review run; the
+/// whole cache is dropped when it overflows, bounding temp disk usage.
+const MAX_CACHED_CLONES: usize = 8;
+
 /// One commit from the history walk: 40-hex hash plus committer timestamp.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CommitMeta {
@@ -287,44 +300,54 @@ fn git_spawn_error(e: &std::io::Error) -> BluelineError {
 
 /// Run the system `git` with fixed argv (never a shell), capture stdout
 /// capped at `max_stdout` bytes, and fail closed on any nonzero exit. Stderr
-/// and stdout are drained on threads so a chatty child cannot deadlock the
-/// pipes, and the child is killed if it exceeds `GIT_TIMEOUT_SECS` — a
-/// remote that connects but never transfers must not hang the review.
+/// and stdout are drained on detached threads so a chatty child cannot
+/// deadlock the pipes, and the child is killed if it exceeds
+/// `GIT_TIMEOUT_SECS` — a remote that connects but never transfers must not
+/// hang the review. `git` runs in its own process group, and because its
+/// transport children (`git-remote-https`, `ssh`, …) inherit the pipes and
+/// can outlive it, results are received with a bounded wait instead of a
+/// `join`: a transport that holds the pipes open must not hang the caller.
 fn git_output(
     dir: Option<&Path>,
     args: &[&str],
     max_stdout: u64,
 ) -> Result<Vec<u8>, BluelineError> {
-    let mut child = Command::new("git")
-        .args(args)
+    let mut cmd = Command::new("git");
+    cmd.args(args)
         .current_dir(dir.unwrap_or(Path::new(".")))
+        // Error-message classification elsewhere matches git's English
+        // wording, so the locale must not translate it.
+        .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| git_spawn_error(&e))?;
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let mut child = cmd.spawn().map_err(|e| git_spawn_error(&e))?;
     let stderr_pipe = child
         .stderr
         .take()
         .ok_or_else(|| BluelineError::Network("git stderr pipe unavailable".to_string()))?;
-    let stderr_reader = std::thread::spawn(move || {
+    let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = stderr_pipe
             .take(MAX_GIT_STDERR_BYTES + 1)
             .read_to_end(&mut buf);
-        buf
+        let _ = stderr_tx.send(buf);
     });
     let stdout_pipe = child
         .stdout
         .take()
         .ok_or_else(|| BluelineError::Network("git stdout pipe unavailable".to_string()))?;
-    let stdout_reader = std::thread::spawn(move || {
+    let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut out = Vec::new();
         let read_ok = stdout_pipe
             .take(max_stdout + 1)
             .read_to_end(&mut out)
             .is_ok();
-        (read_ok, out)
+        let _ = stdout_tx.send((read_ok, out));
     });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(GIT_TIMEOUT_SECS);
     let status = loop {
@@ -344,12 +367,26 @@ fn git_output(
             Err(e) => return Err(BluelineError::Network(format!("waiting for git: {e}"))),
         }
     };
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| BluelineError::Network("git stderr reader panicked".to_string()))?;
-    let (stdout_ok, out) = stdout_reader
-        .join()
-        .map_err(|_| BluelineError::Network("git stdout reader panicked".to_string()))?;
+    fn drained<T>(
+        rx: std::sync::mpsc::Receiver<T>,
+        what: &str,
+        verb: &str,
+    ) -> Result<T, BluelineError> {
+        match rx.recv_timeout(std::time::Duration::from_secs(GIT_STREAM_GRACE_SECS)) {
+            Ok(buf) => Ok(buf),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                Err(BluelineError::Network(format!(
+                    "git {verb} exited but its transport still holds the {what} pipe after \
+                 {GIT_STREAM_GRACE_SECS}s; refusing to wait"
+                )))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(BluelineError::Network(
+                format!("git {what} reader panicked"),
+            )),
+        }
+    }
+    let stderr = drained(stderr_rx, "stderr", git_verb(args))?;
+    let (stdout_ok, out) = drained(stdout_rx, "stdout", git_verb(args))?;
     if !stdout_ok {
         return Err(BluelineError::Network(format!(
             "reading git {} output failed",
@@ -513,6 +550,12 @@ pub struct AurRegistry {
     rpc: AurRpc,
     git_base: String,
     limits: RegistryLimits,
+    /// Shallow clones reused across the read-only history operations of one
+    /// pkgbase (resolve walk, releases walk, author lookup). Keyed by the
+    /// full clone url, so packages can never share a repo. `fetch_verified`
+    /// deliberately does not use this cache: its re-clone exists so the
+    /// archive bytes are a second, independent sample from the remote.
+    clone_cache: Mutex<HashMap<String, tempfile::TempDir>>,
 }
 
 impl AurRegistry {
@@ -528,6 +571,7 @@ impl AurRegistry {
             rpc: AurRpc::with_limits(rpc_base, limits),
             git_base: git_base.trim_end_matches('/').to_string(),
             limits,
+            clone_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -571,6 +615,27 @@ impl AurRegistry {
         tempfile::tempdir().map_err(|e| BluelineError::Network(format!("creating temp dir: {e}")))
     }
 
+    /// Clone `url` once and return the repo path, reusing a prior clone of
+    /// the same url. Read-only git operations (rev-list, show, log, archive)
+    /// run against the returned path.
+    fn cached_repo(&self, url: &str) -> Result<PathBuf, BluelineError> {
+        let mut cache = self
+            .clone_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(repo) = cache.get(url) {
+            return Ok(repo.path().to_path_buf());
+        }
+        if cache.len() >= MAX_CACHED_CLONES {
+            cache.clear();
+        }
+        let repo = self.temp_repo()?;
+        self.clone_repo(url, repo.path())?;
+        let path = repo.path().to_path_buf();
+        cache.insert(url.to_string(), repo);
+        Ok(path)
+    }
+
     fn resolve_package(&self, name: &str, version: &str) -> Result<Package, BluelineError> {
         if !validate_aur_name(name) {
             return Err(BluelineError::InvalidPackageSpec(format!(
@@ -590,14 +655,13 @@ impl AurRegistry {
             )));
         }
         let clone_url = self.clone_url(&pkgbase);
-        let repo = self.temp_repo()?;
-        self.clone_repo(&clone_url, repo.path())?;
-        let (commits, truncated) = commit_history(repo.path(), MAX_HISTORY_COMMITS)?;
+        let repo_path = self.cached_repo(&clone_url)?;
+        let (commits, truncated) = commit_history(&repo_path, MAX_HISTORY_COMMITS)?;
 
         let mut skipped = 0usize;
         let mut matched: Option<(&CommitMeta, AurVersionInfo)> = None;
         for c in &commits {
-            match commit_version(repo.path(), &c.hash)? {
+            match commit_version(&repo_path, &c.hash)? {
                 Some(v) if v == target => {
                     matched = Some((c, v));
                     break;
@@ -621,7 +685,7 @@ impl AurRegistry {
             BluelineError::Manifest(pkgbase.clone(), msg)
         })?;
 
-        let bytes = self.archive_bytes(repo.path(), &commit.hash)?;
+        let bytes = self.archive_bytes(&repo_path, &commit.hash)?;
         let checksum = Checksum {
             alg: ChecksumAlg::Sha256,
             value_hex: sha256_hex(&bytes),
@@ -697,9 +761,8 @@ impl AurRegistry {
             )));
         }
         let clone_url = self.clone_url(&pkgbase);
-        let repo = self.temp_repo()?;
-        self.clone_repo(&clone_url, repo.path())?;
-        let (commits, truncated) = commit_history(repo.path(), MAX_HISTORY_COMMITS)?;
+        let repo_path = self.cached_repo(&clone_url)?;
+        let (commits, truncated) = commit_history(&repo_path, MAX_HISTORY_COMMITS)?;
         if truncated {
             return Err(BluelineError::Manifest(
                 pkgbase,
@@ -713,7 +776,7 @@ impl AurRegistry {
         let mut seen: Vec<(AurVersionInfo, Release)> = Vec::new();
         let mut skipped = 0usize;
         for c in &commits {
-            match commit_version(repo.path(), &c.hash)? {
+            match commit_version(&repo_path, &c.hash)? {
                 Some(v) => {
                     // Commits are newest-first; keep the newest commit per
                     // distinct version for an accurate publish time.
@@ -793,11 +856,10 @@ impl Registry for AurRegistry {
     fn release_author(&self, pkg: &Package) -> Option<String> {
         let (clone_url, commit) = parse_git_tarball_url(&pkg.tarball_url).ok()?;
         self.pin_clone_url(&clone_url).ok()?;
-        let repo = self.temp_repo().ok()?;
-        self.clone_repo(&clone_url, repo.path()).ok()?;
-        verify_commit_exists(repo.path(), &commit).ok()?;
+        let repo_path = self.cached_repo(&clone_url).ok()?;
+        verify_commit_exists(&repo_path, &commit).ok()?;
         let text = git_text(
-            Some(repo.path()),
+            Some(&repo_path),
             &["log", "-1", "--format=%ae", &commit],
             MAX_GIT_SMALL_OUTPUT_BYTES,
         )
@@ -1353,6 +1415,27 @@ mod tests {
             !dest.path().join("yay").exists(),
             "git archive emits files at the root, not under a pkgbase dir"
         );
+    }
+
+    #[test]
+    fn cached_repo_reuses_one_clone_per_url_and_drops_overflow() {
+        let fx = spawn_git_fixture();
+        init_fixture_repo(&fx.fixtures, "yay");
+        let reg = fx.registry();
+        let url = reg.clone_url("yay");
+        let first = reg.cached_repo(&url).unwrap();
+        let second = reg.cached_repo(&url).unwrap();
+        assert_eq!(first, second, "same url must reuse the same clone");
+
+        // Overflowing the cache drops every entry, so the next call for the
+        // same url clones again into a fresh directory (old dir deleted).
+        for i in 0..MAX_CACHED_CLONES {
+            let name = format!("filler{i}");
+            init_fixture_repo(&fx.fixtures, &name);
+            reg.cached_repo(&reg.clone_url(&name)).unwrap();
+        }
+        assert!(reg.cached_repo(&url).unwrap() != first);
+        assert!(!first.exists(), "evicted clone must be deleted");
     }
 
     #[test]

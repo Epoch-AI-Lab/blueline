@@ -292,12 +292,7 @@ fn evaluate_with_registry<R: Registry, V: VersionInfo>(
 
     if ecosystem == Ecosystem::Aur {
         if matches!(base_pkgbuild.as_deref(), Some("")) {
-            verdict.findings.push(crate::verdict::Finding {
-                rule_id: "R00_BASELINE_UNREADABLE".to_string(),
-                severity: crate::verdict::VerdictBand::Low,
-                title: "Baseline PKGBUILD unreadable".to_string(),
-                description: "baseline PKGBUILD could not be read; pair rules skipped".to_string(),
-            });
+            verdict.findings.push(baseline_unreadable_finding());
         }
         // `None` is first sighting (no baseline package); `Some("")` is an
         // unreadable baseline file, already surfaced above. Both skip pair
@@ -394,6 +389,17 @@ fn prepare_extracted_root(
         }
     };
     Ok((root, manifest))
+}
+
+// Pair rules cannot run against a baseline whose PKGBUILD cannot be read,
+// so the refusal itself must be loud: High, matching the unparseable case.
+fn baseline_unreadable_finding() -> crate::verdict::Finding {
+    crate::verdict::Finding {
+        rule_id: "R00_BASELINE_UNREADABLE".to_string(),
+        severity: crate::verdict::VerdictBand::High,
+        title: "Baseline PKGBUILD unreadable".to_string(),
+        description: "baseline PKGBUILD could not be read; pair rules skipped".to_string(),
+    }
 }
 
 fn bootstrap_hint(verdict: &crate::verdict::Verdict) -> Option<String> {
@@ -870,6 +876,13 @@ fn package_json_path(root: &std::path::Path) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn baseline_unreadable_finding_is_high() {
+        let f = baseline_unreadable_finding();
+        assert_eq!(f.rule_id, "R00_BASELINE_UNREADABLE");
+        assert_eq!(f.severity, crate::verdict::VerdictBand::High);
+    }
 
     #[test]
     fn parses_plain_spec() {

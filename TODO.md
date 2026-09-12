@@ -122,11 +122,13 @@ Rulings:
 
 - yay v13 `AURPreInstall` Lua hook recipe (README): ~10 lines invoking
   `blueline --ecosystem aur review <pkgbase>@<version> --yes --policy
-  blueline.toml` to gate the build. Document the TOCTOU property: the hook
-  reviews the bytes already downloaded, never a re-fetch.
-- `blueline ci`: v1 accepts a file of `pkgbase@commit` lines (lockfile
-  analog; `pacman -Qqm` output can be piped through the user's own tooling).
-  No alpm linking.
+  blueline.toml` to gate the build. Document the timing property honestly:
+  the review re-pins the newest commit for that version at review time while
+  yay builds its own download, so re-run the review right before the build
+  and treat any version drift as a re-review signal.
+- `blueline ci`: v1 accepts a pin file of `pkgbase@pkgver-pkgrel` lines
+  (lockfile analog; `pacman -Qqm` output can be piped through the user's own
+  tooling). No alpm linking.
 - Policy: `ecosystem = "aur"` rules work via the existing optional-ecosystem
   matching; audit log records commit hashes.
 - Docs: threat-model disclosure card copy and the "review with blueline,
@@ -137,7 +139,7 @@ Rulings:
 - [x] PR1 feat/aur-foundation
 - [x] PR2 feat/aur-adapter
 - [x] PR3 feat/pkgbuild-heuristics
-- [ ] PR4 feat/aur-integration
+- [x] PR4 feat/aur-integration
 
 Mark your PR's box `[x]` in the same branch before opening it.
 
