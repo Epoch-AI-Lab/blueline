@@ -90,13 +90,22 @@ jobs:
 
           r = json.load(open("blueline-dogfood.json"))
           names = {i["name"] for i in r["items"]}
-          expected = {"@bluelinecli/cli", "blueline", "@bluelinecli/binary-linux-x64-gnu"}
+          expected = {
+              "@bluelinecli/cli", "blueline",
+              "@bluelinecli/binary-darwin-arm64", "@bluelinecli/binary-darwin-x64",
+              "@bluelinecli/binary-linux-arm64-gnu", "@bluelinecli/binary-linux-x64-musl",
+              "@bluelinecli/binary-linux-x64-gnu", "@bluelinecli/binary-win32-arm64",
+              "@bluelinecli/binary-win32-x64",
+          }
 
-          if r["total_evaluated"] == 0:
-              assert r["unchanged_count"] > 0, "no delta and nothing unchanged — scan saw nothing"
-          else:
-              missing = expected - names
-              assert not missing, f"scanner failed to evaluate: {missing}"
+          # Scanner health: everything evaluated must be a shipped package,
+          # the lockfile delta must produce evaluations, and unchanged
+          # packages must still be counted. Which shipped packages land in
+          # the delta is PR-dependent, so a hardcoded missing-set is wrong.
+          unknown = names - expected
+          assert not unknown, f"scanner evaluated unknown packages: {unknown}"
+          assert r["total_evaluated"] > 0, "lockfile delta produced no evaluations"
+          assert r["unchanged_count"] > 0, "nothing unchanged — scan saw nothing"
 
           print(f"dogfood scanner healthy: evaluated {r['total_evaluated']}, "
                 f"unchanged {r['unchanged_count']}, max band {r['max_band']}")

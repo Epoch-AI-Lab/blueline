@@ -170,6 +170,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The npm dogfood CI gate no longer hardcodes which shipped packages must
+  appear in the evaluated set: a lockfile delta that adds platform
+  binaries (as the completed platform matrix does) shifted the evaluated
+  names and failed the assert even though the scan was healthy. The gate
+  now asserts that every evaluated package is a shipped package, that the
+  delta produces evaluations, and that unchanged packages are counted.
 - Agent-gate hardening from the campaign review: every gate error path now
   DENIES instead of exiting 1 (hook hosts treat non-2 exits as
   non-blocking, so a hostile stdin payload sized to break the UTF-8 read,
