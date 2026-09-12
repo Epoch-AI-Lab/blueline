@@ -156,6 +156,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   creation, real binaries are checked for the exec bit, each manager's
   shim passes only its own registry override, `pip3` ships as a shim
   target, and gate denials are audited.
+- The gate scanner finds verbs behind leading global flags
+  (`npm --no-fund install evil` was a silent allow), denies npm registry
+  and config overrides in gated installs (`--registry=`, `--userconfig`,
+  `--tag=`, `npm_config_*` env assignments, `npm config set registry` —
+  reviewing one registry while installing from another), discloses
+  dynamic `--package` values as unparseable markers instead of dropping
+  them behind decoy positionals, and stops scanning at shell comments.
 - The README hook recipes pin `BLUELINE_POLICY` for the hook environment
   (a repo's committed blueline.toml otherwise governs hooks fired with the
   repository as cwd) and disclose the remaining bypass surface.

