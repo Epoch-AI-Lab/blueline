@@ -1667,6 +1667,35 @@ mod recursive_tests {
     }
 
     #[test]
+    fn install_references_at_the_exact_cap_are_not_disclosed_as_overflow() {
+        let policy = no_advisory_policy();
+        let specs: Vec<(String, String)> = (1..=MAX_INSTALL_REFS as i64)
+            .map(|i| {
+                let json = format!(r#"{{"name":"p{i}","version":"1.0.0"}}"#);
+                (format!("p{i}@1.0.0"), json)
+            })
+            .collect();
+        let many = specs
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let script =
+            r#"{"name":"a","version":"1.0.0","scripts":{"postinstall":"npm install SPECS"}}"#
+                .replace("SPECS", &many);
+        let mut packages: Vec<(&str, &str)> = vec![("a@1.0.0", script.as_str())];
+        packages.extend(specs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        let (verdict, _) = evaluate_test(&packages, "a@1.0.0", &policy);
+        assert!(
+            !verdict
+                .findings
+                .iter()
+                .any(|f| f.title == "Install-reference cap exceeded"),
+            "exactly {MAX_INSTALL_REFS} references fit the cap; disclosure would be a false positive"
+        );
+    }
+
+    #[test]
     fn install_reference_overflow_is_truncated_and_disclosed() {
         let policy = no_advisory_policy();
         let specs: Vec<(String, String)> = (1..=33)

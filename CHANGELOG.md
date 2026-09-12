@@ -170,6 +170,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A mutation-testing survivor in the recursive-review reference cap: the
+  overflow disclosure fired one reference early (`>` vs `>=`), which would
+  have flagged a payload carrying exactly the cap as overflowing. The
+  boundary is now pinned by a test at exactly 32 references.
 - The npm dogfood CI gate no longer hardcodes which shipped packages must
   appear in the evaluated set: a lockfile delta that adds platform
   binaries (as the completed platform matrix does) shifted the evaluated
