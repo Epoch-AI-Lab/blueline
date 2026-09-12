@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-pub const SHIM_MANAGERS: [&str; 6] = ["npm", "npx", "pip", "cargo", "yay", "paru"];
+pub const SHIM_MANAGERS: [&str; 7] = ["npm", "npx", "pip", "pip3", "cargo", "yay", "paru"];
 
 fn default_dir() -> anyhow::Result<PathBuf> {
     if let Ok(dir) = std::env::var("BLUELINE_DATA_DIR") {
@@ -28,7 +28,7 @@ fn find_on_path(name: &str, exclude_dir: &Path) -> anyhow::Result<PathBuf> {
             continue;
         }
         let candidate = dir.join(name);
-        if candidate.is_file() {
+        if is_executable_file(&candidate) {
             return Ok(candidate);
         }
     }
@@ -36,6 +36,33 @@ fn find_on_path(name: &str, exclude_dir: &Path) -> anyhow::Result<PathBuf> {
         "no real `{name}` binary found on PATH (excluding the shim directory); \
          refusing to write a shim that cannot exec anything"
     ))
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.is_file()
+        && std::fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
+/// Baked paths land inside double-quoted bash assignments; a path carrying
+/// `"`, `$`, a backtick, or a backslash could break out of the assignment
+/// and execute arbitrary code at every shim call. Refuse instead of escaping.
+fn assert_bakeable(path: &Path, what: &str) -> anyhow::Result<()> {
+    let text = path.display().to_string();
+    if text.chars().any(|c| matches!(c, '"' | '$' | '`' | '\\')) {
+        anyhow::bail!(
+            "{what} path `{text}` contains characters that cannot be baked into a shim safely"
+        );
+    }
+    Ok(())
 }
 
 fn shim_script(manager: &str, blueline: &Path, real: &Path) -> String {
@@ -74,10 +101,24 @@ fi
 "#,
         );
     }
-    script.push_str(
-        r#"
+    script.push_str(&match manager {
+        "npm" | "npx" => r#"
 args=(agent gate --command "${cmd[*]}" --format plain)
 args+=(--registry "${BLUELINE_REGISTRY:-https://registry.npmjs.org}")
+"#
+        .to_string(),
+        "cargo" => r#"
+args=(agent gate --command "${cmd[*]}" --format plain)
+args+=(--index "${BLUELINE_INDEX:-https://index.crates.io}")
+"#
+        .to_string(),
+        _ => r#"
+args=(agent gate --command "${cmd[*]}" --format plain)
+"#
+        .to_string(),
+    });
+    script.push_str(
+        r#"
 if [ -n "${BLUELINE_POLICY:-}" ]; then
   args+=(--policy "$BLUELINE_POLICY")
 fi
@@ -103,6 +144,7 @@ pub fn install(managers: &[String], dir: Option<&Path>) -> anyhow::Result<()> {
     std::fs::create_dir_all(&dir)
         .map_err(|e| anyhow::anyhow!("creating shim dir {}: {e}", dir.display()))?;
     let blueline = std::env::current_exe()?;
+    assert_bakeable(&blueline, "blueline binary")?;
     for manager in managers {
         if !SHIM_MANAGERS.contains(&manager.as_str()) {
             anyhow::bail!(
@@ -111,6 +153,7 @@ pub fn install(managers: &[String], dir: Option<&Path>) -> anyhow::Result<()> {
             );
         }
         let real = find_on_path(manager, &dir)?;
+        assert_bakeable(&real, "package-manager")?;
         let script = shim_script(manager, &blueline, &real);
         let path = dir.join(manager);
         std::fs::write(&path, script)

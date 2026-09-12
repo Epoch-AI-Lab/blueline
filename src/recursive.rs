@@ -392,6 +392,7 @@ pub fn install_ref_findings(refs: &[InstallRef]) -> Vec<Finding> {
                 RefOrigin::NpmLifecycle { script } => format!("`{script}` lifecycle script"),
                 RefOrigin::Pkgbuild { function } => format!("PKGBUILD `{function}()`"),
                 RefOrigin::WheelDataScript { path } => format!("wheel script `{path}`"),
+                RefOrigin::CommandLine => "command line".to_string(),
             };
             let invocation = format!(
                 "{} install of `{}`",

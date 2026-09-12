@@ -116,20 +116,35 @@ pub fn gate(
     bases: &RegistryBases,
     policy_path: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
-    let command = match command {
-        Some(c) => c.to_string(),
-        None => read_hook_command()?,
-    };
-    let decision = decide(&command, bases, policy_path)?;
+    // Fail closed: ANY internal error (unreadable policy, store failure,
+    // oversized or undecodable hook stdin) is a DENY. Hook hosts treat
+    // every non-2 non-zero exit as non-blocking, so an error exit would
+    // let the command run ungated.
+    let decision = (|| -> anyhow::Result<GateDecision> {
+        let command = match command {
+            Some(c) => c.to_string(),
+            None => read_hook_command()?,
+        };
+        decide(&command, bases, policy_path)
+    })()
+    .unwrap_or_else(|e| GateDecision {
+        allow: false,
+        reason: format!("blueline gate failed closed: {e:#}"),
+    });
     emit_decision(format, &decision)
 }
 
 fn read_hook_command() -> anyhow::Result<String> {
-    let mut buf = String::new();
+    let mut buf = Vec::new();
     std::io::stdin()
-        .take(MAX_HOOK_STDIN_BYTES as u64)
-        .read_to_string(&mut buf)
+        .take(MAX_HOOK_STDIN_BYTES as u64 + 1)
+        .read_to_end(&mut buf)
         .map_err(|e| anyhow::anyhow!("reading hook stdin: {e}"))?;
+    if buf.len() > MAX_HOOK_STDIN_BYTES {
+        anyhow::bail!("hook stdin exceeds {MAX_HOOK_STDIN_BYTES} bytes; refusing to parse");
+    }
+    let buf =
+        String::from_utf8(buf).map_err(|e| anyhow::anyhow!("hook stdin is not UTF-8: {e}"))?;
     let trimmed = buf.trim();
     if trimmed.is_empty() {
         anyhow::bail!("no --command given and hook stdin is empty");
@@ -178,17 +193,8 @@ fn decide(
             reasons.push(format!("{label}: target is dynamic or unreadable"));
             continue;
         }
-        let child_eco = match manager {
-            RefManager::Pip => Ecosystem::PyPi,
-            _ => Ecosystem::Npm,
-        };
-        let parsed = install_ref::raw_ref(
-            install_ref::RefOrigin::NpmLifecycle {
-                script: "gate".to_string(),
-            },
-            *manager,
-            spec,
-        );
+        let child_eco = child_ecosystem(*manager);
+        let parsed = install_ref::raw_ref(install_ref::RefOrigin::CommandLine, *manager, spec);
         let Some((name, version)) = parsed.registry_spec() else {
             reasons.push(format!(
                 "{label}: not a registry-installable spec; not reviewed"
@@ -232,6 +238,17 @@ fn decide(
             Err(e) => reasons.push(format!("{label}: review failed: {e:#}")),
         }
     }
+    let _ = store.record_audit_log(
+        Ecosystem::Npm,
+        "command",
+        "gate",
+        "",
+        "agent_gate_summary",
+        0,
+        if reasons.is_empty() { "LOW" } else { "HIGH" },
+        &identity_for_audit(),
+        Some(&format!("command: {}", truncate_command(command))),
+    );
     if reasons.is_empty() {
         Ok(GateDecision {
             allow: true,
@@ -240,13 +257,29 @@ fn decide(
     } else {
         Ok(GateDecision {
             allow: false,
-            reason: format!(
-                "blueline refused the install: {}; bypass only by running the package \
-                 manager outside the gated tool",
-                reasons.join("; ")
-            ),
+            reason: deny_reason(&reasons),
         })
     }
+}
+
+/// Which registry a gate-managed install resolves against: AUR helpers
+/// deliver through the AUR, cargo installs through crates.io, pip through
+/// PyPI, everything else through npm.
+fn child_ecosystem(manager: RefManager) -> Ecosystem {
+    match manager {
+        RefManager::Pip => Ecosystem::PyPi,
+        RefManager::Cargo => Ecosystem::Cargo,
+        RefManager::Yay | RefManager::Paru => Ecosystem::Aur,
+        _ => Ecosystem::Npm,
+    }
+}
+
+fn deny_reason(reasons: &[String]) -> String {
+    format!(
+        "blueline refused the install: {}; bypass only by running the package \
+         manager outside the gated tool",
+        reasons.join("; ")
+    )
 }
 
 fn truncate_command(command: &str) -> String {
@@ -319,6 +352,21 @@ mod tests {
         assert_eq!(id, "codex");
         let (id, _) = detect_agent_identity(&env_of(&[]));
         assert_eq!(id, "unknown-agent");
+    }
+
+    #[test]
+    fn child_ecosystem_routes_every_manager_to_its_registry() {
+        use crate::install_ref::RefManager;
+        assert_eq!(child_ecosystem(RefManager::Npm), Ecosystem::Npm);
+        assert_eq!(child_ecosystem(RefManager::Npx), Ecosystem::Npm);
+        assert_eq!(child_ecosystem(RefManager::Pnpm), Ecosystem::Npm);
+        assert_eq!(child_ecosystem(RefManager::Yarn), Ecosystem::Npm);
+        assert_eq!(child_ecosystem(RefManager::Bun), Ecosystem::Npm);
+        assert_eq!(child_ecosystem(RefManager::Bunx), Ecosystem::Npm);
+        assert_eq!(child_ecosystem(RefManager::Pip), Ecosystem::PyPi);
+        assert_eq!(child_ecosystem(RefManager::Cargo), Ecosystem::Cargo);
+        assert_eq!(child_ecosystem(RefManager::Yay), Ecosystem::Aur);
+        assert_eq!(child_ecosystem(RefManager::Paru), Ecosystem::Aur);
     }
 
     #[test]

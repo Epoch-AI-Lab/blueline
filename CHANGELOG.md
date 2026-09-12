@@ -139,6 +139,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (building a PKGBUILD executes its shell script); `review` and `ci` fail
   closed until the AUR adapter PR lands.
 
+### Fixed
+
+- Agent-gate hardening from the campaign review: every gate error path now
+  DENIES instead of exiting 1 (hook hosts treat non-2 exits as
+  non-blocking, so a hostile stdin payload sized to break the UTF-8 read,
+  a corrupt store, or an unreadable policy previously let the command run
+  ungated); gate-managed installs route to their own registries (`cargo
+  install` → crates.io, `yay`/`paru -S` → the AUR, `pip` → PyPI — the
+  wrong-registry routing previously reviewed an npm namesake); and the
+  scanner + gate close the silent-allow shapes: `pip install -r/-e/-c`
+  (non-registry sources), `npx --package=<pkg>`, `npm exec`/`npm x`/`bun x`
+  (which execute packages exactly like npx), and manager tokens hidden
+  behind quoting or backslash escapes. Oversized hook stdin is refused, a
+  missing-real-binary or hostile-character install path refuses shim
+  creation, real binaries are checked for the exec bit, each manager's
+  shim passes only its own registry override, `pip3` ships as a shim
+  target, and gate denials are audited.
+- The README hook recipes pin `BLUELINE_POLICY` for the hook environment
+  (a repo's committed blueline.toml otherwise governs hooks fired with the
+  repository as cwd) and disclose the remaining bypass surface.
+
 ### Changed
 
 - The policy loader honors `BLUELINE_POLICY` (an absolute path) ahead of

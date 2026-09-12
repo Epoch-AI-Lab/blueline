@@ -143,8 +143,13 @@ three enforcement surfaces, one per trust boundary:
 - **`blueline agent gate`** — the hook binding. It polices one command line
   (`--command "<cmd>"`, or the hook payload on stdin — Claude Code
   `PreToolUse` and Cursor `beforeShellExecution` shapes are both accepted),
-  reviews every package the command names with the recursive engine, and
-  answers with exit codes or the product's native decision JSON.
+  reviews every package the command names with the recursive engine (npm
+  packages through npm, pip through PyPI, `cargo install` through
+  crates.io, `yay`/`paru -S` through the AUR), and answers with exit codes
+  or the product's native decision JSON. Any internal error denies —
+  never allows. Best-effort obfuscation that hides a package-manager token
+  entirely (indirect scripts, `python -m pip`, `pip3` without a shim) is
+  outside the scanner's reach and disclosed below.
 
 ### Claude Code hook
 
@@ -173,6 +178,10 @@ The gate reads the tool-call JSON from stdin, scans the command with the
 same parser the review engine uses, reviews the named packages, and denies
 with `exit 2` (Claude Code's documented contract for policy hooks). A
 dynamic target like `npm install $(cat deps.txt)` is denied — fail closed.
+**Pin a user-level policy** by exporting `BLUELINE_POLICY=/path/to/blueline.toml`
+for the hook's environment: a hook fires with the repository as its working
+directory, so without it a malicious repo's committed `blueline.toml`
+allowlist would govern the gate.
 
 ### Cursor hook
 
@@ -208,7 +217,7 @@ prefix_rule(pattern = ["npm", "install"], decision = "prompt",
 ### PATH shims (interactive-terminal backstop)
 
 ```bash
-blueline shim install npm npx pip cargo yay paru
+blueline shim install npm npx pip pip3 cargo yay paru
 export PATH="$HOME/.local/share/blueline/shims:$PATH"
 ```
 
@@ -220,12 +229,13 @@ shell with `BLUELINE_REGISTRY=<mirror>` and `BLUELINE_POLICY=<blueline.toml>`.
 **What shims cannot stop** — stated plainly, because a gate that overstates
 its coverage is security theater: absolute binary paths (`/usr/bin/npm`),
 `command npm`, `env -i`, direct `node .../npm-cli.js` invocation, npx
-resolving from an existing `node_modules/.bin`, PATH reordering, and edits
-to repo-committable hook config. Shims are defense-in-depth for the
-terminal; hooks are the agent boundary; `blueline ci` polices the manifest
-and lockfile where the real authority lives. Unpinned specs are reviewed at
-their current default version — re-review before the install if the window
-matters.
+resolving from an existing `node_modules/.bin`, PATH reordering,
+repo-committable hook config, and unshimmed near-synonyms (`pip3` is
+shipped, but `python -m pip` and `uv pip` are not). Shims are
+defense-in-depth for the terminal; hooks are the agent boundary;
+`blueline ci` polices the manifest and lockfile where the real authority
+lives. Unpinned specs are reviewed at their current default version —
+re-review before the install if the window matters.
 
 ## Contributors
 

