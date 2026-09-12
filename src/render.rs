@@ -318,7 +318,9 @@ pub fn render_text_to_string(verdict: &Verdict, delta: &Delta) -> String {
                 child.risk_score,
                 child.findings.len(),
             ));
-            for f in child.findings.iter().take(MAX_RENDERED_CHILD_FINDINGS) {
+            let mut worst: Vec<&crate::verdict::Finding> = child.findings.iter().collect();
+            worst.sort_by_key(|f| std::cmp::Reverse(f.severity));
+            for f in worst.into_iter().take(MAX_RENDERED_CHILD_FINDINGS) {
                 out.push_str(&format!(
                     "    [{}] {}: {}\n",
                     f.severity,
@@ -581,7 +583,7 @@ mod tests {
         let card = render_text_to_string(&verdict, &delta);
         assert!(card.contains("Recursive Reviews (10):"), "{card}");
         assert!(card.contains("pkg7"), "{card}");
-        assert!(!card.contains("pkg8 ["), "{card}");
+        assert!(!card.contains("npm:pkg8"), "{card}");
         assert!(card.contains("… and 2 more recursive review(s)"), "{card}");
     }
 
