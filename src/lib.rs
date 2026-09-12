@@ -9,6 +9,7 @@ pub mod error;
 pub mod executor;
 pub mod extract;
 pub mod heuristic;
+pub mod install_ref;
 pub mod lockfile;
 pub mod manifest;
 pub mod mcp;
