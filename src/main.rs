@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use blueline::{ci, cli, mcp, review};
+use blueline::{agent, ci, cli, mcp, review};
 
 use clap::Parser;
 
@@ -44,5 +44,16 @@ fn run() -> anyhow::Result<()> {
             output_file.as_deref(),
         ),
         cli::Command::Mcp => mcp::run_stdio(&bases, cli.policy.as_deref()),
+        cli::Command::Agent { action } => match action {
+            cli::AgentAction::Review { pkg } => {
+                agent::run(&pkg, ecosystem, &bases, cli.policy.as_deref())
+            }
+            cli::AgentAction::Gate { command, format } => agent::gate(
+                command.as_deref(),
+                format.into(),
+                &bases,
+                cli.policy.as_deref(),
+            ),
+        },
     }
 }

@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Agent-native enforcement (`blueline agent`): `agent review <pkg>` gives
+  autonomous agents a policy-bound, never-interactive gate — single-line
+  JSON verdict on stdout (the D7 schema, recursive reviews included),
+  exit 0 when the policy allows and 2 when it refuses, human hints on
+  stderr, no known_clean mutation (an agent cannot bless baselines), and
+  an audit-log entry with `decided_by = "agent:<identity>"` where the
+  identity comes from the agent's process environment (Claude Code,
+  Cursor, Codex CLI; env names only, never values — no telemetry beyond
+  the local store). `agent gate` is the hook binding: it polices a command
+  line via `--command` or hook stdin (Claude Code PreToolUse and Cursor
+  `beforeShellExecution` payloads both accepted), scans it with the same
+  install-reference scanner the review engine uses, reviews every named
+  install with the recursive engine, and answers with exit codes or the
+  native decision JSON (`--format claude|cursor`). Dynamic or unresolvable
+  targets deny fail closed; bare installs are allowed with a note that
+  manifest dependencies are policed by `blueline ci`.
 - Recursive review (`src/recursive.rs`): an install reference found in a
   reviewed payload — npm lifecycle scripts, PKGBUILD `npm`/`bun` delivery
   (R23), or PyPI wheel `.data/scripts` — is now piped through the same

@@ -22,7 +22,7 @@ pub struct UnreviewedBaseline {
     pub checksum: Checksum,
 }
 
-fn ctxless_registry(
+pub(crate) fn ctxless_registry(
     ecosystem: Ecosystem,
     bases: &RegistryBases,
 ) -> anyhow::Result<std::rc::Rc<dyn Registry>> {
@@ -917,7 +917,10 @@ pub fn parse_spec(spec: &str, ecosystem: Ecosystem) -> anyhow::Result<(String, S
 /// Flexible parser for install: `<name>` or `<name>@<version>`.
 /// If version is omitted, resolves the registry's default version
 /// (`dist-tags.latest` for npm, falling back to latest stable semver release).
-fn parse_spec_flexible(spec: &str, registry: &dyn Registry) -> anyhow::Result<(String, String)> {
+pub(crate) fn parse_spec_flexible(
+    spec: &str,
+    registry: &dyn Registry,
+) -> anyhow::Result<(String, String)> {
     let has_version_sep = spec.contains("==")
         || if let Some(rest) = spec.strip_prefix('@') {
             rest.contains('@')

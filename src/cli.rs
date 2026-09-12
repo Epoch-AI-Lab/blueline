@@ -179,6 +179,49 @@ pub enum Command {
 
     /// Start Model Context Protocol (MCP) JSON-RPC 2.0 stdio server
     Mcp,
+
+    /// Non-interactive review and hook gating for autonomous agents
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum AgentAction {
+    /// Review a package and print a machine-readable verdict (exit 0 Low, 2 blocked)
+    Review {
+        /// `<name>` or `<name>@<version>` to review
+        #[arg(value_parser = trim_pkg)]
+        pkg: String,
+    },
+    /// Police one command line for package-manager installs (hook binding)
+    Gate {
+        /// The command line to police; read from hook stdin when omitted
+        #[arg(long)]
+        command: Option<String>,
+
+        /// Decision output shape: plain (exit codes), claude, or cursor
+        #[arg(long, value_enum, default_value_t = GateFormatArg::Plain)]
+        format: GateFormatArg,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum GateFormatArg {
+    Plain,
+    Claude,
+    Cursor,
+}
+
+impl From<GateFormatArg> for crate::agent::GateFormat {
+    fn from(arg: GateFormatArg) -> Self {
+        match arg {
+            GateFormatArg::Plain => crate::agent::GateFormat::Plain,
+            GateFormatArg::Claude => crate::agent::GateFormat::Claude,
+            GateFormatArg::Cursor => crate::agent::GateFormat::Cursor,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod advisory;
+pub mod agent;
 pub mod baseline;
 pub mod ci;
 pub mod cli;
