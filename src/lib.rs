@@ -16,6 +16,7 @@ pub mod mcp;
 pub mod pkgbuild;
 pub mod policy;
 pub mod provenance;
+pub mod recursive;
 pub mod registry;
 pub mod render;
 pub mod review;

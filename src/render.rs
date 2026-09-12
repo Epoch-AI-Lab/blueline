@@ -446,6 +446,7 @@ mod tests {
                 lines_deleted: 2,
             },
             trust_sources: None,
+            recursive: Vec::new(),
         };
 
         render_text(&verdict, &delta);

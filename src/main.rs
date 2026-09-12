@@ -16,18 +16,13 @@ fn run() -> anyhow::Result<()> {
     let ecosystem = cli.ecosystem.into();
     let bases = cli::RegistryBases::from_flags(&cli.registry, &cli.index);
     match cli.command {
-        cli::Command::Review { pkg, output, yes } => review::run(
-            &pkg,
-            ecosystem,
-            bases.for_ecosystem(ecosystem),
-            output,
-            cli.policy.as_deref(),
-            yes,
-        ),
+        cli::Command::Review { pkg, output, yes } => {
+            review::run(&pkg, ecosystem, &bases, output, cli.policy.as_deref(), yes)
+        }
         cli::Command::Install { pkg, npm_args, yes } => review::install(
             &pkg,
             ecosystem,
-            bases.for_ecosystem(ecosystem),
+            &bases,
             &npm_args,
             cli.policy.as_deref(),
             yes,
@@ -41,7 +36,7 @@ fn run() -> anyhow::Result<()> {
         } => ci::run(
             &base,
             &lockfile,
-            bases.for_ecosystem(ecosystem),
+            &bases,
             ecosystem,
             cli.policy.as_deref(),
             format.to_ci_format(),

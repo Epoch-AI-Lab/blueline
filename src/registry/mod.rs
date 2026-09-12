@@ -11,7 +11,7 @@ pub mod pypi;
 
 /// The package ecosystems blueline knows about. npm is fully wired; cargo,
 /// PyPI, and AUR adapters build on these seams in later PRs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Ecosystem {
     Npm,

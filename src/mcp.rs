@@ -279,7 +279,6 @@ fn execute_tool(
     policy: &Policy,
 ) -> Result<serde_json::Value, JsonRpcError> {
     let ecosystem = parse_ecosystem(args)?;
-    let base = bases.for_ecosystem(ecosystem);
 
     match name {
         "review_install" => {
@@ -292,12 +291,14 @@ fn execute_tool(
                 JsonRpcError::invalid_params(format!("invalid package spec `{pkg_spec}`: {e}"))
             })?;
 
-            let (verdict, _delta, _, _) = evaluate_package(
-                &pkg_name, &version, ecosystem, base, store, policy,
-            )
-            .map_err(|e| {
-                JsonRpcError::internal_error(format!("review error for `{pkg_spec}`: {e:#}"))
-            })?;
+            let mut rctx = crate::recursive::ReviewContext::new(policy, bases.clone());
+            let (verdict, _delta, _, _) =
+                evaluate_package(&pkg_name, &version, ecosystem, store, policy, &mut rctx)
+                    .map_err(|e| {
+                        JsonRpcError::internal_error(format!(
+                            "review error for `{pkg_spec}`: {e:#}"
+                        ))
+                    })?;
 
             let recommendation = match verdict.band {
                 crate::verdict::VerdictBand::Low => "APPROVE — Safe to install",
@@ -409,12 +410,14 @@ fn execute_tool(
                 JsonRpcError::invalid_params(format!("invalid package spec `{pkg_spec}`: {e}"))
             })?;
 
-            let (_verdict, delta, _, _) = evaluate_package(
-                &pkg_name, &version, ecosystem, base, store, policy,
-            )
-            .map_err(|e| {
-                JsonRpcError::internal_error(format!("review error for `{pkg_spec}`: {e:#}"))
-            })?;
+            let mut rctx = crate::recursive::ReviewContext::new(policy, bases.clone());
+            let (_verdict, delta, _, _) =
+                evaluate_package(&pkg_name, &version, ecosystem, store, policy, &mut rctx)
+                    .map_err(|e| {
+                        JsonRpcError::internal_error(format!(
+                            "review error for `{pkg_spec}`: {e:#}"
+                        ))
+                    })?;
 
             let name = crate::render::sanitize_single_line(&pkg_name);
             let ver = crate::render::sanitize_single_line(&version);

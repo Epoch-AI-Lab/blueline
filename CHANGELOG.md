@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Recursive review (`src/recursive.rs`): an install reference found in a
+  reviewed payload — npm lifecycle scripts, PKGBUILD `npm`/`bun` delivery
+  (R23), or PyPI wheel `.data/scripts` — is now piped through the same
+  review engine as a second-order review instead of only being named.
+  Referenced packages are re-reviewed with a depth cap (policy
+  `recursion.max_depth`, default 3), a per-review child budget
+  (`max_child_reviews`, default 8), cycle detection (A → B → A is cut and
+  disclosed), and a session tarball memo so referenced packages are never
+  re-downloaded. Every reference is disclosed as
+  `R24_LIFECYCLE_INSTALL_REF` (HIGH when pinned, MEDIUM when unpinned,
+  unresolvable, or dynamic; HIGH for non-registry git/URL/path specs, which
+  are not recursively reviewed), cap overruns as `R25_RECURSION_DEPTH` and
+  cycles as `R26_RECURSION_CYCLE` (both HIGH, fail closed), and a child
+  finding at or above `recursion.child_block_band` (default `high`) rolls
+  up into the parent verdict as `R27_SECOND_ORDER` — a HIGH finding in a
+  referenced package can BLOCK the parent. The JSON verdict schema grows a
+  `recursive` array of child reviews (delivery chain, band, score,
+  findings), so the CLI, CI reports, and the MCP `structuredVerdict` all
+  carry the second-order results from the single source of truth.
 - Install-reference extraction (`src/install_ref.rs`), the scanning layer for
   recursive review: static detection of package-manager invocations that
   resolve another install at install/build time — npm lifecycle scripts

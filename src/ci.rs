@@ -49,7 +49,7 @@ pub struct CiReport {
 pub struct CiContext<'a> {
     pub base_ref: &'a str,
     pub lockfile_path: &'a str,
-    pub registry_base: &'a str,
+    pub bases: &'a crate::cli::RegistryBases,
     pub fail_on: Option<VerdictBand>,
     pub ecosystem: Ecosystem,
 }
@@ -139,7 +139,7 @@ fn band_passes(max_band: VerdictBand, threshold: VerdictBand) -> bool {
 pub fn run(
     base_ref: &str,
     lockfile_path: &Path,
-    registry_base: &str,
+    bases: &crate::cli::RegistryBases,
     ecosystem: Ecosystem,
     policy_path: Option<&Path>,
     format: CiOutputFormat,
@@ -170,7 +170,7 @@ pub fn run(
     let ctx = CiContext {
         base_ref,
         lockfile_path: &lockfile_str,
-        registry_base,
+        bases,
         fail_on: fail_on_override,
         ecosystem,
     };
@@ -303,14 +303,9 @@ pub fn evaluate_lockfile_diff(
             continue;
         }
 
-        let (mut verdict, _, checksum, _) = evaluate_package(
-            name,
-            new_version,
-            ctx.ecosystem,
-            ctx.registry_base,
-            store,
-            policy,
-        )?;
+        let mut rctx = crate::recursive::ReviewContext::new(policy, ctx.bases.clone());
+        let (mut verdict, _, checksum, _) =
+            evaluate_package(name, new_version, ctx.ecosystem, store, policy, &mut rctx)?;
 
         // If lockfile declared a hash, verify it matches
         if let Some(expected_integ) = head_integrity_map
@@ -407,14 +402,9 @@ fn evaluate_aur_ci_diff(
     let mut items = Vec::new();
     let mut max_band = VerdictBand::Low;
     for (name, old_version, new_version) in evals {
-        let (verdict, _, _, _) = evaluate_package(
-            &name,
-            &new_version,
-            ctx.ecosystem,
-            ctx.registry_base,
-            store,
-            policy,
-        )?;
+        let mut rctx = crate::recursive::ReviewContext::new(policy, ctx.bases.clone());
+        let (verdict, _, _, _) =
+            evaluate_package(&name, &new_version, ctx.ecosystem, store, policy, &mut rctx)?;
         max_band = update_max_band(max_band, verdict.band);
         items.push(CiReviewItem {
             name,
@@ -618,6 +608,17 @@ pub fn render_text_summary(report: &CiReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_bases(registry: &str) -> crate::cli::RegistryBases {
+        crate::cli::RegistryBases::from_flags(registry, "https://index.crates.io")
+    }
+
+    fn bases_index() -> crate::cli::RegistryBases {
+        test_bases("https://index.crates.io")
+    }
+
+    fn bases_npm() -> crate::cli::RegistryBases {
+        test_bases("https://registry.npmjs.org")
+    }
 
     #[test]
     fn parses_band_strings() {
@@ -825,6 +826,7 @@ mod tests {
                         lines_deleted: 0,
                     },
                     trust_sources: None,
+                    recursive: Vec::new(),
                 },
             }],
         };
@@ -872,6 +874,7 @@ mod tests {
                         lines_deleted: 0,
                     },
                     trust_sources: None,
+                    recursive: Vec::new(),
                 },
             }],
         };
@@ -913,6 +916,7 @@ mod tests {
                         lines_deleted: 1,
                     },
                     trust_sources: None,
+                    recursive: Vec::new(),
                 },
             }],
         };
@@ -978,6 +982,7 @@ mod tests {
                         lines_deleted: 0,
                     },
                     trust_sources: None,
+                    recursive: Vec::new(),
                 },
             }],
         };
@@ -1029,6 +1034,7 @@ mod tests {
                         lines_deleted: 0,
                     },
                     trust_sources: None,
+                    recursive: Vec::new(),
                 },
             }],
         };
@@ -1169,10 +1175,11 @@ mod tests {
         let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
         let mut policy = Policy::default();
         policy.ci.max_evaluations = 1;
+        let bases = test_bases("http://127.0.0.1:9");
         let ctx = CiContext {
             base_ref: "HEAD",
             lockfile_path: "aur.lock",
-            registry_base: "http://127.0.0.1:9",
+            bases: &bases,
             fail_on: None,
             ecosystem: Ecosystem::Aur,
         };
@@ -1195,10 +1202,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
         let policy = Policy::load_or_default(None).unwrap();
+        let bases = test_bases("http://127.0.0.1:9");
         let ctx = CiContext {
             base_ref: "HEAD",
             lockfile_path: "aur.lock",
-            registry_base: "http://127.0.0.1:9",
+            bases: &bases,
             fail_on: None,
             ecosystem: Ecosystem::Aur,
         };
@@ -1221,10 +1229,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
         let policy = Policy::load_or_default(None).unwrap();
+        let bases = test_bases("http://127.0.0.1:9");
         let ctx = CiContext {
             base_ref: "HEAD",
             lockfile_path: "aur.lock",
-            registry_base: "http://127.0.0.1:9",
+            bases: &bases,
             fail_on: None,
             ecosystem: Ecosystem::Aur,
         };
@@ -1261,11 +1270,13 @@ checksum = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
             BaselineStore::open_at(&tempfile::tempdir().unwrap().path().join("t.db")).unwrap();
         let policy = Policy::load_or_default(None).unwrap();
 
+        let bases_tmp = bases_index();
+        let bases_tmp2 = bases_npm();
         // Case 1: filename is Cargo.lock but ecosystem is Npm → must still parse as Cargo.
         let ctx_file = CiContext {
             base_ref: "origin/main",
             lockfile_path: "Cargo.lock",
-            registry_base: "https://index.crates.io",
+            bases: &bases_tmp,
             fail_on: Some(VerdictBand::Block),
             ecosystem: crate::registry::Ecosystem::Npm,
         };
@@ -1278,7 +1289,7 @@ checksum = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         let ctx_eco = CiContext {
             base_ref: "origin/main",
             lockfile_path: "my.lock",
-            registry_base: "https://index.crates.io",
+            bases: &bases_tmp,
             fail_on: Some(VerdictBand::Block),
             ecosystem: crate::registry::Ecosystem::Cargo,
         };
@@ -1289,7 +1300,7 @@ checksum = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         let ctx_npm = CiContext {
             base_ref: "origin/main",
             lockfile_path: "package-lock.json",
-            registry_base: "https://registry.npmjs.org",
+            bases: &bases_tmp2,
             fail_on: Some(VerdictBand::Block),
             ecosystem: crate::registry::Ecosystem::Npm,
         };
@@ -1329,10 +1340,11 @@ checksum = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         let dir = tempfile::tempdir().unwrap();
         let store = BaselineStore::open_at(&dir.path().join("blueline.db")).unwrap();
         let policy = Policy::default();
+        let bases_tmp = bases_index();
         let ctx = CiContext {
             base_ref: "origin/main",
             lockfile_path: "Cargo.lock",
-            registry_base: "https://index.crates.io",
+            bases: &bases_tmp,
             fail_on: None,
             ecosystem: crate::registry::Ecosystem::Cargo,
         };

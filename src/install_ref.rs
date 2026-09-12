@@ -142,11 +142,19 @@ fn valid_npm_name(name: &str) -> bool {
     plain_npm_segment(scope) && plain_npm_segment(pkg)
 }
 
+/// Mirrors the npm registry's own `is_valid_name_segment`: no leading `.`
+/// or `_`, never `.` or `..`, lowercase letters/digits/`-`/`_`/`.` only.
+/// A name this scanner accepts must be a name the registry would too, so
+/// a crafted reference can never smuggle a path segment past review.
 fn plain_npm_segment(seg: &str) -> bool {
     !seg.is_empty()
-        && seg.chars().all(|c| {
-            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.' | '~')
-        })
+        && seg != "."
+        && seg != ".."
+        && !seg.starts_with('.')
+        && !seg.starts_with('_')
+        && seg
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.'))
 }
 
 fn valid_py_name(name: &str) -> bool {
@@ -349,6 +357,11 @@ fn positionals(toks: &[Tok], manager: RefManager, take_all: bool) -> Vec<String>
             if specs.last().map(String::is_empty) != Some(true) {
                 specs.push(String::new());
             }
+        } else if non_registry_spec(&t.raw) {
+            // git:/URL/path specs are real references (the TanStack lane):
+            // captured so the review can disclose them as unresolvable to
+            // any registry, never silently dropped as flag-value noise.
+            specs.push(t.raw.clone());
         } else if plausible_spec(manager, &t.raw) {
             specs.push(t.raw.clone());
         }
@@ -365,6 +378,23 @@ fn plausible_spec(manager: RefManager, token: &str) -> bool {
         RefManager::Pip => valid_py_name(name),
         _ => valid_npm_name(name),
     }
+}
+
+/// A parseable token that names a NON-registry source: git specs, URLs,
+/// local paths, tarballs. These are real install references whose payload
+/// no registry can vouch for.
+fn non_registry_spec(token: &str) -> bool {
+    token.contains("://")
+        || token.starts_with("git+")
+        || token.starts_with("git@")
+        || token.starts_with("github:")
+        || token.starts_with("gitlab:")
+        || token.starts_with("bitbucket:")
+        || token.starts_with("./")
+        || token.starts_with("../")
+        || token.starts_with('/')
+        || token.ends_with(".tgz")
+        || token.ends_with(".tar.gz")
 }
 
 /// Install references inside an npm package's lifecycle scripts. Only the
@@ -728,6 +758,31 @@ mod tests {
         assert_eq!(r.registry_spec(), Some(("requests", Some("2.31.0"))));
         r.spec = "my_pkg".into();
         assert_eq!(r.registry_spec(), Some(("my_pkg", None)));
+    }
+
+    #[test]
+    fn npm_segment_grammar_matches_registry_rules() {
+        let mut r = InstallRef {
+            origin: RefOrigin::NpmLifecycle {
+                script: "postinstall".into(),
+            },
+            manager: RefManager::Npm,
+            spec: String::new(),
+            pinned: false,
+            parseable: true,
+        };
+        for rejected in ["~pkg", "_pkg", ".pkg", "..", "."] {
+            r.spec = rejected.to_string();
+            assert_eq!(r.registry_spec(), None, "`{rejected}` must be rejected");
+        }
+        for accepted in ["pkg", "pkg.name", "pkg_name", "pkg-name"] {
+            r.spec = accepted.to_string();
+            assert_eq!(
+                r.registry_spec(),
+                Some((accepted, None)),
+                "`{accepted}` must be accepted"
+            );
+        }
     }
 
     #[test]

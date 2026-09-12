@@ -49,7 +49,7 @@ impl BaselineResolution {
     }
 }
 
-pub fn resolve_baseline<R: Registry, V: VersionInfo>(
+pub fn resolve_baseline<R: Registry + ?Sized, V: VersionInfo>(
     name: &str,
     target_ver: &V,
     registry: &R,

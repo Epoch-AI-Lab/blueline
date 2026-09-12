@@ -22,6 +22,7 @@ pub struct Policy {
     pub allowlist: AllowlistConfig,
     pub blocklist: BlocklistConfig,
     pub ci: CiPolicyConfig,
+    pub recursion: RecursionPolicyConfig,
 }
 
 impl Policy {
@@ -117,6 +118,20 @@ impl Policy {
             return Err(BluelineError::Policy(format!(
                 "invalid thresholds: block_score ({}) cannot exceed 100",
                 self.thresholds.block_score
+            )));
+        }
+
+        if self.recursion.max_depth > 16 {
+            return Err(BluelineError::Policy(format!(
+                "invalid recursion policy: max_depth ({}) exceeds the cap of 16",
+                self.recursion.max_depth
+            )));
+        }
+
+        if self.recursion.max_child_reviews > 256 {
+            return Err(BluelineError::Policy(format!(
+                "invalid recursion policy: max_child_reviews ({}) exceeds the cap of 256",
+                self.recursion.max_child_reviews
             )));
         }
 
@@ -293,6 +308,34 @@ impl Default for CiPolicyConfig {
             fail_on: "high".to_string(),
             max_evaluations: 100,
             include_dev: true,
+        }
+    }
+}
+
+/// Recursive-review policy: caps on second-order review fan-out and the
+/// band at which a referenced package's finding escalates the parent
+/// verdict. Ambiguity resolves to block (fail closed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RecursionPolicyConfig {
+    /// Maximum review depth for referenced installs (root review is depth
+    /// 0; default 3). Exceeding the cap emits R25_RECURSION_DEPTH (HIGH).
+    pub max_depth: u32,
+    /// Maximum child reviews per top-level evaluation (default 8); bounds
+    /// fan-out cost for CI. Exceeding the budget emits R25_RECURSION_DEPTH.
+    pub max_child_reviews: u32,
+    /// Band at or above which a referenced package's finding escalates the
+    /// parent verdict via R27_SECOND_ORDER (default HIGH; TOML values are
+    /// the uppercase band names, e.g. `child_block_band = "HIGH"`).
+    pub child_block_band: VerdictBand,
+}
+
+impl Default for RecursionPolicyConfig {
+    fn default() -> Self {
+        Self {
+            max_depth: 3,
+            max_child_reviews: 8,
+            child_block_band: VerdictBand::High,
         }
     }
 }
@@ -551,5 +594,23 @@ name = "x"
 ecosystem = "rubygems"
 "#;
         assert!(Policy::from_toml_str(bad).is_err());
+    }
+
+    #[test]
+    fn recursion_policy_caps_fail_closed() {
+        let ok = Policy::from_toml_str("[recursion]\nmax_depth = 16\n").unwrap();
+        assert_eq!(ok.recursion.max_depth, 16);
+        assert!(Policy::from_toml_str("[recursion]\nmax_depth = 17\n").is_err());
+        let ok = Policy::from_toml_str("[recursion]\nmax_child_reviews = 256\n").unwrap();
+        assert_eq!(ok.recursion.max_child_reviews, 256);
+        assert!(Policy::from_toml_str("[recursion]\nmax_child_reviews = 257\n").is_err());
+    }
+
+    #[test]
+    fn recursion_child_block_band_parses_from_toml() {
+        let policy = Policy::from_toml_str("[recursion]\nchild_block_band = \"HIGH\"\n").unwrap();
+        assert_eq!(policy.recursion.child_block_band, VerdictBand::High);
+        let policy = Policy::from_toml_str("[recursion]\nchild_block_band = \"MEDIUM\"\n").unwrap();
+        assert_eq!(policy.recursion.child_block_band, VerdictBand::Medium);
     }
 }
