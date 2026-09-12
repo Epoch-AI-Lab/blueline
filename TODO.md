@@ -221,6 +221,80 @@ One branch, `feat/close-the-loop`, carries all four campaigns; the PRs stack
 per campaign with explicit `--base` per the convention above. Campaign briefs
 2–4 are appended here at their campaign boundaries, before their first slice.
 
+### Campaign 2 — agent-native enforcement (research brief)
+
+Motivation, verified against the Claude Code hooks reference, the Cursor
+hooks docs (1.7+), the Codex CLI execpolicy/config references, corepack/
+pipx/volta docs, and 2025-2026 gate prior art (Socket MCP, Attach Guard):
+Claude Code and Cursor both expose a stdin-JSON / exit-code-2 veto contract
+at the tool-call boundary; Codex has no hook process (bind point is
+Starlark prefix_rule + sandbox policy); PATH shims intercept the LAUNCHER
+only (corepack/pipx/volta all share the same bypass family: absolute
+paths, `command`, `env -i`, direct npm-cli.js), so per ARCHITECTURE.md the
+MCP/explicit call is primary and the shim is the enforcement backstop for
+the interactive terminal. `npm_execpath` is user-controllable (2linenodejs
+CTF pivot) and must never be trusted for security decisions. Hooks are
+repo-committable config and themselves an attack vector — recipes must
+live in USER-level settings, not the repo, and say so.
+
+Rulings (locked, no re-litigating):
+
+1. Primary surface: `blueline agent <pkg>` — no interactive prompt ever,
+   single-line JSON verdict on stdout (the D7 schema), deterministic exit
+   codes (0 approve/Low, 2 blocked/refused, 1 error), human hints on
+   stderr only. Approval is policy-bound: the verdict band decides, the
+   same blueline.toml thresholds/allowlists apply.
+2. Second surface: `blueline agent gate` — the hook binding. Input: the
+   command line to police via `--command`, or hook stdin (Claude Code
+   PreToolUse JSON and Cursor beforeShellExecution JSON are both accepted;
+   the command string is extracted). Output via `--format claude|cursor|
+   plain` in each product's native decision shape; plain (default) uses
+   exit codes only. The command string is scanned with the SAME
+   install-reference scanner as reviews (install_ref::scan_line) — one
+   parser, one grammar, no second opinion to drift. Package operands are
+   reviewed via the recursive engine; bare installs (no operands) are
+   ALLOWED with a stderr note pointing at `blueline ci` (a bare install
+   pulls the manifest's deps — policed by CI, disclosed honestly).
+3. Backstop: `blueline shim install <npm|npx|pip|cargo|yay|paru...>
+   [--dir <path>]` (and `blueline shim uninstall`) writes bash shims into
+   a user-chosen dir. Shims extract specs from the invocation, run
+   `blueline agent` per spec, and exec the REAL package manager (absolute
+   path resolved at install time, PATH fallback excluding the shim dir)
+   only when every verdict is Low. Fail closed everywhere: blueline
+   missing, errored, or refusing ⇒ the install does not run. pip flags
+   that name non-registry sources (-r/-e/--constraint/--target/...) are
+   refused with a pointer to `blueline ci` rather than guessed at.
+   `yay/paru -S` with operands reviews each AUR spec; update runs without
+   operands pass through and are disclosed as a bypass in the docs.
+4. The bypass list is documented on the card of truth (README): absolute
+   binary paths, `command npm`, `env -i`, direct npm-cli.js, npx resolving
+   from node_modules/.bin, PATH reordering, hook config tampering in
+   repo-committable settings. No security theater: the shim is
+   defense-in-depth for the terminal, hooks for the agent, CI for the
+   manifest — the campaign says so in writing.
+5. Audit: every `agent` decision writes the existing audit_log with
+   `decided_by = "agent:<identity>"`; identity comes from process env
+   (CLAUDECODE/CLAUDE_CODE_ENTRYPOINT → claude-code, CURSOR_* → cursor,
+   CODEX_* → codex, else unknown-agent) and lands in `notes` (env names
+   only, never values — no telemetry beyond the local store, D8 holds).
+6. Codex CLI has no hook process: the recipe is a Starlark `prefix_rule`
+   set to `prompt` for install verbs plus instructions to route installs
+   through `blueline agent` — stated as advisory in the docs, not sold as
+   enforcement.
+7. No new dependencies; shims are generated scripts, parsing reuses
+   install_ref; store schema untouched.
+
+Slices:
+
+- Slice 1 `agent-mode`: `src/agent.rs` — `blueline agent <pkg>` +
+  `blueline agent gate`, identity detection, audit entries, exit codes,
+  unit + integration tests.
+- Slice 2 `shims`: `src/shim.rs` — install/uninstall for npm, npx, pip,
+  cargo, yay, paru; fail-closed script templates; tests running real shim
+  scripts against the fixture registry.
+- Slice 3 `recipes`: README/Claude/Cursor/Codex recipes with the honest
+  bypass list; user-level-settings warning; use-it pass.
+
 ### Campaign 1 — recursive review (research brief)
 
 Motivation, verified against the TanStack postmortem, the Unit42 writeup,
