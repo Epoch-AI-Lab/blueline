@@ -243,7 +243,7 @@ re-review before the install if the window matters.
 The CLI ships through npm (`@bluelinecli/cli`, `npx blueline`) with the
 native binary delivered via platform packages for linux (x64 glibc/musl,
 arm64), macOS (x64, arm64), and Windows (x64, arm64). Release binaries
-carry SLSA build-provenance attestations
+are attested at release time with SLSA build provenance
 (`actions/attest-build-provenance`) and a `SHA256SUMS` manifest; npm
 publishes use `--provenance`. Packaging configs for the other channels
 live in-repo: `packaging/homebrew/blueline.rb` (source build via cargo)
