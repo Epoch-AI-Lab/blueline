@@ -35,6 +35,7 @@ Phased plan from greenfield to a trustworthy release-diff review desk. See
 ## Phase 4 — Scale & Multi-Registry ✅
 - [x] crates.io registry adapter (`--ecosystem cargo`, `Cargo.lock` CI scanning, `.crate` verification, yanked-aware baselines)
 - [x] PyPI registry adapter (`--ecosystem pypi`, `requirements.txt` CI scanning, PEP 440 / PEP 503, wheel extraction, PEP 740 provenance)
+- [x] AUR registry adapter (`--ecosystem aur`, review-only): git-history-backed reviews with vercmp ordering, static PKGBUILD heuristics (R11-R23), maintainer-transition finding, pin-file CI scanning, and a yay `AURPreInstall` gate hook
 - [ ] Advisory feed contributions back to OSV / GitHub
 
 ---
