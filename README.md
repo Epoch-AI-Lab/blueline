@@ -89,20 +89,25 @@ rewrite never passes as the same approval.
 
 ### yay gate hook
 
-yay v13 runs `AURPreInstall` Lua hooks before building. Drop this in your
-yay config to block the build unless blueline approves the version:
+yay v13 runs `AURPreInstall` hooks before building. Drop this in your yay
+`init.lua` to block the build unless blueline approves the version:
 
 ```lua
-function AURPreInstall(packages)
-  for _, pkg in ipairs(packages) do
-    local ok = os.execute(
-      "blueline --ecosystem aur review "
-        .. string.format("%q", pkg) .. " --yes --policy blueline.toml"
-    )
-    if ok ~= 0 then return 1 end
-  end
-  return 0
-end
+yay.create_autocmd("AURPreInstall", {
+  desc = "gate the build on a blueline review",
+  callback = function(event)
+    for _, pkg in ipairs(event.data.packages) do
+      local spec = event.match .. "@" .. pkg.version
+      local ok = os.execute(
+        "blueline --ecosystem aur review "
+          .. string.format("%q", spec) .. " --yes --policy blueline.toml"
+      )
+      if ok ~= 0 then
+        yay.abort(event.match .. ": blueline refused " .. spec)
+      end
+    end
+  end,
+})
 ```
 
 Timing note: the review pins the newest commit for that version at review
