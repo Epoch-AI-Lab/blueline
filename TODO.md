@@ -212,3 +212,102 @@ Rulings:
 - [x] PR4 feat/pypi-adapter
 
 Mark your PR's box `[x]` in the same branch before opening it.
+
+---
+
+## Night run: close the loop (2026-09-12, drafted by the agent run — Kriday to veto any ruling before the PR opens)
+
+One branch, `feat/close-the-loop`, carries all four campaigns; the PRs stack
+per campaign with explicit `--base` per the convention above. Campaign briefs
+2–4 are appended here at their campaign boundaries, before their first slice.
+
+### Campaign 1 — recursive review (research brief)
+
+Motivation, verified against the TanStack postmortem, the Unit42 writeup,
+StepSecurity's and Sonatype's Atomic Arch coverage: both campaigns delivered
+through a **machine-resolved reference inside an already-reviewed artifact** —
+TanStack injected `optionalDependencies: { "@tanstack/setup":
+"github:tanstack/router#<orphan-sha>" }` whose `prepare` script ran at install
+time (with valid SLSA L3 provenance, which attests the builder, not the
+referenced install), and Atomic Arch's PKGBUILDs carried a one-line
+`npm install atomic-lockfile` whose npm `preinstall` ran the infostealer. In
+both, the reviewed diff is benign; the payload lives one hop away. OSV/GHSA
+classify new malware on the order of ~3 days (28-day NVD median), so advisory
+gating alone misses the window. The exploitable invariant: a reference whose
+resolution happens on the victim machine is neither reviewed nor pinned.
+
+Rulings (locked, no re-litigating):
+
+1. Recursion lives in the ENGINE, not the CLI. `evaluate_with_registry` gains
+   a threaded review context (depth, visited set, delivery chain, shared
+   registries); every entry point — CLI `review`/`install`/`ci`, MCP
+   `review_install` — inherits it with no surface-specific code.
+2. Reference surfaces in v1: (a) npm manifest lifecycle scripts
+   (`preinstall`/`install`/`postinstall`/`prepare`) invoking a package
+   manager (`npm/npx/pnpm/yarn/bun` + `install/i/add/exec/x/dlx/run`) — the
+   Shai-Hulud/TanStack lane; (b) PKGBUILD npm/bun delivery — the existing
+   R23 scan, extended to yield the parsed spec; (c) wheel `.data/scripts`
+   and entry-point-adjacent payloads scanned statically for pip/npm
+   invocations. Entry points that reference the distribution's OWN modules
+   are not recursion triggers (they execute deferred, but reference nothing
+   installable; R02 already covers them).
+3. Non-registry references (`git:`, URLs, `file:`) are NOT recursively
+   reviewed in v1 — resolving arbitrary git hosts is a new trust surface.
+   They keep their existing findings (R04 family) and the card discloses
+   that referenced non-registry installs were not reviewed. No silent gap.
+4. New rules: `R24_LIFECYCLE_INSTALL_REF` (HIGH) for a package-manager
+   install invoked from an npm lifecycle script, with MEDIUM variants for an
+   unpinned spec (mutable payload) and an unresolvable spec; dynamic/
+   unparseable specs (command substitution etc.) surface as MEDIUM
+   "unparseable install reference" — never guessed at. `R25_RECURSION_DEPTH`
+   (HIGH, fail closed: the cap is stated, never silent) and
+   `R26_RECURSION_CYCLE` (HIGH). Roll-up finding `R27_SECOND_ORDER` carries a
+   child finding that meets the policy threshold into the parent verdict.
+5. R23 graduates Low → MEDIUM: with recursion covering what it points at,
+   the delivery line is a real second-order install signal; the INFO band
+   existed only because nobody resolved the reference.
+6. Policy (`[recursion]` in blueline.toml): `max_depth` default 3,
+   `max_child_reviews` default 8 (bounds CI/fan-out cost; exceeding either
+   emits R25, fail closed), `child_block_band` default `"high"` — a child
+   finding at or above the band escalates the parent verdict; ambiguity
+   resolves to block.
+7. Cache/memo: a session-scoped driver holds one registry instance per
+   ecosystem (today each `evaluate_package` call builds a fresh one) and a
+   bounded in-memory tarball memo keyed `(ecosystem, name, version)`, cleared
+   on overflow like the AUR `clone_cache`. The visited set is both cycle
+   detection and the no-re-review memo. Store schema UNTOUCHED.
+8. Children are never approved, never marked clean; `record_verified`
+   evidence rows only. The parent decision decides; interactive approval
+   happens once, on the parent.
+9. Verdict JSON grows `recursive: Vec<ChildReview>` (skipped when empty)
+   where `ChildReview = { chain: Vec<String>, name, version, ecosystem, band,
+   risk_score, findings }`. Per D7 the CLI card, CI report, and MCP
+   structuredVerdict all inherit it. The card renders the delivery chain
+   ("delivered via: pkgbase → npm:package@ver").
+10. `extract.rs` untouched (scanning happens post-extract on the extracted
+    root and manifest views). No new dependencies. The npm-lifecycle
+    reference extractor is hand-rolled token scanning with fail-closed
+    bounds, same discipline as the PKGBUILD tokenizer; fuzz target added.
+
+Slices (each independently green, small commits, CHANGELOG entry per slice):
+
+- Slice 1 `ref-extraction`: reference extraction module (npm lifecycle
+  scripts + PKGBUILD R23 spec plumbing + wheel `.data/scripts` scan),
+  unit tests, CHANGELOG.
+- Slice 2 `recursive-engine`: review context, recursive driver with depth
+  cap / cycle detection / visited memo / registry + tarball reuse, child
+  evaluation, unit + integration tests against the fixture registry.
+- Slice 3 `rollup-render`: `ChildReview` in the verdict schema, policy
+  `[recursion]`, R23 graduation, card chain rendering, MCP/CI inheritance
+  tests, fuzz target.
+- Slice 4 `use-it`: adversarial fixture registry (A → B backdoored chain)
+  end-to-end BLOCK proof, README/ARCHITECTURE notes.
+
+## Status: close the loop
+
+- [ ] Campaign 1: recursive review
+- [ ] Campaign 2: agent-native enforcement
+- [ ] Campaign 3: recall / revocation index
+- [ ] Campaign 4: dogfood & distribution
+
+Mark each campaign's box `[x]` in the same branch when it lands.
