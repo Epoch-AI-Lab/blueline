@@ -48,6 +48,7 @@ If a release exceeds risk thresholds, Blueline blocks the install and halts the 
 ## Project status
 
 - [x] Multi-registry support: npm, crates.io (`--ecosystem cargo`), PyPI (`--ecosystem pypi`), and AUR (`--ecosystem aur`, review-only)
+- [x] Recursive review: an install reference inside a reviewed payload (npm lifecycle script, PKGBUILD `npm install` delivery, wheel `.data/scripts`) is itself reviewed — depth-capped, cycle-safe, and rolled up into the parent verdict
 - [x] Sandboxed archive extraction with path traversal, symlink, and decompression bomb guards
 - [x] Package manifest parsing, cryptographic integrity (SHA-256 / SHA-512), and PEP 740 / SLSA provenance
 - [x] SQLite store for verified baseline releases and audit logging
