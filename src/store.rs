@@ -5,6 +5,7 @@ use rusqlite_migration::{M, Migrations};
 
 use crate::error::BluelineError;
 use crate::registry::{Checksum, Ecosystem};
+use serde::{Deserialize, Serialize};
 
 const MIGRATIONS: &[&str] = &[
     "
@@ -677,6 +678,58 @@ impl BaselineStore {
 
         Ok(())
     }
+
+    /// Read-only audit-log reader for the recall curation workflow: holds,
+    /// blocks, and refusals become candidate revocations a human curates.
+    /// Reads only; the store schema and write paths are untouched.
+    pub fn audit_entries(&self, limit: usize) -> Result<Vec<AuditEntry>, BluelineError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT ecosystem, package, version, integrity, action, score, verdict,
+                        decided_by, notes, decided_at
+                 FROM audit_log ORDER BY id DESC LIMIT ?1",
+            )
+            .map_err(|e| BluelineError::Store(format!("preparing audit_entries: {e}")))?;
+        let rows = stmt
+            .query_map(rusqlite::params![limit as i64], |row| {
+                Ok(AuditEntry {
+                    ecosystem: row.get(0)?,
+                    package: row.get(1)?,
+                    version: row.get(2)?,
+                    integrity: row.get(3)?,
+                    action: row.get(4)?,
+                    score: row.get::<_, i64>(5)? as u32,
+                    verdict: row.get(6)?,
+                    decided_by: row.get(7)?,
+                    notes: row.get(8)?,
+                    decided_at: row.get(9)?,
+                })
+            })
+            .map_err(|e| BluelineError::Store(format!("querying audit_entries: {e}")))?;
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(
+                row.map_err(|e| BluelineError::Store(format!("reading audit_entries row: {e}")))?,
+            );
+        }
+        Ok(entries)
+    }
+}
+
+/// One audit-trail row, as read back by the recall curation export.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEntry {
+    pub ecosystem: String,
+    pub package: String,
+    pub version: String,
+    pub integrity: String,
+    pub action: String,
+    pub score: u32,
+    pub verdict: String,
+    pub decided_by: String,
+    pub notes: Option<String>,
+    pub decided_at: i64,
 }
 
 fn default_db_path() -> Result<std::path::PathBuf, BluelineError> {

@@ -327,6 +327,34 @@ fn evaluate_with_registry<V: VersionInfo>(
         crate::heuristic::apply_extra_findings(&mut verdict, extra, policy);
     }
 
+    // Recall-index staleness (R28): a synced snapshot older than the
+    // policy window is disclosed; an unreadable one is disclosed at
+    // MEDIUM — never silently ignored.
+    match crate::recall::stale_band(policy) {
+        Ok(Some(band)) => {
+            let finding = crate::verdict::Finding {
+                rule_id: "R28_RECALL_STALE".to_string(),
+                severity: band,
+                title: "Recall index stale".to_string(),
+                description: format!(
+                    "the synced revocation index is older than the policy window                      ({}h); revocation coverage is not current",
+                    policy.recall.max_age_hours
+                ),
+            };
+            crate::heuristic::apply_extra_findings(&mut verdict, vec![finding], policy);
+        }
+        Ok(None) => {}
+        Err(e) => {
+            let finding = crate::verdict::Finding {
+                rule_id: "R28_RECALL_STALE".to_string(),
+                severity: crate::verdict::VerdictBand::Medium,
+                title: "Recall index unreadable".to_string(),
+                description: format!("the synced revocation index could not be read: {e:#}"),
+            };
+            crate::heuristic::apply_extra_findings(&mut verdict, vec![finding], policy);
+        }
+    }
+
     // Recursive review pass: every install reference the payload carries
     // is disclosed (R24), then piped through the same review engine with
     // depth/cycle/budget caps failing closed (R25/R26), and child findings

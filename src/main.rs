@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use blueline::{agent, ci, cli, mcp, review, shim};
+use blueline::{agent, ci, cli, mcp, recall, review, shim};
 
 use clap::Parser;
 
@@ -54,6 +54,40 @@ fn run() -> anyhow::Result<()> {
                 &bases,
                 cli.policy.as_deref(),
             ),
+        },
+        cli::Command::Recall { action } => match action {
+            cli::RecallAction::Sync { url } => {
+                let synced = recall::sync(&url)?;
+                println!(
+                    "synced recall snapshot: sequence {}, {} revocations, fetched {}s ago (0)",
+                    synced.snapshot.sequence,
+                    synced.snapshot.revocations.len(),
+                    synced.age_secs()
+                );
+                Ok(())
+            }
+            cli::RecallAction::Serve { port, snapshot } => recall::serve(port, &snapshot),
+            cli::RecallAction::ExportCandidates { out, limit } => {
+                let store = blueline::store::BaselineStore::open()?;
+                let candidates: Vec<blueline::store::AuditEntry> = store
+                    .audit_entries(limit)?
+                    .into_iter()
+                    .filter(|e| {
+                        matches!(e.action.as_str(), "hold" | "agent_gate" | "agent_review")
+                            || e.verdict == "BLOCK"
+                            || e.verdict == "HIGH"
+                    })
+                    .collect();
+                let json = serde_json::to_string_pretty(&candidates)?;
+                std::fs::write(&out, json)
+                    .map_err(|e| anyhow::anyhow!("writing {}: {e}", out.display()))?;
+                println!(
+                    "exported {} candidate(s) to {}",
+                    candidates.len(),
+                    out.display()
+                );
+                Ok(())
+            }
         },
         cli::Command::Shim { action } => match action {
             cli::ShimAction::Install { managers, dir } => shim::install(&managers, dir.as_deref()),

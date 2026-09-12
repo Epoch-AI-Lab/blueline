@@ -186,10 +186,45 @@ pub enum Command {
         action: AgentAction,
     },
 
+    /// Local-first recall index: serve, sync, and export audit candidates
+    Recall {
+        #[command(subcommand)]
+        action: RecallAction,
+    },
+
     /// Install or remove PATH shims that route package managers through blueline
     Shim {
         #[command(subcommand)]
         action: ShimAction,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum RecallAction {
+    /// Fetch the curated snapshot from a recall service and validate it
+    Sync {
+        /// Base URL of the recall service, e.g. http://127.0.0.1:7979
+        #[arg(long)]
+        url: String,
+    },
+    /// Serve a curated revocations.json on loopback
+    Serve {
+        #[arg(long, default_value_t = 7979)]
+        port: u16,
+
+        /// Path to the curated revocations.json
+        #[arg(long)]
+        snapshot: std::path::PathBuf,
+    },
+    /// Export hold/block audit entries as curation candidates
+    ExportCandidates {
+        /// Path to write the candidates JSON
+        #[arg(long)]
+        out: std::path::PathBuf,
+
+        /// Maximum entries to export
+        #[arg(long, default_value_t = 1000)]
+        limit: usize,
     },
 }
 

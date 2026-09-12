@@ -23,6 +23,7 @@ pub struct Policy {
     pub blocklist: BlocklistConfig,
     pub ci: CiPolicyConfig,
     pub recursion: RecursionPolicyConfig,
+    pub recall: RecallPolicyConfig,
 }
 
 impl Policy {
@@ -138,6 +139,13 @@ impl Policy {
             return Err(BluelineError::Policy(format!(
                 "invalid recursion policy: max_depth ({}) exceeds the cap of 16",
                 self.recursion.max_depth
+            )));
+        }
+
+        if self.recall.max_age_hours == 0 || self.recall.max_age_hours > 24 * 365 {
+            return Err(BluelineError::Policy(format!(
+                "invalid recall policy: max_age_hours ({}) out of range",
+                self.recall.max_age_hours
             )));
         }
 
@@ -349,6 +357,25 @@ impl Default for RecursionPolicyConfig {
             max_depth: 3,
             max_child_reviews: 8,
             child_block_band: VerdictBand::High,
+        }
+    }
+}
+
+/// Recall-index policy: how far past its fetch time the synced revocation
+/// snapshot may drift before it is disclosed (R28), and whether that
+/// staleness escalates to BLOCK.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RecallPolicyConfig {
+    pub max_age_hours: u64,
+    pub block_on_stale: bool,
+}
+
+impl Default for RecallPolicyConfig {
+    fn default() -> Self {
+        Self {
+            max_age_hours: 48,
+            block_on_stale: false,
         }
     }
 }
