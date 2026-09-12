@@ -305,7 +305,10 @@ Slices (each independently green, small commits, CHANGELOG entry per slice):
 
 ## Status: close the loop
 
-- [ ] Campaign 1: recursive review
+- [x] Campaign 1: recursive review (slices: ref-extraction, recursive
+  engine, rollup-render, use-it e2e; reviewers PASS; use-it: real binary
+  BLOCKed the adversarial A→B chain and live AUR webtorrent-desktop review
+  rendered R23 at MEDIUM)
 - [ ] Campaign 2: agent-native enforcement
 - [ ] Campaign 3: recall / revocation index
 - [ ] Campaign 4: dogfood & distribution
