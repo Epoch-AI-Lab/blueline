@@ -37,3 +37,9 @@ name = "aur_version"
 path = "fuzz_targets/aur_version.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "pkgbuild_tokenizer"
+path = "fuzz_targets/pkgbuild_tokenizer.rs"
+test = false
+doc = false

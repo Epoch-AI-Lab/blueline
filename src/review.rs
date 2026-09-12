@@ -148,7 +148,7 @@ fn evaluate_with_registry<R: Registry, V: VersionInfo>(
         resolve_baseline(&target_pkg.name, &target_ver, &registry, store)
             .map_err(|e| anyhow::anyhow!("baseline resolution: {e}"))?;
 
-    let delta = if let Some(base_pkg) = baseline_res.resolution.package() {
+    let (delta, base_pkgbuild) = if let Some(base_pkg) = baseline_res.resolution.package() {
         let base_tarball = registry.fetch_tarball(base_pkg)?;
         let base_temp =
             tempfile::tempdir().map_err(|e| anyhow::anyhow!("creating temp dir: {e}"))?;
@@ -179,23 +179,35 @@ fn evaluate_with_registry<R: Registry, V: VersionInfo>(
             )
         })?;
 
-        compute_delta(
+        let delta = compute_delta(
             Some(&base_root),
             Some(&base_manifest),
             Some(&base_pkg.version),
             &target_root,
             &target_manifest,
             &target_pkg.version,
-        )?
+        )?;
+        let base_pkgbuild = if ecosystem == Ecosystem::Aur {
+            match std::fs::read_to_string(base_root.join("PKGBUILD")) {
+                Ok(text) => Some(text),
+                Err(_) => Some(String::new()),
+            }
+        } else {
+            None
+        };
+        (delta, base_pkgbuild)
     } else {
-        compute_delta(
+        (
+            compute_delta(
+                None,
+                None,
+                None,
+                &target_root,
+                &target_manifest,
+                &target_pkg.version,
+            )?,
             None,
-            None,
-            None,
-            &target_root,
-            &target_manifest,
-            &target_pkg.version,
-        )?
+        )
     };
 
     let is_unreviewed = matches!(
@@ -264,7 +276,7 @@ fn evaluate_with_registry<R: Registry, V: VersionInfo>(
         )
     };
 
-    let verdict = evaluate_with_trust(
+    let mut verdict = evaluate_with_trust(
         &target_pkg.name,
         ecosystem,
         &checksum.to_display(),
@@ -277,6 +289,26 @@ fn evaluate_with_registry<R: Registry, V: VersionInfo>(
         Some(&advisories),
         provenance.as_ref(),
     );
+
+    if ecosystem == Ecosystem::Aur {
+        if matches!(base_pkgbuild.as_deref(), Some("")) {
+            verdict.findings.push(crate::verdict::Finding {
+                rule_id: "R00_BASELINE_UNREADABLE".to_string(),
+                severity: crate::verdict::VerdictBand::Low,
+                title: "Baseline PKGBUILD unreadable".to_string(),
+                description: "baseline PKGBUILD could not be read; pair rules skipped".to_string(),
+            });
+        }
+        // `None` is first sighting (no baseline package); `Some("")` is an
+        // unreadable baseline file, already surfaced above. Both skip pair
+        // rules; anything else diffs.
+        let base_text = match base_pkgbuild.as_deref() {
+            None | Some("") => None,
+            Some(text) => Some(text),
+        };
+        let extra = crate::pkgbuild::review_roots(&target_root, base_text, &delta);
+        crate::heuristic::apply_extra_findings(&mut verdict, extra, policy);
+    }
 
     Ok((verdict, delta, checksum, unreviewed_baseline))
 }

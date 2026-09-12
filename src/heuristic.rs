@@ -660,6 +660,52 @@ pub fn evaluate_with_trust(
     }
 }
 
+/// Recompute band and score after late findings (e.g. PKGBUILD heuristics)
+/// are appended post-evaluation. Same weights and policy thresholds as the
+/// initial computation, so late HIGHs move the band instead of riding along
+/// silently.
+pub fn apply_extra_findings(verdict: &mut Verdict, extra: Vec<Finding>, policy: &Policy) {
+    verdict.findings.extend(extra);
+    let mut score: u32 = 0;
+    let mut band = VerdictBand::Low;
+    for f in &verdict.findings {
+        match f.severity {
+            VerdictBand::Block => {
+                score = score.saturating_add(50);
+                band = VerdictBand::Block;
+            }
+            VerdictBand::High => {
+                score = score.saturating_add(25);
+                if band < VerdictBand::High {
+                    band = VerdictBand::High;
+                }
+            }
+            VerdictBand::Medium => {
+                let add = if f.rule_id == "R06_FIRST_SIGHTING" {
+                    15
+                } else {
+                    10
+                };
+                score = score.saturating_add(add);
+                if band < VerdictBand::Medium {
+                    band = VerdictBand::Medium;
+                }
+            }
+            VerdictBand::Low => {}
+        }
+    }
+    let capped_score = score.min(100);
+    if capped_score >= policy.thresholds.block_score {
+        band = VerdictBand::Block;
+    } else if capped_score > policy.thresholds.max_medium_score && band < VerdictBand::High {
+        band = VerdictBand::High;
+    } else if capped_score > policy.thresholds.max_low_score && band < VerdictBand::Medium {
+        band = VerdictBand::Medium;
+    }
+    verdict.band = band;
+    verdict.risk_score = capped_score;
+}
+
 fn is_non_semver_url(v: &str) -> bool {
     const PREFIXES: [&str; 10] = [
         "git",

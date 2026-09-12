@@ -136,7 +136,7 @@ Rulings:
 
 - [x] PR1 feat/aur-foundation
 - [x] PR2 feat/aur-adapter
-- [ ] PR3 feat/pkgbuild-heuristics
+- [x] PR3 feat/pkgbuild-heuristics
 - [ ] PR4 feat/aur-integration
 
 Mark your PR's box `[x]` in the same branch before opening it.
