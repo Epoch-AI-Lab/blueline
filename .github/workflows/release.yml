@@ -245,10 +245,18 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+      attestation: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
+      - name: Attest build provenance for the release binaries
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            artifacts/binary-*/blueline
+            artifacts/binary-*/blueline.exe
       - name: Create release with all binaries
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
