@@ -28,9 +28,22 @@ pub struct Policy {
 impl Policy {
     /// Load policy from a specific file path or search standard candidate locations.
     /// Fails closed if an existing file cannot be read or contains invalid syntax.
+    /// The `BLUELINE_POLICY` environment variable scopes shells and hooks
+    /// launched outside a project directory (shims and agent hooks set and
+    /// honor it); a set-but-unreadable path fails closed.
     pub fn load_or_default(custom_path: Option<&Path>) -> Result<Self, BluelineError> {
+        Self::load_with_env(custom_path, || std::env::var("BLUELINE_POLICY").ok())
+    }
+
+    fn load_with_env(
+        custom_path: Option<&Path>,
+        env: impl Fn() -> Option<String>,
+    ) -> Result<Self, BluelineError> {
         if let Some(path) = custom_path {
             return Self::from_file(path);
+        }
+        if let Some(path) = env() {
+            return Self::from_file(Path::new(&path));
         }
 
         // Search candidate paths in priority order:
@@ -612,5 +625,29 @@ ecosystem = "rubygems"
         assert_eq!(policy.recursion.child_block_band, VerdictBand::High);
         let policy = Policy::from_toml_str("[recursion]\nchild_block_band = \"MEDIUM\"\n").unwrap();
         assert_eq!(policy.recursion.child_block_band, VerdictBand::Medium);
+    }
+    #[test]
+    fn blueline_policy_env_scopes_policy_loading_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scoped.toml");
+        std::fs::write(
+            &path,
+            "[[allowlist.packages]]\nname = \"ok\"\nallow_unreviewed_baseline = true\n",
+        )
+        .unwrap();
+        let scoped = || Some(path.display().to_string());
+        let policy = Policy::load_with_env(None, scoped).unwrap();
+        assert!(policy.allows_unreviewed_baseline("ok", crate::registry::Ecosystem::Npm));
+
+        let missing = || Some(dir.path().join("missing.toml").display().to_string());
+        assert!(
+            Policy::load_with_env(None, missing).is_err(),
+            "a set-but-unreadable BLUELINE_POLICY must fail closed"
+        );
+
+        // An explicit --policy path wins over the environment.
+        let other = dir.path().join("other.toml");
+        std::fs::write(&other, "").unwrap();
+        assert!(Policy::load_with_env(Some(&other), scoped).is_ok());
     }
 }

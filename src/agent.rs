@@ -224,11 +224,8 @@ fn decide(
                 );
                 if verdict.band != VerdictBand::Low {
                     reasons.push(format!(
-                        "{label}: {}@{} verdict {} (score {})",
-                        child_eco.key(),
-                        name,
-                        version,
-                        verdict.band
+                        "{label}: {name}@{version} verdict {} (score {})",
+                        verdict.band, verdict.risk_score
                     ));
                 }
             }

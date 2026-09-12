@@ -141,6 +141,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- The policy loader honors `BLUELINE_POLICY` (an absolute path) ahead of
+  the default search, so shimmed shells and agent hooks running outside a
+  project directory keep their policy scoping; a set-but-unreadable path
+  fails closed, and an explicit `--policy` flag wins over the environment.
 - `R23_NPM_DELIVERY` graduates from INFO to MEDIUM: recursive review now
   resolves and reviews the npm/bun packages a PKGBUILD delivery line names,
   so the delivery line is a true second-order signal. The three
