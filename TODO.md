@@ -221,6 +221,42 @@ One branch, `feat/close-the-loop`, carries all four campaigns; the PRs stack
 per campaign with explicit `--base` per the convention above. Campaign briefs
 2–4 are appended here at their campaign boundaries, before their first slice.
 
+### Campaign 4 — dogfood & distribution (research brief)
+
+State check: the self-CI dogfood jobs (blueline ci on our own
+package-lock.json and Cargo.lock on every PR) ALREADY exist in
+ci.yml; npm publishing already uses --provenance; the npm shim tree is
+complete except that the launcher shims list only the linux-x64-gnu
+binary in optionalDependencies — every other platform would install a
+launcher that cannot find a binary. That is the real distribution gap.
+
+Rulings (locked, no re-litigating):
+
+1. Fill the shim gap: packages/blueline and packages/npx carry the FULL
+   platform matrix (all seven @bluelinecli/binary-* packages) in
+   optionalDependencies, package-lock.json regenerated to match
+   (--package-lock-only), and `npx blueline` verified from a cold
+   environment via the launcher's BLUELINE_BINARY path and a real
+   `node bin/blueline.js --version`.
+2. crates.io publish config: Cargo.toml gains repository/keywords/
+   categories metadata. No publish — config only.
+3. Homebrew formula in-repo (packaging/homebrew/blueline.rb): source
+   build via cargo, GitHub tag URL, head block. No tap push.
+4. AUR scaffold in-repo (packaging/aur/PKGBUILD + .SRCINFO): builds from
+   the signed GitHub tag with cargo, checksums left as the placeholder
+   the release process fills. Reviewed with blueline's own PKGBUILD
+   heuristics via the corpus gate before it ever lands on the AUR. No AUR
+   publish.
+5. Release provenance per D9: release.yml gains
+   actions/attest-build-provenance for the GitHub-release binaries
+   (id-token: write scoped to that job); npm --provenance stays; the
+   smoke gate runs BEFORE shims publish (already ordered). NOTHING is
+   published by this campaign — publish is outward-facing and needs
+   explicit human confirmation.
+6. Dogfood runs recorded as use-it evidence: `blueline ci` against our
+   own Cargo.lock (cargo ecosystem) and package-lock.json (npm), and
+   `blueline agent review` on one of our own locked dependencies.
+
 ### Campaign 2 — agent-native enforcement (research brief)
 
 Motivation, verified against the Claude Code hooks reference, the Cursor
