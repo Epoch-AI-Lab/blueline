@@ -253,7 +253,7 @@ After all four campaigns are implemented, reviewed, and use-it verified:
 - [x] Campaign 4: dogfood & distribution — packaged, signed config wired,
       self-CI gated, publish pending user confirmation
 - [x] CI gate green on the final branch of each campaign
-- [ ] PR(s) open via make-a-pr with the full evidence trail
+- [x] PR(s) open via make-a-pr with the full evidence trail
 
 Start with Phase 0 research. Do not write implementation code before the
 Campaign 1 brief exists.
