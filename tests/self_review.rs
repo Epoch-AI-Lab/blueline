@@ -21,10 +21,11 @@ fn our_aur_pkgbuild_passes_our_own_heuristics() {
 
 #[test]
 fn npm_shims_declare_the_published_platform_matrix() {
-    let expected: [&str; 7] = [
+    let expected: [&str; 8] = [
         "@bluelinecli/binary-darwin-arm64",
         "@bluelinecli/binary-darwin-x64",
         "@bluelinecli/binary-linux-arm64-gnu",
+        "@bluelinecli/binary-linux-arm64-musl",
         "@bluelinecli/binary-linux-x64-musl",
         "@bluelinecli/binary-linux-x64-gnu",
         "@bluelinecli/binary-win32-arm64",

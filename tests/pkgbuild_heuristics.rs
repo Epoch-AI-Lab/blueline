@@ -69,3 +69,27 @@ fn benign_corpus_scores_zero_above_info() {
         loud.join("\n")
     );
 }
+
+#[test]
+fn r23_is_medium_and_fires_on_all_three_true_positive_fixtures() {
+    for fixture in R23_TRUE_POSITIVE_FIXTURES {
+        let path = benign_dir().join(fixture).join("PKGBUILD");
+        let content = fs::read_to_string(&path).unwrap();
+        let findings = review_text(&content).unwrap();
+        let hits: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "R23_NPM_DELIVERY")
+            .collect();
+        assert!(
+            !hits.is_empty(),
+            "{fixture}: expected R23 to fire, got none"
+        );
+        for hit in hits {
+            assert_eq!(
+                hit.severity,
+                VerdictBand::Medium,
+                "{fixture}: R23 must stay MEDIUM"
+            );
+        }
+    }
+}

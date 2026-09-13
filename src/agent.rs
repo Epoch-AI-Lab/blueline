@@ -8,9 +8,9 @@
 use std::io::Read;
 
 use crate::cli::RegistryBases;
-use crate::install_ref::{self, RefManager};
+use crate::install_ref::{self};
 use crate::policy::Policy;
-use crate::recursive::ReviewContext;
+use crate::recursive::{ReviewContext, child_ecosystem};
 use crate::registry::Ecosystem;
 use crate::store::BaselineStore;
 use crate::verdict::VerdictBand;
@@ -56,7 +56,8 @@ pub fn run(
     bases: &RegistryBases,
     policy_path: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
-    let policy = Policy::load_or_default(policy_path)?;
+    let policy = Policy::load_for_agent(policy_path)?;
+    warn_on_ignored_env_policy(policy_path);
     let registry = crate::review::ctxless_registry(ecosystem, bases)?;
     let (name, version) = crate::review::parse_spec_flexible(pkg_spec, registry.as_ref())?;
     let store = BaselineStore::open()?;
@@ -172,27 +173,40 @@ fn decide(
     bases: &RegistryBases,
     policy_path: Option<&std::path::Path>,
 ) -> anyhow::Result<GateDecision> {
-    let policy = Policy::load_or_default(policy_path)?;
+    let policy = Policy::load_for_agent(policy_path)?;
+    warn_on_ignored_env_policy(policy_path);
     // Shapes the token scanner cannot resolve are hard denials: pip flags
-    // that name or redirect non-registry sources, and manager tokens hidden
-    // behind quoting, escapes, or command substitution.
+    // that name or redirect non-registry sources, inline registry-redirect
+    // assignments (`PIP_INDEX_URL=...`, `NPM_CONFIG_*`, `CARGO_*`) and
+    // `.npmrc` references, and manager tokens hidden behind quoting,
+    // escapes, or command substitution.
     let mut reasons: Vec<String> = install_ref::gate_hard_denies(command)
         .into_iter()
         .map(|detail| format!("unreviewable invocation shape: {detail}"))
         .collect();
+    // An exported redirect (`PIP_INDEX_URL`, `NPM_CONFIG_REGISTRY`,
+    // `CARGO_*` in the gate's process environment) never appears in the
+    // gated command line, so it cannot deny here — but it changes where
+    // the install fetches from. Disclose it in the verdict reason and the
+    // audit trail. Names only; values are never read or stored.
+    let env_keys: Vec<String> = std::env::vars().map(|(k, _)| k).collect();
+    let redirect_env = install_ref::redirect_env_present(env_keys.iter().map(String::as_str));
+    let env_note = exported_redirect_note(&redirect_env);
     let refs = install_ref::scan_line(command);
     if refs.is_empty() {
         if reasons.is_empty() {
             return Ok(GateDecision {
                 allow: true,
-                reason: "no named package-manager install found in the command; the manifest's \
-                         dependencies are policed by `blueline ci`"
-                    .to_string(),
+                reason: with_env_note(
+                    "no named package-manager install found in the command; the manifest's \
+                     dependencies are policed by `blueline ci`",
+                    &env_note,
+                ),
             });
         }
         return Ok(GateDecision {
             allow: false,
-            reason: deny_reason(&reasons),
+            reason: with_env_note(&deny_reason(&reasons), &env_note),
         });
     }
     let store = BaselineStore::open()?;
@@ -250,6 +264,10 @@ fn decide(
             Err(e) => reasons.push(format!("{label}: review failed: {e:#}")),
         }
     }
+    let summary_detail = match &env_note {
+        Some(note) => format!("command: {}; {note}", truncate_command(command)),
+        None => format!("command: {}", truncate_command(command)),
+    };
     let _ = store.record_audit_log(
         Ecosystem::Npm,
         "command",
@@ -259,30 +277,52 @@ fn decide(
         0,
         if reasons.is_empty() { "LOW" } else { "HIGH" },
         &identity_for_audit(),
-        Some(&format!("command: {}", truncate_command(command))),
+        Some(&summary_detail),
     );
     if reasons.is_empty() {
         Ok(GateDecision {
             allow: true,
-            reason: "all named installs reviewed LOW".to_string(),
+            reason: with_env_note("all named installs reviewed LOW", &env_note),
         })
     } else {
         Ok(GateDecision {
             allow: false,
-            reason: deny_reason(&reasons),
+            reason: with_env_note(&deny_reason(&reasons), &env_note),
         })
     }
 }
 
-/// Which registry a gate-managed install resolves against: AUR helpers
-/// deliver through the AUR, cargo installs through crates.io, pip through
-/// PyPI, everything else through npm.
-fn child_ecosystem(manager: RefManager) -> Ecosystem {
-    match manager {
-        RefManager::Pip => Ecosystem::PyPi,
-        RefManager::Cargo => Ecosystem::Cargo,
-        RefManager::Yay | RefManager::Paru => Ecosystem::Aur,
-        _ => Ecosystem::Npm,
+/// Warning disclosed when redirect-capable variables are exported in the
+/// gate's process environment. Names only — values are never inspected or
+/// stored.
+fn exported_redirect_note(names: &[String]) -> Option<String> {
+    if names.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "warning: exported redirect environment present (names only): {}; \
+         the install may fetch from elsewhere than the reviewed registry",
+        names.join(", ")
+    ))
+}
+
+fn with_env_note(reason: &str, env_note: &Option<String>) -> String {
+    match env_note {
+        Some(note) => format!("{reason}; {note}"),
+        None => reason.to_string(),
+    }
+}
+
+/// Ambient `BLUELINE_POLICY` is ignored by agent entry points unless an
+/// explicit `--policy` flag names the file (see `Policy::load_for_agent`):
+/// warn on stderr so a scoped shell that expected its policy notices, and
+/// the audit trail keeps the decision it actually ran under.
+fn warn_on_ignored_env_policy(policy_path: Option<&std::path::Path>) {
+    if policy_path.is_none() && Policy::env_policy_present() {
+        eprintln!(
+            "warning: ignoring BLUELINE_POLICY from the environment; \
+             pass --policy to apply a policy file to agent review/gate"
+        );
     }
 }
 
@@ -389,5 +429,19 @@ mod tests {
         assert!(!out.contains('\n'));
         assert!(out.chars().count() <= 201);
         assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn exported_redirect_note_names_names_only() {
+        assert!(exported_redirect_note(&[]).is_none());
+        let note = exported_redirect_note(&[
+            "NPM_CONFIG_REGISTRY".to_string(),
+            "PIP_INDEX_URL".to_string(),
+        ])
+        .expect("names present must warn");
+        assert!(note.contains("NPM_CONFIG_REGISTRY"));
+        assert!(note.contains("PIP_INDEX_URL"));
+        assert!(with_env_note("ok", &None) == "ok");
+        assert!(with_env_note("ok", &Some("w".to_string())) == "ok; w");
     }
 }

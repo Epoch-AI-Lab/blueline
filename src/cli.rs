@@ -232,7 +232,7 @@ pub enum RecallAction {
 pub enum ShimAction {
     /// Write fail-closed shims that gate installs through `blueline agent gate`
     Install {
-        /// Managers to shim: npm, npx, pip, cargo, yay, paru
+        /// Managers to shim: npm, npx, pnpm, yarn, bun, bunx, pip, pip3, cargo, yay, paru
         #[arg(value_delimiter = ' ')]
         managers: Vec<String>,
 

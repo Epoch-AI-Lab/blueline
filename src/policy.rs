@@ -36,6 +36,23 @@ impl Policy {
         Self::load_with_env(custom_path, || std::env::var("BLUELINE_POLICY").ok())
     }
 
+    /// Agent entry points (`agent gate`, `agent review`) load policy through
+    /// this constructor: `BLUELINE_POLICY` from the environment is ignored
+    /// unless an explicit `--policy` flag names the file. A hook fires with
+    /// the repository as its working directory and inherits ambient env, so
+    /// honoring the variable would let any process that exports it steer
+    /// the gate. Shims pass `--policy` explicitly, so scoped shells keep
+    /// working; callers warn on stderr when ambient env is ignored.
+    pub fn load_for_agent(custom_path: Option<&Path>) -> Result<Self, BluelineError> {
+        Self::load_with_env(custom_path, || None)
+    }
+
+    /// True when `BLUELINE_POLICY` is set in the process environment, used
+    /// by agent entry points to warn that the ambient value is ignored.
+    pub fn env_policy_present() -> bool {
+        std::env::var("BLUELINE_POLICY").is_ok()
+    }
+
     fn load_with_env(
         custom_path: Option<&Path>,
         env: impl Fn() -> Option<String>,

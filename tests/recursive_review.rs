@@ -244,6 +244,109 @@ fn lifecycle_delivery_to_backdoored_child_blocks_the_parent() {
         findings.iter().any(|f| f["rule_id"] == "R27_SECOND_ORDER"),
         "parent must carry the second-order roll-up: {findings:?}"
     );
+    let rollup = findings
+        .iter()
+        .find(|f| f["rule_id"] == "R27_SECOND_ORDER")
+        .unwrap();
+    assert!(
+        rollup["description"]
+            .as_str()
+            .unwrap_or("")
+            .contains("npm:b@1.0.0"),
+        "roll-up must name the reviewed child: {rollup:?}"
+    );
+}
+
+#[test]
+fn install_reference_cycle_a_to_b_to_a_is_cut_fail_closed() {
+    let a_json =
+        r#"{"name":"a","version":"1.0.0","scripts":{"postinstall":"npm install b@1.0.0"}}"#;
+    let a_tar = tarball_with(a_json, &[]);
+    let b_json =
+        r#"{"name":"b","version":"1.0.0","scripts":{"postinstall":"npm install a@1.0.0"}}"#;
+    let b_tar = tarball_with(b_json, &[]);
+    let fixture = spawn_fixture(move |base| {
+        let mut packages = HashMap::new();
+        packages.insert(
+            "a".to_string(),
+            (packument("a", base, "1.0.0", &sha512_b64(&a_tar)), a_tar),
+        );
+        packages.insert(
+            "b".to_string(),
+            (packument("b", base, "1.0.0", &sha512_b64(&b_tar)), b_tar),
+        );
+        packages
+    });
+
+    let (code, stdout) = review_json(&fixture.base, "a@1.0.0");
+    assert_eq!(code, 2, "cyclic delivery must not be LOW: {stdout}");
+    let verdict: serde_json::Value = serde_json::from_str(stdout.lines().next().unwrap())
+        .unwrap_or_else(|e| panic!("JSON verdict expected: {e}; stdout: {stdout}"));
+    let child = verdict["recursive"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "b")
+        .expect("child b must be reviewed");
+    assert!(
+        child["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["rule_id"] == "R26_RECURSION_CYCLE"),
+        "the A → B → A loop must be cut with R26: {child:?}"
+    );
+}
+
+#[test]
+fn max_depth_1_reviews_children_but_discloses_grandchildren() {
+    let a_json =
+        r#"{"name":"a","version":"1.0.0","scripts":{"postinstall":"npm install b@1.0.0"}}"#;
+    let a_tar = tarball_with(a_json, &[]);
+    let b_json =
+        r#"{"name":"b","version":"1.0.0","scripts":{"postinstall":"npm install c@1.0.0"}}"#;
+    let b_tar = tarball_with(b_json, &[]);
+    let c_json = r#"{"name":"c","version":"1.0.0"}"#;
+    let c_tar = tarball_with(c_json, &[]);
+    let fixture = spawn_fixture(move |base| {
+        let mut packages = HashMap::new();
+        packages.insert(
+            "a".to_string(),
+            (packument("a", base, "1.0.0", &sha512_b64(&a_tar)), a_tar),
+        );
+        packages.insert(
+            "b".to_string(),
+            (packument("b", base, "1.0.0", &sha512_b64(&b_tar)), b_tar),
+        );
+        packages.insert(
+            "c".to_string(),
+            (packument("c", base, "1.0.0", &sha512_b64(&c_tar)), c_tar),
+        );
+        packages
+    });
+
+    let policy_dir = tempfile::tempdir().unwrap();
+    let policy_path = policy_dir.path().join("blueline.toml");
+    std::fs::write(&policy_path, "[recursion]\nmax_depth = 1\n").unwrap();
+    let (code, stdout) = review_json_with_policy(&fixture.base, "a@1.0.0", Some(&policy_path));
+    assert_eq!(code, 2, "second-order delivery must not be LOW: {stdout}");
+    let verdict: serde_json::Value = serde_json::from_str(stdout.lines().next().unwrap())
+        .unwrap_or_else(|e| panic!("JSON verdict expected: {e}; stdout: {stdout}"));
+    assert_eq!(
+        verdict["recursive"].as_array().unwrap().len(),
+        1,
+        "depth-1 child b is still reviewed: {stdout}"
+    );
+    let child = &verdict["recursive"][0];
+    assert_eq!(child["name"], "b");
+    assert!(
+        child["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["rule_id"] == "R25_RECURSION_DEPTH"),
+        "grandchild c exceeds max_depth=1 and must be disclosed R25: {child:?}"
+    );
 }
 
 #[test]

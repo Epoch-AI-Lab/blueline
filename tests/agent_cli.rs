@@ -239,6 +239,10 @@ fn agent_gate_uses_exit_codes_and_native_decision_shapes() {
     ]);
     assert_eq!(code, 2);
     assert!(stderr.contains("blueline refused"), "{stderr}");
+    assert!(
+        stderr.contains("risky@1.0.0"),
+        "denial must name the refused spec: {stderr}"
+    );
 
     // Dynamic target: fail closed.
     let (code, _, stderr) = agent(&[

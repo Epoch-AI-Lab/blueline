@@ -284,6 +284,56 @@ fn now_secs() -> i64 {
 }
 
 #[test]
+fn backward_sequence_is_refused_without_write_and_equal_sequence_is_idempotent() {
+    let work = tempfile::tempdir().unwrap();
+    let index_path = work.path().join("revocations.json");
+    std::fs::write(&index_path, curated_index(now_secs())).unwrap();
+    let server = spawn_recall_server(&index_path);
+
+    let data_dir = tempfile::tempdir().unwrap();
+    let out = blueline(data_dir.path())
+        .args(["recall", "sync", "--url", &server.url])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let snapshot_path = data_dir.path().join("recall_snapshot.json");
+    let synced_bytes = std::fs::read(&snapshot_path).unwrap();
+
+    // Backward sequence: refused, and the stored snapshot is untouched.
+    let stale_index = curated_index(now_secs()).replace("\"sequence\":42", "\"sequence\":41");
+    let old_dir = tempfile::tempdir().unwrap();
+    let old_index = old_dir.path().join("revocations.json");
+    std::fs::write(&old_index, stale_index).unwrap();
+    let old_server = spawn_recall_server(&old_index);
+    let out = blueline(data_dir.path())
+        .args(["recall", "sync", "--url", &old_server.url])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let reread = std::fs::read(&snapshot_path).unwrap();
+    assert_eq!(
+        reread, synced_bytes,
+        "refused sync must not partially write"
+    );
+    let stored: serde_json::Value = serde_json::from_slice(&reread).unwrap();
+    assert_eq!(stored["snapshot"]["sequence"], 42);
+
+    // Equal sequence: accepted and byte-identical (idempotent re-sync).
+    let out = blueline(data_dir.path())
+        .args(["recall", "sync", "--url", &server.url])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "equal sequence must re-sync cleanly: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&snapshot_path).unwrap()).unwrap();
+    assert_eq!(stored["snapshot"]["sequence"], 42);
+}
+
+#[test]
 fn stale_index_is_disclosed_and_escalates_per_policy() {
     let data_dir = tempfile::tempdir().unwrap();
     let snapshot_path = data_dir.path().join("recall_snapshot.json");
@@ -371,6 +421,64 @@ fn stale_index_is_disclosed_and_escalates_per_policy() {
 }
 
 #[test]
+fn corrupt_snapshot_is_disclosed_high_and_blocks_low() {
+    let data_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        data_dir.path().join("recall_snapshot.json"),
+        "{ not valid json",
+    )
+    .unwrap();
+
+    let json = r#"{"name":"clean","version":"1.0.0"}"#;
+    let tar = tarball_with(json);
+    let fixture = spawn_fixture(move |base| {
+        let mut packages = HashMap::new();
+        packages.insert(
+            "clean".to_string(),
+            (packument("clean", base, "1.0.0", &sha512_b64(&tar)), tar),
+        );
+        packages
+    });
+
+    let policy_dir = tempfile::tempdir().unwrap();
+    let policy_path = policy_dir.path().join("blueline.toml");
+    std::fs::write(
+        &policy_path,
+        "[[allowlist.packages]]\nname = \"clean\"\nallow_unreviewed_baseline = true\n",
+    )
+    .unwrap();
+
+    let out = blueline(data_dir.path())
+        .args([
+            "review",
+            "clean@1.0.0",
+            "--registry",
+            &fixture.base,
+            "--output",
+            "json",
+            "--yes",
+            "--policy",
+            policy_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let verdict: serde_json::Value = serde_json::from_str(stdout.lines().next().unwrap()).unwrap();
+    let corrupt = verdict["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["rule_id"] == "R28_RECALL_STALE")
+        .expect("corrupt index must be disclosed as R28")
+        .clone();
+    assert_eq!(corrupt["severity"], "HIGH", "{corrupt:?}");
+    assert_ne!(
+        verdict["band"], "LOW",
+        "a blind revocation index is never LOW: {stdout}"
+    );
+}
+
+#[test]
 fn audit_export_candidates_lists_denials_for_curation() {
     let data_dir = tempfile::tempdir().unwrap();
     // An agent-gate denial writes the audit row the curator would review.
@@ -406,12 +514,12 @@ fn audit_export_candidates_lists_denials_for_curation() {
     let entries = candidates.as_array().unwrap();
     assert!(
         entries.iter().any(|e| {
-            e["verdict"] != "LOW"
-                && (e["package"] == "risky-thing"
-                    || e["notes"]
-                        .as_str()
-                        .is_some_and(|n| n.contains("risky-thing")))
+            e["action"] == "agent_gate_summary"
+                && e["verdict"] == "HIGH"
+                && e["notes"]
+                    .as_str()
+                    .is_some_and(|n| n.contains("risky-thing"))
         }),
-        "the denial must be a curation candidate: {entries:?}"
+        "the gate summary denial must be a curation candidate: {entries:?}"
     );
 }

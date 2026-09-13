@@ -1,4 +1,4 @@
-# Maintainer: Kriday Dave <kriday@epochailab.example>
+# Maintainer: Kriday Dave <technocratix902@gmail.com>
 # Blueline reviews this file with its own PKGBUILD heuristics before it
 # ever lands on the AUR; sources are pinned to the signed GitHub tag.
 pkgname=blueline
@@ -10,7 +10,13 @@ url="https://github.com/Epoch-AI-Lab/blueline"
 license=('MIT')
 makedepends=('cargo' 'git')
 source=("${pkgname}-${pkgver}.tar.gz::https://github.com/Epoch-AI-Lab/blueline/archive/refs/tags/v${pkgver}.tar.gz")
+# Release process: after retagging pkgver above, fill the tag-tarball hash
+# with `makepkg -g` output and regenerate .SRCINFO via
+# `makepkg --printsrcinfo > .SRCINFO`. Never ship FILL_AT_RELEASE.
 sha256sums=('FILL_AT_RELEASE')
+# !lto per the ArchWiki Rust guidelines: blueline links bundled C objects
+# (rusqlite/SQLite) and makepkg-injected LTO flags break that link. It only
+# governs intermediate C/C++ objects; Rust LTO from Cargo.toml still applies.
 options=(!lto)
 
 build() {

@@ -206,9 +206,64 @@ impl Snapshot {
     pub fn lookup(&self, ecosystem: Ecosystem, name: &str, version: &str) -> Option<&Revocation> {
         self.revocations.iter().find(|rev| {
             rev.ecosystem == ecosystem
-                && rev.name == name
-                && (rev.all_versions || rev.versions.iter().any(|v| v == version))
+                && names_match(ecosystem, &rev.name, name)
+                && (rev.all_versions
+                    || rev
+                        .versions
+                        .iter()
+                        .any(|v| versions_match(ecosystem, v, version)))
         })
+    }
+}
+
+/// Name identity for revocation matching: PEP 503 canonicalization on both
+/// sides for PyPI (a revocation for `foo-bar` fires on `Foo_Bar`), exact
+/// match elsewhere where separators are significant.
+fn names_match(ecosystem: Ecosystem, indexed: &str, queried: &str) -> bool {
+    match ecosystem {
+        Ecosystem::PyPi => {
+            crate::version::canonicalize_name(indexed) == crate::version::canonicalize_name(queried)
+        }
+        _ => indexed == queried,
+    }
+}
+
+/// Version identity for revocation matching: parsed-and-compared per
+/// ecosystem grammar so `1.0` fires on `1.0.0` (PEP 440 zero-padding,
+/// semver build metadata). Unparseable input falls back to exact match
+/// rather than failing open.
+fn versions_match(ecosystem: Ecosystem, indexed: &str, queried: &str) -> bool {
+    if indexed == queried {
+        return true;
+    }
+    match ecosystem {
+        Ecosystem::Npm | Ecosystem::Cargo => {
+            match (
+                semver::Version::parse(indexed),
+                semver::Version::parse(queried),
+            ) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            }
+        }
+        Ecosystem::PyPi => {
+            match (
+                crate::version::Pep440Version::parse(indexed),
+                crate::version::Pep440Version::parse(queried),
+            ) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            }
+        }
+        Ecosystem::Aur => {
+            match (
+                crate::version::AurVersionInfo::parse(indexed),
+                crate::version::AurVersionInfo::parse(queried),
+            ) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            }
+        }
     }
 }
 
@@ -415,6 +470,50 @@ mod tests {
         let mut snap = valid_snapshot();
         snap.revocations[0].versions.clear();
         assert!(snap.validate().is_err());
+    }
+
+    #[test]
+    fn lookup_normalizes_pypi_names_and_versions() {
+        let snap = Snapshot {
+            schema: SNAPSHOT_SCHEMA,
+            generated_at: now_secs() - 60,
+            sequence: 7,
+            revocations: vec![Revocation {
+                ecosystem: Ecosystem::PyPi,
+                name: "foo-bar".into(),
+                versions: vec!["1.0".into()],
+                all_versions: false,
+                reason: "revoked".into(),
+                id: "BL-2026-0002".into(),
+            }],
+        };
+        assert!(snap.lookup(Ecosystem::PyPi, "Foo_Bar", "1.0.0").is_some());
+        assert!(snap.lookup(Ecosystem::PyPi, "foo.bar", "1.0").is_some());
+        assert!(snap.lookup(Ecosystem::PyPi, "foo-bar", "2.0").is_none());
+        assert!(snap.lookup(Ecosystem::Npm, "Foo_Bar", "1.0.0").is_none());
+        let npm_snap = Snapshot {
+            schema: SNAPSHOT_SCHEMA,
+            generated_at: now_secs() - 60,
+            sequence: 7,
+            revocations: vec![Revocation {
+                ecosystem: Ecosystem::Npm,
+                name: "foo_bar".into(),
+                versions: vec!["1.0.0".into()],
+                all_versions: false,
+                reason: "revoked".into(),
+                id: "BL-2026-0003".into(),
+            }],
+        };
+        assert!(
+            npm_snap
+                .lookup(Ecosystem::Npm, "foo_bar", "1.0.0")
+                .is_some()
+        );
+        assert!(
+            npm_snap
+                .lookup(Ecosystem::Npm, "foo-bar", "1.0.0")
+                .is_none()
+        );
     }
 
     #[test]

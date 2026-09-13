@@ -284,6 +284,54 @@ fn shim_installs_gates_and_uninstalls() {
 }
 
 #[test]
+fn shim_installs_all_eleven_managers() {
+    let work = tempfile::tempdir().unwrap();
+    let shim_dir = work.path().join("shims");
+    let data_dir = tempfile::tempdir().unwrap();
+    let bin_dir = work.path().join("realbin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    for manager in [
+        "npm", "npx", "pnpm", "yarn", "bun", "bunx", "pip", "pip3", "cargo", "yay", "paru",
+    ] {
+        let bin = bin_dir.join(manager);
+        std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    let managers: Vec<&str> = vec![
+        "npm", "npx", "pnpm", "yarn", "bun", "bunx", "pip", "pip3", "cargo", "yay", "paru",
+    ];
+    let out = Command::cargo_bin("blueline")
+        .unwrap()
+        .arg("shim")
+        .arg("install")
+        .args(&managers)
+        .arg("--dir")
+        .arg(shim_dir.to_str().unwrap())
+        .env("BLUELINE_DATA_DIR", data_dir.path())
+        .env(
+            "PATH",
+            format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap()),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "installing all managers failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for manager in managers {
+        assert!(
+            shim_dir.join(manager).is_file(),
+            "{manager} shim must exist"
+        );
+    }
+}
+
+#[test]
 fn shim_install_refuses_unknown_manager_and_missing_real_binary() {
     let work = tempfile::tempdir().unwrap();
     let shim_dir = work.path().join("shims");
@@ -302,6 +350,11 @@ fn shim_install_refuses_unknown_manager_and_missing_real_binary() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unknown shim manager"),
+        "must name the refusal: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // No real `npm` on the (emptied) PATH: fail closed, no shim written.
     let out = Command::cargo_bin("blueline")
@@ -321,6 +374,11 @@ fn shim_install_refuses_unknown_manager_and_missing_real_binary() {
         out.status.code(),
         Some(1),
         "missing real binary must fail closed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no real `npm` binary"),
+        "must disclose the missing binary: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(!shim_dir.join("npm").exists());

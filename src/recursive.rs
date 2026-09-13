@@ -108,7 +108,7 @@ impl ReviewContext {
     pub fn enter_scope(&mut self, ecosystem: Ecosystem, name: &str, version: &str, root: bool) {
         self.stack.push((
             ecosystem,
-            crate::version::canonicalize_name(name),
+            crate::version::canonicalize_for_ecosystem(ecosystem, name),
             version.to_string(),
         ));
         let label = if root {
@@ -155,18 +155,20 @@ impl ReviewContext {
             let Some((name, version_part)) = r.registry_spec() else {
                 continue;
             };
-            let child_eco = match r.manager {
-                RefManager::Pip => Ecosystem::PyPi,
-                _ => Ecosystem::Npm,
-            };
+            let child_eco = child_ecosystem(r.manager);
             let chain = self.chain.clone();
             // A repeated reference to an already-reviewed package reuses
             // the cached review without re-resolving, budget or not.
-            let canon_name = crate::version::canonicalize_name(name);
+            let canon_name = crate::version::canonicalize_for_ecosystem(child_eco, name);
             if let Some(stored_key) = self.completed_names.get(&(child_eco, canon_name.clone())) {
                 let same_version = match version_part {
                     Some(v) => stored_key.2 == v,
-                    None => true,
+                    // An unpinned reference floats with the registry: it may
+                    // only reuse the cached review when the resolved latest
+                    // equals the stored version. Never assume that here —
+                    // resolution below either reuses the exact completed
+                    // review or reviews the new latest.
+                    None => false,
                 };
                 if same_version && let Some(cached) = self.completed.get(stored_key) {
                     let mut child = cached.clone();
@@ -249,12 +251,13 @@ impl ReviewContext {
     /// Identity placeholder for a reference whose target was never resolved
     /// (cap hit before resolution): the raw spec, not a guessed version.
     fn dropped_key(&self, r: &InstallRef) -> ReviewKey {
-        let child_eco = match r.manager {
-            RefManager::Pip => Ecosystem::PyPi,
-            _ => Ecosystem::Npm,
-        };
+        let child_eco = child_ecosystem(r.manager);
         let (name, _) = r.registry_spec().unwrap_or(("", None));
-        (child_eco, name.to_string(), String::new())
+        (
+            child_eco,
+            crate::version::canonicalize_for_ecosystem(child_eco, name),
+            String::new(),
+        )
     }
 
     fn resolve_child_version(
@@ -475,6 +478,13 @@ pub fn second_order_finding(child: &ChildReview) -> Finding {
     }
 }
 
+/// Which registry a referenced install resolves against. Delegates to the
+/// manager's own mapping so the gate and the recursive reviewer can never
+/// disagree about where a `cargo install` or `yay -S` lands.
+pub(crate) fn child_ecosystem(manager: RefManager) -> Ecosystem {
+    manager.ecosystem()
+}
+
 /// Registry factory shared by the review context and one-off spec
 /// resolution: AUR parents deliver through npm, pip invocations in wheel
 /// scripts resolve in PyPI.
@@ -484,5 +494,44 @@ pub(crate) fn registry_for(ecosystem: Ecosystem, base: &str) -> Rc<dyn Registry>
         Ecosystem::Cargo => Rc::new(crate::registry::cratesio::CratesIoRegistry::new(base)),
         Ecosystem::PyPi => Rc::new(crate::registry::pypi::PyPIRegistry::new(base)),
         Ecosystem::Aur => Rc::new(crate::registry::aur::AurRegistry::new(base)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn child_ecosystem_routes_cargo_and_aur_helpers() {
+        assert_eq!(child_ecosystem(RefManager::Cargo), Ecosystem::Cargo);
+        assert_eq!(child_ecosystem(RefManager::Yay), Ecosystem::Aur);
+        assert_eq!(child_ecosystem(RefManager::Paru), Ecosystem::Aur);
+        assert_eq!(child_ecosystem(RefManager::Pip), Ecosystem::PyPi);
+        assert_eq!(child_ecosystem(RefManager::Npm), Ecosystem::Npm);
+        assert_eq!(child_ecosystem(RefManager::Npx), Ecosystem::Npm);
+    }
+
+    #[test]
+    fn dropped_key_uses_the_child_registry() {
+        let ctx = ReviewContext::new(
+            &Policy::default(),
+            crate::cli::RegistryBases {
+                npm: String::new(),
+                cargo: String::new(),
+                pypi: String::new(),
+                aur: String::new(),
+            },
+        );
+        for (manager, ecosystem) in [
+            (RefManager::Cargo, Ecosystem::Cargo),
+            (RefManager::Yay, Ecosystem::Aur),
+            (RefManager::Paru, Ecosystem::Aur),
+            (RefManager::Pip, Ecosystem::PyPi),
+            (RefManager::Npm, Ecosystem::Npm),
+        ] {
+            let r = crate::install_ref::raw_ref(RefOrigin::CommandLine, manager, "some-pkg");
+            let key = ctx.dropped_key(&r);
+            assert_eq!(key.0, ecosystem, "{manager:?} must drop into {ecosystem:?}");
+        }
     }
 }

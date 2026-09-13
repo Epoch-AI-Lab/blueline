@@ -329,7 +329,7 @@ fn evaluate_with_registry<V: VersionInfo>(
 
     // Recall-index staleness (R28): a synced snapshot older than the
     // policy window is disclosed; an unreadable one is disclosed at
-    // MEDIUM — never silently ignored.
+    // HIGH — a blind revocation index is a coverage hole, never silence.
     match crate::recall::stale_band(policy) {
         Ok(Some(band)) => {
             let finding = crate::verdict::Finding {
@@ -347,7 +347,7 @@ fn evaluate_with_registry<V: VersionInfo>(
         Err(e) => {
             let finding = crate::verdict::Finding {
                 rule_id: "R28_RECALL_STALE".to_string(),
-                severity: crate::verdict::VerdictBand::Medium,
+                severity: crate::verdict::VerdictBand::High,
                 title: "Recall index unreadable".to_string(),
                 description: format!("the synced revocation index could not be read: {e:#}"),
             };
@@ -359,8 +359,12 @@ fn evaluate_with_registry<V: VersionInfo>(
     // is disclosed (R24), then piped through the same review engine with
     // depth/cycle/budget caps failing closed (R25/R26), and child findings
     // at or above the policy band roll up into this verdict (R27).
-    let mut refs = collect_install_refs(ecosystem, &target_root, &target_manifest, &delta);
+    let (mut refs, target_disclosure) =
+        collect_install_refs(ecosystem, &target_root, &target_manifest, &delta);
     let mut ref_findings = crate::recursive::install_ref_findings(&refs);
+    if let Some(finding) = target_disclosure {
+        ref_findings.push(finding);
+    }
     if refs.len() > MAX_INSTALL_REFS {
         let total = refs.len();
         refs.truncate(MAX_INSTALL_REFS);
@@ -408,15 +412,21 @@ fn collect_install_refs(
     target_root: &std::path::Path,
     target_manifest: &crate::manifest::PackageJson,
     delta: &crate::diff::Delta,
-) -> Vec<InstallRef> {
+) -> (Vec<InstallRef>, Option<crate::verdict::Finding>) {
     match ecosystem {
-        Ecosystem::Npm => crate::install_ref::from_npm_lifecycle(target_manifest),
-        Ecosystem::PyPi => crate::install_ref::from_wheel_data_scripts(target_root, delta),
-        Ecosystem::Aur => {
-            let text = std::fs::read_to_string(target_root.join("PKGBUILD")).unwrap_or_default();
-            crate::pkgbuild::npm_delivery_refs(&text)
-        }
-        Ecosystem::Cargo => Vec::new(),
+        Ecosystem::Npm => (
+            crate::install_ref::from_npm_lifecycle(target_manifest),
+            None,
+        ),
+        Ecosystem::PyPi => (
+            crate::install_ref::from_wheel_data_scripts(target_root, delta),
+            None,
+        ),
+        Ecosystem::Aur => match std::fs::read_to_string(target_root.join("PKGBUILD")) {
+            Ok(text) => (crate::pkgbuild::npm_delivery_refs(&text), None),
+            Err(e) => (Vec::new(), Some(target_unreadable_finding(&e.to_string()))),
+        },
+        Ecosystem::Cargo => (Vec::new(), None),
     }
 }
 
@@ -511,6 +521,20 @@ fn baseline_unreadable_finding() -> crate::verdict::Finding {
         severity: crate::verdict::VerdictBand::High,
         title: "Baseline PKGBUILD unreadable".to_string(),
         description: "baseline PKGBUILD could not be read; pair rules skipped".to_string(),
+    }
+}
+
+// The target PKGBUILD itself cannot be read (permissions, non-UTF-8):
+// delivery references are unextractable, so the hole is disclosed at the
+// same HIGH band rather than scanned as an empty file.
+fn target_unreadable_finding(detail: &str) -> crate::verdict::Finding {
+    crate::verdict::Finding {
+        rule_id: "R00_BASELINE_UNREADABLE".to_string(),
+        severity: crate::verdict::VerdictBand::High,
+        title: "Target PKGBUILD unreadable".to_string(),
+        description: format!(
+            "target PKGBUILD could not be read ({detail}); delivery references unextractable"
+        ),
     }
 }
 
@@ -994,6 +1018,31 @@ mod tests {
     }
 
     #[test]
+    fn target_unreadable_pkgbuild_is_disclosed_high() {
+        let f = target_unreadable_finding("permission denied");
+        assert_eq!(f.rule_id, "R00_BASELINE_UNREADABLE");
+        assert_eq!(f.severity, crate::verdict::VerdictBand::High);
+        assert!(f.description.contains("permission denied"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let delta = crate::diff::Delta {
+            baseline_version: None,
+            target_version: "1.0-1".into(),
+            ..Default::default()
+        };
+        let manifest = crate::manifest::PackageJson {
+            name: "demo".into(),
+            version: "1.0-1".into(),
+            ..Default::default()
+        };
+        let (refs, disclosure) =
+            collect_install_refs(Ecosystem::Aur, dir.path(), &manifest, &delta);
+        assert!(refs.is_empty());
+        let finding = disclosure.expect("missing PKGBUILD must disclose, never silent allow");
+        assert_eq!(finding.severity, crate::verdict::VerdictBand::High);
+    }
+
+    #[test]
     fn parses_plain_spec() {
         assert_eq!(
             parse_spec("express@4.21.2", Ecosystem::Npm).unwrap(),
@@ -1361,12 +1410,14 @@ mod recursive_tests {
             &self,
             name: &str,
         ) -> Result<Vec<semver::Version>, crate::error::BluelineError> {
-            Ok(self
+            let mut versions: Vec<semver::Version> = self
                 .packages
                 .keys()
                 .filter(|k| k.rsplit_once('@').map(|(n, _)| n == name).unwrap_or(false))
                 .filter_map(|k| k.rsplit_once('@')?.1.parse().ok())
-                .collect())
+                .collect();
+            versions.sort();
+            Ok(versions)
         }
         fn list_releases(&self, name: &str) -> Result<Vec<Release>, crate::error::BluelineError> {
             Ok(self
@@ -1621,6 +1672,76 @@ mod recursive_tests {
                 .iter()
                 .any(|f| f.rule_id == "R25_RECURSION_DEPTH"),
             "reusing a completed review is not a cap violation"
+        );
+    }
+
+    #[test]
+    fn unpinned_reference_does_not_reuse_a_stale_pinned_review() {
+        // `foo@1.0.0` is reviewed first; the bare `foo` floats and must
+        // resolve the current latest (`2.0.0`) for its own review rather
+        // than reusing the completed `1.0.0` review. Reusing it would vouch
+        // for bytes the install never fetches.
+        let policy = no_advisory_policy();
+        let (verdict, _) = evaluate_test(
+            &[
+                (
+                    "a@1.0.0",
+                    r#"{"name":"a","version":"1.0.0","scripts":{"postinstall":"npm install foo@1.0.0 && npm install foo"}}"#,
+                ),
+                ("foo@1.0.0", r#"{"name":"foo","version":"1.0.0"}"#),
+                ("foo@2.0.0", r#"{"name":"foo","version":"2.0.0"}"#),
+            ],
+            "a@1.0.0",
+            &policy,
+        );
+        assert_eq!(
+            verdict.recursive.len(),
+            2,
+            "pinned and floating references must each be reviewed: {}",
+            serde_json::to_string(&verdict.recursive).unwrap_or_default()
+        );
+        let mut versions: Vec<&str> = verdict
+            .recursive
+            .iter()
+            .map(|c| c.version.as_str())
+            .collect();
+        versions.sort_unstable();
+        assert_eq!(versions, ["1.0.0", "2.0.0"]);
+    }
+
+    #[test]
+    fn unpinned_reference_reuses_the_exact_completed_review() {
+        // When the floating reference resolves to the already-reviewed
+        // release, the exact completed review is reused: one fresh review,
+        // two roll-ups, no cap violation.
+        let policy = no_advisory_policy();
+        let (verdict, _) = evaluate_test(
+            &[
+                (
+                    "a@1.0.0",
+                    r#"{"name":"a","version":"1.0.0","scripts":{"postinstall":"npm install foo@1.0.0 && npm install foo"}}"#,
+                ),
+                ("foo@1.0.0", r#"{"name":"foo","version":"1.0.0"}"#),
+            ],
+            "a@1.0.0",
+            &policy,
+        );
+        assert_eq!(verdict.recursive.len(), 2);
+        assert!(
+            verdict.recursive.iter().all(|c| c.version == "1.0.0"),
+            "both references resolve the same release: {:?}",
+            verdict
+                .recursive
+                .iter()
+                .map(|c| &c.version)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "R25_RECURSION_DEPTH"),
+            "reusing the exact completed review is not a cap violation"
         );
     }
 

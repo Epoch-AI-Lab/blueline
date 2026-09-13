@@ -21,6 +21,7 @@
     "@bluelinecli/binary-darwin-arm64": "*",
     "@bluelinecli/binary-darwin-x64": "*",
     "@bluelinecli/binary-linux-arm64-gnu": "*",
+    "@bluelinecli/binary-linux-arm64-musl": "*",
     "@bluelinecli/binary-linux-x64-musl": "*",
     "@bluelinecli/binary-linux-x64-gnu": "*",
     "@bluelinecli/binary-win32-arm64": "*",

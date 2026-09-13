@@ -1,6 +1,6 @@
-//! PATH-shim routing: generated bash shims that route `npm`, `npx`, `pip`,
-//! `cargo`, `yay`, and `paru` invocations through `blueline agent gate`
-//! before the real package manager runs. Fail closed everywhere: if
+//! PATH-shim routing: generated bash shims that route `npm`, `npx`, `pnpm`,
+//! `yarn`, `bun`, `bunx`, `pip`, `cargo`, `yay`, and `paru` invocations
+//! through `blueline agent gate` before the real package manager runs. Fail closed everywhere: if
 //! blueline is missing, errors, or refuses, the install does not run.
 //! Shims are a backstop for the interactive terminal, never the primary
 //! gate (hooks and MCP are); every known bypass is documented in the
@@ -8,7 +8,9 @@
 
 use std::path::{Path, PathBuf};
 
-pub const SHIM_MANAGERS: [&str; 7] = ["npm", "npx", "pip", "pip3", "cargo", "yay", "paru"];
+pub const SHIM_MANAGERS: [&str; 11] = [
+    "npm", "npx", "pnpm", "yarn", "bun", "bunx", "pip", "pip3", "cargo", "yay", "paru",
+];
 
 fn default_dir() -> anyhow::Result<PathBuf> {
     if let Ok(dir) = std::env::var("BLUELINE_DATA_DIR") {
@@ -102,7 +104,7 @@ fi
         );
     }
     script.push_str(&match manager {
-        "npm" | "npx" => r#"
+        "npm" | "npx" | "pnpm" | "yarn" | "bun" | "bunx" => r#"
 args=(agent gate --command "${cmd[*]}" --format plain)
 args+=(--registry "${BLUELINE_REGISTRY:-https://registry.npmjs.org}")
 "#
@@ -206,6 +208,35 @@ pub fn uninstall(managers: &[String], dir: Option<&Path>) -> anyhow::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_shim_managers_cover_every_scanned_manager() {
+        for manager in [
+            "npm", "npx", "pnpm", "yarn", "bun", "bunx", "pip", "pip3", "cargo", "yay", "paru",
+        ] {
+            assert!(
+                SHIM_MANAGERS.contains(&manager),
+                "scanned manager `{manager}` must have shim coverage"
+            );
+        }
+    }
+
+    #[test]
+    fn node_family_shims_forward_the_registry_override() {
+        for manager in ["pnpm", "yarn", "bun", "bunx"] {
+            let script = shim_script(
+                manager,
+                Path::new("/usr/local/bin/blueline"),
+                Path::new("/usr/bin/tool"),
+            );
+            assert!(
+                script.contains("BLUELINE_REGISTRY"),
+                "{manager} shim must forward BLUELINE_REGISTRY"
+            );
+            assert!(script.contains("agent gate"));
+            assert!(script.contains("exec \"$REAL\" \"$@\""));
+        }
+    }
 
     #[test]
     fn shim_script_is_fail_closed_and_execs_real_binary() {

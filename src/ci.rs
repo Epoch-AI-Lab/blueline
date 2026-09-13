@@ -307,11 +307,13 @@ pub fn evaluate_lockfile_diff(
         let (mut verdict, _, checksum, _) =
             evaluate_package(name, new_version, ctx.ecosystem, store, policy, &mut rctx)?;
 
-        // If lockfile declared a hash, verify it matches
-        if let Some(expected_integ) = head_integrity_map
-            .get(name)
-            .or_else(|| head_integrity_map.get(&crate::version::canonicalize_name(name)))
-        {
+        // If lockfile declared a hash, verify it matches. The PEP 503
+        // alias lookup is PyPI-only: on npm/cargo `foo_bar` and `foo-bar`
+        // are distinct packages and must never share an integrity entry.
+        let canon_alias = (ctx.ecosystem == Ecosystem::PyPi)
+            .then(|| head_integrity_map.get(&crate::version::canonicalize_name(name)))
+            .flatten();
+        if let Some(expected_integ) = head_integrity_map.get(name).or(canon_alias) {
             let matches_integ = expected_integ.split_whitespace().any(|expected_one| {
                 let expected_hex = expected_one.strip_prefix("sha256:").unwrap_or(expected_one);
                 checksum.value_hex.eq_ignore_ascii_case(expected_hex)

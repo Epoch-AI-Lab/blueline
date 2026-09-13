@@ -93,7 +93,8 @@ jobs:
           expected = {
               "@bluelinecli/cli", "blueline",
               "@bluelinecli/binary-darwin-arm64", "@bluelinecli/binary-darwin-x64",
-              "@bluelinecli/binary-linux-arm64-gnu", "@bluelinecli/binary-linux-x64-musl",
+              "@bluelinecli/binary-linux-arm64-gnu", "@bluelinecli/binary-linux-arm64-musl",
+              "@bluelinecli/binary-linux-x64-musl",
               "@bluelinecli/binary-linux-x64-gnu", "@bluelinecli/binary-win32-arm64",
               "@bluelinecli/binary-win32-x64",
           }
@@ -102,9 +103,12 @@ jobs:
           # the lockfile delta must produce evaluations, and unchanged
           # packages must still be counted. Which shipped packages land in
           # the delta is PR-dependent, so a hardcoded missing-set is wrong.
+          # An empty delta (docs-only PR) is healthy, not a scanner failure.
           unknown = names - expected
           assert not unknown, f"scanner evaluated unknown packages: {unknown}"
-          assert r["total_evaluated"] > 0, "lockfile delta produced no evaluations"
+          if r["total_evaluated"] == 0:
+              print("dogfood scanner healthy: empty lockfile delta, nothing to evaluate")
+              sys.exit(0)
           assert r["unchanged_count"] > 0, "nothing unchanged — scan saw nothing"
 
           print(f"dogfood scanner healthy: evaluated {r['total_evaluated']}, "
@@ -186,7 +190,9 @@ jobs:
             --file src/registry/pypi.rs --file src/wheel_extract.rs --file src/baseline.rs \
             --file src/version.rs --file src/review.rs --file src/store.rs \
             --file src/executor.rs --file src/lockfile.rs --file src/ci.rs \
-            --file src/mcp.rs \
+            --file src/mcp.rs --file src/install_ref.rs --file src/recursive.rs \
+            --file src/agent.rs --file src/recall.rs --file src/shim.rs \
+            --file src/pkgbuild.rs --file src/render.rs --file src/policy.rs \
             --in-place --baseline=skip --timeout 30
       - uses: actions/upload-artifact@v4
         if: always()
@@ -234,7 +240,9 @@ jobs:
             --file src/registry/pypi.rs --file src/wheel_extract.rs --file src/baseline.rs \
             --file src/version.rs --file src/review.rs --file src/store.rs \
             --file src/executor.rs --file src/lockfile.rs --file src/ci.rs \
-            --file src/mcp.rs \
+            --file src/mcp.rs --file src/install_ref.rs --file src/recursive.rs \
+            --file src/agent.rs --file src/recall.rs --file src/shim.rs \
+            --file src/pkgbuild.rs --file src/render.rs --file src/policy.rs \
             --in-place --baseline=skip --timeout 30
       - uses: actions/upload-artifact@v4
         if: always()
