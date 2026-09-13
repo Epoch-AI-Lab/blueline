@@ -57,7 +57,7 @@ pub fn run(
     policy_path: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     let policy = Policy::load_for_agent(policy_path)?;
-    warn_on_ignored_env_policy(policy_path);
+    let _ = warn_on_ignored_env_policy(policy_path, &|k| std::env::var(k).ok());
     let registry = crate::review::ctxless_registry(ecosystem, bases)?;
     let (name, version) = crate::review::parse_spec_flexible(pkg_spec, registry.as_ref())?;
     let store = BaselineStore::open()?;
@@ -136,12 +136,24 @@ pub fn gate(
 }
 
 fn read_hook_command() -> anyhow::Result<String> {
+    read_hook_command_from(std::io::stdin())
+}
+
+fn hook_stdin_limit() -> u64 {
+    MAX_HOOK_STDIN_BYTES as u64 + 1
+}
+
+fn hook_stdin_too_large(len: usize) -> bool {
+    len > MAX_HOOK_STDIN_BYTES
+}
+
+fn read_hook_command_from<R: Read>(reader: R) -> anyhow::Result<String> {
     let mut buf = Vec::new();
-    std::io::stdin()
-        .take(MAX_HOOK_STDIN_BYTES as u64 + 1)
+    reader
+        .take(hook_stdin_limit())
         .read_to_end(&mut buf)
         .map_err(|e| anyhow::anyhow!("reading hook stdin: {e}"))?;
-    if buf.len() > MAX_HOOK_STDIN_BYTES {
+    if hook_stdin_too_large(buf.len()) {
         anyhow::bail!("hook stdin exceeds {MAX_HOOK_STDIN_BYTES} bytes; refusing to parse");
     }
     let buf =
@@ -174,7 +186,7 @@ fn decide(
     policy_path: Option<&std::path::Path>,
 ) -> anyhow::Result<GateDecision> {
     let policy = Policy::load_for_agent(policy_path)?;
-    warn_on_ignored_env_policy(policy_path);
+    let _ = warn_on_ignored_env_policy(policy_path, &|k| std::env::var(k).ok());
     // Shapes the token scanner cannot resolve are hard denials: pip flags
     // that name or redirect non-registry sources, inline registry-redirect
     // assignments (`PIP_INDEX_URL=...`, `NPM_CONFIG_*`, `CARGO_*`) and
@@ -317,13 +329,18 @@ fn with_env_note(reason: &str, env_note: &Option<String>) -> String {
 /// explicit `--policy` flag names the file (see `Policy::load_for_agent`):
 /// warn on stderr so a scoped shell that expected its policy notices, and
 /// the audit trail keeps the decision it actually ran under.
-fn warn_on_ignored_env_policy(policy_path: Option<&std::path::Path>) {
-    if policy_path.is_none() && Policy::env_policy_present() {
+fn warn_on_ignored_env_policy(
+    policy_path: Option<&std::path::Path>,
+    getenv: &dyn Fn(&str) -> Option<String>,
+) -> bool {
+    if policy_path.is_none() && getenv("BLUELINE_POLICY").is_some() {
         eprintln!(
             "warning: ignoring BLUELINE_POLICY from the environment; \
              pass --policy to apply a policy file to agent review/gate"
         );
+        return true;
     }
+    false
 }
 
 fn deny_reason(reasons: &[String]) -> String {
@@ -443,5 +460,81 @@ mod tests {
         assert!(note.contains("PIP_INDEX_URL"));
         assert!(with_env_note("ok", &None) == "ok");
         assert!(with_env_note("ok", &Some("w".to_string())) == "ok; w");
+    }
+
+    #[test]
+    fn hook_stdin_cap_is_exactly_64kib() {
+        assert_eq!(MAX_HOOK_STDIN_BYTES, 65536);
+        assert_eq!(MAX_HOOK_STDIN_BYTES, 64 * 1024);
+        assert_eq!(hook_stdin_limit(), 65537);
+    }
+
+    #[test]
+    fn audit_identity_carries_agent_prefix() {
+        let identity = identity_for_audit();
+        assert!(!identity.is_empty());
+        assert!(identity.starts_with("agent:"));
+        assert!(identity.len() > "agent:".len());
+        assert_ne!(identity, "xyzzy");
+    }
+
+    #[test]
+    fn hook_stdin_exact_max_is_accepted_whole() {
+        let input = format!("echo {}", "a".repeat(MAX_HOOK_STDIN_BYTES - 5));
+        assert!(input.len() <= MAX_HOOK_STDIN_BYTES);
+        let out = read_hook_command_from(std::io::Cursor::new(input.clone()))
+            .expect("exactly-MAX input must parse");
+        assert_eq!(out, input);
+        assert!(!hook_stdin_too_large(MAX_HOOK_STDIN_BYTES));
+    }
+
+    #[test]
+    fn hook_stdin_max_plus_one_is_refused() {
+        assert!(hook_stdin_too_large(MAX_HOOK_STDIN_BYTES + 1));
+        let input = "b".repeat(MAX_HOOK_STDIN_BYTES + 1);
+        let err = read_hook_command_from(std::io::Cursor::new(input))
+            .expect_err("MAX+1 input must be refused");
+        assert!(format!("{err:#}").contains("exceeds"));
+        let oversized = "c".repeat(MAX_HOOK_STDIN_BYTES + 512);
+        let err = read_hook_command_from(std::io::Cursor::new(oversized))
+            .expect_err("oversized input must be refused");
+        assert!(format!("{err:#}").contains(&MAX_HOOK_STDIN_BYTES.to_string()));
+    }
+
+    #[test]
+    fn ignored_env_policy_warns_only_without_explicit_flag() {
+        let present = &|_: &str| Some("/tmp/scoped-policy.toml".to_string());
+        let absent: &dyn Fn(&str) -> Option<String> = &|_: &str| None;
+        assert!(warn_on_ignored_env_policy(None, present));
+        assert!(!warn_on_ignored_env_policy(
+            Some(std::path::Path::new("/tmp/policy.toml")),
+            present
+        ));
+        assert!(!warn_on_ignored_env_policy(None, absent));
+    }
+
+    #[test]
+    fn ignored_env_policy_silent_when_flag_names_file() {
+        let present = &|_: &str| Some("/tmp/scoped-policy.toml".to_string());
+        let absent: &dyn Fn(&str) -> Option<String> = &|_: &str| None;
+        assert!(!warn_on_ignored_env_policy(
+            Some(std::path::Path::new("/tmp/policy.toml")),
+            absent
+        ));
+        assert!(!warn_on_ignored_env_policy(None, absent));
+        assert!(warn_on_ignored_env_policy(None, present));
+    }
+
+    #[test]
+    fn command_truncation_boundary_is_exactly_200_chars() {
+        let exact = "a".repeat(200);
+        let out = truncate_command(&exact);
+        assert_eq!(out, exact);
+        assert!(!out.ends_with('…'));
+        let over = "a".repeat(201);
+        let out = truncate_command(&over);
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().count(), 201);
+        assert_eq!(out.len(), 200 + '…'.len_utf8());
     }
 }

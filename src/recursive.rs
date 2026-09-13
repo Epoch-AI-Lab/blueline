@@ -500,6 +500,74 @@ pub(crate) fn registry_for(ecosystem: Ecosystem, base: &str) -> Rc<dyn Registry>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::{Package, Release};
+
+    struct FakeRegistry {
+        ecosystem: Ecosystem,
+        payloads: std::collections::HashMap<(String, String), Vec<u8>>,
+    }
+
+    impl crate::registry::Registry for FakeRegistry {
+        fn ecosystem(&self) -> Ecosystem {
+            self.ecosystem
+        }
+
+        fn resolve(
+            &self,
+            name: &str,
+            version: &str,
+        ) -> Result<Package, crate::error::BluelineError> {
+            Ok(Package {
+                name: name.to_string(),
+                version: version.to_string(),
+                tarball_url: String::new(),
+                integrity: None,
+            })
+        }
+
+        fn fetch_tarball(&self, pkg: &Package) -> Result<Vec<u8>, crate::error::BluelineError> {
+            match self.payloads.get(&(pkg.name.clone(), pkg.version.clone())) {
+                Some(bytes) => Ok(bytes.clone()),
+                None => Err(crate::error::BluelineError::NotFound(pkg.name.clone())),
+            }
+        }
+
+        fn list_versions(
+            &self,
+            _name: &str,
+        ) -> Result<Vec<semver::Version>, crate::error::BluelineError> {
+            Ok(Vec::new())
+        }
+
+        fn list_releases(&self, _name: &str) -> Result<Vec<Release>, crate::error::BluelineError> {
+            Ok(Vec::new())
+        }
+
+        fn default_version(&self, _: &str) -> Result<Option<String>, crate::error::BluelineError> {
+            Ok(None)
+        }
+    }
+
+    fn test_context() -> ReviewContext {
+        ReviewContext::new(
+            &Policy::default(),
+            crate::cli::RegistryBases {
+                npm: String::new(),
+                cargo: String::new(),
+                pypi: String::new(),
+                aur: String::new(),
+            },
+        )
+    }
+
+    fn test_package(name: &str, version: &str) -> Package {
+        Package {
+            name: name.to_string(),
+            version: version.to_string(),
+            tarball_url: String::new(),
+            integrity: None,
+        }
+    }
 
     #[test]
     fn child_ecosystem_routes_cargo_and_aur_helpers() {
@@ -533,5 +601,86 @@ mod tests {
             let key = ctx.dropped_key(&r);
             assert_eq!(key.0, ecosystem, "{manager:?} must drop into {ecosystem:?}");
         }
+    }
+
+    #[test]
+    fn tarball_memo_cap_is_exactly_256mib() {
+        assert_eq!(MAX_TARBALL_MEMO_BYTES, 268_435_456);
+        assert_eq!(MAX_TARBALL_MEMO_BYTES, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn tarball_fetch_at_exact_cap_keeps_memo() {
+        let ctx = test_context();
+        let mut payloads = std::collections::HashMap::new();
+        payloads.insert(("seed".to_string(), "1.0.0".to_string()), vec![1u8; 5]);
+        payloads.insert(("exact".to_string(), "1.0.0".to_string()), vec![2u8; 5]);
+        let registry = FakeRegistry {
+            ecosystem: Ecosystem::Npm,
+            payloads,
+        };
+        ctx.fetch_tarball(&registry, &test_package("seed", "1.0.0"))
+            .expect("seed fetch must succeed");
+        ctx.memo_bytes.set(MAX_TARBALL_MEMO_BYTES - 5);
+        let bytes = ctx
+            .fetch_tarball(&registry, &test_package("exact", "1.0.0"))
+            .expect("exactly-MAX fetch must succeed");
+        assert_eq!(bytes.len(), 5);
+        assert_eq!(ctx.memo_bytes.get(), MAX_TARBALL_MEMO_BYTES);
+        assert!(ctx.tarballs.borrow().contains_key(&(
+            Ecosystem::Npm,
+            "seed".to_string(),
+            "1.0.0".to_string()
+        )));
+        assert!(ctx.tarballs.borrow().contains_key(&(
+            Ecosystem::Npm,
+            "exact".to_string(),
+            "1.0.0".to_string()
+        )));
+    }
+
+    #[test]
+    fn tarball_fetch_one_past_cap_clears_memo() {
+        let ctx = test_context();
+        let mut payloads = std::collections::HashMap::new();
+        payloads.insert(("seed".to_string(), "1.0.0".to_string()), vec![1u8; 5]);
+        payloads.insert(("over".to_string(), "1.0.0".to_string()), vec![2u8; 6]);
+        let registry = FakeRegistry {
+            ecosystem: Ecosystem::Npm,
+            payloads,
+        };
+        ctx.fetch_tarball(&registry, &test_package("seed", "1.0.0"))
+            .expect("seed fetch must succeed");
+        ctx.memo_bytes.set(MAX_TARBALL_MEMO_BYTES - 5);
+        let bytes = ctx
+            .fetch_tarball(&registry, &test_package("over", "1.0.0"))
+            .expect("overflow fetch must still return bytes");
+        assert_eq!(bytes.len(), 6);
+        assert_eq!(ctx.memo_bytes.get(), 6);
+        assert_eq!(ctx.tarballs.borrow().len(), 1);
+        assert!(ctx.tarballs.borrow().contains_key(&(
+            Ecosystem::Npm,
+            "over".to_string(),
+            "1.0.0".to_string()
+        )));
+    }
+
+    #[test]
+    fn depth_cause_names_depth_and_limit() {
+        let cause = depth_cause(5, 3);
+        assert!(!cause.is_empty());
+        assert_ne!(cause, "xyzzy");
+        assert!(cause.contains('5'), "cause must name the depth: {cause}");
+        assert!(cause.contains('3'), "cause must name max_depth: {cause}");
+        assert!(cause.contains("max_depth"));
+    }
+
+    #[test]
+    fn budget_cause_names_reviews_and_limit() {
+        let cause = budget_cause(8, 8);
+        assert!(!cause.is_empty());
+        assert_ne!(cause, "xyzzy");
+        assert!(cause.contains('8'), "cause must name the budget: {cause}");
+        assert!(cause.contains("budget"));
     }
 }

@@ -615,4 +615,85 @@ mod tests {
             }
         }
     }
+
+    fn high_finding(rule_id: &str) -> crate::verdict::Finding {
+        crate::verdict::Finding {
+            rule_id: rule_id.to_string(),
+            severity: crate::verdict::VerdictBand::High,
+            title: "title".to_string(),
+            description: "description".to_string(),
+        }
+    }
+
+    fn child_with_findings(name: &str, finding_count: usize) -> crate::verdict::ChildReview {
+        crate::verdict::ChildReview {
+            chain: vec!["root@1.0.0".into(), format!("npm:{name}@1.0.0")],
+            name: name.into(),
+            version: "1.0.0".into(),
+            ecosystem: crate::registry::Ecosystem::Npm,
+            band: crate::verdict::VerdictBand::Low,
+            risk_score: 0,
+            findings: (0..finding_count)
+                .map(|i| high_finding(&format!("R{i:02}")))
+                .collect(),
+        }
+    }
+
+    fn card_verdict(
+        findings: Vec<crate::verdict::Finding>,
+        recursive: Vec<crate::verdict::ChildReview>,
+    ) -> crate::verdict::Verdict {
+        crate::verdict::Verdict {
+            name: "root".into(),
+            target_version: "1.0.0".into(),
+            baseline_version: None,
+            integrity: "sha512-test".into(),
+            ecosystem: crate::registry::Ecosystem::Npm,
+            band: crate::verdict::VerdictBand::Low,
+            risk_score: 0,
+            findings,
+            diff_summary: crate::verdict::DiffSummary::default(),
+            trust_sources: None,
+            recursive,
+        }
+    }
+
+    #[test]
+    fn child_findings_truncation_pins_cap_boundary() {
+        let delta = crate::diff::Delta::default();
+        let exact = card_verdict(Vec::new(), vec![child_with_findings("pkg", 3)]);
+        let card = render_text_to_string(&exact, &delta);
+        assert!(card.contains("3 finding(s)"), "{card}");
+        assert!(!card.contains("more finding(s)"), "{card}");
+        let over = card_verdict(Vec::new(), vec![child_with_findings("pkg", 4)]);
+        let card = render_text_to_string(&over, &delta);
+        assert!(card.contains("… and 1 more finding(s)"), "{card}");
+    }
+
+    #[test]
+    fn recursive_list_truncation_pins_cap_boundary() {
+        let delta = crate::diff::Delta::default();
+        let exact = card_verdict(
+            Vec::new(),
+            (0..8)
+                .map(|i| child_with_findings(&format!("pkg{i}"), 0))
+                .collect(),
+        );
+        let card = render_text_to_string(&exact, &delta);
+        assert!(card.contains("Recursive Reviews (8):"), "{card}");
+        assert!(!card.contains("more recursive review(s)"), "{card}");
+    }
+
+    #[test]
+    fn findings_section_renders_only_when_non_empty() {
+        let delta = crate::diff::Delta::default();
+        let populated = card_verdict(vec![high_finding("R01"), high_finding("R02")], Vec::new());
+        assert!(render_text_to_string(&populated, &delta).contains("Security Findings (2):"),);
+        let empty = card_verdict(Vec::new(), Vec::new());
+        let card = render_text_to_string(&empty, &delta);
+        assert!(!card.contains("Security Findings"), "{card}");
+        assert!(!card.contains("Recursive Reviews"), "{card}");
+        let chained = card_verdict(Vec::new(), vec![child_with_findings("pkg", 0)]);
+        assert!(render_text_to_string(&chained, &delta).contains("Recursive Reviews (1):"),);
+    }
 }

@@ -694,4 +694,63 @@ ecosystem = "rubygems"
         std::fs::write(&other, "").unwrap();
         assert!(Policy::load_with_env(Some(&other), scoped).is_ok());
     }
+
+    #[test]
+    fn env_policy_present_reads_process_environment() {
+        // `std::env::set_var` is `unsafe` (and forbidden) in edition 2024,
+        // so each outcome runs in a child harness with a scrubbed/set env.
+        fn run_probe(name: &str, set: bool) -> std::process::Output {
+            let exe = std::env::current_exe().unwrap();
+            let mut cmd = std::process::Command::new(exe);
+            cmd.args(["--exact", "--ignored", name]);
+            if set {
+                cmd.env(
+                    "BLUELINE_POLICY",
+                    "/tmp/blueline-policy-presence-probe.toml",
+                );
+            } else {
+                cmd.env_remove("BLUELINE_POLICY");
+            }
+            cmd.output().unwrap()
+        }
+        let out = run_probe("policy::tests::probe_env_policy_present_when_set", true);
+        assert!(
+            out.status.success(),
+            "set BLUELINE_POLICY must read present: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let out = run_probe("policy::tests::probe_env_policy_present_when_unset", false);
+        assert!(
+            out.status.success(),
+            "unset BLUELINE_POLICY must read absent: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn probe_env_policy_present_when_set() {
+        assert!(Policy::env_policy_present());
+    }
+
+    #[test]
+    #[ignore]
+    fn probe_env_policy_present_when_unset() {
+        assert!(!Policy::env_policy_present());
+    }
+
+    #[test]
+    fn recall_max_age_hours_bounds() {
+        let with_max_age = |hours: u64| Policy {
+            recall: RecallPolicyConfig {
+                max_age_hours: hours,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(with_max_age(0).validate().is_err());
+        assert!(with_max_age(1).validate().is_ok());
+        assert!(with_max_age(24 * 365).validate().is_ok());
+        assert!(with_max_age(24 * 365 + 1).validate().is_err());
+    }
 }

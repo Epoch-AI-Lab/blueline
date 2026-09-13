@@ -577,4 +577,511 @@ mod tests {
         let result = crate::recall::load_at(&path);
         assert!(matches!(result, Ok(None)));
     }
+
+    #[test]
+    fn snapshot_size_consts_are_exact() {
+        assert_eq!(MAX_SNAPSHOT_BYTES, 8 * 1024 * 1024);
+        assert_eq!(MAX_SNAPSHOT_BYTES, 8_388_608);
+        assert_eq!(MAX_ENTRIES, 10_000);
+        assert_eq!(MAX_TEXT_BYTES, 512);
+        assert_eq!(TIMESTAMP_SKEW_SECS, 300);
+    }
+
+    fn synced_tagged(sequence: u64, tag: &str) -> SyncedSnapshot {
+        SyncedSnapshot {
+            fetched_at: 1_700_000_000,
+            url: format!("http://127.0.0.1:1/{tag}"),
+            snapshot: Snapshot {
+                schema: SNAPSHOT_SCHEMA,
+                generated_at: 1_700_000_000,
+                sequence,
+                revocations: Vec::new(),
+            },
+        }
+    }
+
+    fn big_snapshot(sequence: u64) -> Snapshot {
+        Snapshot {
+            schema: SNAPSHOT_SCHEMA,
+            generated_at: 1_700_000_000,
+            sequence,
+            revocations: (0..6000)
+                .map(|i| Revocation {
+                    ecosystem: Ecosystem::Npm,
+                    name: format!("bulk-pkg-{i}"),
+                    versions: vec!["1.0.0".into()],
+                    all_versions: false,
+                    reason: "bulk".into(),
+                    id: format!("BLK-{i:05}"),
+                })
+                .collect(),
+        }
+    }
+
+    fn synced_padded_to_bytes(total_len: usize, sequence: u64) -> SyncedSnapshot {
+        let mut synced = SyncedSnapshot {
+            fetched_at: 1_700_000_000,
+            url: "http://127.0.0.1:1/pad".into(),
+            snapshot: big_snapshot(sequence),
+        };
+        let base_len = serde_json::to_string(&synced).unwrap().len();
+        assert!(base_len < total_len, "fixture must fit under the cap");
+        synced.url.push_str(&"a".repeat(total_len - base_len));
+        assert_eq!(serde_json::to_string(&synced).unwrap().len(), total_len);
+        synced
+    }
+
+    fn snapshot_padded_to_bytes(total_len: usize, sequence: u64) -> Snapshot {
+        fn entry(reason_len: usize) -> Revocation {
+            Revocation {
+                ecosystem: Ecosystem::Npm,
+                name: "a".repeat(214),
+                versions: (0..20).map(|i| format!("1.0.{i}")).collect(),
+                all_versions: false,
+                reason: "r".repeat(reason_len),
+                id: "b".repeat(512),
+            }
+        }
+        let mut count = 6000usize;
+        for _ in 0..100 {
+            let probe = Snapshot {
+                schema: SNAPSHOT_SCHEMA,
+                generated_at: 1_700_000_000,
+                sequence,
+                revocations: (0..count).map(|_| entry(1)).collect(),
+            };
+            let size = serde_json::to_string(&probe).unwrap().len();
+            let extra = total_len as i64 - size as i64;
+            let capacity = (count * 511) as i64;
+            if extra >= 0 && extra <= capacity {
+                let mut remaining = extra as usize;
+                let mut revocations = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let add = remaining.min(511);
+                    revocations.push(entry(1 + add));
+                    remaining -= add;
+                }
+                assert_eq!(remaining, 0);
+                let snap = Snapshot {
+                    schema: SNAPSHOT_SCHEMA,
+                    generated_at: 1_700_000_000,
+                    sequence,
+                    revocations,
+                };
+                assert_eq!(serde_json::to_string(&snap).unwrap().len(), total_len);
+                snap.validate().unwrap();
+                return snap;
+            }
+            if extra < 0 {
+                count = count * 3 / 4;
+            } else {
+                count += 500;
+            }
+            assert!(
+                (100..MAX_ENTRIES).contains(&count),
+                "padding must stay a valid snapshot"
+            );
+        }
+        panic!("could not pad snapshot to {total_len} bytes");
+    }
+
+    #[test]
+    fn cached_load_hits_on_same_mtime_and_misses_on_change() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recall_snapshot.json");
+
+        fn set_mtime(path: &std::path::Path, mtime: std::time::SystemTime) {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
+        }
+
+        // A miss always rereads the file: anchor the mtime away from any
+        // cached entry, future-dated so even a concurrent population of the
+        // process-global cache cannot collide with it.
+        let probe_a = synced_tagged(11, "phase-a");
+        std::fs::write(&path, serde_json::to_string(&probe_a).unwrap()).unwrap();
+        let anchor = match SNAPSHOT_CACHE.get() {
+            Some((cached_at, _)) => *cached_at + Duration::from_secs(60),
+            None => std::time::SystemTime::now() + Duration::from_secs(60),
+        };
+        set_mtime(&path, anchor);
+        assert_eq!(cached_load(&path).unwrap(), Some(probe_a));
+
+        // The cache is definitely populated now (set-once: pre-existing or
+        // stored by the miss above), so rewinding the mtime to the cached
+        // entry must return the cached snapshot without rereading the file.
+        let (cached_at, cached) = SNAPSHOT_CACHE.get().cloned().unwrap();
+        let probe_b = synced_tagged(12, "phase-b");
+        assert_ne!(cached, Some(probe_b.clone()));
+        std::fs::write(&path, serde_json::to_string(&probe_b).unwrap()).unwrap();
+        set_mtime(&path, cached_at);
+        assert_eq!(cached_load(&path).unwrap(), cached);
+
+        // A changed mtime reloads: the fresh file wins over the cache.
+        let probe_c = synced_tagged(13, "phase-c");
+        std::fs::write(&path, serde_json::to_string(&probe_c).unwrap()).unwrap();
+        set_mtime(&path, cached_at + Duration::from_secs(60));
+        assert_eq!(cached_load(&path).unwrap(), Some(probe_c));
+    }
+
+    #[test]
+    fn load_at_distinguishes_absent_index_from_unreadable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("recall_snapshot.json");
+        assert!(matches!(load_at(&missing), Ok(None)));
+        let err = load_at(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("reading recall snapshot"));
+    }
+
+    #[test]
+    fn load_at_enforces_byte_cap_at_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recall_snapshot.json");
+        let exact = synced_padded_to_bytes(MAX_SNAPSHOT_BYTES, 21);
+        std::fs::write(&path, serde_json::to_string(&exact).unwrap()).unwrap();
+        assert_eq!(load_at(&path).unwrap(), Some(exact));
+        let over = synced_padded_to_bytes(MAX_SNAPSHOT_BYTES + 1, 22);
+        std::fs::write(&path, serde_json::to_string(&over).unwrap()).unwrap();
+        let err = load_at(&path).unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err:#}");
+    }
+
+    #[test]
+    fn validate_enforces_entry_count_cap_at_boundary() {
+        let rev = valid_snapshot().revocations.pop().unwrap();
+        let mut at_cap = valid_snapshot();
+        at_cap.revocations = vec![rev.clone(); MAX_ENTRIES];
+        assert!(at_cap.validate().is_ok());
+        let mut over = valid_snapshot();
+        over.revocations = vec![rev; MAX_ENTRIES + 1];
+        assert!(over.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_generated_at_at_skew_boundary() {
+        let mut at_skew = valid_snapshot();
+        at_skew.generated_at = now_secs() + TIMESTAMP_SKEW_SECS;
+        assert!(at_skew.validate().is_ok());
+        let mut past_skew = valid_snapshot();
+        past_skew.generated_at = now_secs() + TIMESTAMP_SKEW_SECS + 1;
+        assert!(past_skew.validate().is_err());
+    }
+
+    #[test]
+    fn validate_enforces_name_length_at_boundary() {
+        let mut empty = valid_snapshot();
+        empty.revocations[0].name.clear();
+        assert!(empty.validate().is_err());
+        let mut at_cap = valid_snapshot();
+        at_cap.revocations[0].name = "a".repeat(214);
+        assert!(at_cap.validate().is_ok());
+        let mut over = valid_snapshot();
+        over.revocations[0].name = "a".repeat(215);
+        assert!(over.validate().is_err());
+    }
+
+    #[test]
+    fn validate_enforces_reason_length_at_boundary() {
+        let mut empty = valid_snapshot();
+        empty.revocations[0].reason.clear();
+        assert!(empty.validate().is_err());
+        let mut at_cap = valid_snapshot();
+        at_cap.revocations[0].reason = "r".repeat(MAX_TEXT_BYTES);
+        assert!(at_cap.validate().is_ok());
+        let mut over = valid_snapshot();
+        over.revocations[0].reason = "r".repeat(MAX_TEXT_BYTES + 1);
+        assert!(over.validate().is_err());
+    }
+
+    #[test]
+    fn validate_enforces_id_length_at_boundary() {
+        let mut empty = valid_snapshot();
+        empty.revocations[0].id.clear();
+        assert!(empty.validate().is_err());
+        let mut at_cap = valid_snapshot();
+        at_cap.revocations[0].id = "b".repeat(MAX_TEXT_BYTES);
+        assert!(at_cap.validate().is_ok());
+        let mut over = valid_snapshot();
+        over.revocations[0].id = "b".repeat(MAX_TEXT_BYTES + 1);
+        assert!(over.validate().is_err());
+    }
+
+    #[test]
+    fn versions_match_equivalence_and_fallback() {
+        assert!(versions_match(Ecosystem::Aur, "1.0-1", "1.0-1"));
+        assert!(versions_match(Ecosystem::Aur, "1.0", "1.0-1"));
+        assert!(!versions_match(Ecosystem::Aur, "1.0-1", "2.0-1"));
+        assert!(versions_match(Ecosystem::PyPi, "1.0", "1.0.0"));
+        assert!(!versions_match(Ecosystem::PyPi, "1.0", "2.0"));
+        assert!(versions_match(Ecosystem::Aur, "!!!", "!!!"));
+        assert!(!versions_match(Ecosystem::Aur, "!!!a", "!!!b"));
+        assert!(!versions_match(
+            Ecosystem::Npm,
+            "not-a-version",
+            "also-not-a-version"
+        ));
+    }
+
+    #[test]
+    fn stale_band_pins_max_age_boundary() {
+        let policy = crate::policy::Policy::default();
+        let max_age_secs = (policy.recall.max_age_hours as i64).saturating_mul(3600);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recall_snapshot.json");
+        let snap = valid_snapshot();
+        let write_at = |fetched_at: i64| {
+            let synced = SyncedSnapshot {
+                fetched_at,
+                url: "http://127.0.0.1:1".into(),
+                snapshot: snap.clone(),
+            };
+            std::fs::write(&path, serde_json::to_string(&synced).unwrap()).unwrap();
+        };
+        let mut fresh_at_cap = false;
+        for _ in 0..8 {
+            write_at(now_secs() - max_age_secs);
+            if stale_band_at(&policy, &path).unwrap().is_none() {
+                fresh_at_cap = true;
+                break;
+            }
+        }
+        assert!(fresh_at_cap, "age exactly max_age_secs must be fresh");
+        write_at(now_secs() - max_age_secs - 1);
+        assert_eq!(
+            stale_band_at(&policy, &path).unwrap(),
+            Some(crate::verdict::VerdictBand::Medium)
+        );
+        write_at(now_secs() - max_age_secs + 1);
+        assert!(stale_band_at(&policy, &path).unwrap().is_none());
+    }
+
+    fn blueline_cmd(data_dir: &std::path::Path) -> assert_cmd::Command {
+        let mut cmd = assert_cmd::Command::cargo_bin("blueline").unwrap();
+        cmd.env("BLUELINE_DATA_DIR", data_dir);
+        cmd
+    }
+
+    fn serve_recall_once(body: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let handle = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_secs(15) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buf = [0u8; 8192];
+                        let n = stream.read(&mut buf).unwrap_or(0);
+                        let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                        let path = req
+                            .lines()
+                            .next()
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .unwrap_or("/");
+                        if path == "/revocations.json" {
+                            let head = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = stream.write_all(head.as_bytes());
+                            let _ = stream.write_all(&body);
+                            return;
+                        }
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot found",
+                        );
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                }
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), handle)
+    }
+
+    fn recall_snapshot(sequence: u64, generated_at: i64) -> Snapshot {
+        Snapshot {
+            schema: SNAPSHOT_SCHEMA,
+            generated_at,
+            sequence,
+            revocations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn sync_refuses_sequence_rollback_without_touching_file() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let snapshot_path = data_dir.path().join("recall_snapshot.json");
+        let (seed_url, seed_handle) =
+            serve_recall_once(serde_json::to_vec(&recall_snapshot(42, 1_700_000_000)).unwrap());
+        let out = blueline_cmd(data_dir.path())
+            .args(["recall", "sync", "--url", &seed_url])
+            .output()
+            .unwrap();
+        seed_handle.join().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stored_bytes = std::fs::read(&snapshot_path).unwrap();
+
+        let (old_url, old_handle) =
+            serve_recall_once(serde_json::to_vec(&recall_snapshot(41, 1_700_000_000)).unwrap());
+        let out = blueline_cmd(data_dir.path())
+            .args(["recall", "sync", "--url", &old_url])
+            .output()
+            .unwrap();
+        old_handle.join().unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("older than the stored sequence"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(std::fs::read(&snapshot_path).unwrap(), stored_bytes);
+    }
+
+    #[test]
+    fn sync_accepts_equal_sequence_idempotently() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let snapshot_path = data_dir.path().join("recall_snapshot.json");
+        let (seed_url, seed_handle) =
+            serve_recall_once(serde_json::to_vec(&recall_snapshot(42, 1_700_000_000)).unwrap());
+        let out = blueline_cmd(data_dir.path())
+            .args(["recall", "sync", "--url", &seed_url])
+            .output()
+            .unwrap();
+        seed_handle.join().unwrap();
+        assert!(out.status.success());
+
+        let (url, handle) =
+            serve_recall_once(serde_json::to_vec(&recall_snapshot(42, 1_700_000_001)).unwrap());
+        let out = blueline_cmd(data_dir.path())
+            .args(["recall", "sync", "--url", &format!("{url}///")])
+            .output()
+            .unwrap();
+        handle.join().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stored: SyncedSnapshot =
+            serde_json::from_slice(&std::fs::read(&snapshot_path).unwrap()).unwrap();
+        assert_eq!(stored.snapshot.sequence, 42);
+        assert_eq!(stored.snapshot.generated_at, 1_700_000_001);
+    }
+
+    #[test]
+    fn sync_enforces_snapshot_byte_cap_at_boundary() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let exact = snapshot_padded_to_bytes(MAX_SNAPSHOT_BYTES, 31);
+        let (url, handle) = serve_recall_once(serde_json::to_vec(&exact).unwrap());
+        let out = blueline_cmd(data_dir.path())
+            .args(["recall", "sync", "--url", &url])
+            .output()
+            .unwrap();
+        handle.join().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stored: SyncedSnapshot = serde_json::from_slice(
+            &std::fs::read(data_dir.path().join("recall_snapshot.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stored.snapshot.sequence, 31);
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let over = snapshot_padded_to_bytes(MAX_SNAPSHOT_BYTES + 1, 32);
+        let (url, handle) = serve_recall_once(serde_json::to_vec(&over).unwrap());
+        let out = blueline_cmd(data_dir.path())
+            .args(["recall", "sync", "--url", &url])
+            .output()
+            .unwrap();
+        handle.join().unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("exceeds"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn serve_refuses_oversized_index_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let index_path = dir.path().join("index.json");
+        let over = snapshot_padded_to_bytes(MAX_SNAPSHOT_BYTES + 1, 51);
+        std::fs::write(&index_path, serde_json::to_vec(&over).unwrap()).unwrap();
+        let out = blueline_cmd(dir.path())
+            .args([
+                "recall",
+                "serve",
+                "--port",
+                "0",
+                "--snapshot",
+                index_path.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("exceeds"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn serve_serves_at_cap_snapshot_with_health_endpoint() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let index_path = dir.path().join("index.json");
+        let snap = snapshot_padded_to_bytes(MAX_SNAPSHOT_BYTES, 52);
+        std::fs::write(&index_path, serde_json::to_vec(&snap).unwrap()).unwrap();
+        let bin = assert_cmd::cargo::cargo_bin("blueline");
+        let mut child = std::process::Command::new(bin)
+            .args([
+                "recall",
+                "serve",
+                "--port",
+                "0",
+                "--snapshot",
+                index_path.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut banner = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut banner)
+            .unwrap();
+        let port: u16 = banner
+            .trim()
+            .split("http://127.0.0.1:")
+            .nth(1)
+            .and_then(|rest| rest.split('/').next())
+            .and_then(|p| p.parse().ok())
+            .unwrap_or_else(|| panic!("cannot parse serve banner: {banner}"));
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        let response = String::from_utf8_lossy(&response).to_string();
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.ends_with("ok"), "{response}");
+    }
 }

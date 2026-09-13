@@ -285,6 +285,102 @@ mod tests {
         assert!(find_on_path_with("npm", dir.path(), &only_shim_dir).is_err());
     }
 
+    #[test]
+    fn default_dir_resolves_under_data_dir() {
+        let dir = default_dir().expect("data dir must resolve");
+        assert!(!dir.as_os_str().is_empty());
+        assert!(
+            dir.ends_with("shims"),
+            "resolved shim dir must end with shims: {}",
+            dir.display()
+        );
+    }
+
+    #[test]
+    fn executable_check_requires_file_and_exec_bit() {
+        assert!(!is_executable_file(Path::new(
+            "/nonexistent-blueline-shim-probe"
+        )));
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("tool");
+        std::fs::write(&plain, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        assert!(!is_executable_file(&plain));
+        assert!(!is_executable_file(Path::new(
+            "/nonexistent-blueline-shim-probe"
+        )));
+    }
+
+    #[test]
+    fn executable_check_accepts_755() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("tool");
+        std::fs::write(&exe, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert!(is_executable_file(&exe));
+    }
+
+    #[test]
+    fn bakeable_rejects_shell_metacharacters() {
+        assert!(assert_bakeable(Path::new("/opt/blueline/bin"), "blueline binary").is_ok());
+        for dangerous in [
+            "/tmp/$HOME/blueline",
+            "/tmp/`evil`/blueline",
+            "/tmp/\"quoted\"/blueline",
+            "/tmp/back\\slash/blueline",
+        ] {
+            assert!(
+                assert_bakeable(Path::new(dangerous), "blueline binary").is_err(),
+                "{dangerous} must not bake"
+            );
+        }
+    }
+
+    #[test]
+    fn cargo_shim_resolves_the_cargo_real_binary() {
+        let script = shim_script(
+            "cargo",
+            Path::new("/usr/local/bin/blueline"),
+            Path::new("/usr/bin/cargo"),
+        );
+        assert!(script.contains("cargo"));
+        assert!(
+            script.contains("BLUELINE_INDEX"),
+            "cargo shim must resolve the real cargo binary via the index override"
+        );
+        assert!(script.contains("index.crates.io"));
+        let generic = shim_script(
+            "yay",
+            Path::new("/usr/local/bin/blueline"),
+            Path::new("/usr/bin/yay"),
+        );
+        assert!(!generic.contains("BLUELINE_INDEX"));
+    }
+
+    #[test]
+    fn uninstalling_an_absent_shim_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        uninstall(&["npm".to_string()], Some(dir.path())).expect("absent shim must succeed");
+    }
+
+    #[test]
+    fn uninstall_propagates_non_notfound_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocking = dir.path().join("npm");
+        std::fs::create_dir(&blocking).unwrap();
+        let err = uninstall(&["npm".to_string()], Some(dir.path()))
+            .expect_err("non-NotFound IO errors must propagate");
+        assert!(format!("{err:#}").contains("removing shim"));
+    }
+
     fn find_on_path_with(
         name: &str,
         exclude_dir: &Path,

@@ -1381,4 +1381,355 @@ source = "path+file:///some/local/path"
         assert_eq!(report.items.len(), 0);
         assert!(report.passed);
     }
+
+    #[test]
+    fn lockfile_diff_classifies_changed_and_unchanged_with_stub_registry() {
+        use std::io::{Read, Write};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        fn npm_tgz(name: &str, version: &str) -> Vec<u8> {
+            use std::io::Write as _;
+            let manifest = format!(r#"{{"name":"{name}","version":"{version}"}}"#);
+            let mut tar_data = Vec::new();
+            {
+                let mut builder = tar::Builder::new(&mut tar_data);
+                let mut header = tar::Header::new_gnu();
+                header.set_size(manifest.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, "package/package.json", manifest.as_bytes())
+                    .unwrap();
+                builder.finish().unwrap();
+            }
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(&tar_data).unwrap();
+            encoder.finish().unwrap()
+        }
+
+        fn sri_sha512(bytes: &[u8]) -> String {
+            use base64::Engine as _;
+            use sha2::Digest as _;
+            let mut hasher = sha2::Sha512::new();
+            hasher.update(bytes);
+            format!(
+                "sha512-{}",
+                base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
+            )
+        }
+
+        let tgz_dash = npm_tgz("foo-bar", "2.0.0");
+        let tgz_dot = npm_tgz("foo.bar", "2.0.0");
+        let integ_dash = sri_sha512(&tgz_dash);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base = format!("http://127.0.0.1:{port}");
+        let pack_dash = format!(
+            r#"{{"name":"foo-bar","dist-tags":{{"latest":"2.0.0"}},"versions":{{"2.0.0":{{"name":"foo-bar","version":"2.0.0","dist":{{"tarball":"{base}/foo-bar-2.0.0.tgz","integrity":"{integ_dash}"}}}}}}}}"#
+        );
+        let integ_dot = sri_sha512(&tgz_dot);
+        let pack_dot = format!(
+            r#"{{"name":"foo.bar","dist-tags":{{"latest":"2.0.0"}},"versions":{{"2.0.0":{{"name":"foo.bar","version":"2.0.0","dist":{{"tarball":"{base}/foo.bar-2.0.0.tgz","integrity":"{integ_dot}"}}}}}}}}"#
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_srv = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            while !stop_srv.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buf = [0u8; 4096];
+                        let n = stream.read(&mut buf).unwrap_or(0);
+                        let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                        let path = req
+                            .lines()
+                            .next()
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .unwrap_or("/");
+                        let body: Vec<u8> = if path == "/foo-bar" {
+                            pack_dash.clone().into_bytes()
+                        } else if path == "/foo.bar" {
+                            pack_dot.clone().into_bytes()
+                        } else if path == "/foo-bar-2.0.0.tgz" {
+                            tgz_dash.clone()
+                        } else if path == "/foo.bar-2.0.0.tgz" {
+                            tgz_dot.clone()
+                        } else {
+                            let _ = stream.write_all(
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot found",
+                            );
+                            continue;
+                        };
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(head.as_bytes());
+                        let _ = stream.write_all(&body);
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                }
+            }
+        });
+
+        let base_lock = serde_json::json!({
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "app", "version": "1.0.0" },
+                "node_modules/foo-bar": { "version": "1.0.0" },
+                "node_modules/foo.bar": { "version": "1.0.0" },
+                "node_modules/steady": { "version": "3.0.0" }
+            }
+        })
+        .to_string();
+        let head_lock = serde_json::json!({
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "app", "version": "1.0.0" },
+                "node_modules/foo-bar": {
+                    "version": "2.0.0",
+                    "resolved": format!("{base}/foo-bar-2.0.0.tgz"),
+                    "integrity": integ_dash
+                },
+                "node_modules/foo.bar": { "version": "2.0.0" },
+                "node_modules/steady": { "version": "3.0.0" }
+            }
+        })
+        .to_string();
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&dir.path().join("blueline.db")).unwrap();
+        let mut policy = Policy::default();
+        policy.policy.check_advisories = false;
+        let bases_tmp = test_bases(&base);
+        let ctx = CiContext {
+            base_ref: "origin/main",
+            lockfile_path: "package-lock.json",
+            bases: &bases_tmp,
+            fail_on: Some(VerdictBand::Block),
+            ecosystem: crate::registry::Ecosystem::Npm,
+        };
+        let result = evaluate_lockfile_diff(&base_lock, &head_lock, &ctx, &store, &policy);
+        stop.store(true, Ordering::SeqCst);
+        let _ = handle.join();
+        let report = result.unwrap();
+
+        assert_eq!(report.items.len(), 2);
+        for (name, old) in [("foo-bar", "1.0.0"), ("foo.bar", "1.0.0")] {
+            let item = report
+                .items
+                .iter()
+                .find(|i| i.name == name)
+                .unwrap_or_else(|| panic!("bumped {name} must be evaluated"));
+            assert_eq!(item.old_version.as_deref(), Some(old));
+            assert_eq!(item.new_version, "2.0.0");
+        }
+        // `foo.bar` carries no integrity of its own, so only a PEP 503 alias
+        // leak would subject it to `foo-bar`'s pin: its absence proves the
+        // alias lookup stays PyPI-only.
+        let dot = report.items.iter().find(|i| i.name == "foo.bar").unwrap();
+        assert!(
+            !dot.verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "R10_LOCKFILE_HASH_MISMATCH"),
+            "unexpected lockfile hash mismatch: {:?}",
+            dot.verdict
+                .findings
+                .iter()
+                .map(|f| &f.rule_id)
+                .collect::<Vec<_>>()
+        );
+        assert!(!report.items.iter().any(|i| i.name == "steady"));
+        assert_eq!(report.unchanged_count, 1);
+        assert_eq!(report.removed_count, 0);
+    }
+
+    #[test]
+    fn lockfile_diff_keeps_pypi_alias_off_cargo_pins() {
+        use std::io::{Read, Write};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        fn sha256_hex(bytes: &[u8]) -> String {
+            use sha2::Digest as _;
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(bytes);
+            hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        }
+
+        fn cargo_crate(name: &str, version: &str) -> Vec<u8> {
+            use std::io::Write as _;
+            let manifest = format!(
+                "[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\n"
+            );
+            let mut tar_data = Vec::new();
+            {
+                let mut builder = tar::Builder::new(&mut tar_data);
+                let mut header = tar::Header::new_gnu();
+                header.set_size(manifest.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(
+                        &mut header,
+                        format!("{name}-{version}/Cargo.toml"),
+                        manifest.as_bytes(),
+                    )
+                    .unwrap();
+                builder.finish().unwrap();
+            }
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(&tar_data).unwrap();
+            encoder.finish().unwrap()
+        }
+
+        let crate_dash = cargo_crate("foo-bar", "2.0.0");
+        let crate_under = cargo_crate("foo_bar", "2.0.0");
+        let hex_dash = sha256_hex(&crate_dash);
+        let hex_under = sha256_hex(&crate_under);
+        assert_ne!(hex_dash, hex_under);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base = format!("http://127.0.0.1:{port}");
+        let config = format!(r#"{{"dl":"{base}"}}"#);
+        let index_dash =
+            format!("{{\"name\":\"foo-bar\",\"vers\":\"2.0.0\",\"cksum\":\"{hex_dash}\"}}\n");
+        let index_under =
+            format!("{{\"name\":\"foo_bar\",\"vers\":\"2.0.0\",\"cksum\":\"{hex_under}\"}}\n");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_srv = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            while !stop_srv.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buf = [0u8; 4096];
+                        let n = stream.read(&mut buf).unwrap_or(0);
+                        let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                        let path = req
+                            .lines()
+                            .next()
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .unwrap_or("/");
+                        let body: Vec<u8> = if path == "/config.json" {
+                            config.clone().into_bytes()
+                        } else if path == "/fo/o-/foo-bar" {
+                            index_dash.clone().into_bytes()
+                        } else if path == "/fo/o_/foo_bar" {
+                            index_under.clone().into_bytes()
+                        } else if path == "/foo-bar/2.0.0/download" {
+                            crate_dash.clone()
+                        } else if path == "/foo_bar/2.0.0/download" {
+                            crate_under.clone()
+                        } else {
+                            let _ = stream.write_all(
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot found",
+                            );
+                            continue;
+                        };
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(head.as_bytes());
+                        let _ = stream.write_all(&body);
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                }
+            }
+        });
+
+        let base_lock = "version = 4\n\
+            \n\
+            [[package]]\n\
+            name = \"foo-bar\"\n\
+            version = \"1.0.0\"\n\
+            source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+            \n\
+            [[package]]\n\
+            name = \"foo_bar\"\n\
+            version = \"1.0.0\"\n\
+            source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+            \n\
+            [[package]]\n\
+            name = \"steady\"\n\
+            version = \"3.0.0\"\n";
+        let head_lock = format!(
+            "version = 4\n\
+            \n\
+            [[package]]\n\
+            name = \"foo-bar\"\n\
+            version = \"2.0.0\"\n\
+            source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+            checksum = \"{hex_dash}\"\n\
+            \n\
+            [[package]]\n\
+            name = \"foo_bar\"\n\
+            version = \"2.0.0\"\n\
+            source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+            \n\
+            [[package]]\n\
+            name = \"steady\"\n\
+            version = \"3.0.0\"\n"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&dir.path().join("blueline.db")).unwrap();
+        let mut policy = Policy::default();
+        policy.policy.check_advisories = false;
+        let bases_tmp = crate::cli::RegistryBases::from_flags("https://index.crates.io", &base);
+        let ctx = CiContext {
+            base_ref: "origin/main",
+            lockfile_path: "Cargo.lock",
+            bases: &bases_tmp,
+            fail_on: Some(VerdictBand::Block),
+            ecosystem: crate::registry::Ecosystem::Cargo,
+        };
+        let result = evaluate_lockfile_diff(base_lock, &head_lock, &ctx, &store, &policy);
+        stop.store(true, Ordering::SeqCst);
+        let _ = handle.join();
+        let report = result.unwrap();
+
+        assert_eq!(report.items.len(), 2);
+        for name in ["foo-bar", "foo_bar"] {
+            let item = report
+                .items
+                .iter()
+                .find(|i| i.name == name)
+                .unwrap_or_else(|| panic!("changed {name} must be evaluated"));
+            assert_eq!(item.new_version, "2.0.0");
+            // On cargo `foo_bar` and `foo-bar` are distinct packages: the
+            // PEP 503 alias must not subject `foo_bar` to `foo-bar`'s pin.
+            assert!(
+                !item
+                    .verdict
+                    .findings
+                    .iter()
+                    .any(|f| f.rule_id == "R10_LOCKFILE_HASH_MISMATCH"),
+                "{name} must not inherit a foreign pin: {:?}",
+                item.verdict
+                    .findings
+                    .iter()
+                    .map(|f| &f.rule_id)
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert!(!report.items.iter().any(|i| i.name == "steady"));
+        assert_eq!(report.unchanged_count, 1);
+        assert_eq!(report.removed_count, 2);
+    }
 }

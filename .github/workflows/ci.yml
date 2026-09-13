@@ -99,17 +99,18 @@ jobs:
               "@bluelinecli/binary-win32-x64",
           }
 
-          # Scanner health: everything evaluated must be a shipped package,
-          # the lockfile delta must produce evaluations, and unchanged
-          # packages must still be counted. Which shipped packages land in
-          # the delta is PR-dependent, so a hardcoded missing-set is wrong.
-          # An empty delta (docs-only PR) is healthy, not a scanner failure.
+          # Scanner health: everything evaluated must be a shipped package
+          # and the lockfile delta must produce evaluations. Which shipped
+          # packages land in the delta is PR-dependent, so a hardcoded
+          # missing-set is wrong. An empty delta (docs-only PR) is healthy,
+          # not a scanner failure — and a version-bump PR legitimately has
+          # zero unchanged packages, so unchanged_count is reported but
+          # never gated.
           unknown = names - expected
           assert not unknown, f"scanner evaluated unknown packages: {unknown}"
           if r["total_evaluated"] == 0:
               print("dogfood scanner healthy: empty lockfile delta, nothing to evaluate")
               sys.exit(0)
-          assert r["unchanged_count"] > 0, "nothing unchanged — scan saw nothing"
 
           print(f"dogfood scanner healthy: evaluated {r['total_evaluated']}, "
                 f"unchanged {r['unchanged_count']}, max band {r['max_band']}")
