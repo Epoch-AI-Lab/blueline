@@ -128,6 +128,19 @@ pub fn sanitize_terminal(input: &str) -> String {
 }
 
 pub fn render_text(verdict: &Verdict, delta: &Delta) {
+    print!("{}", render_text_to_string(verdict, delta));
+}
+
+/// Cap on child reviews displayed on the card: the engine's fan-out is
+/// bounded by the recursion policy, but memo reuse can attach more; the
+/// rest is counted, never silently dropped.
+const MAX_RENDERED_CHILDREN: usize = 8;
+
+/// Cap on child findings rendered per child review.
+const MAX_RENDERED_CHILD_FINDINGS: usize = 3;
+
+pub fn render_text_to_string(verdict: &Verdict, delta: &Delta) -> String {
+    let mut out = String::new();
     let mut table = Table::new();
     table
         .load_preset(UTF8_FULL)
@@ -285,11 +298,57 @@ pub fn render_text(verdict: &Verdict, delta: &Delta) {
         }
     }
 
-    println!("{table}");
+    out.push_str(&format!("{table}\n"));
+
+    // Second-order reviews: the delivery chain and each referenced
+    // package's verdict, so the parent card tells the whole story.
+    if !verdict.recursive.is_empty() {
+        out.push_str(&format!(
+            "\nRecursive Reviews ({}):\n",
+            verdict.recursive.len()
+        ));
+        for child in verdict.recursive.iter().take(MAX_RENDERED_CHILDREN) {
+            out.push_str(&format!(
+                "  delivered via: {} — {}:{}@{} [{}] (score {}), {} finding(s)\n",
+                sanitize_single_line(&child.chain.join(" → ")),
+                child.ecosystem.key(),
+                sanitize_single_line(&child.name),
+                sanitize_single_line(&child.version),
+                child.band,
+                child.risk_score,
+                child.findings.len(),
+            ));
+            let mut worst: Vec<&crate::verdict::Finding> = child.findings.iter().collect();
+            worst.sort_by_key(|f| std::cmp::Reverse(f.severity));
+            for f in worst.into_iter().take(MAX_RENDERED_CHILD_FINDINGS) {
+                out.push_str(&format!(
+                    "    [{}] {}: {}\n",
+                    f.severity,
+                    sanitize_single_line(&f.rule_id),
+                    sanitize_single_line(&f.title),
+                ));
+            }
+            if child.findings.len() > MAX_RENDERED_CHILD_FINDINGS {
+                out.push_str(&format!(
+                    "    … and {} more finding(s)\n",
+                    child.findings.len() - MAX_RENDERED_CHILD_FINDINGS
+                ));
+            }
+        }
+        if verdict.recursive.len() > MAX_RENDERED_CHILDREN {
+            out.push_str(&format!(
+                "  … and {} more recursive review(s) (see JSON verdict)\n",
+                verdict.recursive.len() - MAX_RENDERED_CHILDREN
+            ));
+        }
+    }
 
     // Findings breakdown
     if !verdict.findings.is_empty() {
-        println!("\nSecurity Findings ({}):", verdict.findings.len());
+        out.push_str(&format!(
+            "\nSecurity Findings ({}):\n",
+            verdict.findings.len()
+        ));
         for f in &verdict.findings {
             let tag = match f.severity {
                 VerdictBand::Block => "  [BLOCK]  ",
@@ -297,14 +356,15 @@ pub fn render_text(verdict: &Verdict, delta: &Delta) {
                 VerdictBand::Medium => "  [MEDIUM] ",
                 VerdictBand::Low => "  [INFO]   ",
             };
-            println!(
-                "{} {}: {}",
+            out.push_str(&format!(
+                "{} {}: {}\n",
                 tag,
                 sanitize_single_line(&f.title),
                 sanitize_single_line(&f.description)
-            );
+            ));
         }
     }
+    out
 }
 
 pub fn render_json(verdict: &Verdict) -> anyhow::Result<()> {
@@ -446,10 +506,85 @@ mod tests {
                 lines_deleted: 2,
             },
             trust_sources: None,
+            recursive: Vec::new(),
         };
 
         render_text(&verdict, &delta);
         assert!(render_json(&verdict).is_ok());
+    }
+
+    #[test]
+    fn card_renders_recursive_delivery_chains() {
+        let delta = crate::diff::Delta::default();
+        let child = crate::verdict::ChildReview {
+            chain: vec!["my-pkg@1.1.0".into(), "npm:evil-pkg@2.0.0".into()],
+            name: "evil-pkg".into(),
+            version: "2.0.0".into(),
+            ecosystem: crate::registry::Ecosystem::Npm,
+            band: crate::verdict::VerdictBand::High,
+            risk_score: 30,
+            findings: vec![crate::verdict::Finding {
+                rule_id: "R01_LIFECYCLE_SCRIPT_ADDED".into(),
+                severity: crate::verdict::VerdictBand::High,
+                title: "New install-time lifecycle script: `preinstall`".into(),
+                description: "backdoored script".into(),
+            }],
+        };
+        let verdict = crate::verdict::Verdict {
+            name: "my-pkg".into(),
+            target_version: "1.1.0".into(),
+            baseline_version: Some("1.0.0".into()),
+            integrity: "sha512-test".into(),
+            ecosystem: crate::registry::Ecosystem::Npm,
+            band: crate::verdict::VerdictBand::Block,
+            risk_score: 75,
+            findings: Vec::new(),
+            diff_summary: crate::verdict::DiffSummary::default(),
+            trust_sources: None,
+            recursive: vec![child],
+        };
+        let card = render_text_to_string(&verdict, &delta);
+        assert!(
+            card.contains("delivered via: my-pkg@1.1.0 → npm:evil-pkg@2.0.0"),
+            "{card}"
+        );
+        assert!(
+            card.contains("npm:evil-pkg@2.0.0 [HIGH] (score 30), 1 finding(s)"),
+            "{card}"
+        );
+        assert!(card.contains("[HIGH] R01_LIFECYCLE_SCRIPT_ADDED"), "{card}");
+    }
+
+    #[test]
+    fn card_truncates_long_recursive_lists_without_silence() {
+        let delta = crate::diff::Delta::default();
+        let child = |name: String| crate::verdict::ChildReview {
+            chain: vec!["root@1.0.0".into(), format!("npm:{name}@1.0.0")],
+            name,
+            version: "1.0.0".into(),
+            ecosystem: crate::registry::Ecosystem::Npm,
+            band: crate::verdict::VerdictBand::Low,
+            risk_score: 0,
+            findings: Vec::new(),
+        };
+        let verdict = crate::verdict::Verdict {
+            name: "root".into(),
+            target_version: "1.0.0".into(),
+            baseline_version: None,
+            integrity: "sha512-test".into(),
+            ecosystem: crate::registry::Ecosystem::Npm,
+            band: crate::verdict::VerdictBand::Low,
+            risk_score: 0,
+            findings: Vec::new(),
+            diff_summary: crate::verdict::DiffSummary::default(),
+            trust_sources: None,
+            recursive: (0..10).map(|i| child(format!("pkg{i}"))).collect(),
+        };
+        let card = render_text_to_string(&verdict, &delta);
+        assert!(card.contains("Recursive Reviews (10):"), "{card}");
+        assert!(card.contains("pkg7"), "{card}");
+        assert!(!card.contains("npm:pkg8"), "{card}");
+        assert!(card.contains("… and 2 more recursive review(s)"), "{card}");
     }
 
     mod proptest_invariants {
@@ -479,5 +614,86 @@ mod tests {
                 prop_assert!(!single.contains('\t'));
             }
         }
+    }
+
+    fn high_finding(rule_id: &str) -> crate::verdict::Finding {
+        crate::verdict::Finding {
+            rule_id: rule_id.to_string(),
+            severity: crate::verdict::VerdictBand::High,
+            title: "title".to_string(),
+            description: "description".to_string(),
+        }
+    }
+
+    fn child_with_findings(name: &str, finding_count: usize) -> crate::verdict::ChildReview {
+        crate::verdict::ChildReview {
+            chain: vec!["root@1.0.0".into(), format!("npm:{name}@1.0.0")],
+            name: name.into(),
+            version: "1.0.0".into(),
+            ecosystem: crate::registry::Ecosystem::Npm,
+            band: crate::verdict::VerdictBand::Low,
+            risk_score: 0,
+            findings: (0..finding_count)
+                .map(|i| high_finding(&format!("R{i:02}")))
+                .collect(),
+        }
+    }
+
+    fn card_verdict(
+        findings: Vec<crate::verdict::Finding>,
+        recursive: Vec<crate::verdict::ChildReview>,
+    ) -> crate::verdict::Verdict {
+        crate::verdict::Verdict {
+            name: "root".into(),
+            target_version: "1.0.0".into(),
+            baseline_version: None,
+            integrity: "sha512-test".into(),
+            ecosystem: crate::registry::Ecosystem::Npm,
+            band: crate::verdict::VerdictBand::Low,
+            risk_score: 0,
+            findings,
+            diff_summary: crate::verdict::DiffSummary::default(),
+            trust_sources: None,
+            recursive,
+        }
+    }
+
+    #[test]
+    fn child_findings_truncation_pins_cap_boundary() {
+        let delta = crate::diff::Delta::default();
+        let exact = card_verdict(Vec::new(), vec![child_with_findings("pkg", 3)]);
+        let card = render_text_to_string(&exact, &delta);
+        assert!(card.contains("3 finding(s)"), "{card}");
+        assert!(!card.contains("more finding(s)"), "{card}");
+        let over = card_verdict(Vec::new(), vec![child_with_findings("pkg", 4)]);
+        let card = render_text_to_string(&over, &delta);
+        assert!(card.contains("… and 1 more finding(s)"), "{card}");
+    }
+
+    #[test]
+    fn recursive_list_truncation_pins_cap_boundary() {
+        let delta = crate::diff::Delta::default();
+        let exact = card_verdict(
+            Vec::new(),
+            (0..8)
+                .map(|i| child_with_findings(&format!("pkg{i}"), 0))
+                .collect(),
+        );
+        let card = render_text_to_string(&exact, &delta);
+        assert!(card.contains("Recursive Reviews (8):"), "{card}");
+        assert!(!card.contains("more recursive review(s)"), "{card}");
+    }
+
+    #[test]
+    fn findings_section_renders_only_when_non_empty() {
+        let delta = crate::diff::Delta::default();
+        let populated = card_verdict(vec![high_finding("R01"), high_finding("R02")], Vec::new());
+        assert!(render_text_to_string(&populated, &delta).contains("Security Findings (2):"),);
+        let empty = card_verdict(Vec::new(), Vec::new());
+        let card = render_text_to_string(&empty, &delta);
+        assert!(!card.contains("Security Findings"), "{card}");
+        assert!(!card.contains("Recursive Reviews"), "{card}");
+        let chained = card_verdict(Vec::new(), vec![child_with_findings("pkg", 0)]);
+        assert!(render_text_to_string(&chained, &delta).contains("Recursive Reviews (1):"),);
     }
 }

@@ -179,6 +179,114 @@ pub enum Command {
 
     /// Start Model Context Protocol (MCP) JSON-RPC 2.0 stdio server
     Mcp,
+
+    /// Non-interactive review and hook gating for autonomous agents
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
+    },
+
+    /// Local-first recall index: serve, sync, and export audit candidates
+    Recall {
+        #[command(subcommand)]
+        action: RecallAction,
+    },
+
+    /// Install or remove PATH shims that route package managers through blueline
+    Shim {
+        #[command(subcommand)]
+        action: ShimAction,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum RecallAction {
+    /// Fetch the curated snapshot from a recall service and validate it
+    Sync {
+        /// Base URL of the recall service, e.g. http://127.0.0.1:7979
+        #[arg(long)]
+        url: String,
+    },
+    /// Serve a curated revocations.json on loopback
+    Serve {
+        #[arg(long, default_value_t = 7979)]
+        port: u16,
+
+        /// Path to the curated revocations.json
+        #[arg(long)]
+        snapshot: std::path::PathBuf,
+    },
+    /// Export hold/block audit entries as curation candidates
+    ExportCandidates {
+        /// Path to write the candidates JSON
+        #[arg(long)]
+        out: std::path::PathBuf,
+
+        /// Maximum entries to export
+        #[arg(long, default_value_t = 1000)]
+        limit: usize,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum ShimAction {
+    /// Write fail-closed shims that gate installs through `blueline agent gate`
+    Install {
+        /// Managers to shim: npm, npx, pnpm, yarn, bun, bunx, pip, pip3, cargo, yay, paru
+        #[arg(value_delimiter = ' ')]
+        managers: Vec<String>,
+
+        /// Target directory (default: the blueline data directory)
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+    },
+    /// Remove previously installed shims
+    Uninstall {
+        /// Managers to unshim
+        #[arg(value_delimiter = ' ')]
+        managers: Vec<String>,
+
+        /// Target directory (default: the blueline data directory)
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum AgentAction {
+    /// Review a package and print a machine-readable verdict (exit 0 Low, 2 blocked)
+    Review {
+        /// `<name>` or `<name>@<version>` to review
+        #[arg(value_parser = trim_pkg)]
+        pkg: String,
+    },
+    /// Police one command line for package-manager installs (hook binding)
+    Gate {
+        /// The command line to police; read from hook stdin when omitted
+        #[arg(long)]
+        command: Option<String>,
+
+        /// Decision output shape: plain (exit codes), claude, or cursor
+        #[arg(long, value_enum, default_value_t = GateFormatArg::Plain)]
+        format: GateFormatArg,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum GateFormatArg {
+    Plain,
+    Claude,
+    Cursor,
+}
+
+impl From<GateFormatArg> for crate::agent::GateFormat {
+    fn from(arg: GateFormatArg) -> Self {
+        match arg {
+            GateFormatArg::Plain => crate::agent::GateFormat::Plain,
+            GateFormatArg::Claude => crate::agent::GateFormat::Claude,
+            GateFormatArg::Cursor => crate::agent::GateFormat::Cursor,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]

@@ -212,3 +212,277 @@ Rulings:
 - [x] PR4 feat/pypi-adapter
 
 Mark your PR's box `[x]` in the same branch before opening it.
+
+---
+
+## Night run: close the loop (2026-09-12, drafted by the agent run — Kriday to veto any ruling before the PR opens)
+
+One branch, `feat/close-the-loop`, carries all four campaigns; the PRs stack
+per campaign with explicit `--base` per the convention above. Campaign briefs
+2–4 are appended here at their campaign boundaries, before their first slice.
+
+### Campaign 4 — dogfood & distribution (research brief)
+
+State check: the self-CI dogfood jobs (blueline ci on our own
+package-lock.json and Cargo.lock on every PR) ALREADY exist in
+ci.yml; npm publishing already uses --provenance; the npm shim tree is
+complete except that the launcher shims list only the linux-x64-gnu
+binary in optionalDependencies — every other platform would install a
+launcher that cannot find a binary. That is the real distribution gap.
+
+Rulings (locked, no re-litigating):
+
+1. Fill the shim gap: packages/blueline and packages/npx carry the FULL
+   platform matrix (all seven @bluelinecli/binary-* packages) in
+   optionalDependencies, package-lock.json regenerated to match
+   (--package-lock-only), and `npx blueline` verified from a cold
+   environment via the launcher's BLUELINE_BINARY path and a real
+   `node bin/blueline.js --version`.
+2. crates.io publish config: Cargo.toml gains repository/keywords/
+   categories metadata. No publish — config only.
+3. Homebrew formula in-repo (packaging/homebrew/blueline.rb): source
+   build via cargo, GitHub tag URL, head block. No tap push.
+4. AUR scaffold in-repo (packaging/aur/PKGBUILD + .SRCINFO): builds from
+   the signed GitHub tag with cargo, checksums left as the placeholder
+   the release process fills. Reviewed with blueline's own PKGBUILD
+   heuristics via the corpus gate before it ever lands on the AUR. No AUR
+   publish.
+5. Release provenance per D9: release.yml gains
+   actions/attest-build-provenance for the GitHub-release binaries
+   (id-token: write scoped to that job); npm --provenance stays; the
+   smoke gate runs BEFORE shims publish (already ordered). NOTHING is
+   published by this campaign — publish is outward-facing and needs
+   explicit human confirmation.
+6. Dogfood runs recorded as use-it evidence: `blueline ci` against our
+   own Cargo.lock (cargo ecosystem) and package-lock.json (npm), and
+   `blueline agent review` on one of our own locked dependencies.
+
+### Campaign 2 — agent-native enforcement (research brief)
+
+Motivation, verified against the Claude Code hooks reference, the Cursor
+hooks docs (1.7+), the Codex CLI execpolicy/config references, corepack/
+pipx/volta docs, and 2025-2026 gate prior art (Socket MCP, Attach Guard):
+Claude Code and Cursor both expose a stdin-JSON / exit-code-2 veto contract
+at the tool-call boundary; Codex has no hook process (bind point is
+Starlark prefix_rule + sandbox policy); PATH shims intercept the LAUNCHER
+only (corepack/pipx/volta all share the same bypass family: absolute
+paths, `command`, `env -i`, direct npm-cli.js), so per ARCHITECTURE.md the
+MCP/explicit call is primary and the shim is the enforcement backstop for
+the interactive terminal. `npm_execpath` is user-controllable (2linenodejs
+CTF pivot) and must never be trusted for security decisions. Hooks are
+repo-committable config and themselves an attack vector — recipes must
+live in USER-level settings, not the repo, and say so.
+
+Rulings (locked, no re-litigating):
+
+1. Primary surface: `blueline agent <pkg>` — no interactive prompt ever,
+   single-line JSON verdict on stdout (the D7 schema), deterministic exit
+   codes (0 approve/Low, 2 blocked/refused, 1 error), human hints on
+   stderr only. Approval is policy-bound: the verdict band decides, the
+   same blueline.toml thresholds/allowlists apply.
+2. Second surface: `blueline agent gate` — the hook binding. Input: the
+   command line to police via `--command`, or hook stdin (Claude Code
+   PreToolUse JSON and Cursor beforeShellExecution JSON are both accepted;
+   the command string is extracted). Output via `--format claude|cursor|
+   plain` in each product's native decision shape; plain (default) uses
+   exit codes only. The command string is scanned with the SAME
+   install-reference scanner as reviews (install_ref::scan_line) — one
+   parser, one grammar, no second opinion to drift. Package operands are
+   reviewed via the recursive engine; bare installs (no operands) are
+   ALLOWED with a stderr note pointing at `blueline ci` (a bare install
+   pulls the manifest's deps — policed by CI, disclosed honestly).
+3. Backstop: `blueline shim install <npm|npx|pip|cargo|yay|paru...>
+   [--dir <path>]` (and `blueline shim uninstall`) writes bash shims into
+   a user-chosen dir. Shims extract specs from the invocation, run
+   `blueline agent` per spec, and exec the REAL package manager (absolute
+   path resolved at install time, PATH fallback excluding the shim dir)
+   only when every verdict is Low. Fail closed everywhere: blueline
+   missing, errored, or refusing ⇒ the install does not run. pip flags
+   that name non-registry sources (-r/-e/--constraint/--target/...) are
+   refused with a pointer to `blueline ci` rather than guessed at.
+   `yay/paru -S` with operands reviews each AUR spec; update runs without
+   operands pass through and are disclosed as a bypass in the docs.
+4. The bypass list is documented on the card of truth (README): absolute
+   binary paths, `command npm`, `env -i`, direct npm-cli.js, npx resolving
+   from node_modules/.bin, PATH reordering, hook config tampering in
+   repo-committable settings. No security theater: the shim is
+   defense-in-depth for the terminal, hooks for the agent, CI for the
+   manifest — the campaign says so in writing.
+5. Audit: every `agent` decision writes the existing audit_log with
+   `decided_by = "agent:<identity>"`; identity comes from process env
+   (CLAUDECODE/CLAUDE_CODE_ENTRYPOINT → claude-code, CURSOR_* → cursor,
+   CODEX_* → codex, else unknown-agent) and lands in `notes` (env names
+   only, never values — no telemetry beyond the local store, D8 holds).
+6. Codex CLI has no hook process: the recipe is a Starlark `prefix_rule`
+   set to `prompt` for install verbs plus instructions to route installs
+   through `blueline agent` — stated as advisory in the docs, not sold as
+   enforcement.
+7. No new dependencies; shims are generated scripts, parsing reuses
+   install_ref; store schema untouched.
+
+Slices:
+
+- Slice 1 `agent-mode`: `src/agent.rs` — `blueline agent <pkg>` +
+  `blueline agent gate`, identity detection, audit entries, exit codes,
+  unit + integration tests.
+- Slice 2 `shims`: `src/shim.rs` — install/uninstall for npm, npx, pip,
+  cargo, yay, paru; fail-closed script templates; tests running real shim
+  scripts against the fixture registry.
+- Slice 3 `recipes`: README/Claude/Cursor/Codex recipes with the honest
+  bypass list; user-level-settings warning; use-it pass.
+
+### Campaign 3 — recall / revocation index (research brief)
+
+Motivation, verified against the OSV API docs and the OpenSSF/GitHub lag
+data from the Campaign 1 research: OSV/GHSA classify new malware on the
+order of ~3 days (28-day NVD median), which is exactly the window the
+TanStack worm used. A curated, human-verified revocation index that a team
+controls closes that gap WITHOUT the hosted paid tier (D6): the service and
+the client ship in-repo, run end-to-end locally, and the curation workflow
+starts from blueline's own audit log.
+
+Rulings (locked, no re-litigating):
+
+1. LOCAL-FIRST and self-hostable: `blueline recall serve --port N
+   --index <revocations.json>` serves a curated snapshot over a minimal
+   std-only HTTP server (no new dependency); `blueline recall sync --url
+   <base>` fetches it; `blueline recall export-candidates` turns the local
+   audit log (holds, blocks, refusals) into a candidates file a human
+   curates by hand. No hosted deployment, no tokens, no paid tier.
+2. The synced snapshot lives in a JSON FILE under the data directory —
+   NOT in the SQLite store. store.rs is untouched (the ask-first
+   guardrail holds; a schema migration is not needed for a cache that is
+   rebuilt wholesale on every sync). The snapshot is validated fail
+   closed on every load: schema version, entry caps, per-ecosystem name
+   grammar reuse, valid versions, sane timestamps; anything off → the
+   index is treated as absent WITH a disclosure, never as trusted.
+3. Snapshot format: `{schema, generated_at, sequence, revocations:
+   [{ecosystem, name, versions: [...] | all_versions, reason, id}]}`,
+   sequence + generated_at for staleness and monotonic sync checks (a
+   sync that would move the sequence BACKWARD is refused — fail closed).
+4. Fold-in: hits surface through the EXISTING advisory engine — a
+   revocation hit is an advisory item with `is_malware: true`, which the
+   heuristic already maps to R09_ADVISORY_MALWARE (BLOCK, D7: CLI, CI and
+   MCP inherit). Staleness is its own rule `R28_RECALL_STALE` (MEDIUM
+   disclosure by default; policy `recall.block_on_stale` escalates to
+   BLOCK). Policy `[recall]`: `max_age_hours` (default 48) and
+   `block_on_stale` (default false). A missing snapshot is not stale —
+   it is simply absent (no index installed), and says nothing on the
+   card beyond absence.
+5. Client fetches are bounded (size cap, entry cap) and the server is
+   read-only over loopback-friendly defaults; the curated index file is
+   the single source of truth and the served bytes are exactly the file
+   bytes (no server-side mutation).
+
+Slices:
+
+- Slice 1 `recall-service`: snapshot format + fail-closed validation +
+  sync client + serve + export-candidates, unit and integration tests.
+- Slice 2 `fold-in`: advisory fold-in + staleness policy + card/JSON
+  disclosure + use-it pass (serve locally, seed a human-verified
+  revocation, sync, hit → BLOCK; stale → disclosed; sync-down → explicit).
+
+### Campaign 1 — recursive review (research brief)
+
+Motivation, verified against the TanStack postmortem, the Unit42 writeup,
+StepSecurity's and Sonatype's Atomic Arch coverage: both campaigns delivered
+through a **machine-resolved reference inside an already-reviewed artifact** —
+TanStack injected `optionalDependencies: { "@tanstack/setup":
+"github:tanstack/router#<orphan-sha>" }` whose `prepare` script ran at install
+time (with valid SLSA L3 provenance, which attests the builder, not the
+referenced install), and Atomic Arch's PKGBUILDs carried a one-line
+`npm install atomic-lockfile` whose npm `preinstall` ran the infostealer. In
+both, the reviewed diff is benign; the payload lives one hop away. OSV/GHSA
+classify new malware on the order of ~3 days (28-day NVD median), so advisory
+gating alone misses the window. The exploitable invariant: a reference whose
+resolution happens on the victim machine is neither reviewed nor pinned.
+
+Rulings (locked, no re-litigating):
+
+1. Recursion lives in the ENGINE, not the CLI. `evaluate_with_registry` gains
+   a threaded review context (depth, visited set, delivery chain, shared
+   registries); every entry point — CLI `review`/`install`/`ci`, MCP
+   `review_install` — inherits it with no surface-specific code.
+2. Reference surfaces in v1: (a) npm manifest lifecycle scripts
+   (`preinstall`/`install`/`postinstall`/`prepare`) invoking a package
+   manager (`npm/npx/pnpm/yarn/bun` + `install/i/add/exec/x/dlx/run`) — the
+   Shai-Hulud/TanStack lane; (b) PKGBUILD npm/bun delivery — the existing
+   R23 scan, extended to yield the parsed spec; (c) wheel `.data/scripts`
+   and entry-point-adjacent payloads scanned statically for pip/npm
+   invocations. Entry points that reference the distribution's OWN modules
+   are not recursion triggers (they execute deferred, but reference nothing
+   installable; R02 already covers them).
+3. Non-registry references (`git:`, URLs, `file:`) are NOT recursively
+   reviewed in v1 — resolving arbitrary git hosts is a new trust surface.
+   They keep their existing findings (R04 family) and the card discloses
+   that referenced non-registry installs were not reviewed. No silent gap.
+4. New rules: `R24_LIFECYCLE_INSTALL_REF` (HIGH) for a package-manager
+   install invoked from an npm lifecycle script, with MEDIUM variants for an
+   unpinned spec (mutable payload) and an unresolvable spec; dynamic/
+   unparseable specs (command substitution etc.) surface as MEDIUM
+   "unparseable install reference" — never guessed at. `R25_RECURSION_DEPTH`
+   (HIGH, fail closed: the cap is stated, never silent) and
+   `R26_RECURSION_CYCLE` (HIGH). Roll-up finding `R27_SECOND_ORDER` carries a
+   child finding that meets the policy threshold into the parent verdict.
+5. R23 graduates Low → MEDIUM: with recursion covering what it points at,
+   the delivery line is a real second-order install signal; the INFO band
+   existed only because nobody resolved the reference.
+6. Policy (`[recursion]` in blueline.toml): `max_depth` default 3,
+   `max_child_reviews` default 8 (bounds CI/fan-out cost; exceeding either
+   emits R25, fail closed), `child_block_band` default `"high"` — a child
+   finding at or above the band escalates the parent verdict; ambiguity
+   resolves to block.
+7. Cache/memo: a session-scoped driver holds one registry instance per
+   ecosystem (today each `evaluate_package` call builds a fresh one) and a
+   bounded in-memory tarball memo keyed `(ecosystem, name, version)`, cleared
+   on overflow like the AUR `clone_cache`. The visited set is both cycle
+   detection and the no-re-review memo. Store schema UNTOUCHED.
+8. Children are never approved, never marked clean; `record_verified`
+   evidence rows only. The parent decision decides; interactive approval
+   happens once, on the parent.
+9. Verdict JSON grows `recursive: Vec<ChildReview>` (skipped when empty)
+   where `ChildReview = { chain: Vec<String>, name, version, ecosystem, band,
+   risk_score, findings }`. Per D7 the CLI card, CI report, and MCP
+   structuredVerdict all inherit it. The card renders the delivery chain
+   ("delivered via: pkgbase → npm:package@ver").
+10. `extract.rs` untouched (scanning happens post-extract on the extracted
+    root and manifest views). No new dependencies. The npm-lifecycle
+    reference extractor is hand-rolled token scanning with fail-closed
+    bounds, same discipline as the PKGBUILD tokenizer; fuzz target added.
+
+Slices (each independently green, small commits, CHANGELOG entry per slice):
+
+- Slice 1 `ref-extraction`: reference extraction module (npm lifecycle
+  scripts + PKGBUILD R23 spec plumbing + wheel `.data/scripts` scan),
+  unit tests, CHANGELOG.
+- Slice 2 `recursive-engine`: review context, recursive driver with depth
+  cap / cycle detection / visited memo / registry + tarball reuse, child
+  evaluation, unit + integration tests against the fixture registry.
+- Slice 3 `rollup-render`: `ChildReview` in the verdict schema, policy
+  `[recursion]`, R23 graduation, card chain rendering, MCP/CI inheritance
+  tests, fuzz target.
+- Slice 4 `use-it`: adversarial fixture registry (A → B backdoored chain)
+  end-to-end BLOCK proof, README/ARCHITECTURE notes.
+
+## Status: close the loop
+
+- [x] Campaign 1: recursive review (slices: ref-extraction, recursive
+  engine, rollup-render, use-it e2e; reviewers PASS; use-it: real binary
+  BLOCKed the adversarial A→B chain and live AUR webtorrent-desktop review
+  rendered R23 at MEDIUM)
+- [x] Campaign 2: agent-native enforcement (slices: agent-mode, shims,
+  recipes; review loop fixed gate fail-open P1s — error-deny, per-registry
+  routing, flag/override/comment scanner shapes; use-it: real npm install
+  through an installed shim blocked unapproved and ran approved, Claude
+  Code + Cursor hook payloads denied/allowed with agent identities in the
+  audit log)
+- [x] Campaign 3: recall / revocation index (slices: recall-service,
+  fold-in; use-it: e2e serve/sync/block, staleness disclosure and
+  escalation, curation export pinned in tests/recall_cli.rs)
+- [x] Campaign 4: dogfood & distribution (platform matrix filled,
+  crates.io/homebrew/AUR configs in-repo, SLSA attestation wired;
+  publish pending human confirmation per the goal; use-it: blueline ci
+  PASSED on own Cargo.lock and package-lock.json, agent review of
+  serde_json@1.0.151 LOW, npx launcher cold start verified)
+
+Mark each campaign's box `[x]` in the same branch when it lands.

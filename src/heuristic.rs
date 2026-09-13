@@ -671,6 +671,7 @@ pub fn evaluate_with_trust(
         } else {
             None
         },
+        recursive: Vec::new(),
     }
 }
 

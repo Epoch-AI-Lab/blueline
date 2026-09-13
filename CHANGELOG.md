@@ -9,6 +9,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- PATH-shim routing (`blueline shim install|uninstall <npm|npx|pip|cargo|yay|paru>
+  [--dir <path>]`): generated bash shims that rebuild the invocation and
+  route it through `blueline agent gate` before the real package manager
+  (resolved on PATH at install time, excluding the shim directory) runs.
+  Fail closed everywhere — blueline missing, errored, or refusing means the
+  install does not run, and a missing real binary refuses shim creation.
+  The scanner gained `cargo install`, and `yay`/`paru -S` operands
+  (AUR-grammar specs with `name=version` pinning), so all six managers are
+  reviewed through one grammar; pip flags that name non-registry sources
+  (`-r`, `-e`, `--constraint`, …) are refused with a pointer to
+  `blueline ci`. `BLUELINE_REGISTRY` and `BLUELINE_POLICY` environment
+  variables scope a shimmed shell to a mirror and a project policy.
+- Agent-native enforcement (`blueline agent`): `agent review <pkg>` gives
+  autonomous agents a policy-bound, never-interactive gate — single-line
+  JSON verdict on stdout (the D7 schema, recursive reviews included),
+  exit 0 when the policy allows and 2 when it refuses, human hints on
+  stderr, no known_clean mutation (an agent cannot bless baselines), and
+  an audit-log entry with `decided_by = "agent:<identity>"` where the
+  identity comes from the agent's process environment (Claude Code,
+  Cursor, Codex CLI; env names only, never values — no telemetry beyond
+  the local store). `agent gate` is the hook binding: it polices a command
+  line via `--command` or hook stdin (Claude Code PreToolUse and Cursor
+  `beforeShellExecution` payloads both accepted), scans it with the same
+  install-reference scanner the review engine uses, reviews every named
+  install with the recursive engine, and answers with exit codes or the
+  native decision JSON (`--format claude|cursor`). Dynamic or unresolvable
+  targets deny fail closed; bare installs are allowed with a note that
+  manifest dependencies are policed by `blueline ci`.
+- Recursive review (`src/recursive.rs`): an install reference found in a
+  reviewed payload — npm lifecycle scripts, PKGBUILD `npm`/`bun` delivery
+  (R23), or PyPI wheel `.data/scripts` — is now piped through the same
+  review engine as a second-order review instead of only being named.
+  Referenced packages are re-reviewed with a depth cap (policy
+  `recursion.max_depth`, default 3), a per-review child budget
+  (`max_child_reviews`, default 8), cycle detection (A → B → A is cut and
+  disclosed), and a session tarball memo so referenced packages are never
+  re-downloaded. Every reference is disclosed as
+  `R24_LIFECYCLE_INSTALL_REF` (HIGH when pinned, MEDIUM when unpinned,
+  unresolvable, or dynamic; HIGH for non-registry git/URL/path specs, which
+  are not recursively reviewed), cap overruns as `R25_RECURSION_DEPTH` and
+  cycles as `R26_RECURSION_CYCLE` (both HIGH, fail closed), and a child
+  finding at or above `recursion.child_block_band` (default HIGH) rolls up
+  into the parent verdict as `R27_SECOND_ORDER` — a HIGH finding in a
+  referenced package can BLOCK the parent. The JSON verdict schema grows a
+  `recursive` array of child reviews (delivery chain, band, score,
+  findings), so the CLI, CI reports, and the MCP `structuredVerdict` all
+  carry the second-order results from the single source of truth; the
+  review card renders each child's delivery chain and worst findings.
+- Install-reference extraction (`src/install_ref.rs`), the scanning layer for
+  recursive review: static detection of package-manager invocations that
+  resolve another install at install/build time — npm lifecycle scripts
+  (`preinstall`/`install`/`postinstall`/`prepare`/kin) invoking
+  `npm`/`npx`/`pnpm`/`yarn`/`bun`/`pip` with a named spec, PKGBUILD npm/bun
+  delivery specs exposed by the new `pkgbuild::npm_delivery_refs`, and wheel
+  `.data/scripts` payloads. Each reference records its manager, origin, raw
+  spec, whether the spec is exactly pinned, and whether it was statically
+  parseable (dynamic shell payloads are disclosed unparseable, never
+  guessed). Nothing executes or fetches — pure parsing of already-extracted
+  bytes, bounded per line, with non-UTF-8 `.data/scripts` files surfaced as
+  unparseable references instead of silently skipped.
+
 - AUR integration (`feat/aur-integration`): `blueline --ecosystem aur ci
   --lockfile aur.lock` reviews added and version-changed pins from a file of
   one `pkgbase@pkgver-pkgrel` per line (blank lines and `#` comments
@@ -80,6 +141,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- The policy loader honors `BLUELINE_POLICY` (an absolute path) ahead of
+  the default search, so shimmed shells and agent hooks running outside a
+  project directory keep their policy scoping; a set-but-unreadable path
+  fails closed, and an explicit `--policy` flag wins over the environment.
+- `R23_NPM_DELIVERY` graduates from INFO to MEDIUM: recursive review now
+  resolves and reviews the npm/bun packages a PKGBUILD delivery line names,
+  so the delivery line is a true second-order signal. The three
+  benign-corpus fixtures that fire it (joplin, bitwarden-cli, insomnia) are
+  pinned as documented true positives in the corpus gate.
 - Push-to-main mutation testing now mutates only the lines of the pushed
   commit (`git diff HEAD~1..HEAD` fed to `cargo mutants --in-diff`) instead of
   re-running the full trust-boundary file set on every merge, spread across a
@@ -100,49 +170,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- AUR review hardening from the PR #53 review: PKGBUILD function bodies are
-  comment-stripped before rule scanning, so a commented-out `curl | bash`
-  inside `build()` no longer produces a HIGH R13/R14/R17 false positive; an
-  unreadable baseline PKGBUILD now raises `R00_BASELINE_UNREADABLE` at High
-  (matching the unparseable case) instead of Low, so invalid-UTF-8 baselines
-  cannot slip past the R12/R19 pair rules for a Low finding; interpreter
-  process substitution (`bash <(curl -fsSL https://…)` and fused
-  `bash<(curl …)`) now fires R13 even without a pipe; `git` runs under
-  `LC_ALL=C` so error classification no longer depends on the system locale;
-  and `git` invocations run in their own process group with bounded pipe
-  drain, so a transport child (`git-remote-https`, `ssh`, …) that outlives
-  git and holds the output pipes can no longer hang the review.
-- AUR review hardening from the adapter review follow-up: per-commit
-  `.SRCINFO` reads distinguish content failures (missing, oversized,
-  non-UTF-8, malformed — counted as skips) from git plumbing failures
-  (propagated fail-closed, so object corruption can no longer masquerade as
-  "no parseable .SRCINFO"); `Package.version` now stores the pinned commit's
-  canonical version instead of the user's spelling, so vercmp aliases like
-  `1.1.0-01` resolve to identical store keys and displayed identities; the
-  extracted `.SRCINFO`'s declared `pkgbase` is cross-checked against the
-  resolved package base at the review boundary; `list_versions` keeps the
-  adapter's vercmp ordering instead of re-sorting with semver prerelease
-  rules; new tests pin the deterministic equal-timestamp hash tiebreak, the
-  split-package pkgname → pkgbase path, directory-not-file refusals, and the
-  pkgbase mismatch refusal.
-- The MCP `check_known_clean` AUR arm compares the requested version against
-  stored clean versions with libalpm vercmp equality instead of canonical
-  strings, so grammar-accepted spellings of an approved release (pkgrel-less
-  `12.4.2`, epoch-explicit `0:12.4.2-1`) now report `isClean: true` against a
-  stored `12.4.2-1` instead of a false negative; an unparseable AUR version is
-  now an `invalid params` error rather than a guaranteed not-clean.
-- AUR review follow-up fixes: R05 no longer runs the semver leg on AUR
-  versions (two-component `1.0-1` spellings are normal, validated with
-  `AurVersionInfo` instead); split-package pkgnames fail closed with a
-  pointer to review the pkgbase explicitly instead of silently swapping
-  identity; `release_author` pins the clone URL and verifies the commit
-  before reading the author email; R13 spots spaceless pipes (`curl x|bash`)
-  and fetcher pipes into `python`/`perl`/`ruby`/`php`.
-- Release workflow smoke gate invokes the shipped binary with
-  `--policy blueline.toml --output json --yes` and asserts on the presence of
-  the `integrity` field, matching the current CLI flags and the 0.3.0
-  canonical digest display (the old grep for `"integrity":"verified` could
-  never match).
+- A mutation-testing survivor in the recursive-review reference cap: the
+  overflow disclosure fired one reference early (`>` vs `>=`), which would
+  have flagged a payload carrying exactly the cap as overflowing. The
+  boundary is now pinned by a test at exactly 32 references.
+- The npm dogfood CI gate no longer hardcodes which shipped packages must
+  appear in the evaluated set: a lockfile delta that adds platform
+  binaries (as the completed platform matrix does) shifted the evaluated
+  names and failed the assert even though the scan was healthy. The gate
+  now asserts that every evaluated package is a shipped package, that the
+  delta produces evaluations, and that unchanged packages are counted.
+- Agent-gate hardening from the campaign review: every gate error path now
+  DENIES instead of exiting 1 (hook hosts treat non-2 exits as
+  non-blocking, so a hostile stdin payload sized to break the UTF-8 read,
+  a corrupt store, or an unreadable policy previously let the command run
+  ungated); gate-managed installs route to their own registries (`cargo
+  install` → crates.io, `yay`/`paru -S` → the AUR, `pip` → PyPI — the
+  wrong-registry routing previously reviewed an npm namesake); and the
+  scanner + gate close the silent-allow shapes: `pip install -r/-e/-c`
+  (non-registry sources), `npx --package=<pkg>`, `npm exec`/`npm x`/`bun x`
+  (which execute packages exactly like npx), and manager tokens hidden
+  behind quoting or backslash escapes. Oversized hook stdin is refused, a
+  missing-real-binary or hostile-character install path refuses shim
+  creation, real binaries are checked for the exec bit, each manager's
+  shim passes only its own registry override, `pip3` ships as a shim
+  target, and gate denials are audited.
+- The gate scanner finds verbs behind leading global flags
+  (`npm --no-fund install evil` was a silent allow), denies npm registry
+  and config overrides in gated installs (`--registry=`, `--userconfig`,
+  `--tag=`, `npm_config_*` env assignments, `npm config set registry` —
+  reviewing one registry while installing from another), discloses
+  dynamic `--package` values as unparseable markers instead of dropping
+  them behind decoy positionals, and stops scanning at shell comments.
+- The README hook recipes pin `BLUELINE_POLICY` for the hook environment
+  (a repo's committed blueline.toml otherwise governs hooks fired with the
+  repository as cwd) and disclose the remaining bypass surface.
 
 ## [0.3.0] - 2026-08-31
 

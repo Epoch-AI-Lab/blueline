@@ -42,6 +42,9 @@ and any `postinstall`/`preinstall` script is surfaced for a *separate* human dec
 │                     approval overrides, policy                │
 │  extract         ── verify hash → bounded sandbox extract    │
 │  diff            ── file-level + line-level (similar crate)   │
+│  install_ref     ── scan payload for referenced installs      │
+│  recursive       ── re-review referenced installs: depth caps,│
+│                     cycle detection, roll-up                  │
 │  heuristic       ── rule engine → risk score → verdict        │
 │  revocation      ── OSV / GitHub Advisory cache + hosted idx  │
 │  provenance      ── sigstore/SLSA attestation *surfaced*,     │
@@ -135,6 +138,73 @@ Every tarball and registry response is fully untrusted. The `extract` stage enfo
 Explicit `review_install` tool (agent calls before install) is primary; optional
 invasive PATH shim that routes `npm`/`npx` through blueline is secondary.
 Recommend the explicit tool to avoid breaking agent toolchains.
+
+---
+
+## 5. Second-order lanes (agent / recall / shim)
+
+Install-time references (npm lifecycle scripts, wheel `.data/scripts`,
+PKGBUILD npm/bun delivery) are first-class findings, reviewed recursively:
+
+- **R24** — every statically visible reference is disclosed; band reflects
+  pinnability (HIGH pinned, MEDIUM unpinned/dynamic, HIGH non-registry).
+- **R25** — depth/budget caps (`[recursion] max_depth`, `max_child_reviews`)
+  fail closed as HIGH findings, never silent skips.
+- **R26** — install-reference cycles (A → B → A) are cut with a HIGH finding.
+- **R27** — roll-up: a child finding at/above `child_block_band` escalates
+  the parent via a second-order finding carrying the delivery chain.
+- **R28** — recall-index staleness: MEDIUM past `[recall] max_age_hours`,
+  HIGH when unreadable, BLOCK with `block_on_stale`.
+
+### `ReviewContext` cycle (`src/recursive.rs`)
+
+One `ReviewContext` spans a top-level evaluation. `enter_scope` pushes the
+cycle key `(ecosystem, name, version)` and the human-readable delivery-chain
+label; `exit_scope` pops both after the evaluation *including its children*.
+Name identity in keys is ecosystem-scoped (`canonicalize_for_ecosystem`):
+PEP 503 applies to PyPI only — npm/cargo/AUR `foo_bar` vs `foo-bar` are
+distinct. The verdict schema (D7) carries the outcome in its `recursive`
+field: `Vec<ChildReview>` with chain, band, score, and findings per child.
+
+### Agent lane (`src/agent.rs`)
+
+`agent review` (JSON verdict, exit 0/2, never marks clean) and `agent gate`
+(hook binding policing one command line through the same scanner + engine).
+Both load policy via `Policy::load_for_agent`, which **ignores
+`BLUELINE_POLICY` unless `--policy` names the file** — ambient env is
+attacker-shaped at the hook boundary — and warns on stderr when it does.
+Redirect-capable env (`PIP_*`, `NPM_CONFIG_*`, `CARGO_*`) present at gate
+time is disclosed by name (never value) in the reason and audit trail.
+
+### Recall lane (`src/recall.rs`)
+
+Curated revocation snapshot synced wholesale (`recall sync`, monotonic
+`sequence`, backward moves refused without writing). Lookup normalizes
+PyPI names on both sides (PEP 503) and compares versions by grammar
+(`1.0` fires on `1.0.0`); other ecosystems match exactly. A hit BLOCKs via
+the advisory engine *before* the `check_advisories` switch — disabling OSV
+never silences recall — and never routes through the advisory cache.
+
+### Shim lane (`src/shim.rs`)
+
+Fail-closed bash shims for all eleven scanned managers (`npm`, `npx`,
+`pnpm`, `yarn`, `bun`, `bunx`, `pip`, `pip3`, `cargo`, `yay`, `paru`)
+routing through `agent gate --policy` before exec'ing the real binary.
+Known bypasses stay documented in the README.
+
+### Policy tables (`blueline.toml`)
+
+| Table | Keys |
+|---|---|
+| `thresholds` | `max_low_score` (19), `max_medium_score` (49), `block_score` (80) |
+| `policy` | `require_provenance`, `block_unreviewed_scripts`, `allow_git_dependencies`, `check_advisories`, `fail_closed_network` |
+| `advisories` | `block_on_malware`, `block_on_critical_cve`, cache TTLs |
+| `provenance` | `require_provenance`, `require_signatures`, builders/repos |
+| `allowlist.packages` | exact `name` (+optional `ecosystem`), `allowed_scripts`, `allow_unreviewed_baseline` |
+| `blocklist` | glob `packages` (+optional `ecosystem`), `maintainers` |
+| `ci` | `fail_on`, `max_evaluations`, `include_dev` |
+| `recursion` | `max_depth` (3, cap 16), `max_child_reviews` (8, cap 256), `child_block_band` (HIGH) |
+| `recall` | `max_age_hours` (48), `block_on_stale` |
 
 ---
 

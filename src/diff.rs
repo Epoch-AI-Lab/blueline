@@ -10,14 +10,15 @@ use crate::manifest::PackageJson;
 
 const MAX_DIFF_FILE_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB cap for line diffing
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum FileKind {
+    #[default]
     Text,
     Binary,
     OpaqueTooLarge,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FileChange {
     pub relative_path: String,
     pub kind: FileKind,
@@ -27,7 +28,7 @@ pub struct FileChange {
     pub unified_diff: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Delta {
     pub baseline_version: Option<String>,
     pub target_version: String,
