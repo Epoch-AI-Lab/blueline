@@ -1226,6 +1226,8 @@ mod tests {
         assert!(gate_hard_denies("pip3 install -e git+https://x").len() == 1);
         assert!(gate_hard_denies("pip install requests==2.31.0").is_empty());
         assert!(gate_hard_denies("pip install -q requests").is_empty());
+        assert!(gate_hard_denies("npm install -r requirements.txt").is_empty());
+        assert!(gate_hard_denies("install -r requirements.txt").is_empty());
     }
 
     #[test]
