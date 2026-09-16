@@ -1751,6 +1751,15 @@ mod tests {
     }
 
     #[test]
+    fn pip_exactness_accepts_non_semver_starts_with_digit() {
+        assert!(version_is_exact(RefManager::Pip, "2.31"));
+        assert!(version_is_exact(RefManager::Pip, "1.0"));
+        assert!(!version_is_exact(RefManager::Npm, "2.31"));
+        assert!(!version_is_exact(RefManager::Npm, "1.0"));
+        assert!(!version_is_exact(RefManager::Pip, "==2.31"));
+    }
+
+    #[test]
     fn scan_line_preserves_raw_spec_casing() {
         let refs = scan_line("pip install Requests==2.31.0");
         assert_eq!(
@@ -1799,6 +1808,43 @@ mod tests {
         assert_eq!(
             scan_line("npx --package=evil-pkg serve"),
             vec![(RefManager::Npx, "evil-pkg".to_string())]
+        );
+    }
+
+    #[test]
+    fn repeated_equals_package_flags_yield_each_ref() {
+        assert_eq!(
+            scan_line("npx --package=a --package=b serve"),
+            vec![
+                (RefManager::Npx, "a".to_string()),
+                (RefManager::Npx, "b".to_string()),
+            ]
+        );
+        assert_eq!(
+            scan_line("npx --package=a --package=b --package=c serve"),
+            vec![
+                (RefManager::Npx, "a".to_string()),
+                (RefManager::Npx, "b".to_string()),
+                (RefManager::Npx, "c".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn chained_managers_across_separators_yield_each_ref() {
+        assert_eq!(
+            scan_line("npm install a && yay -S foo"),
+            vec![
+                (RefManager::Npm, "a".to_string()),
+                (RefManager::Yay, "foo".to_string()),
+            ]
+        );
+        assert_eq!(
+            scan_line("yay -S foo && pip install b"),
+            vec![
+                (RefManager::Yay, "foo".to_string()),
+                (RefManager::Pip, "b".to_string()),
+            ]
         );
     }
 
@@ -1914,6 +1960,14 @@ mod tests {
         assert!(!non_registry_spec("evil-pkg"));
         assert!(!non_registry_spec("requests==2.31.0"));
         assert!(!non_registry_spec("@scope/pkg"));
+    }
+
+    #[test]
+    fn non_registry_single_disjunct_shapes_still_match() {
+        assert!(non_registry_spec("https://evil.example/pkg"));
+        assert!(non_registry_spec("git+evil/pkg"));
+        assert!(!non_registry_spec("git"));
+        assert!(!non_registry_spec("pkg.tgz.bak"));
     }
 
     #[test]
