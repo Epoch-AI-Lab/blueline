@@ -1053,7 +1053,11 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let out = loop {
             match child.try_wait().expect("serve child must be waitable") {
-                Some(_) => break child.wait_with_output().expect("serve output must be readable"),
+                Some(_) => {
+                    break child
+                        .wait_with_output()
+                        .expect("serve output must be readable");
+                }
                 None if std::time::Instant::now() > deadline => {
                     let _ = child.kill();
                     let _ = child.wait();
