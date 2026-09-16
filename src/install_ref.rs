@@ -1711,6 +1711,7 @@ mod tests {
         assert!(!valid_npm_name(""));
         assert!(!valid_npm_name("Foo"));
         assert!(!valid_npm_name("foo!bar"));
+        assert!(!valid_npm_name("scope/pkg"));
     }
 
     #[test]
@@ -1834,13 +1835,15 @@ mod tests {
                 (RefManager::Npx, "b".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn long_flag_walk_does_not_truncate_refs() {
         assert_eq!(
-            scan_line("npx --package=a --package=b --package=c serve"),
-            vec![
-                (RefManager::Npx, "a".to_string()),
-                (RefManager::Npx, "b".to_string()),
-                (RefManager::Npx, "c".to_string()),
-            ]
+            scan_line(
+                "npm --no-fund --no-audit --dry-run --prefer-offline --no-progress --ignore-scripts install evil-pkg"
+            ),
+            vec![(RefManager::Npm, "evil-pkg".to_string())]
         );
     }
 

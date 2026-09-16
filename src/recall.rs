@@ -834,7 +834,6 @@ mod tests {
     #[test]
     fn index_cap_boundary_is_exact() {
         assert_eq!(MAX_SNAPSHOT_BYTES, 8 * 1024 * 1024);
-        assert_eq!(MAX_SNAPSHOT_BYTES, 8_388_608);
         assert!(index_size_within_cap(0));
         assert!(index_size_within_cap(MAX_SNAPSHOT_BYTES - 1));
         assert!(index_size_within_cap(MAX_SNAPSHOT_BYTES));
