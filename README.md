@@ -59,7 +59,7 @@ If a release exceeds risk thresholds, Blueline blocks the install and halts the 
 - [x] npm and npx wrapper shim (`@blueline/cli`)
 - [x] GitHub Action PR check
 - [x] Agent hook via Model Context Protocol (MCP)
-- [ ] Revocation index and recall API
+- [x] Recall / revocation index (local-first, self-hostable; hosted API remains out of scope)
 
 ## Quickstart
 

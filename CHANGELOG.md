@@ -170,6 +170,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Mutation-testing survivors in the close-the-loop trust boundary:
+  `valid_npm_name` rejects a missing `@` up front (empty scope/pkg
+  segments were already rejected by the segment grammar, so the extra
+  disjuncts were dead logic); the pip non-registry scan and the yay/paru
+  verb search drop inert index arithmetic; npm/cargo recall matching is
+  pinned as exact (strict semver has no distinct-but-equal forms, the old
+  parse-and-compare arm could never fire); the serve size cap is a
+  boundary-tested predicate and the oversized-index refusal test kills a
+  hung server instead of hanging the suite; `is_executable_file` is one
+  function with cfg branches inside; and both `scan_words` walks carry
+  fuel so a stalled index trips instead of looping. New pinning tests:
+  pip exactness for non-semver (`2.31`), single-disjunct non-registry
+  shapes, repeated `--package=` flags, and chained managers.
 - A mutation-testing survivor in the recursive-review reference cap: the
   overflow disclosure fired one reference early (`>` vs `>=`), which would
   have flagged a payload carrying exactly the cap as overflowing. The
