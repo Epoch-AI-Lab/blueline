@@ -347,7 +347,12 @@ fn scan_words(toks: &[Tok]) -> Vec<(RefManager, String)> {
         let mut j = i + 1;
         let mut skip_value = false;
         let mut pending_package = false;
+        let mut fuel = toks.len();
         while j < toks.len() {
+            if fuel == 0 {
+                break;
+            }
+            fuel = fuel.saturating_sub(1);
             let t = &toks[j];
             if t.is_separator || t.ends_command {
                 break;
@@ -418,7 +423,12 @@ fn scan_words(toks: &[Tok]) -> Vec<(RefManager, String)> {
                     j
                 };
                 let mut found = None;
+                let mut fuel = toks.len();
                 while k < toks.len() && !toks[k].is_separator && !toks[k].ends_command {
+                    if fuel == 0 {
+                        break;
+                    }
+                    fuel = fuel.saturating_sub(1);
                     let word = toks[k].lower.as_str();
                     let is_verb = match manager {
                         RefManager::Npm => matches!(word, "install" | "i" | "add" | "exec" | "x"),
