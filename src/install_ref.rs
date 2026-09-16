@@ -167,7 +167,7 @@ fn valid_npm_name(name: &str) -> bool {
     let Some((scope, pkg)) = body.split_once('/') else {
         return plain_npm_segment(name);
     };
-    if name.strip_prefix('@').is_none() || scope.is_empty() || pkg.is_empty() {
+    if name.strip_prefix('@').is_none() {
         return false;
     }
     plain_npm_segment(scope) && plain_npm_segment(pkg)
@@ -413,7 +413,7 @@ fn scan_words(toks: &[Tok]) -> Vec<(RefManager, String)> {
                     // (`yay -S foo`): the flag walk above already consumed
                     // it, so search from the manager token itself, not
                     // from the first positional.
-                    i + 1
+                    i
                 } else {
                     j
                 };
@@ -887,9 +887,11 @@ fn pip_non_registry_shape(line: &str) -> Option<String> {
         }
         // Anywhere after `pip install`, any dangerous flag is a hard deny —
         // flags between install and the danger, or after a package name,
-        // must not dilute the signal.
+        // must not dilute the signal. The manager token at `i` is inert
+        // here (never `install` nor dangerous), so scanning from it is
+        // the same verdict without index arithmetic.
         let mut in_install = false;
-        for word in &words[i + 1..] {
+        for word in &words[i..] {
             if *word == "install" || *word == "i" {
                 in_install = true;
                 continue;
