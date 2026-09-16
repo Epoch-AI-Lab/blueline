@@ -124,6 +124,26 @@ pub fn fetch_advisories(
     store: Option<&BaselineStore>,
     policy: &Policy,
 ) -> Result<AdvisoryReport, BluelineError> {
+    // The recall index is local, curated truth: a hit blocks regardless of
+    // the OSV path, and never routes through the advisory cache (a stale
+    // OSV cache entry must not mask a fresh revocation).
+    if let Some(revocation) = crate::recall::lookup(ecosystem, package, version)? {
+        return Ok(AdvisoryReport {
+            status: AdvisoryStatus::Vulnerable,
+            hits: vec![AdvisoryItem {
+                id: revocation.id,
+                summary: format!("revoked by recall index: {}", revocation.reason),
+                details: String::new(),
+                aliases: Vec::new(),
+                severity: VerdictBand::Block,
+                cvss_score: None,
+                is_malware: true,
+            }],
+            source: "blueline-recall".to_string(),
+            message: None,
+        });
+    }
+
     if !policy.policy.check_advisories {
         return Ok(AdvisoryReport::unverified(
             "advisory checking disabled by policy",

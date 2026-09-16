@@ -13,6 +13,9 @@ pub enum BluelineError {
     #[error("registry response for `{0}`: {1}")]
     Manifest(String, String),
 
+    #[error("registry response for `{0}`: package not found in registry")]
+    NotFound(String),
+
     #[error("extraction failed: {0}")]
     Extraction(String),
 

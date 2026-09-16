@@ -22,14 +22,46 @@ pub struct Policy {
     pub allowlist: AllowlistConfig,
     pub blocklist: BlocklistConfig,
     pub ci: CiPolicyConfig,
+    pub recursion: RecursionPolicyConfig,
+    pub recall: RecallPolicyConfig,
 }
 
 impl Policy {
     /// Load policy from a specific file path or search standard candidate locations.
     /// Fails closed if an existing file cannot be read or contains invalid syntax.
+    /// The `BLUELINE_POLICY` environment variable scopes shells and hooks
+    /// launched outside a project directory (shims and agent hooks set and
+    /// honor it); a set-but-unreadable path fails closed.
     pub fn load_or_default(custom_path: Option<&Path>) -> Result<Self, BluelineError> {
+        Self::load_with_env(custom_path, || std::env::var("BLUELINE_POLICY").ok())
+    }
+
+    /// Agent entry points (`agent gate`, `agent review`) load policy through
+    /// this constructor: `BLUELINE_POLICY` from the environment is ignored
+    /// unless an explicit `--policy` flag names the file. A hook fires with
+    /// the repository as its working directory and inherits ambient env, so
+    /// honoring the variable would let any process that exports it steer
+    /// the gate. Shims pass `--policy` explicitly, so scoped shells keep
+    /// working; callers warn on stderr when ambient env is ignored.
+    pub fn load_for_agent(custom_path: Option<&Path>) -> Result<Self, BluelineError> {
+        Self::load_with_env(custom_path, || None)
+    }
+
+    /// True when `BLUELINE_POLICY` is set in the process environment, used
+    /// by agent entry points to warn that the ambient value is ignored.
+    pub fn env_policy_present() -> bool {
+        std::env::var("BLUELINE_POLICY").is_ok()
+    }
+
+    fn load_with_env(
+        custom_path: Option<&Path>,
+        env: impl Fn() -> Option<String>,
+    ) -> Result<Self, BluelineError> {
         if let Some(path) = custom_path {
             return Self::from_file(path);
+        }
+        if let Some(path) = env() {
+            return Self::from_file(Path::new(&path));
         }
 
         // Search candidate paths in priority order:
@@ -117,6 +149,27 @@ impl Policy {
             return Err(BluelineError::Policy(format!(
                 "invalid thresholds: block_score ({}) cannot exceed 100",
                 self.thresholds.block_score
+            )));
+        }
+
+        if self.recursion.max_depth > 16 {
+            return Err(BluelineError::Policy(format!(
+                "invalid recursion policy: max_depth ({}) exceeds the cap of 16",
+                self.recursion.max_depth
+            )));
+        }
+
+        if self.recall.max_age_hours == 0 || self.recall.max_age_hours > 24 * 365 {
+            return Err(BluelineError::Policy(format!(
+                "invalid recall policy: max_age_hours ({}) out of range",
+                self.recall.max_age_hours
+            )));
+        }
+
+        if self.recursion.max_child_reviews > 256 {
+            return Err(BluelineError::Policy(format!(
+                "invalid recursion policy: max_child_reviews ({}) exceeds the cap of 256",
+                self.recursion.max_child_reviews
             )));
         }
 
@@ -293,6 +346,53 @@ impl Default for CiPolicyConfig {
             fail_on: "high".to_string(),
             max_evaluations: 100,
             include_dev: true,
+        }
+    }
+}
+
+/// Recursive-review policy: caps on second-order review fan-out and the
+/// band at which a referenced package's finding escalates the parent
+/// verdict. Ambiguity resolves to block (fail closed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RecursionPolicyConfig {
+    /// Maximum review depth for referenced installs (root review is depth
+    /// 0; default 3). Exceeding the cap emits R25_RECURSION_DEPTH (HIGH).
+    pub max_depth: u32,
+    /// Maximum child reviews per top-level evaluation (default 8); bounds
+    /// fan-out cost for CI. Exceeding the budget emits R25_RECURSION_DEPTH.
+    pub max_child_reviews: u32,
+    /// Band at or above which a referenced package's finding escalates the
+    /// parent verdict via R27_SECOND_ORDER (default HIGH; TOML values are
+    /// the uppercase band names, e.g. `child_block_band = "HIGH"`).
+    pub child_block_band: VerdictBand,
+}
+
+impl Default for RecursionPolicyConfig {
+    fn default() -> Self {
+        Self {
+            max_depth: 3,
+            max_child_reviews: 8,
+            child_block_band: VerdictBand::High,
+        }
+    }
+}
+
+/// Recall-index policy: how far past its fetch time the synced revocation
+/// snapshot may drift before it is disclosed (R28), and whether that
+/// staleness escalates to BLOCK.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RecallPolicyConfig {
+    pub max_age_hours: u64,
+    pub block_on_stale: bool,
+}
+
+impl Default for RecallPolicyConfig {
+    fn default() -> Self {
+        Self {
+            max_age_hours: 48,
+            block_on_stale: false,
         }
     }
 }
@@ -551,5 +651,106 @@ name = "x"
 ecosystem = "rubygems"
 "#;
         assert!(Policy::from_toml_str(bad).is_err());
+    }
+
+    #[test]
+    fn recursion_policy_caps_fail_closed() {
+        let ok = Policy::from_toml_str("[recursion]\nmax_depth = 16\n").unwrap();
+        assert_eq!(ok.recursion.max_depth, 16);
+        assert!(Policy::from_toml_str("[recursion]\nmax_depth = 17\n").is_err());
+        let ok = Policy::from_toml_str("[recursion]\nmax_child_reviews = 256\n").unwrap();
+        assert_eq!(ok.recursion.max_child_reviews, 256);
+        assert!(Policy::from_toml_str("[recursion]\nmax_child_reviews = 257\n").is_err());
+    }
+
+    #[test]
+    fn recursion_child_block_band_parses_from_toml() {
+        let policy = Policy::from_toml_str("[recursion]\nchild_block_band = \"HIGH\"\n").unwrap();
+        assert_eq!(policy.recursion.child_block_band, VerdictBand::High);
+        let policy = Policy::from_toml_str("[recursion]\nchild_block_band = \"MEDIUM\"\n").unwrap();
+        assert_eq!(policy.recursion.child_block_band, VerdictBand::Medium);
+    }
+    #[test]
+    fn blueline_policy_env_scopes_policy_loading_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scoped.toml");
+        std::fs::write(
+            &path,
+            "[[allowlist.packages]]\nname = \"ok\"\nallow_unreviewed_baseline = true\n",
+        )
+        .unwrap();
+        let scoped = || Some(path.display().to_string());
+        let policy = Policy::load_with_env(None, scoped).unwrap();
+        assert!(policy.allows_unreviewed_baseline("ok", crate::registry::Ecosystem::Npm));
+
+        let missing = || Some(dir.path().join("missing.toml").display().to_string());
+        assert!(
+            Policy::load_with_env(None, missing).is_err(),
+            "a set-but-unreadable BLUELINE_POLICY must fail closed"
+        );
+
+        // An explicit --policy path wins over the environment.
+        let other = dir.path().join("other.toml");
+        std::fs::write(&other, "").unwrap();
+        assert!(Policy::load_with_env(Some(&other), scoped).is_ok());
+    }
+
+    #[test]
+    fn env_policy_present_reads_process_environment() {
+        // `std::env::set_var` is `unsafe` (and forbidden) in edition 2024,
+        // so each outcome runs in a child harness with a scrubbed/set env.
+        fn run_probe(name: &str, set: bool) -> std::process::Output {
+            let exe = std::env::current_exe().unwrap();
+            let mut cmd = std::process::Command::new(exe);
+            cmd.args(["--exact", "--ignored", name]);
+            if set {
+                cmd.env(
+                    "BLUELINE_POLICY",
+                    "/tmp/blueline-policy-presence-probe.toml",
+                );
+            } else {
+                cmd.env_remove("BLUELINE_POLICY");
+            }
+            cmd.output().unwrap()
+        }
+        let out = run_probe("policy::tests::probe_env_policy_present_when_set", true);
+        assert!(
+            out.status.success(),
+            "set BLUELINE_POLICY must read present: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let out = run_probe("policy::tests::probe_env_policy_present_when_unset", false);
+        assert!(
+            out.status.success(),
+            "unset BLUELINE_POLICY must read absent: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn probe_env_policy_present_when_set() {
+        assert!(Policy::env_policy_present());
+    }
+
+    #[test]
+    #[ignore]
+    fn probe_env_policy_present_when_unset() {
+        assert!(!Policy::env_policy_present());
+    }
+
+    #[test]
+    fn recall_max_age_hours_bounds() {
+        let with_max_age = |hours: u64| Policy {
+            recall: RecallPolicyConfig {
+                max_age_hours: hours,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(with_max_age(0).validate().is_err());
+        assert!(with_max_age(1).validate().is_ok());
+        assert!(with_max_age(24 * 365).validate().is_ok());
+        assert!(with_max_age(24 * 365 + 1).validate().is_err());
     }
 }

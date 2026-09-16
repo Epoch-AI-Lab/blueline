@@ -46,10 +46,7 @@ impl NpmRegistry {
         let resp = match self.agent.get(&url).set("accept", CORGI_ACCEPT).call() {
             Ok(resp) => resp,
             Err(ureq::Error::Status(404, _)) => {
-                return Err(BluelineError::Manifest(
-                    name.to_string(),
-                    "package not found in registry".to_string(),
-                ));
+                return Err(BluelineError::NotFound(name.to_string()));
             }
             Err(e) => return Err(BluelineError::Network(format!("GET {url}: {e}"))),
         };

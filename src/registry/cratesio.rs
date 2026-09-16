@@ -79,10 +79,7 @@ impl CratesIoRegistry {
         {
             Ok(resp) => resp,
             Err(ureq::Error::Status(404, _)) => {
-                return Err(BluelineError::Manifest(
-                    url.to_string(),
-                    "not found on this registry".to_string(),
-                ));
+                return Err(BluelineError::NotFound(url.to_string()));
             }
             Err(e) => return Err(BluelineError::Network(format!("GET {url}: {e}"))),
         };

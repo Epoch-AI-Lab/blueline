@@ -40,7 +40,7 @@ impl PyPIRegistry {
         let resp = match self.agent.get(&url).set("accept", SIMPLE_ACCEPT).call() {
             Ok(r) => r,
             Err(ureq::Error::Status(404, _)) => {
-                return Err(BluelineError::Manifest(n.to_string(), "not found".into()));
+                return Err(BluelineError::NotFound(n.to_string()));
             }
             Err(e) => return Err(BluelineError::Network(format!("GET {url}: {e}"))),
         };

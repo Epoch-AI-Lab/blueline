@@ -77,6 +77,16 @@ pub fn canonicalize_name(name: &str) -> String {
     out
 }
 
+/// Ecosystem-scoped name identity for caches and cycle keys. PEP 503
+/// canonicalization applies to PyPI only: on npm/cargo/AUR `foo_bar` and
+/// `foo-bar` are distinct packages and must never share a cache entry.
+pub fn canonicalize_for_ecosystem(ecosystem: crate::registry::Ecosystem, name: &str) -> String {
+    match ecosystem {
+        crate::registry::Ecosystem::PyPi => canonicalize_name(name),
+        _ => name.to_string(),
+    }
+}
+
 pub fn validate_pypi_name(name: &str) -> bool {
     if name.is_empty() {
         return false;
@@ -1034,6 +1044,28 @@ mod tests {
         let target_pre = pv("2.0.0a1");
         assert!(pre.baseline_eligible_for(&target_pre));
         assert!(stable.baseline_eligible_for(&target_pre));
+    }
+
+    #[test]
+    fn non_pypi_names_are_distinct_for_cache_identity() {
+        use crate::registry::Ecosystem;
+        for eco in [Ecosystem::Npm, Ecosystem::Cargo, Ecosystem::Aur] {
+            assert_ne!(
+                canonicalize_for_ecosystem(eco, "foo_bar"),
+                canonicalize_for_ecosystem(eco, "foo-bar"),
+                "{eco:?}: foo_bar vs foo-bar must be distinct"
+            );
+            assert_eq!(
+                canonicalize_for_ecosystem(eco, "foo_bar"),
+                "foo_bar",
+                "{eco:?}: non-PyPI names keep their spelling"
+            );
+        }
+        assert_eq!(
+            canonicalize_for_ecosystem(Ecosystem::PyPi, "Foo_Bar"),
+            canonicalize_for_ecosystem(Ecosystem::PyPi, "foo-bar"),
+            "PyPI still canonicalizes per PEP 503"
+        );
     }
 
     #[test]

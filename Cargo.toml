@@ -4,6 +4,9 @@ version = "0.3.0"
 edition = "2024"
 description = "Release-diff review desk for the package install line. Approve the delta, not the download."
 license = "MIT"
+repository = "https://github.com/Epoch-AI-Lab/blueline"
+keywords = ["security", "supply-chain", "npm", "review", "cli"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1"

@@ -15,6 +15,14 @@ fn above_info(band: &VerdictBand) -> bool {
     !matches!(band, VerdictBand::Low)
 }
 
+/// R23 graduated from INFO once recursive review resolved what the
+/// delivery line points at. These corpus fixtures genuinely run
+/// `npm install` in their build (electron-class source builds), so their
+/// R23 hits are true positives, not false ones — the gate stays strict
+/// for every other rule and every other fixture.
+const R23_TRUE_POSITIVE_FIXTURES: [&str; 3] =
+    ["016-insomnia", "018-bitwarden-cli", "078-joplin-desktop"];
+
 #[test]
 fn benign_corpus_scores_zero_above_info() {
     let dir = benign_dir();
@@ -35,13 +43,18 @@ fn benign_corpus_scores_zero_above_info() {
     for file in &files {
         let content = fs::read_to_string(file).unwrap();
         let findings = review_text(&content).unwrap();
+        let fixture = file
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
         for finding in findings {
+            if finding.rule_id == "R23_NPM_DELIVERY"
+                && R23_TRUE_POSITIVE_FIXTURES.contains(&fixture.as_str())
+            {
+                continue;
+            }
             if above_info(&finding.severity) {
-                let fixture = file
-                    .parent()
-                    .and_then(|parent| parent.file_name())
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_default();
                 loud.push(format!(
                     "{} {} [{}] {}",
                     fixture, finding.rule_id, finding.severity, finding.evidence
@@ -55,4 +68,28 @@ fn benign_corpus_scores_zero_above_info() {
         loud.len(),
         loud.join("\n")
     );
+}
+
+#[test]
+fn r23_is_medium_and_fires_on_all_three_true_positive_fixtures() {
+    for fixture in R23_TRUE_POSITIVE_FIXTURES {
+        let path = benign_dir().join(fixture).join("PKGBUILD");
+        let content = fs::read_to_string(&path).unwrap();
+        let findings = review_text(&content).unwrap();
+        let hits: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "R23_NPM_DELIVERY")
+            .collect();
+        assert!(
+            !hits.is_empty(),
+            "{fixture}: expected R23 to fire, got none"
+        );
+        for hit in hits {
+            assert_eq!(
+                hit.severity,
+                VerdictBand::Medium,
+                "{fixture}: R23 must stay MEDIUM"
+            );
+        }
+    }
 }

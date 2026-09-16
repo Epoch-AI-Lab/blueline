@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod advisory;
+pub mod agent;
 pub mod baseline;
 pub mod ci;
 pub mod cli;
@@ -9,15 +10,19 @@ pub mod error;
 pub mod executor;
 pub mod extract;
 pub mod heuristic;
+pub mod install_ref;
 pub mod lockfile;
 pub mod manifest;
 pub mod mcp;
 pub mod pkgbuild;
 pub mod policy;
 pub mod provenance;
+pub mod recall;
+pub mod recursive;
 pub mod registry;
 pub mod render;
 pub mod review;
+pub mod shim;
 pub mod store;
 pub mod verdict;
 pub mod version;

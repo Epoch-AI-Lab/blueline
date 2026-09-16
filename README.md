@@ -48,6 +48,8 @@ If a release exceeds risk thresholds, Blueline blocks the install and halts the 
 ## Project status
 
 - [x] Multi-registry support: npm, crates.io (`--ecosystem cargo`), PyPI (`--ecosystem pypi`), and AUR (`--ecosystem aur`, review-only)
+- [x] Recursive review: an install reference inside a reviewed payload (npm lifecycle script, PKGBUILD `npm install` delivery, wheel `.data/scripts`) is itself reviewed — depth-capped, cycle-safe, and rolled up into the parent verdict
+- [x] Recall / revocation index: local-first and self-hostable — serve a curated revocation snapshot, sync it, and any hit blocks; staleness is disclosed (and can BLOCK by policy)
 - [x] Sandboxed archive extraction with path traversal, symlink, and decompression bomb guards
 - [x] Package manifest parsing, cryptographic integrity (SHA-256 / SHA-512), and PEP 740 / SLSA provenance
 - [x] SQLite store for verified baseline releases and audit logging
@@ -57,7 +59,7 @@ If a release exceeds risk thresholds, Blueline blocks the install and halts the 
 - [x] npm and npx wrapper shim (`@blueline/cli`)
 - [x] GitHub Action PR check
 - [x] Agent hook via Model Context Protocol (MCP)
-- [ ] Revocation index and recall API
+- [x] Recall / revocation index (local-first, self-hostable; hosted API remains out of scope)
 
 ## Quickstart
 
@@ -126,6 +128,166 @@ blueline --ecosystem aur ci --lockfile aur.lock --base origin/main
 
 Policy rules take `ecosystem = "aur"` to scope allows and blocks to AUR,
 or omit it to match every ecosystem.
+
+## Agent enforcement
+
+Autonomous agents install dependencies without reading them. Blueline ships
+three enforcement surfaces, one per trust boundary:
+
+- **`blueline agent review <pkg>`** — the agent's own call. Non-interactive
+  and policy-bound: a single-line JSON verdict on stdout, exit `0` when the
+  policy approves, `2` when it refuses, `1` on error. It never prompts and
+  never marks a baseline clean — an agent can learn the verdict, not grant
+  trust. Every decision lands in the local audit log as
+  `agent:<identity>` (Claude Code, Cursor, or Codex CLI detected from the
+  process environment; env names only, never values).
+- **`blueline agent gate`** — the hook binding. It polices one command line
+  (`--command "<cmd>"`, or the hook payload on stdin — Claude Code
+  `PreToolUse` and Cursor `beforeShellExecution` shapes are both accepted),
+  reviews every package the command names with the recursive engine (npm
+  packages through npm, pip through PyPI, `cargo install` through
+  crates.io, `yay`/`paru -S` through the AUR), and answers with exit codes
+   or the product's native decision JSON. Any internal error denies —
+   never allows. Best-effort obfuscation that hides a package-manager token
+   entirely (indirect scripts, `python -m pip`, `pip3` without a shim) is
+   outside the scanner's reach and disclosed below.
+- **`blueline agent gate`** — registry-redirect handling. Inline assignments
+  that would install from elsewhere than the reviewed registry
+  (`PIP_INDEX_URL` / `PIP_EXTRA_INDEX_URL` / `PIP_CONFIG_FILE`, `NPM_CONFIG_*`,
+  `CARGO_*`, `.npmrc` references, `--registry` / `--index-url` overrides)
+  are denied outright: the review would vouch for bytes the install never
+  fetches. The same families exported in the gate's process environment
+  cannot be denied from the command line, so they are disclosed instead —
+  the verdict reason carries a warning and the audit trail records the
+  variable names (never values). Absolute manager paths (`/usr/bin/npm`,
+  `/usr/local/bin/npx`, `/usr/bin/pip`, quoted variants) are scanned like
+  their bare names, not treated as a bypass.
+
+### Claude Code hook
+
+Drop this in **user-level** `~/.claude/settings.json` (not the repo —
+repo-committable hook config is itself an attack vector):
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "blueline agent gate --format claude"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The gate reads the tool-call JSON from stdin, scans the command with the
+same parser the review engine uses, reviews the named packages, and denies
+with `exit 2` (Claude Code's documented contract for policy hooks). A
+dynamic target like `npm install $(cat deps.txt)` is denied — fail closed.
+**Pin a user-level policy** with an explicit flag in the hook command —
+`blueline agent gate --format claude --policy /path/to/blueline.toml`
+(user-level config, not the repo: a hook fires with the repository as its
+working directory, so a committed `blueline.toml` allowlist must never
+govern the gate). `agent gate` and `agent review` ignore `BLUELINE_POLICY`
+from the environment for the same reason — ambient env is attacker-shaped —
+and warn on stderr when it is set but ignored. Every other subcommand
+(`review`, `install`, `ci`, `mcp`) still honors `BLUELINE_POLICY` ahead of
+the working-directory and user-config search paths.
+
+### Cursor hook
+
+`.cursor/hooks.json` (project) or `~/.cursor/hooks.json` (user):
+
+```json
+{
+  "version": 1,
+  "hooks": {
+    "beforeShellExecution": [
+      {
+        "command": "blueline agent gate --format cursor",
+        "timeout": 60,
+        "failClosed": true
+      }
+    ]
+  }
+}
+```
+
+### Codex CLI
+
+Codex has no hook process; its execpolicy is prefix-based and cannot run a
+reviewer. The honest recipe is advisory: mark install verbs as `prompt` in
+`~/.codex/rules/*.rules` and instruct the agent to route installs through
+`blueline agent review` (or run them inside a blueline-shimmed shell):
+
+```python
+prefix_rule(pattern = ["npm", "install"], decision = "prompt",
+            justification = "installs must be reviewed by blueline")
+```
+
+### PATH shims (interactive-terminal backstop)
+
+```bash
+blueline shim install npm npx pnpm yarn bun bunx pip pip3 cargo yay paru
+export PATH="$HOME/.local/share/blueline/shims:$PATH"
+```
+
+Each shim rebuilds the invocation, runs it through `blueline agent gate`,
+and only then execs the real package manager (resolved on PATH at install
+time). If blueline errors or refuses, the install does not run. Scope a
+shell with `BLUELINE_REGISTRY=<mirror>` and `BLUELINE_POLICY=<blueline.toml>`.
+
+**What shims cannot stop** — stated plainly, because a gate that overstates
+its coverage is security theater: absolute binary paths (`/usr/bin/npm`) —
+scanned by the gate but invisible to a PATH shim, so prefer the hook —
+`command npm`, `env -i`, direct `node .../npm-cli.js` invocation, npx
+resolving from an existing `node_modules/.bin`, PATH reordering,
+repo-committable hook config, exported registry-redirect environment
+(`PIP_INDEX_URL`, `NPM_CONFIG_REGISTRY`, `CARGO_*` — disclosed by the gate,
+not denied), and unshimmed near-synonyms (`pip3` is
+shipped, but `python -m pip` and `uv pip` are not). Shims are
+defense-in-depth for the terminal; hooks are the agent boundary;
+`blueline ci` polices the manifest and lockfile where the real authority
+lives. Unpinned specs are reviewed at their current default version —
+re-review before the install if the window matters.
+
+## Distribution
+
+The CLI ships through npm (`@bluelinecli/cli`, `npx blueline`) with the
+native binary delivered via platform packages for linux (x64 glibc/musl,
+arm64), macOS (x64, arm64), and Windows (x64, arm64). Release binaries
+are attested at release time with SLSA build provenance
+(`actions/attest-build-provenance`) and a `SHA256SUMS` manifest; npm
+publishes use `--provenance`. Packaging configs for the other channels
+live in-repo: `packaging/homebrew/blueline.rb` (source build via cargo)
+and `packaging/aur/` (PKGBUILD + .SRCINFO pinned to the signed GitHub
+tag — reviewed with blueline's own PKGBUILD heuristics before it lands on
+the AUR). Publishing to any registry is a manual, human-confirmed step.
+
+We eat our own dog food: CI runs `blueline ci` against this repo's own
+`package-lock.json` and `Cargo.lock` on every PR, and dependency deltas
+are reviewed with the same verdicts customers get.
+
+## Policy reference
+
+- `BLUELINE_POLICY` scopes shells and hooks launched outside a project
+  directory: `review`, `install`, `ci`, and `mcp` read it ahead of
+  `./blueline.toml`, `./.blueline.toml`, and the user config. `agent gate`
+  and `agent review` ignore it unless `--policy` names the file explicitly
+  (ambient env is attacker-shaped at the hook boundary).
+- Recall vs `check_advisories`: the curated recall index is consulted
+  *before* the `check_advisories` policy switch, so setting
+  `check_advisories = false` disables OSV/GHSA lookups but never silences
+  a recall revocation — a hit still BLOCKs. Recall-index staleness
+  (`R28_RECALL_STALE`) is disclosed independently of that switch: MEDIUM
+  when the snapshot is older than `[recall] max_age_hours`, HIGH when it
+  cannot be read at all, BLOCK when `block_on_stale` escalates it.
 
 ## Contributors
 
