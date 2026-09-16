@@ -229,23 +229,16 @@ fn names_match(ecosystem: Ecosystem, indexed: &str, queried: &str) -> bool {
 }
 
 /// Version identity for revocation matching: parsed-and-compared per
-/// ecosystem grammar so `1.0` fires on `1.0.0` (PEP 440 zero-padding,
-/// semver build metadata). Unparseable input falls back to exact match
-/// rather than failing open.
+/// ecosystem grammar so `1.0` fires on `1.0.0` (PEP 440 zero-padding).
+/// Strict semver has no distinct-but-equal forms, so npm/cargo matching
+/// is exact via the identity fast path above. Unparseable input falls
+/// back to exact match rather than failing open.
 fn versions_match(ecosystem: Ecosystem, indexed: &str, queried: &str) -> bool {
     if indexed == queried {
         return true;
     }
     match ecosystem {
-        Ecosystem::Npm | Ecosystem::Cargo => {
-            match (
-                semver::Version::parse(indexed),
-                semver::Version::parse(queried),
-            ) {
-                (Ok(a), Ok(b)) => a == b,
-                _ => false,
-            }
-        }
+        Ecosystem::Npm | Ecosystem::Cargo => false,
         Ecosystem::PyPi => {
             match (
                 crate::version::Pep440Version::parse(indexed),
@@ -371,13 +364,17 @@ pub fn sync(url: &str) -> anyhow::Result<SyncedSnapshot> {
     Ok(synced)
 }
 
+fn index_size_within_cap(len: usize) -> bool {
+    len <= MAX_SNAPSHOT_BYTES
+}
+
 /// Serve a curated index file over a minimal HTTP server. The file is
 /// validated once at startup and the served bytes are exactly the file
 /// bytes; the server never mutates anything.
 pub fn serve(port: u16, index: &Path) -> anyhow::Result<()> {
     let bytes = std::fs::read(index)
         .map_err(|e| anyhow::anyhow!("reading index {}: {e}", index.display()))?;
-    if bytes.len() > MAX_SNAPSHOT_BYTES {
+    if !index_size_within_cap(bytes.len()) {
         anyhow::bail!(
             "index {} exceeds {MAX_SNAPSHOT_BYTES} bytes",
             index.display()
@@ -827,6 +824,21 @@ mod tests {
             "also-not-a-version"
         ));
         assert!(!versions_match(Ecosystem::PyPi, "1.0", "1.0a1"));
+        assert!(versions_match(Ecosystem::Npm, "1.0.0", "1.0.0"));
+        assert!(versions_match(Ecosystem::Cargo, "1.0.0", "1.0.0"));
+        assert!(!versions_match(Ecosystem::Npm, "1.0.0+a", "1.0.0+b"));
+        assert!(!versions_match(Ecosystem::Npm, "1.0.0", "1.0.1"));
+        assert!(!versions_match(Ecosystem::Cargo, "1.0.0", "2.0.0"));
+    }
+
+    #[test]
+    fn index_cap_boundary_is_exact() {
+        assert_eq!(MAX_SNAPSHOT_BYTES, 8 * 1024 * 1024);
+        assert_eq!(MAX_SNAPSHOT_BYTES, 8_388_608);
+        assert!(index_size_within_cap(0));
+        assert!(index_size_within_cap(MAX_SNAPSHOT_BYTES - 1));
+        assert!(index_size_within_cap(MAX_SNAPSHOT_BYTES));
+        assert!(!index_size_within_cap(MAX_SNAPSHOT_BYTES + 1));
     }
 
     #[test]
@@ -1023,7 +1035,9 @@ mod tests {
         let index_path = dir.path().join("index.json");
         let over = snapshot_padded_to_bytes(MAX_SNAPSHOT_BYTES + 1, 51);
         std::fs::write(&index_path, serde_json::to_vec(&over).unwrap()).unwrap();
-        let out = blueline_cmd(dir.path())
+        let bin = assert_cmd::cargo::cargo_bin("blueline");
+        let mut child = std::process::Command::new(bin)
+            .env("BLUELINE_DATA_DIR", dir.path())
             .args([
                 "recall",
                 "serve",
@@ -1032,8 +1046,22 @@ mod tests {
                 "--snapshot",
                 index_path.to_str().unwrap(),
             ])
-            .output()
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let out = loop {
+            match child.try_wait().expect("serve child must be waitable") {
+                Some(_) => break child.wait_with_output().expect("serve output must be readable"),
+                None if std::time::Instant::now() > deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("oversized index hung serve instead of refusing at startup");
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        };
         assert_eq!(out.status.code(), Some(1));
         assert!(
             String::from_utf8_lossy(&out.stderr).contains("exceeds"),
