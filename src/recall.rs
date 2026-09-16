@@ -817,6 +817,7 @@ mod tests {
         assert!(versions_match(Ecosystem::Aur, "1.0", "1.0-1"));
         assert!(!versions_match(Ecosystem::Aur, "1.0-1", "2.0-1"));
         assert!(versions_match(Ecosystem::PyPi, "1.0", "1.0.0"));
+        assert!(versions_match(Ecosystem::PyPi, "2024.1", "2024.1.0"));
         assert!(!versions_match(Ecosystem::PyPi, "1.0", "2.0"));
         assert!(versions_match(Ecosystem::Aur, "!!!", "!!!"));
         assert!(!versions_match(Ecosystem::Aur, "!!!a", "!!!b"));
@@ -825,6 +826,7 @@ mod tests {
             "not-a-version",
             "also-not-a-version"
         ));
+        assert!(!versions_match(Ecosystem::PyPi, "1.0", "1.0a1"));
     }
 
     #[test]
