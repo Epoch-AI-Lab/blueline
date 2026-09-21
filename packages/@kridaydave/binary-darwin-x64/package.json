@@ -1,17 +1,17 @@
 {
-  "name": "@bluelinecli/binary-win32-arm64",
+  "name": "@kridaydave/binary-darwin-x64",
   "version": "0.3.0",
-  "description": "Native blueline binary for win32-arm64",
+  "description": "Native blueline binary for darwin-x64",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Epoch-AI-Lab/blueline.git"
   },
   "os": [
-    "win32"
+    "darwin"
   ],
   "cpu": [
-    "arm64"
+    "x64"
   ],
   "preferUnplugged": true
 }

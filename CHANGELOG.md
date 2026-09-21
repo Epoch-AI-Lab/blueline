@@ -141,6 +141,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- npm distribution renamed to `blueline-cli` (alias `@kridaydave/blueline-cli`)
+  with platform binaries under `@kridaydave/binary-*`: the previous names
+  `blueline` and `@bluelinecli/cli` are frozen at 0.3.0 under a lost
+  publisher account and receive no further updates. Install with
+  `npx blueline-cli` / `npm install -g blueline-cli`; the installed
+  command and the Rust binary stay `blueline`.
 - The policy loader honors `BLUELINE_POLICY` (an absolute path) ahead of
   the default search, so shimmed shells and agent hooks running outside a
   project directory keep their policy scoping; a set-but-unreadable path

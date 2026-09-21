@@ -28,7 +28,7 @@ and any `postinstall`/`preinstall` script is surfaced for a *separate* human dec
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  Entry points                                                 │
-│  • `npx blueline install <pkg>`  → Node shim → Rust binary   │
+│  • `npx blueline-cli install <pkg>`  → Node shim → Rust binary   │
 │  • `blueline review <pkg@ver>`   → Rust binary (direct)      │
 │  • `blueline ci`                 → GitHub Action / CI         │
 │  • `blueline-mcp`                → MCP server (agent hook)    │
@@ -62,10 +62,10 @@ and any `postinstall`/`preinstall` script is surfaced for a *separate* human dec
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### Node shim (`@blueline/cli`)
+### Node shim (`blueline-cli` / `@kridaydave/blueline-cli`)
 A tiny npm package. Its `bin` is a JS launcher that resolves/installs the
 platform-specific Rust binary (via per-platform optional deps
-`@blueline/binary-{linux,darwin,win}-{x64,arm64}`) and `exec`s it. Rust does all
+`@kridaydave/binary-{linux,darwin,win}-{x64,arm64}`) and `exec`s it. Rust does all
 heavy lifting; Node only provides the `npx` ergonomics and PATH registration.
 On approve, the shim delegates to `npm install --ignore-scripts` so the reviewed
 package's own install scripts are never executed automatically (see D11).

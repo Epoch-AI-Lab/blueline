@@ -1,20 +1,17 @@
 {
-  "name": "@bluelinecli/binary-linux-x64-gnu",
+  "name": "@kridaydave/binary-win32-arm64",
   "version": "0.3.0",
-  "description": "Native blueline binary for linux-x64-gnu",
+  "description": "Native blueline binary for win32-arm64",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Epoch-AI-Lab/blueline.git"
   },
   "os": [
-    "linux"
+    "win32"
   ],
   "cpu": [
-    "x64"
-  ],
-  "libc": [
-    "glibc"
+    "arm64"
   ],
   "preferUnplugged": true
 }

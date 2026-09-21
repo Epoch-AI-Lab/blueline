@@ -27,14 +27,18 @@ const PLATFORMS = [
 const packagesDir = path.join(rootDir, "packages");
 
 for (const platform of PLATFORMS) {
-  const pkgDir = path.join(packagesDir, `@blueline/binary-${platform.name}`);
+  const pkgDir = path.join(packagesDir, `@kridaydave/binary-${platform.name}`);
   fs.mkdirSync(pkgDir, { recursive: true });
 
   const pkgJson = {
-    name: `@blueline/binary-${platform.name}`,
+    name: `@kridaydave/binary-${platform.name}`,
     version,
     description: `Native blueline binary for ${platform.name}`,
     license: "MIT",
+    repository: {
+      type: "git",
+      url: "git+https://github.com/Epoch-AI-Lab/blueline.git",
+    },
     os: [platform.os],
     cpu: [platform.cpu],
     ...(platform.libc ? { libc: platform.libc } : {}),
