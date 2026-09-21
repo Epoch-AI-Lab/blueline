@@ -18,7 +18,7 @@ Phased plan from greenfield to a trustworthy release-diff review desk. See
 - [x] Heuristic verdict engine + scoring (rules in `ARCHITECTURE.md` §2)
 - [x] ASCII review card rendering (`comfy-table`) + stable JSON verdict schema
 - [x] Interactive prompt: `[a]pprove · [h]old · [d]iff` with `clean = 1` SQLite store persistence
-- [x] Node shim (`@blueline/cli`) + `npx blueline install` that performs/blocks the real `npm install`
+- [x] Node shim (`blueline-cli`) + `npx blueline-cli install` that performs/blocks the real `npm install`
 
 ## Phase 2 — Trust Sources ✅
 - [x] OSV + GitHub Advisory revocation cache & engine (`src/advisory.rs`)

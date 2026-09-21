@@ -233,9 +233,9 @@ launcher that cannot find a binary. That is the real distribution gap.
 Rulings (locked, no re-litigating):
 
 1. Fill the shim gap: packages/blueline and packages/npx carry the FULL
-   platform matrix (all seven @bluelinecli/binary-* packages) in
-   optionalDependencies, package-lock.json regenerated to match
-   (--package-lock-only), and `npx blueline` verified from a cold
+    platform matrix (all eight @kridaydave/binary-* packages) in
+    optionalDependencies, package-lock.json regenerated to match
+    (--package-lock-only), and `npx blueline-cli` verified from a cold
    environment via the launcher's BLUELINE_BINARY path and a real
    `node bin/blueline.js --version`.
 2. crates.io publish config: Cargo.toml gains repository/keywords/

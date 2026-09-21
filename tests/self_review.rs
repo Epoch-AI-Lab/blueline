@@ -22,14 +22,14 @@ fn our_aur_pkgbuild_passes_our_own_heuristics() {
 #[test]
 fn npm_shims_declare_the_published_platform_matrix() {
     let expected: [&str; 8] = [
-        "@bluelinecli/binary-darwin-arm64",
-        "@bluelinecli/binary-darwin-x64",
-        "@bluelinecli/binary-linux-arm64-gnu",
-        "@bluelinecli/binary-linux-arm64-musl",
-        "@bluelinecli/binary-linux-x64-musl",
-        "@bluelinecli/binary-linux-x64-gnu",
-        "@bluelinecli/binary-win32-arm64",
-        "@bluelinecli/binary-win32-x64",
+        "@kridaydave/binary-darwin-arm64",
+        "@kridaydave/binary-darwin-x64",
+        "@kridaydave/binary-linux-arm64-gnu",
+        "@kridaydave/binary-linux-arm64-musl",
+        "@kridaydave/binary-linux-x64-musl",
+        "@kridaydave/binary-linux-x64-gnu",
+        "@kridaydave/binary-win32-arm64",
+        "@kridaydave/binary-win32-x64",
     ];
     for shim in [
         "packages/blueline/package.json",

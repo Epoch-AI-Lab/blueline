@@ -76,7 +76,7 @@ function resolveBinaryPath() {
     process.exit(1);
   }
 
-  const pkgName = `@bluelinecli/binary-${target}`;
+  const pkgName = `@kridaydave/binary-${target}`;
   const binName = process.platform === "win32" ? "blueline.exe" : "blueline";
 
   try {
@@ -92,7 +92,7 @@ function resolveBinaryPath() {
   console.error(`Failed to locate native blueline binary from package '${pkgName}'.`);
   console.error("This may happen if npm omitted optional dependencies during installation (e.g. npm/cli#4828).");
   console.error("\nTo resolve:");
-  console.error("  1. Reinstall with optional dependencies: npm install -g @bluelinecli/cli");
+  console.error("  1. Reinstall with optional dependencies: npm install -g blueline-cli");
   console.error("  2. Or build from source: https://github.com/Epoch-AI-Lab/blueline#quickstart");
   console.error("  3. Or set BLUELINE_BINARY=/path/to/blueline\n");
   process.exit(1);

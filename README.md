@@ -20,7 +20,7 @@ Autonomous agents install dependencies without reading them. Nobody audits the d
 Blueline intercepts package installs and renders a summary card before extracting files to your project:
 
 ```bash
-$ npx blueline install express@4.21.2
+$ npx blueline-cli install express@4.21.2
 
   BLUELINE REVIEW CARD
   ─────────────────────────────────────────
@@ -56,7 +56,7 @@ If a release exceeds risk thresholds, Blueline blocks the install and halts the 
 - [x] Lockfile CI scanning (`package-lock.json`, `Cargo.lock`, `requirements.txt`)
 - [x] CLI review command (`blueline review <pkg@ver>` / `blueline --ecosystem pypi review <pkg==ver>`)
 - [x] Line-level diff engine and static heuristic risk scoring
-- [x] npm and npx wrapper shim (`@blueline/cli`)
+- [x] npm and npx wrapper shims (`blueline-cli`, `@kridaydave/blueline-cli`)
 - [x] GitHub Action PR check
 - [x] Agent hook via Model Context Protocol (MCP)
 - [x] Recall / revocation index (local-first, self-hostable; hosted API remains out of scope)
@@ -259,9 +259,12 @@ re-review before the install if the window matters.
 
 ## Distribution
 
-The CLI ships through npm (`@bluelinecli/cli`, `npx blueline`) with the
+The CLI ships through npm (`blueline-cli`, `npx blueline-cli`, alias
+`@kridaydave/blueline-cli`) with the
 native binary delivered via platform packages for linux (x64 glibc/musl,
-arm64), macOS (x64, arm64), and Windows (x64, arm64). Release binaries
+arm64), macOS (x64, arm64), and Windows (x64, arm64). The previous names
+`blueline` and `@bluelinecli/cli` (≤ 0.3.0) are frozen under a lost
+publisher account and receive no further updates — use `blueline-cli`. Release binaries
 are attested at release time with SLSA build provenance
 (`actions/attest-build-provenance`) and a `SHA256SUMS` manifest; npm
 publishes use `--provenance`. Packaging configs for the other channels

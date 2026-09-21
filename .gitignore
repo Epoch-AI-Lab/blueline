@@ -13,6 +13,6 @@ node_modules/
 .agents/
 marketing/
 
-packages/@bluelinecli/binary-*/blueline
-packages/@bluelinecli/binary-*/blueline.exe
+packages/@kridaydave/binary-*/blueline
+packages/@kridaydave/binary-*/blueline.exe
 *.tgz

@@ -1,4 +1,4 @@
-# blueline
+# blueline-cli
 
 Approve the delta, not the download.
 
@@ -10,16 +10,16 @@ Run directly via `npx`:
 
 ```bash
 # Review a package release diff
-npx blueline review express@4.21.2
+npx blueline-cli review express@4.21.2
 
 # Review and install with --ignore-scripts upon approval
-npx blueline install express
+npx blueline-cli install express
 ```
 
 Or install globally:
 
 ```bash
-npm install -g blueline
+npm install -g blueline-cli
 blueline install express
 ```
 
@@ -27,6 +27,6 @@ Prebuilt native binaries are published for common platforms (linux, macOS, Windo
 
 ## Security Invariants
 
-- **Zero install scripts:** `blueline` contains no `postinstall` or lifecycle scripts.
+- **Zero install scripts:** `blueline-cli` contains no `postinstall` or lifecycle scripts.
 - **Fail closed:** On any signature, integrity, extraction, or resolution doubt, Blueline aborts rather than guess.
 - **`--ignore-scripts` enforcement:** On approval, package installation executes with `--ignore-scripts` so reviewed package lifecycle scripts never run automatically.

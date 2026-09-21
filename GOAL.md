@@ -162,7 +162,7 @@ API"), motivated by the TanStack-worm lag window in OSV.
 D9 says "we audit supply chains — we must eat our own dog food." Make it true.
 
 - Fill the gaps in `packages/` so the npm shim is genuinely installable;
-  verify `npx blueline` works from a cold environment.
+  verify `npx blueline-cli` works from a cold environment.
 - Ship the CLI for real distribution paths: crates.io publish config, Homebrew
   formula, and blueline itself packaged for the AUR (reviewed by its own AUR
   reviewer, of course).

@@ -93,7 +93,7 @@ jobs:
           path: dist/
 
   publish-platforms:
-    name: Publish @bluelinecli/binary-* to npm
+    name: Publish @kridaydave/binary-* to npm
     needs: [build]
     runs-on: ubuntu-latest
     permissions:
@@ -122,7 +122,7 @@ jobs:
             [aarch64-pc-windows-msvc]=binary-win32-arm64
           )
           for target in "${!MAP[@]}"; do
-            dir="packages/@bluelinecli/${MAP[$target]}"
+            dir="packages/@kridaydave/${MAP[$target]}"
             mkdir -p "$dir"
             if [ -f "artifacts/binary-$target/blueline.exe" ]; then
               cp "artifacts/binary-$target/blueline.exe" "$dir/blueline.exe"
@@ -134,7 +134,7 @@ jobs:
       - name: Pin versions from tag
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          for f in packages/@bluelinecli/binary-*/package.json; do
+          for f in packages/@kridaydave/binary-*/package.json; do
             node -e "
               const fs = require('fs');
               const p = process.argv[1];
@@ -148,10 +148,10 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          for dir in packages/@bluelinecli/binary-*/; do
+          for dir in packages/@kridaydave/binary-*/; do
             if [ -f "$dir/blueline" ] || [ -f "$dir/blueline.exe" ]; then
               pkg="$(basename "$dir")"
-              if npm view "@bluelinecli/$pkg@$VERSION" version >/dev/null 2>&1; then
+              if npm view "@kridaydave/$pkg@$VERSION" version >/dev/null 2>&1; then
                 echo "::notice::$pkg@$VERSION already published, skipping"
               else
                 npm publish "$dir" --access public --provenance
@@ -178,7 +178,7 @@ jobs:
               const j = JSON.parse(fs.readFileSync(p, 'utf8'));
               j.version = '$VERSION';
               for (const k of Object.keys(j.optionalDependencies || {})) {
-                if (k.startsWith('@bluelinecli/')) j.optionalDependencies[k] = '$VERSION';
+                if (k.startsWith('@kridaydave/')) j.optionalDependencies[k] = '$VERSION';
               }
               fs.writeFileSync(p, JSON.stringify(j, null, 2) + '\n');
             " "$f"
@@ -187,7 +187,7 @@ jobs:
         run: |
           cd packages/blueline
           npm pack
-          npm install -g --prefix /tmp/smoke ./bluelinecli-cli-*.tgz
+          npm install -g --prefix /tmp/smoke ./kridaydave-blueline-cli-*.tgz
       - name: Review a real package through the shipped artifact
         run: |
           cat > blueline.toml <<'EOF'
@@ -223,12 +223,12 @@ jobs:
               const j = JSON.parse(fs.readFileSync(p, 'utf8'));
               j.version = '$VERSION';
               for (const k of Object.keys(j.optionalDependencies || {})) {
-                if (k.startsWith('@bluelinecli/')) j.optionalDependencies[k] = '$VERSION';
+                if (k.startsWith('@kridaydave/')) j.optionalDependencies[k] = '$VERSION';
               }
               fs.writeFileSync(p, JSON.stringify(j, null, 2) + '\n');
             " "$f"
           done
-      - name: Publish @bluelinecli/cli and blueline
+      - name: Publish @kridaydave/blueline-cli and blueline-cli
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
@@ -240,8 +240,8 @@ jobs:
               (cd "$2" && npm publish --access public --provenance)
             fi
           }
-          publish_if_missing "@bluelinecli/cli" packages/blueline
-          publish_if_missing "blueline" packages/npx
+          publish_if_missing "@kridaydave/blueline-cli" packages/blueline
+          publish_if_missing "blueline-cli" packages/npx
 
   github-release:
     name: Attach binaries to GitHub release

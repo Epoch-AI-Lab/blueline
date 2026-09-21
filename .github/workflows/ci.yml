@@ -91,12 +91,12 @@ jobs:
           r = json.load(open("blueline-dogfood.json"))
           names = {i["name"] for i in r["items"]}
           expected = {
-              "@bluelinecli/cli", "blueline",
-              "@bluelinecli/binary-darwin-arm64", "@bluelinecli/binary-darwin-x64",
-              "@bluelinecli/binary-linux-arm64-gnu", "@bluelinecli/binary-linux-arm64-musl",
-              "@bluelinecli/binary-linux-x64-musl",
-              "@bluelinecli/binary-linux-x64-gnu", "@bluelinecli/binary-win32-arm64",
-              "@bluelinecli/binary-win32-x64",
+              "@kridaydave/blueline-cli", "blueline-cli",
+              "@kridaydave/binary-darwin-arm64", "@kridaydave/binary-darwin-x64",
+              "@kridaydave/binary-linux-arm64-gnu", "@kridaydave/binary-linux-arm64-musl",
+              "@kridaydave/binary-linux-x64-musl",
+              "@kridaydave/binary-linux-x64-gnu", "@kridaydave/binary-win32-arm64",
+              "@kridaydave/binary-win32-x64",
           }
 
           # Scanner health: everything evaluated must be a shipped package
