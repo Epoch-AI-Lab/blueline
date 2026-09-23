@@ -188,6 +188,15 @@ jobs:
           cd packages/blueline
           npm pack
           npm install -g --prefix /tmp/smoke ./kridaydave-blueline-cli-*.tgz
+          # Installing from a local tarball skips optionalDependencies (npm/cli#4828),
+          # so the platform binary the launcher resolves would be missing and the
+          # smoke would fail on binary lookup instead of exercising the artifact.
+          # The tarball under test carries no binary; the binary under test is the
+          # one built and published earlier in this same pipeline.
+          for i in 1 2 3 4 5; do
+            npm install -g --prefix /tmp/smoke "@kridaydave/binary-linux-x64-gnu@${GITHUB_REF_NAME#v}" && break
+            sleep 15
+          done
       - name: Review a real package through the shipped artifact
         run: |
           cat > blueline.toml <<'EOF'
