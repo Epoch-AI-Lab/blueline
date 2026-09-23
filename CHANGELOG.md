@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-21
+
 ### Added
 
 - PATH-shim routing (`blueline shim install|uninstall <npm|npx|pip|cargo|yay|paru>
