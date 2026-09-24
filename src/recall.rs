@@ -48,6 +48,19 @@ pub struct Snapshot {
     pub revocations: Vec<Revocation>,
 }
 
+/// Does `name` satisfy the package-name grammar of its own ecosystem? A recall
+/// entry that names something no registry in that ecosystem could ever serve is
+/// a curation error, and accepting it would let a path-shaped name sit in an
+/// index that reviewers treat as authoritative.
+fn name_matches_grammar(ecosystem: Ecosystem, name: &str) -> bool {
+    match ecosystem {
+        Ecosystem::Npm => crate::registry::npm::validate_package_name(name).is_ok(),
+        Ecosystem::Cargo => crate::registry::cratesio::validate_crate_name(name).is_ok(),
+        Ecosystem::PyPi => crate::version::validate_pypi_name(name),
+        Ecosystem::Aur => crate::registry::aur::validate_aur_name(name),
+    }
+}
+
 /// What the client persists after a successful sync: the snapshot plus the
 /// client-side facts the snapshot itself cannot attest.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -143,20 +156,12 @@ impl Snapshot {
             ));
         }
         for rev in &self.revocations {
-            if rev.name.is_empty() || rev.name.len() > 214 {
+            if !name_matches_grammar(rev.ecosystem, &rev.name) {
                 return Err(BluelineError::Advisory(format!(
-                    "recall entry `{}`: invalid package name length",
-                    rev.id
-                )));
-            }
-            if !rev
-                .name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | '@'))
-            {
-                return Err(BluelineError::Advisory(format!(
-                    "recall entry `{}`: invalid package name characters",
-                    rev.id
+                    "recall entry `{}`: `{}` is not a valid {} package name",
+                    rev.id,
+                    rev.name,
+                    rev.ecosystem.key()
                 )));
             }
             if rev.reason.is_empty() || rev.reason.len() > MAX_TEXT_BYTES {
@@ -780,6 +785,48 @@ mod tests {
         let mut over = valid_snapshot();
         over.revocations[0].name = "a".repeat(215);
         assert!(over.validate().is_err());
+    }
+
+    #[test]
+    fn validate_applies_the_ecosystems_own_name_grammar() {
+        // A path-shaped name is not a package name in any ecosystem; the old
+        // character-class check let it through because `/` and `.` are legal
+        // in npm scoped names.
+        for name in ["../etc", "a/b/c", "..", "@/x", "x@", "a b", "a\\b"] {
+            let mut snap = valid_snapshot();
+            snap.revocations[0].name = name.to_string();
+            assert!(
+                snap.validate().is_err(),
+                "npm entry `{name}` must be refused"
+            );
+        }
+        // A name legal in npm but not in cargo must not sneak through under
+        // the cargo key, and the scoped form stays legal under npm.
+        let mut scoped = valid_snapshot();
+        scoped.revocations[0].name = "@scope/pkg".to_string();
+        assert!(scoped.validate().is_ok());
+        let mut cargo_scoped = scoped.clone();
+        cargo_scoped.revocations[0].ecosystem = Ecosystem::Cargo;
+        assert!(cargo_scoped.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_names_legal_in_their_own_ecosystem() {
+        for (eco, name) in [
+            (Ecosystem::Npm, "lodash"),
+            (Ecosystem::Npm, "some.pkg_name"),
+            (Ecosystem::Cargo, "serde-json"),
+            (Ecosystem::PyPi, "zope.interface"),
+            (Ecosystem::Aur, "yay"),
+        ] {
+            let mut snap = valid_snapshot();
+            snap.revocations[0].ecosystem = eco;
+            snap.revocations[0].name = name.to_string();
+            assert!(
+                snap.validate().is_ok(),
+                "{name:?} must be legal under {eco:?}"
+            );
+        }
     }
 
     #[test]
