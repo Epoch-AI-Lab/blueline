@@ -11,15 +11,9 @@ sandboxed temp dir — never executed, diffed, and scored. The package's own cod
 never run: even on approve, install proceeds with `npm install --ignore-scripts`,
 and any `postinstall`/`preinstall` script is surfaced for a *separate* human decision.
 
-> Note: the README lists the "Diff rendering engine (Rust)" as done. As of the
-> initial commit only README, LICENSE, and brand assets exist. The engine is a
-> design target, not shipped code.
->
-> Update 2026-08-13: **Phase 0 shipped.** A `blueline` Rust binary exists:
-> `registry::npm` (fetch + sha512-verified tarball download), typed manifest
-> parsing, bounded sandbox extraction, and a SQLite `known_clean` baseline
-> store behind `blueline review <pkg@ver>`. Diff/verdict/card rendering are
-> Phase 1, still unshipped.
+> Status: Phases 0–4 plus the close-the-loop campaigns (recursive review,
+> agent enforcement, local-first recall, dogfood & distribution) are shipped.
+> See `ROADMAP.md`, `TODO.md`, and `CHANGELOG.md` for the per-release record.
 
 ---
 
@@ -115,6 +109,9 @@ Every tarball and registry response is fully untrusted. The `extract` stage enfo
 | D9 | Signed, SLSA-built release binaries                 | We audit supply chains — we must eat our own dog food.                    |
 | D10| Policy-as-code (`blueline.toml`)                    | Per-project + global thresholds, allow/blocklists, required-provenance flags. |
 | D11| Approve = `npm install --ignore-scripts`           | Honors "never execute": install proceeds without running lifecycle scripts; `postinstall` is surfaced for a separate human decision, not auto-run. |
+| D12| Recursive second-order review in the engine           | Install references found in reviewed payloads are re-reviewed with depth/budget caps, cycle detection, and child-to-parent roll-up (§5). Non-registry refs are disclosed, never resolved. |
+| D13| Local-first recall index, no hosted dependency        | Curated revocations sync as a validated JSON snapshot (never the SQLite store); hits BLOCK through the advisory engine, staleness is disclosed (§5). |
+| D14| Explicit agent tool primary, shim as backstop         | `review_install` is what well-behaved agents call; PATH shims and hook bindings enforce at the terminal/agent boundary with honest bypass docs (§5). |
 
 ### Verdict bands
 - `LOW` — auto-approve path
@@ -123,16 +120,24 @@ Every tarball and registry response is fully untrusted. The `extract` stage enfo
 - `BLOCK` — hard policy violation: new `postinstall`/`preinstall` script, known
   revocation, or unpinned dangerous delta
 
-### Heuristic rule set (local, v1)
-- New executable/binaries (executable bit, `.exe`, native bindings)
-- `scripts` field additions (`postinstall`, `preinstall`, etc.)
-- New/changed dependencies (transitive risk)
-- Install-script presence
-- Obfuscated / `base64` / `eval` in diff
-- Maintainer/author change vs baseline
-- Semver-major with large delta
-- Missing/forged provenance (surfaced, not auto-fail)
-- Revocation hit (BLOCK)
+### Heuristic rule set (local, v1 — full inventory; bands tunable via policy)
+- R00 — unparseable/unreadable baseline or PKGBUILD (fail closed), PKGBUILD scope disclosure
+- R01 — lifecycle script added/modified, `binding.gyp` added/modified (native build trigger)
+- R02 — executable/binary blob added/modified, opaque large file, new install script, entry-points script
+- R03 — `child_process`, `eval`, VM execution, network primitives, high entropy in diff
+- R04 — dependency added/modified, sdist build code
+- R05 — large patch diff, non-standard version
+- R06 — first sighting (no baseline), native platform wheel
+- R07 — unreviewed predecessor baseline
+- R08 — yanked predecessor (MEDIUM)
+- R09 — advisory CVE / critical CVE / malware hit (BLOCK), yanked target
+- R10 — maintainer transition, lockfile hash mismatch
+- R11–R23 — PKGBUILD static rules (checksum SKIP, source drift, pipe-to-shell,
+  eval family, indirection, cmd-subst in metadata, build-time network,
+  homoglyph, validpgpkeys change, install/hook change, unpinned VCS,
+  conditional execution, npm delivery); see §5 and `src/pkgbuild.rs`
+- R24–R27 — recursive review (install-ref disclosure, depth cap, cycle, second-order roll-up); see §5
+- R28 — recall-index staleness; see §5
 
 ### MCP design
 Explicit `review_install` tool (agent calls before install) is primary; optional
