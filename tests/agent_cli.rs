@@ -312,3 +312,42 @@ fn agent_gate_uses_exit_codes_and_native_decision_shapes() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn gate_refuses_a_registry_override_without_touching_the_registry() {
+    // A registry the gate cannot reach stands in for any side effect of
+    // resolving the operand. If the shape denial short-circuits, the refusal
+    // is still the shape reason rather than a network failure, and the store
+    // gains no evidence row for a command that never ran.
+    let data_dir = tempfile::tempdir().unwrap();
+    let dead_registry = "http://127.0.0.1:1";
+    let output = Command::cargo_bin("blueline")
+        .unwrap()
+        .args([
+            "agent",
+            "gate",
+            "--command",
+            "npm install risky@1.0.0 --registry=http://elsewhere.test",
+            "--registry",
+            dead_registry,
+        ])
+        .env("BLUELINE_DATA_DIR", data_dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unreviewable invocation shape"),
+        "must refuse on shape alone, not on a failed lookup: {stderr}"
+    );
+    assert!(
+        !stderr.contains("registry lookup failed"),
+        "the operand must not be resolved at all: {stderr}"
+    );
+
+    let conn = rusqlite::Connection::open(data_dir.path().join("baseline.db")).unwrap();
+    let known: i64 = conn
+        .query_row("SELECT count(*) FROM known_clean", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(known, 0, "a refused command must not record evidence");
+}
