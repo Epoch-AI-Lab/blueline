@@ -26,10 +26,71 @@ inputs:
     description: 'Optional path to save the JSON report'
     required: false
     default: ''
+  version:
+    description: 'Blueline release to download (e.g. v0.3.1) or "latest". Ignored when build-from-source is true.'
+    required: false
+    default: 'latest'
+  build-from-source:
+    description: 'Build blueline from the checked-out source with cargo instead of downloading the prebuilt release binary. Required when scanning with unreleased code (e.g. this repo''s own dogfood job).'
+    required: false
+    default: 'false'
 
 runs:
   using: 'composite'
   steps:
+    - name: Resolve Blueline binary
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+        INPUT_BUILD_FROM_SOURCE: ${{ inputs.build-from-source }}
+      run: |
+        set -euo pipefail
+        OUT_DIR="${RUNNER_TEMP}/blueline-bin"
+        mkdir -p "$OUT_DIR"
+        if [ "$INPUT_BUILD_FROM_SOURCE" = "true" ]; then
+          cargo build --locked --release
+          printf '%s' "$PWD/target/release/blueline" > "$OUT_DIR/path"
+          exit 0
+        fi
+
+        OS="$(uname -s)"
+        ARCH="$(uname -m)"
+        case "$OS-$ARCH" in
+          Linux-x86_64) TARGET="x86_64-unknown-linux-gnu" ;;
+          Linux-aarch64) TARGET="aarch64-unknown-linux-gnu" ;;
+          Darwin-arm64) TARGET="aarch64-apple-darwin" ;;
+          Darwin-x86_64) TARGET="x86_64-apple-darwin" ;;
+          MINGW*-x86_64|MSYS*-x86_64|CYGWIN*-x86_64|Windows_NT-x86_64) TARGET="x86_64-pc-windows-msvc" ;;
+          MINGW*-aarch64|MSYS*-aarch64|CYGWIN*-aarch64|Windows_NT-aarch64) TARGET="aarch64-pc-windows-msvc" ;;
+          *) echo "::error::unsupported runner platform $OS-$ARCH" && exit 1 ;;
+        esac
+
+        REPO="Epoch-AI-Lab/blueline"
+        TAG="$INPUT_VERSION"
+        if [ "$TAG" = "latest" ]; then
+          TMP_JSON="$(mktemp)"
+          if [ -n "${GITHUB_TOKEN:-}" ]; then
+            curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" -o "$TMP_JSON" "https://api.github.com/repos/$REPO/releases/latest"
+          else
+            curl -fsSL -o "$TMP_JSON" "https://api.github.com/repos/$REPO/releases/latest"
+          fi
+          TAG="$(grep -m1 '"tag_name"' "$TMP_JSON" | cut -d'"' -f4)"
+          rm -f "$TMP_JSON"
+          [ -n "$TAG" ] || { echo "::error::could not resolve latest blueline release" && exit 1; }
+        fi
+        VER="${TAG#v}"
+        ASSET="blueline-$VER-binary-$TARGET"
+        case "$TARGET" in *windows*) ASSET="$ASSET.exe" ;; esac
+
+        cd "$OUT_DIR"
+        curl -fsSL -o "$ASSET" "https://github.com/$REPO/releases/download/$TAG/$ASSET"
+        curl -fsSL -o SHA256SUMS "https://github.com/$REPO/releases/download/$TAG/SHA256SUMS"
+        EXPECTED="$(grep -F " $ASSET" SHA256SUMS || true)"
+        [ -n "$EXPECTED" ] || { echo "::error::release SHA256SUMS has no entry for $ASSET" && exit 1; }
+        printf '%s\n' "$EXPECTED" | sha256sum -c -
+        chmod +x "$ASSET"
+        printf '%s' "$OUT_DIR/$ASSET" > "$OUT_DIR/path"
+
     - name: Run Blueline CI Scan
       shell: bash
       env:
@@ -39,6 +100,9 @@ runs:
         INPUT_POLICY_PATH: ${{ inputs.policy-path }}
         INPUT_OUTPUT_FILE: ${{ inputs.output-file }}
       run: |
+        set -euo pipefail
+        BLUELINE="$(cat "${RUNNER_TEMP}/blueline-bin/path")"
+        [ -x "$BLUELINE" ] || { echo "::error::blueline binary missing at $BLUELINE" && exit 1; }
         BASE="${INPUT_BASE_REF:-${GITHUB_BASE_REF:-origin/main}}"
         if ! git rev-parse --verify --quiet "$BASE" >/dev/null 2>&1; then
           BASE="origin/$BASE"
@@ -52,4 +116,4 @@ runs:
         fi
 
         echo "Executing: blueline ${ARGS[*]}"
-        cargo run --locked --release -- "${ARGS[@]}"
+        "$BLUELINE" "${ARGS[@]}"

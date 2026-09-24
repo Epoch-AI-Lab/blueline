@@ -76,6 +76,9 @@ jobs:
         id: scan
         continue-on-error: true
         with:
+          # PR code is unreleased, so the action must build it from source:
+          # downloading the latest release binary would scan with stale logic.
+          build-from-source: true
           # First-party packages legitimately ship binaries and process-exec
           # primitives with no registry baseline, so fail-closed scanning
           # reports BLOCK on ourselves and CI runners keep no approval store.
