@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `agent gate` now refuses an unreviewable invocation shape before it resolves
+  any operand. A command carrying a registry override (or any other hard-deny
+  shape) used to be scanned, then still reviewed, downloading tarballs from the
+  registry the command was explicitly redirecting away from and writing
+  evidence rows for an install that never ran. The denial is unchanged and
+  still exit 2; only the wasted and misleading work is gone.
+- Registry requests no longer stall for 90 seconds against a peer that accepts
+  the connection and then goes quiet. All four adapters share one agent with a
+  10s connect ceiling and a 30s per-read/write ceiling. No whole-request
+  timeout is set, because `ureq` lets it override the per-operation values, and
+  response size stays bounded by `RegistryLimits` as before.
+- Concurrent first runs against one data directory no longer fail. Migrations
+  accept a store another process already brought to the target schema instead
+  of surfacing the loser's `table already exists`, and `record_verified`
+  inserts-then-verifies rather than checking-then-inserting, which removed a
+  primary-key collision between two reviewers recording the same package.
+- The unreviewed-baseline refusal hint now names the
+  `allow_unreviewed_baseline = true` policy rule alongside the
+  predecessor-approval command, and warns that walking the chain costs one run
+  per version back. The README quickstart documents the same onboarding path.
+- Recall snapshots validate each entry's package name against its own
+  ecosystem grammar instead of a shared character class, so a path-shaped name
+  such as `../etc` is refused instead of served.
+
+### Changed
+
+- Docs refresh: `ROADMAP.md` marks the local-first recall index shipped
+  (hosted API stays under Someday); `ARCHITECTURE.md` drops the stale
+  Phase-0/1 notes, lists the full R00–R28 heuristic inventory, and records
+  the recursion (D12), local-first recall (D13), and agent-enforcement
+  (D14) decisions.
+- Mutation testing now covers the verdict path: `heuristic.rs`, `diff.rs`,
+  `advisory.rs`, `provenance.rs`, `verdict.rs`, and the crates.io / AUR /
+  `http_util` / registry-mod files join the `--file` scope in both mutants
+  jobs.
+- The `blueline-ci` composite action downloads the checksum-verified
+  prebuilt release binary (new `version` input, default `latest`) instead
+  of `cargo run --release` on every run; `build-from-source: true`
+  preserves the source build for unreleased code, and this repo's dogfood
+  job pins it.
+
 ## [0.3.1] - 2026-09-21
 
 ### Added
