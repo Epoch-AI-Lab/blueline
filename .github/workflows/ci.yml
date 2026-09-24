@@ -197,6 +197,10 @@ jobs:
             --file src/mcp.rs --file src/install_ref.rs --file src/recursive.rs \
             --file src/agent.rs --file src/recall.rs --file src/shim.rs \
             --file src/pkgbuild.rs --file src/render.rs --file src/policy.rs \
+            --file src/heuristic.rs --file src/diff.rs --file src/advisory.rs \
+            --file src/provenance.rs --file src/verdict.rs \
+            --file src/registry/cratesio.rs --file src/registry/aur.rs \
+            --file src/registry/http_util.rs --file src/registry/mod.rs \
             --in-place --baseline=skip --timeout 30
       - uses: actions/upload-artifact@v4
         if: always()
@@ -247,6 +251,10 @@ jobs:
             --file src/mcp.rs --file src/install_ref.rs --file src/recursive.rs \
             --file src/agent.rs --file src/recall.rs --file src/shim.rs \
             --file src/pkgbuild.rs --file src/render.rs --file src/policy.rs \
+            --file src/heuristic.rs --file src/diff.rs --file src/advisory.rs \
+            --file src/provenance.rs --file src/verdict.rs \
+            --file src/registry/cratesio.rs --file src/registry/aur.rs \
+            --file src/registry/http_util.rs --file src/registry/mod.rs \
             --in-place --baseline=skip --timeout 30
       - uses: actions/upload-artifact@v4
         if: always()
