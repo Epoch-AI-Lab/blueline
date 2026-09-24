@@ -548,8 +548,24 @@ fn bootstrap_hint(verdict: &crate::verdict::Verdict) -> Option<String> {
         let base = &crate::render::sanitize_single_line(
             verdict.baseline_version.as_deref().unwrap_or("unknown"),
         );
+        let other_risk = verdict.findings.iter().any(|f| {
+            f.rule_id != "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+                && f.rule_id != "R06_FIRST_SIGHTING"
+                && f.severity > crate::verdict::VerdictBand::Low
+        });
+        let remedy = if other_risk {
+            "Address the findings above first; a baseline allowlist rule will not clear them."
+                .to_string()
+        } else {
+            format!(
+                "Run `blueline review {name}@{base}` to approve it, or add an [[allowlist.packages]] rule for this \
+                 package with `allow_unreviewed_baseline = true` to blueline.toml. Walking the chain one version \
+                 at a time works, but a package with a long release history needs one run per version back to the \
+                 first."
+            )
+        };
         Some(format!(
-            "hint: baseline `{name}@{base}` was never approved locally. Approve it when prompted during an interactive `blueline review`, or run `blueline review {name}@{base}` directly."
+            "hint: baseline `{name}@{base}` was never approved locally. {remedy}"
         ))
     } else if verdict
         .findings

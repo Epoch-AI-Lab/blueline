@@ -1881,7 +1881,8 @@ fn regression_refusal_hints_name_the_bootstrap_command() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains("hint: baseline `hint-pkg@1.0.0`"))
-        .stderr(predicate::str::contains("blueline review hint-pkg@1.0.0"));
+        .stderr(predicate::str::contains("blueline review hint-pkg@1.0.0"))
+        .stderr(predicate::str::contains("allow_unreviewed_baseline = true"));
 }
 
 #[test]
