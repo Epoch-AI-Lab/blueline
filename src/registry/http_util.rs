@@ -3,10 +3,34 @@
 //! nothing in this module knows about packuments or checksums.
 
 use std::io::Read;
+use std::time::Duration;
 
 use ureq::Agent;
 
 use crate::error::BluelineError;
+
+/// Ceiling on establishing the connection. A black-holed host trips this long
+/// before the request does.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Ceiling on a single socket read or write. This is what catches a peer that
+/// accepts the connection and then stalls. `ureq` lets a whole-request
+/// `.timeout()` override these per-operation values, so none is set: overall
+/// size is already bounded by `RegistryLimits`, and a stall is a liveness
+/// problem rather than a size one. Setting a global timeout here would restore
+/// the 90-second stall this exists to remove.
+const IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Shared agent for every registry adapter. Redirects stay off so each hop can
+/// be SSRF-validated by `follow_redirects` instead of followed blindly.
+pub fn registry_agent(user_agent: &str) -> Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(CONNECT_TIMEOUT)
+        .timeout_read(IO_TIMEOUT)
+        .timeout_write(IO_TIMEOUT)
+        .user_agent(user_agent)
+        .redirects(0)
+        .build()
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct RegistryLimits {

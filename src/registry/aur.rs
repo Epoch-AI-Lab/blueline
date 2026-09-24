@@ -115,11 +115,7 @@ impl AurRpc {
     }
 
     pub fn with_limits(base: &str, limits: RegistryLimits) -> Self {
-        let agent = ureq::AgentBuilder::new()
-            .timeout(std::time::Duration::from_secs(90))
-            .user_agent(USER_AGENT)
-            .redirects(0)
-            .build();
+        let agent = super::http_util::registry_agent(USER_AGENT);
         Self {
             agent,
             base: base.trim_end_matches('/').to_string(),

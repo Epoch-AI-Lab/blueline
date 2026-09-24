@@ -26,11 +26,7 @@ impl NpmRegistry {
     }
 
     pub fn with_limits(base: &str, limits: RegistryLimits) -> Self {
-        let agent = ureq::AgentBuilder::new()
-            .timeout(std::time::Duration::from_secs(90))
-            .user_agent(USER_AGENT)
-            .redirects(0) // Do not follow redirects automatically without SSRF validation
-            .build();
+        let agent = super::http_util::registry_agent(USER_AGENT);
         Self {
             agent,
             base: base.trim_end_matches('/').to_string(),
@@ -246,7 +242,7 @@ fn is_valid_name_segment(s: &str) -> bool {
         })
 }
 
-fn validate_package_name(name: &str) -> Result<(), BluelineError> {
+pub fn validate_package_name(name: &str) -> Result<(), BluelineError> {
     if name.is_empty() || name.len() > 214 {
         return Err(BluelineError::Manifest(
             name.to_string(),
