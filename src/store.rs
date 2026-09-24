@@ -249,9 +249,23 @@ impl BaselineStore {
             .map_err(|e| BluelineError::Store(format!("enabling WAL: {e}")))?;
 
         let migrations = Migrations::new(MIGRATIONS.iter().map(|sql| M::up(sql)).collect());
-        migrations
-            .to_latest(&mut conn)
-            .map_err(|e| BluelineError::Store(format!("applying migrations: {e}")))?;
+        if let Err(e) = migrations.to_latest(&mut conn) {
+            // Each migration runs in its own deferred transaction, so two
+            // processes opening a fresh store can both read the pre-migration
+            // version and then collide on `CREATE TABLE`. Losing that race is
+            // not a fault: if the schema now sits at the target version, the
+            // winner applied every migration and this store is usable.
+            let applied: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .map_err(|pe| {
+                    BluelineError::Store(format!(
+                        "applying migrations: {e}; reading schema version: {pe}"
+                    ))
+                })?;
+            if applied != MIGRATIONS.len() as i64 {
+                return Err(BluelineError::Store(format!("applying migrations: {e}")));
+            }
+        }
 
         Ok(Self { conn })
     }
@@ -270,53 +284,58 @@ impl BaselineStore {
         version: &str,
         checksum: &Checksum,
     ) -> Result<(), BluelineError> {
-        let stored = self.stored_integrity(ecosystem, name, version)?;
-        match stored {
-            Some(existing) => {
-                let existing = Checksum::parse(&existing).map_err(|_| {
-                    BluelineError::Store(format!(
-                        "integrity changed for {name}@{version}: the stored record no longer matches this \
-                         tarball; refusing to overwrite it"
-                    ))
-                })?;
-                if existing != *checksum {
-                    return Err(BluelineError::Store(format!(
-                        "integrity changed for {name}@{version}: the stored record no longer matches this \
-                         tarball; refusing to overwrite it"
-                    )));
-                }
-                self.conn
-                    .prepare_cached(
-                        "UPDATE known_clean
-                         SET reviewed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-                         WHERE ecosystem = ?1 AND name = ?2 AND version = ?3",
-                    )
-                    .map_err(|e| BluelineError::Store(format!("preparing refresh: {e}")))?
-                    .execute(rusqlite::params![ecosystem.key(), name, version])
-                    .map_err(|e| {
-                        BluelineError::Store(format!("recording {name}@{version}: {e}"))
-                    })?;
-                Ok(())
-            }
-            None => {
-                self.conn
-                    .prepare_cached(
-                        "INSERT INTO known_clean (ecosystem, name, version, integrity)
-                         VALUES (?1, ?2, ?3, ?4)",
-                    )
-                    .map_err(|e| BluelineError::Store(format!("preparing upsert: {e}")))?
-                    .execute(rusqlite::params![
-                        ecosystem.key(),
-                        name,
-                        version,
-                        checksum.to_display()
-                    ])
-                    .map_err(|e| {
-                        BluelineError::Store(format!("recording {name}@{version}: {e}"))
-                    })?;
-                Ok(())
-            }
+        // Insert-or-ignore first rather than reading then writing: a
+        // check-then-insert lets two processes both observe an absent row and
+        // then collide on the primary key. The digest comparison happens after,
+        // so losing the insert race still ends in the same fail-closed answer.
+        let inserted = self
+            .conn
+            .prepare_cached(
+                "INSERT INTO known_clean (ecosystem, name, version, integrity)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(ecosystem, name, version) DO NOTHING",
+            )
+            .map_err(|e| BluelineError::Store(format!("preparing upsert: {e}")))?
+            .execute(rusqlite::params![
+                ecosystem.key(),
+                name,
+                version,
+                checksum.to_display()
+            ])
+            .map_err(|e| BluelineError::Store(format!("recording {name}@{version}: {e}")))?;
+        if inserted > 0 {
+            return Ok(());
         }
+
+        let existing = self
+            .stored_integrity(ecosystem, name, version)?
+            .ok_or_else(|| {
+                BluelineError::Store(format!(
+                    "recording {name}@{version}: the row vanished between insert and read"
+                ))
+            })?;
+        let existing = Checksum::parse(&existing).map_err(|_| {
+            BluelineError::Store(format!(
+                "integrity changed for {name}@{version}: the stored record no longer matches this \
+                 tarball; refusing to overwrite it"
+            ))
+        })?;
+        if existing != *checksum {
+            return Err(BluelineError::Store(format!(
+                "integrity changed for {name}@{version}: the stored record no longer matches this \
+                 tarball; refusing to overwrite it"
+            )));
+        }
+        self.conn
+            .prepare_cached(
+                "UPDATE known_clean
+                 SET reviewed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                 WHERE ecosystem = ?1 AND name = ?2 AND version = ?3",
+            )
+            .map_err(|e| BluelineError::Store(format!("preparing refresh: {e}")))?
+            .execute(rusqlite::params![ecosystem.key(), name, version])
+            .map_err(|e| BluelineError::Store(format!("recording {name}@{version}: {e}")))?;
+        Ok(())
     }
 
     fn stored_integrity(
@@ -881,6 +900,50 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    fn err_of(result: &Result<BaselineStore, BluelineError>) -> String {
+        match result {
+            Ok(_) => "ok".into(),
+            Err(e) => format!("{e}"),
+        }
+    }
+
+    #[test]
+    fn concurrent_open_of_a_fresh_store_all_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("race.db");
+
+        // A second opener must accept a store another process already brought
+        // to the target schema rather than surfacing that process's
+        // "table already exists" failure.
+        let first = BaselineStore::open_at(&db_path);
+        assert!(first.is_ok(), "first open failed: {}", err_of(&first));
+        let again = BaselineStore::open_at(&db_path);
+        assert!(again.is_ok(), "reopen failed: {}", err_of(&again));
+        drop(first);
+        drop(again);
+    }
+
+    #[test]
+    fn repeated_opens_of_a_fresh_store_leave_one_usable_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("repeat.db");
+        for i in 0..5 {
+            let store = BaselineStore::open_at(&db_path);
+            assert!(store.is_ok(), "open {i} failed: {}", err_of(&store));
+        }
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let applied: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(applied, MIGRATIONS.len() as i64);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM known_clean", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
         );
     }
 
