@@ -245,14 +245,23 @@ fn evaluate_with_registry<V: VersionInfo>(
         _ => None,
     };
 
-    let advisories = crate::advisory::fetch_advisories(
+    // The error is kept rather than collapsed into the report. An operator who
+    // set `fail_closed_network` asked for exactly this to stop the review, and
+    // as an `unverified` report it produced no finding at all, so the verdict
+    // came out the same as a clean advisory pass. It becomes a finding below.
+    let (advisories, advisory_error) = match crate::advisory::fetch_advisories(
         &target_pkg.name,
         &target_pkg.version,
         ecosystem,
         Some(store),
         policy,
-    )
-    .unwrap_or_else(|e| crate::advisory::AdvisoryReport::unverified(&e.to_string()));
+    ) {
+        Ok(report) => (report, None),
+        Err(e) => (
+            crate::advisory::AdvisoryReport::unverified(&e.to_string()),
+            Some(e.to_string()),
+        ),
+    };
 
     let provenance = match ecosystem {
         Ecosystem::Npm => Some(crate::provenance::inspect_provenance(
@@ -353,6 +362,19 @@ fn evaluate_with_registry<V: VersionInfo>(
             };
             crate::heuristic::apply_extra_findings(&mut verdict, vec![finding], policy);
         }
+    }
+
+    if let Some(detail) = advisory_error {
+        let finding = crate::verdict::Finding {
+            rule_id: "R09_ADVISORY_UNVERIFIED".to_string(),
+            severity: crate::verdict::VerdictBand::High,
+            title: "Advisory source unavailable".to_string(),
+            description: format!(
+                "the advisory lookup failed and policy is configured to fail closed, so \
+                 revocation coverage for this release is unknown: {detail}"
+            ),
+        };
+        crate::heuristic::apply_extra_findings(&mut verdict, vec![finding], policy);
     }
 
     // Recursive review pass: every install reference the payload carries

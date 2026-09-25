@@ -247,14 +247,18 @@ fn fallback_or_fail(
     policy: &Policy,
     err_msg: &str,
 ) -> Result<AdvisoryReport, BluelineError> {
-    if let Some(stale) = stale_fallback {
-        return Ok(stale);
-    }
-
+    // Checked before the stale fallback. Serving a cached report while the
+    // policy says fail closed returned a possibly month-old answer as if it
+    // were fresh, and a stale CLEAN report produces no hits and no staleness
+    // disclosure, so it was indistinguishable from a clean pass.
     if policy.policy.fail_closed_network {
         return Err(BluelineError::Advisory(format!(
             "{err_msg} (failing closed as configured by policy)"
         )));
+    }
+
+    if let Some(stale) = stale_fallback {
+        return Ok(stale);
     }
 
     Ok(AdvisoryReport::unverified(err_msg))
@@ -488,6 +492,32 @@ fn calculate_advisory_severity(
 }
 
 #[cfg(test)]
+/// A cached report must not be served while the policy says fail closed.
+/// It did, which returned a possibly month-old answer as if it were fresh,
+/// and a stale CLEAN report produces neither hits nor a staleness
+/// disclosure, so it read as a clean pass.
+#[test]
+fn fail_closed_network_outranks_a_stale_cached_report() {
+    let mut policy = Policy::default();
+    policy.policy.fail_closed_network = true;
+    let stale = AdvisoryReport {
+        status: AdvisoryStatus::Clean,
+        hits: Vec::new(),
+        source: "cache".to_string(),
+        message: None,
+    };
+    let result = fallback_or_fail(Some(stale.clone()), &policy, "osv unreachable");
+    assert!(
+        result.is_err(),
+        "fail_closed_network must not be satisfied by a cached report"
+    );
+
+    // Without the policy the fallback is still the answer.
+    let mut lenient = Policy::default();
+    lenient.policy.fail_closed_network = false;
+    assert!(fallback_or_fail(Some(stale), &lenient, "osv unreachable").is_ok());
+}
+
 mod tests {
     use super::*;
 
