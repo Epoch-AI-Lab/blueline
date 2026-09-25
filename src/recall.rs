@@ -54,7 +54,13 @@ pub struct Snapshot {
 /// index that reviewers treat as authoritative.
 fn name_matches_grammar(ecosystem: Ecosystem, name: &str) -> bool {
     match ecosystem {
-        Ecosystem::Npm => crate::registry::npm::validate_package_name(name).is_ok(),
+        // npm folds case on publish, and packages published before that rule
+        // still carry capitals. Curators write the name they know, so compare
+        // case-insensitively rather than refusing the whole index over one
+        // legacy spelling.
+        Ecosystem::Npm => {
+            crate::registry::npm::validate_package_name(&name.to_ascii_lowercase()).is_ok()
+        }
         Ecosystem::Cargo => crate::registry::cratesio::validate_crate_name(name).is_ok(),
         Ecosystem::PyPi => crate::version::validate_pypi_name(name),
         Ecosystem::Aur => crate::registry::aur::validate_aur_name(name),
@@ -808,6 +814,32 @@ mod tests {
         let mut cargo_scoped = scoped.clone();
         cargo_scoped.revocations[0].ecosystem = Ecosystem::Cargo;
         assert!(cargo_scoped.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_legacy_capitalised_npm_names() {
+        // npm folded case on publish, but pre-rule packages still carry
+        // capitals and curators write the name they know. One such entry must
+        // not take the whole index down with it.
+        for name in ["React", "MyPackage", "@scope/Pkg", "ExPRESS"] {
+            let mut snap = valid_snapshot();
+            snap.revocations[0].ecosystem = Ecosystem::Npm;
+            snap.revocations[0].name = name.to_string();
+            assert!(snap.validate().is_ok(), "npm entry `{name}` must load");
+        }
+    }
+
+    #[test]
+    fn validate_still_rejects_shaped_names_after_case_folding() {
+        for name in ["../ETC", "A/B/C", "@/x", "..", "a b"] {
+            let mut snap = valid_snapshot();
+            snap.revocations[0].ecosystem = Ecosystem::Npm;
+            snap.revocations[0].name = name.to_string();
+            assert!(
+                snap.validate().is_err(),
+                "npm entry `{name}` must still be refused"
+            );
+        }
     }
 
     #[test]
