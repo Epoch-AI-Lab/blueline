@@ -493,6 +493,21 @@ mod tests {
         h.to_vec()
     }
 
+    /// Same header with the ustar magic set. Without it tar-rs yields the
+    /// metadata entry to us, and our own cap applies; with it, tar-rs
+    /// consumes L/K/x headers inside its iterator, which is the path that
+    /// buffers the declared size. Tests of the metadata cap must use this.
+    fn raw_ustar_header(name: &str, typeflag: u8, size: u64) -> Vec<u8> {
+        let mut h = raw_header(name, typeflag, size, "", 0o644);
+        h[257..263].copy_from_slice(b"ustar\x00");
+        // Blank the checksum field before summing, or the old value is counted.
+        h[148..156].fill(b' ');
+        let sum: u64 = h.iter().map(|&b| u64::from(b)).sum();
+        let chksum = format!("{:06o}\x00 ", sum);
+        h[148..156].copy_from_slice(chksum.as_bytes());
+        h
+    }
+
     fn raw_tarball(entries: &[(String, u8, &str)]) -> Vec<u8> {
         use std::io::Write;
 
@@ -797,6 +812,72 @@ mod tests {
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         enc.write_all(&out).unwrap();
         enc.finish().unwrap()
+    }
+
+    #[test]
+    fn ustar_metadata_headers_are_capped() {
+        // Every ustar header kind that can carry a long name or an extended
+        // attribute, each declaring 256 MiB behind a small gzip. The report
+        // that these bypassed the per-entry cap did not reproduce: all four
+        // are refused by the existing metadata cap. This pins that, with the
+        // ustar magic set, which the older fixtures did not have.
+        use std::io::Write;
+        const PAYLOAD: usize = 256 * 1024 * 1024;
+        for (label, typeflag, meta_name) in [
+            ("pax-local", b'x', "PaxHeaders/demo"),
+            ("pax-global", b'g', "pax_global_header"),
+            ("gnu-longname", b'L', "././@LongLink"),
+            ("gnu-longlink", b'K', "././@LongLink"),
+        ] {
+            let mut out = Vec::new();
+            out.extend_from_slice(&raw_ustar_header(meta_name, typeflag, PAYLOAD as u64));
+            out.extend(std::iter::repeat_n(b'A', PAYLOAD));
+            out.extend_from_slice(&raw_ustar_header("package/demo", 0x30, 1));
+            out.push(b'z');
+            out.extend_from_slice(&[0u8; 1024]);
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            enc.write_all(&out).unwrap();
+            let tgz = enc.finish().unwrap();
+            assert!(
+                tgz.len() * 100 < PAYLOAD,
+                "[{label}] fixture must be far smaller than it declares"
+            );
+
+            let dir = tempfile::tempdir().unwrap();
+            match safe_extract(&tgz, dir.path(), &ExtractionLimits::default()) {
+                Ok(stats) => panic!(
+                    "[{label}] a {PAYLOAD}-byte metadata header was accepted \
+                     (files={})",
+                    stats.files
+                ),
+                Err(e) => assert!(
+                    matches!(e, BluelineError::ExtractionLimit(_)),
+                    "[{label}] must hit a declared cap, got {e:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn stream_budget_does_not_reject_a_header_heavy_archive() {
+        // The slack term exists for this: 1000 tiny entries need real header
+        // bytes, which a ratio on the compressed size cannot cover.
+        use std::io::Write;
+        let mut out = Vec::new();
+        for i in 0..1000 {
+            out.extend_from_slice(&raw_ustar_header(&format!("package/f{i}"), 0x30, 1));
+            out.push(b'x');
+            out.extend_from_slice(&[0u8; 511]);
+        }
+        out.extend_from_slice(&[0u8; 1024]);
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(&out).unwrap();
+        let tgz = enc.finish().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let stats = safe_extract(&tgz, dir.path(), &ExtractionLimits::default())
+            .expect("a legal header-heavy archive must still extract");
+        assert_eq!(stats.files, 1000);
     }
 
     #[test]
