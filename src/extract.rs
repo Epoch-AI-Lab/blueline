@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io::{Cursor, Read, Write};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use crate::error::BluelineError;
 
@@ -34,6 +34,18 @@ pub struct ExtractStats {
     pub unpacked_bytes: u64,
 }
 
+/// One definition of "lands on the same file", shared by the tar and wheel
+/// paths. `Path::components` drops `CurDir` and collapses `a//b` to `a/b`, so a
+/// plain string comparison of the raw entry name would miss those duplicates
+/// and let the second one overwrite the first.
+fn normalized_entry_key(path: &Path) -> String {
+    path.components()
+        .filter(|c| !matches!(c, Component::CurDir))
+        .collect::<PathBuf>()
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Extract a gzipped tarball into `dest` under hard bounds.
 ///
 /// Safety invariants:
@@ -55,6 +67,7 @@ pub fn safe_extract(
 
     let mut stats = ExtractStats::default();
     let mut seen = 0usize;
+    let mut seen_paths: HashSet<String> = HashSet::new();
 
     for entry in entries {
         seen += 1;
@@ -105,6 +118,25 @@ pub fn safe_extract(
             .map_err(|e| BluelineError::Extraction(format!("unreadable entry path: {e}")))?
             .to_path_buf();
         validate_entry_path(&path).map_err(BluelineError::Extraction)?;
+
+        let normalized_key = normalized_entry_key(&path);
+        if !seen_paths.insert(normalized_key.clone()) {
+            return Err(BluelineError::Extraction(format!(
+                "duplicate entry `{}` (normalized `{normalized_key}`)",
+                path.display()
+            )));
+        }
+
+        if entry_type.is_dir() && size != 0 {
+            // No tar writer emits payload for a directory, and tar-rs cannot
+            // seek past one, so a declared size here is inflated in full while
+            // counting as zero against every byte cap. Refuse rather than
+            // count, which is what the wheel path already does.
+            return Err(BluelineError::ExtractionLimit(format!(
+                "directory entry `{}` declares {size} payload bytes",
+                path.display()
+            )));
+        }
 
         if entry_type.is_file() {
             if size > limits.max_entry_bytes {
@@ -197,12 +229,7 @@ pub fn safe_extract_wheel(
 
         validate_entry_path(&enclosed_path).map_err(BluelineError::Extraction)?;
 
-        let normalized_key = enclosed_path
-            .components()
-            .filter(|c| !matches!(c, std::path::Component::CurDir))
-            .collect::<std::path::PathBuf>()
-            .to_string_lossy()
-            .into_owned();
+        let normalized_key = normalized_entry_key(&enclosed_path);
         if !seen.insert(normalized_key.clone()) {
             return Err(BluelineError::Extraction(format!(
                 "duplicate entry `{raw_name}` (normalized `{normalized_key}`)"
@@ -770,6 +797,70 @@ mod tests {
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         enc.write_all(&out).unwrap();
         enc.finish().unwrap()
+    }
+
+    #[test]
+    fn tar_duplicate_entry_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let tgz = raw_tarball_with_payload(&[
+            ("package/a.txt".into(), 0x30, b"first".to_vec()),
+            ("package/a.txt".into(), 0x30, b"second".to_vec()),
+        ]);
+        let err = safe_extract(&tgz, dir.path(), &ExtractionLimits::default()).unwrap_err();
+        assert!(
+            format!("{err}").contains("duplicate entry"),
+            "a repeated path must be refused, not silently overwritten: {err}"
+        );
+    }
+
+    #[test]
+    fn tar_duplicate_entry_that_normalizes_to_one_path_is_refused() {
+        // The case a string-keyed duplicate check misses: `a/b` and `a//b` are
+        // the same destination, so the second overwrites the first and the
+        // reviewed tree depends on entry order.
+        let dir = tempfile::tempdir().unwrap();
+        for second in ["package//a.txt", "./package/a.txt"] {
+            let tgz = raw_tarball_with_payload(&[
+                ("package/a.txt".into(), 0x30, b"first".to_vec()),
+                (second.into(), 0x30, b"second".to_vec()),
+            ]);
+            let err = safe_extract(&tgz, dir.path(), &ExtractionLimits::default())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("duplicate entry"),
+                "`{second}` normalizes onto an existing path and must be refused: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn tar_distinct_paths_still_extract() {
+        let dir = tempfile::tempdir().unwrap();
+        let tgz = raw_tarball_with_payload(&[
+            ("package/a.txt".into(), 0x30, b"a".to_vec()),
+            ("package/b.txt".into(), 0x30, b"b".to_vec()),
+            ("./package/c.txt".into(), 0x30, b"c".to_vec()),
+        ]);
+        let stats = safe_extract(&tgz, dir.path(), &ExtractionLimits::default()).unwrap();
+        assert_eq!(stats.files, 3, "distinct paths must not be confused");
+    }
+
+    #[test]
+    fn tar_directory_declaring_payload_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        // No tar writer emits payload for a directory, and tar-rs cannot seek
+        // past one, so a declared size is decompressed in full while counting
+        // as zero against every byte cap.
+        let tgz = raw_tarball_with_payload(&[
+            ("package/d".into(), 0x35, vec![b'A'; 64 * 1024]),
+            ("package/d/ok.txt".into(), 0x30, b"ok".to_vec()),
+        ]);
+        let err = safe_extract(&tgz, dir.path(), &ExtractionLimits::default()).unwrap_err();
+        assert!(
+            matches!(err, BluelineError::ExtractionLimit(_)),
+            "a directory with a declared payload must hit the byte budget, got {err:?}"
+        );
     }
 
     #[test]
