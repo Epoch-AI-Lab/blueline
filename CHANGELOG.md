@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Provenance is no longer reported as verified when nothing was verified.
+  Blueline base64-decoded the in-toto statement, compared the subject digest
+  to the bytes under review, and returned `Verified` with a hardcoded SLSA
+  level 3. No DSSE signature and no Sigstore certificate chain was ever
+  checked, yet `require_provenance` accepted the result and the card rendered
+  it green. The status is now `Attested` with no earned level, the renderer
+  says the signature is not verified, and `require_provenance` requires
+  actual cryptographic verification, which this build does not perform and
+  therefore refuses. **Behaviour change:** a policy with
+  `require_provenance = true` now blocks every release until Sigstore
+  verification is implemented, which needs a dependency that has not been
+  approved. An attestation that no policy requires is disclosed at `LOW`,
+  which cannot move a verdict.
+
 - Opening the store now checks the declared shape of the columns whose
   default decides trust, not only their names. `record_verified` never
   supplies `clean`, so a database declaring `clean INTEGER NOT NULL
