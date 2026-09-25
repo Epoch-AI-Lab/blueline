@@ -38,7 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   per version back. The README quickstart documents the same onboarding path.
 - Recall snapshots validate each entry's package name against its own
   ecosystem grammar instead of a shared character class, so a path-shaped name
-  such as `../etc` is refused instead of served.
+  such as `../etc` is refused instead of served. npm names are compared
+  case-insensitively, since npm folds case on publish and packages published
+  before that rule still carry capitals; otherwise a single legacy spelling
+  would refuse the whole index and silently stop every revocation in it from
+  blocking.
 
 ### Changed
 
