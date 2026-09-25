@@ -1092,16 +1092,24 @@ mod tests {
             );
         }
 
-        // A Low finding is not "other risk": the escape still applies.
-        let low_mix = bootstrap_hint(&hint_verdict(vec![
-            finding(r07, crate::verdict::VerdictBand::Medium),
-            finding("R06_FIRST_SIGHTING", crate::verdict::VerdictBand::Low),
-        ]))
-        .expect("R07 always produces a hint");
-        assert!(
-            low_mix.contains("allow_unreviewed_baseline = true"),
-            "Low findings must not suppress the escape: {low_mix}"
-        );
+        // A Low finding is not "other risk": the escape still applies. The
+        // rule id must be one the predicate does not already exclude, or this
+        // case would pass even if the comparison were off by a band.
+        for low_rule in [
+            "R04_DEPENDENCY_MODIFIED",
+            "R00_PKGBUILD_SCOPE",
+            "R02_BINARY_BLOB_MODIFIED",
+        ] {
+            let low_mix = bootstrap_hint(&hint_verdict(vec![
+                finding(r07, crate::verdict::VerdictBand::Medium),
+                finding(low_rule, crate::verdict::VerdictBand::Low),
+            ]))
+            .expect("R07 always produces a hint");
+            assert!(
+                low_mix.contains("allow_unreviewed_baseline = true"),
+                "a Low {low_rule} must not suppress the escape: {low_mix}"
+            );
+        }
     }
 
     #[test]
