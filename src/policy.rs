@@ -131,6 +131,15 @@ impl Policy {
 
     /// Validate internal policy consistency and invariants.
     pub fn validate(&self) -> Result<(), BluelineError> {
+        // A typo here used to fall back to HIGH, so `fail_on = "blockk"`
+        // quietly weakened a gate instead of refusing the policy. The CLI flag
+        // already refused the same typo; the policy key did not.
+        if crate::verdict::VerdictBand::parse(&self.ci.fail_on).is_none() {
+            return Err(BluelineError::Policy(format!(
+                "invalid ci policy: fail_on ({}) is not one of low, medium, high, block",
+                self.ci.fail_on
+            )));
+        }
         if self.thresholds.max_low_score > self.thresholds.max_medium_score {
             return Err(BluelineError::Policy(format!(
                 "invalid thresholds: max_low_score ({}) cannot exceed max_medium_score ({})",
@@ -600,6 +609,28 @@ block_score = 101
         assert!(glob_match("*middle*", "some-middle-name"));
         assert!(glob_match("exact", "exact"));
         assert!(!glob_match("exact", "exact-not"));
+    }
+
+    #[test]
+    fn rejects_an_unparseable_ci_fail_on() {
+        for bad in ["blockk", "", "medium-high", "  "] {
+            let toml = format!("[ci]\nfail_on = \"{bad}\"\n");
+            assert!(
+                Policy::from_toml_str(&toml).is_err(),
+                "fail_on = {bad:?} must be refused rather than silently weakened"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_ci_fail_on_case_and_whitespace_insensitively() {
+        for good in ["low", "HIGH", "  Block  ", "Medium"] {
+            let toml = format!("[ci]\nfail_on = \"{good}\"\n");
+            assert!(
+                Policy::from_toml_str(&toml).is_ok(),
+                "fail_on = {good:?} must stay valid"
+            );
+        }
     }
 
     #[test]

@@ -471,18 +471,7 @@ fn extract_base_lockfile(
 }
 
 fn parse_band_str(s: &str) -> Option<VerdictBand> {
-    let t = s.trim();
-    if t.eq_ignore_ascii_case("low") {
-        Some(VerdictBand::Low)
-    } else if t.eq_ignore_ascii_case("medium") {
-        Some(VerdictBand::Medium)
-    } else if t.eq_ignore_ascii_case("high") {
-        Some(VerdictBand::High)
-    } else if t.eq_ignore_ascii_case("block") {
-        Some(VerdictBand::Block)
-    } else {
-        None
-    }
+    VerdictBand::parse(s)
 }
 
 fn is_missing_base_error(stderr: &str) -> bool {

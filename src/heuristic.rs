@@ -286,46 +286,7 @@ pub fn evaluate_with_trust(
         }
     }
 
-    // R04: Dependency changes
-    if !delta.new_dependencies.is_empty() {
-        let deps_str = delta
-            .new_dependencies
-            .iter()
-            .map(|(d, v)| format!("{d}@{v}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let has_suspicious_url = delta
-            .new_dependencies
-            .iter()
-            .any(|(_, v)| is_non_semver_url(v));
-
-        findings.push(Finding {
-            rule_id: "R04_DEPENDENCY_ADDED".into(),
-            severity: if has_suspicious_url {
-                VerdictBand::High
-            } else {
-                VerdictBand::Medium
-            },
-            title: format!(
-                "{} new runtime dependencies added",
-                delta.new_dependencies.len()
-            ),
-            description: format!("Added dependencies: {deps_str}"),
-        });
-    }
-
-    for (dep, old_ver, new_ver) in &delta.modified_dependencies {
-        if is_non_semver_url(new_ver) {
-            findings.push(Finding {
-                rule_id: "R04_DEPENDENCY_MODIFIED".into(),
-                severity: VerdictBand::High,
-                title: format!("Dependency `{dep}` changed to non-semver URL"),
-                description: format!(
-                    "Dependency `{dep}` version modified from `{old_ver}` to suspicious URL `{new_ver}`."
-                ),
-            });
-        }
-    }
+    findings.extend(dependency_findings(delta));
 
     // R05: Large diff anomaly on patch or non-standard semver
     if let Some(base_ver_str) = &delta.baseline_version {
@@ -1784,6 +1745,70 @@ pub fn is_repo_allowed(provenance_repo: &str, allowed_pattern: &str) -> bool {
     false
 }
 
+/// The dependency-change rules. Split out so a delta can be tested without
+/// building a whole verdict around it.
+fn dependency_findings(delta: &Delta) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    if !delta.new_dependencies.is_empty() {
+        let deps_str = delta
+            .new_dependencies
+            .iter()
+            .map(|(d, v)| format!("{d}@{v}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let has_suspicious_url = delta
+            .new_dependencies
+            .iter()
+            .any(|(_, v)| is_non_semver_url(v));
+
+        findings.push(Finding {
+            rule_id: "R04_DEPENDENCY_ADDED".into(),
+            severity: if has_suspicious_url {
+                VerdictBand::High
+            } else {
+                VerdictBand::Medium
+            },
+            title: format!(
+                "{} new runtime dependencies added",
+                delta.new_dependencies.len()
+            ),
+            description: format!("Added dependencies: {deps_str}"),
+        });
+    }
+
+    for (dep, old_ver, new_ver) in &delta.modified_dependencies {
+        // Both directions. A change *from* a URL back to a range is the mirror
+        // of the redirect and was producing nothing.
+        if is_non_semver_url(new_ver) || is_non_semver_url(old_ver) {
+            findings.push(Finding {
+                rule_id: "R04_DEPENDENCY_MODIFIED".into(),
+                severity: VerdictBand::High,
+                title: format!("Dependency `{dep}` changed to non-semver URL"),
+                description: format!(
+                    "Dependency `{dep}` version modified from `{old_ver}` to suspicious URL `{new_ver}`."
+                ),
+            });
+        } else {
+            // A range-to-range change used to produce no finding at all, which
+            // is the shape a dependency-takeover payload takes when the
+            // attacker re-pins to a compromised patch release. LOW, because a
+            // benign patch bump is the overwhelmingly common case and this
+            // fires on every one of them; LOW is score-neutral and cannot move
+            // a band, so the cost is a disclosed line and not a gate.
+            findings.push(Finding {
+                rule_id: "R04_DEPENDENCY_MODIFIED".into(),
+                severity: VerdictBand::Low,
+                title: format!("Dependency `{dep}` version constraint changed"),
+                description: format!(
+                    "Dependency `{dep}` modified from `{old_ver}` to `{new_ver}`."
+                ),
+            });
+        }
+    }
+
+    findings
+}
+
 /// Every rule that reads the provenance report. Split out from the main
 /// evaluation so the policy gate can be tested on a report alone.
 fn provenance_findings(
@@ -2028,6 +2053,42 @@ mod tests {
         // A value shorter than every prefix must not slice out of range.
         assert!(!is_non_semver_url("x"));
         assert!(!is_non_semver_url("gi"));
+    }
+
+    #[test]
+    fn detects_a_dependency_change_that_is_not_a_url() {
+        let mut delta = Delta::default();
+        delta
+            .modified_dependencies
+            .push(("cookie".into(), "0.7.1".into(), "0.7.2".into()));
+        let findings = dependency_findings(&delta);
+        let r04: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "R04_DEPENDENCY_MODIFIED")
+            .collect();
+        assert_eq!(r04.len(), 1, "a range-to-range change must be disclosed");
+        assert_eq!(
+            r04[0].severity,
+            VerdictBand::Low,
+            "it must stay score-neutral: a benign patch bump is the common case"
+        );
+    }
+
+    #[test]
+    fn detects_a_dependency_leaving_a_url() {
+        let mut delta = Delta::default();
+        delta.modified_dependencies.push((
+            "pkg".into(),
+            "https://x/pkg.tgz".into(),
+            "1.0.0".into(),
+        ));
+        let findings = dependency_findings(&delta);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == "R04_DEPENDENCY_MODIFIED" && f.severity == VerdictBand::High),
+            "moving off a URL is the mirror of the redirect and must be HIGH"
+        );
     }
 
     #[test]
