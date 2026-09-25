@@ -22,12 +22,15 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Shared agent for every registry adapter. Redirects stay off so each hop can
 /// be SSRF-validated by `follow_redirects` instead of followed blindly.
-pub fn registry_agent(user_agent: &str) -> Agent {
+pub fn registry_agent(user_agent: &str, base: &str) -> Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
         .user_agent(user_agent)
         .redirects(0)
+        .resolver(ValidatingResolver {
+            base_host: authority_of(base),
+        })
         .build()
 }
 
@@ -285,7 +288,12 @@ pub fn is_private_or_local_host(host: &str) -> bool {
         return is_private_ip(ip);
     }
 
-    // Resolve hostname to IP to prevent DNS rebinding or hostname-based SSRF
+    // Resolves the name to check for a private answer. A name that does not
+    // resolve is reported as not-private here, because refusing it would break
+    // every offline or DNS-less environment, and it cannot be exploited: the
+    // registry agent carries a ValidatingResolver that re-resolves and
+    // re-checks at connection time, so an unresolvable or empty answer fails
+    // the request there. This function is the early-out, not the guard.
     use std::net::ToSocketAddrs;
     if let Ok(addrs) = (host, 443).to_socket_addrs() {
         for socket_addr in addrs {
@@ -298,9 +306,106 @@ pub fn is_private_or_local_host(host: &str) -> bool {
     false
 }
 
+/// The `host:port` authority of a registry base URL, which is the form
+/// `ureq` hands its resolver. A base with no port is compared on the host
+/// alone, since that is all the two strings can share.
+fn authority_of(base: &str) -> String {
+    let lower = base.trim().to_ascii_lowercase();
+    let without_scheme = lower
+        .strip_prefix("http://")
+        .or_else(|| lower.strip_prefix("https://"))
+        .unwrap_or(&lower);
+    without_scheme.trim_end_matches('/').to_string()
+}
+
+/// Resolver that is the SSRF guard rather than a duplicate of it.
+///
+/// `is_private_or_local_host` resolved a name once for validation while
+/// `ureq` resolved it again for the connection, so a name that answered
+/// publicly and then privately passed the check and connected to loopback,
+/// RFC1918, or a metadata address. This runs at the only point where a name
+/// becomes an address, validates every answer it hands back, and the
+/// connection then uses that same answer by construction.
+///
+/// The configured registry base is exempt, because pointing a review at a
+/// local fixture registry is a supported use and every integration test does
+/// it. Addresses are validated per call rather than pinned, since the agent
+/// is long-lived in the MCP server and pinned addresses would never refresh.
+struct ValidatingResolver {
+    base_host: String,
+}
+
+impl ureq::Resolver for ValidatingResolver {
+    fn resolve(&self, netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        use std::net::ToSocketAddrs;
+        let addrs: Vec<std::net::SocketAddr> = netloc.to_socket_addrs()?.collect();
+        if addrs.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("{netloc} resolved to no addresses"),
+            ));
+        }
+        let netloc_lower = netloc.to_ascii_lowercase();
+        if self.base_host == netloc_lower
+            || self
+                .base_host
+                .split_once(':')
+                .is_some_and(|(h, _)| *h == netloc_lower)
+        {
+            return Ok(addrs);
+        }
+        if let Some(bad) = addrs.iter().find(|a| is_private_ip(a.ip())) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("{netloc} resolves to private or local address {bad}"),
+            ));
+        }
+        Ok(addrs)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ureq::Resolver as _;
+
+    #[test]
+    fn the_resolver_refuses_private_and_unresolvable_targets() {
+        let r = ValidatingResolver {
+            base_host: "registry.npmjs.org".to_string(),
+        };
+        // The guard runs where the name becomes an address, so these are
+        // refused there rather than by a separate check that could disagree.
+        for target in ["127.0.0.1:8080", "169.254.169.254:443", "10.0.0.1:443"] {
+            assert!(
+                r.resolve(target).is_err(),
+                "`{target}` must be refused by the resolver"
+            );
+        }
+        // A dead name fails rather than connecting somewhere unexpected.
+        assert!(r.resolve("nx-host.invalid:443").is_err());
+    }
+
+    #[test]
+    fn the_resolver_exempts_only_the_configured_base() {
+        // Pointing a review at a local fixture registry is supported, and every
+        // integration test does it, so the base is exempt. Nothing else is.
+        let r = ValidatingResolver {
+            base_host: "127.0.0.1:8080".to_string(),
+        };
+        assert!(r.resolve("127.0.0.1:8080").is_ok());
+        assert!(r.resolve("127.0.0.1:9090").is_err());
+    }
+
+    #[test]
+    fn authority_of_extracts_the_host_port_a_resolver_sees() {
+        assert_eq!(
+            authority_of("https://registry.npmjs.org/"),
+            "registry.npmjs.org"
+        );
+        assert_eq!(authority_of("http://127.0.0.1:8080"), "127.0.0.1:8080");
+        assert_eq!(authority_of("HTTP://Example.COM:80/"), "example.com:80");
+    }
 
     #[test]
     fn validates_download_url_ssrf_and_schemes() {

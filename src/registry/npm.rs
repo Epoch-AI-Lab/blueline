@@ -26,7 +26,7 @@ impl NpmRegistry {
     }
 
     pub fn with_limits(base: &str, limits: RegistryLimits) -> Self {
-        let agent = super::http_util::registry_agent(USER_AGENT);
+        let agent = super::http_util::registry_agent(USER_AGENT, base);
         Self {
             agent,
             base: base.trim_end_matches('/').to_string(),
