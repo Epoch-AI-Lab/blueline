@@ -77,22 +77,48 @@ pub struct SyncedSnapshot {
 }
 
 /// Per-process snapshot cache: reviews evaluate many packages (CI, recursive
-/// children) and re-validating the snapshot per lookup is wasted work. The
-/// cache is keyed by modification timestamp so a re-sync in the same
-/// process is picked up.
-static SNAPSHOT_CACHE: std::sync::OnceLock<(std::time::SystemTime, Option<SyncedSnapshot>)> =
-    std::sync::OnceLock::new();
+/// children) and re-validating a snapshot that can carry 10 000 entries per
+/// lookup is wasted work.
+///
+/// A `OnceLock` cannot do this job. `set` fails once the cell is occupied and
+/// the result was discarded, so the cache froze at the first snapshot it ever
+/// saw. That stayed correct, because a stamp miss falls through to a fresh
+/// read, but the cache stopped hitting the moment the file changed, which is
+/// the only case it exists for. It was also keyed on mtime alone, so two
+/// snapshot paths sharing a timestamp served each other's index.
+///
+/// Keyed on the full path plus `(mtime, len)`. The length is free and closes
+/// the same-second collision a coarse filesystem clock would otherwise allow,
+/// and an `Arc` makes a hit a refcount bump rather than a deep clone of up to
+/// 10 000 entries.
+type CacheKey = (std::path::PathBuf, (std::time::SystemTime, u64));
+static SNAPSHOT_CACHE: std::sync::Mutex<
+    Option<(CacheKey, std::sync::Arc<Option<SyncedSnapshot>>)>,
+> = std::sync::Mutex::new(None);
+
+fn stamp(path: &Path) -> (std::time::SystemTime, u64) {
+    match std::fs::metadata(path) {
+        Ok(m) => (m.modified().unwrap_or(std::time::UNIX_EPOCH), m.len()),
+        Err(_) => (std::time::UNIX_EPOCH, 0),
+    }
+}
 
 fn cached_load(path: &Path) -> Result<Option<SyncedSnapshot>, BluelineError> {
-    let mtime = std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .unwrap_or(std::time::UNIX_EPOCH);
-    match SNAPSHOT_CACHE.get() {
-        Some((cached_at, cached)) if *cached_at == mtime => return Ok(cached.clone()),
-        _ => {}
+    let key = (path.to_path_buf(), stamp(path));
+    let hit = SNAPSHOT_CACHE
+        .lock()
+        .map_err(|_| BluelineError::Advisory("recall snapshot cache poisoned".into()))?
+        .clone();
+    if let Some((cached_key, value)) = hit
+        && cached_key == key
+    {
+        return Ok(value.as_ref().clone());
     }
     let loaded = load_at(path)?;
-    let _ = SNAPSHOT_CACHE.set((mtime, loaded.clone()));
+    let mut guard = SNAPSHOT_CACHE
+        .lock()
+        .map_err(|_| BluelineError::Advisory("recall snapshot cache poisoned".into()))?;
+    *guard = Some((key, std::sync::Arc::new(loaded.clone())));
     Ok(loaded)
 }
 
@@ -305,7 +331,7 @@ pub(crate) fn stale_band_at(
     policy: &crate::policy::Policy,
     path: &Path,
 ) -> Result<Option<crate::verdict::VerdictBand>, BluelineError> {
-    let Some(synced) = load_at(path)? else {
+    let Some(synced) = cached_load(path)? else {
         return Ok(None);
     };
     let max_age_secs = (policy.recall.max_age_hours as i64).saturating_mul(3600);
@@ -369,16 +395,71 @@ pub fn sync(url: &str) -> anyhow::Result<SyncedSnapshot> {
         );
     }
     let path = snapshot_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| anyhow::anyhow!("creating {}: {e}", parent.display()))?;
-    }
-    let tmp = path.with_extension(format!("json.tmp-{}", std::process::id()));
-    std::fs::write(&tmp, serde_json::to_string_pretty(&synced)?)
-        .map_err(|e| anyhow::anyhow!("writing {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &path)
-        .map_err(|e| anyhow::anyhow!("renaming into {}: {e}", path.display()))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| anyhow::anyhow!("creating {}: {e}", parent.display()))?;
+
+    // Held across the read-compare-write above, so two concurrent syncs
+    // cannot both pass the sequence check and then write out of order. The
+    // wait is bounded and then fails loudly, which is the right direction for
+    // a tool that fails closed; a crashed holder is cleared by the guard on
+    // drop. Cooperative: only blueline takes it.
+    let _lock = SyncLock::acquire(parent)?;
+
+    // A tempfile rather than a name derived from the pid. The old name was
+    // fully predictable and `fs::write` follows a symlink, so a planted link
+    // in a shared data directory turned a sync into an arbitrary-file
+    // overwrite. `tempfile` is already a dependency and creates with O_EXCL.
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".recall_snapshot.")
+        .tempfile_in(parent)
+        .map_err(|e| anyhow::anyhow!("creating a temp file in {}: {e}", parent.display()))?;
+    tmp.write_all(serde_json::to_string_pretty(&synced)?.as_bytes())
+        .map_err(|e| anyhow::anyhow!("writing the snapshot: {e}"))?;
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| anyhow::anyhow!("flushing the snapshot: {e}"))?;
+    tmp.persist(&path)
+        .map_err(|e| anyhow::anyhow!("renaming into {}: {}", path.display(), e.error))?;
     Ok(synced)
+}
+
+/// Advisory lock for the sync read-compare-write, built on `create_new` so it
+/// needs no new dependency. Removed on drop, including on an error path.
+struct SyncLock(PathBuf);
+
+impl SyncLock {
+    fn acquire(parent: &Path) -> anyhow::Result<Self> {
+        let path = parent.join("recall_snapshot.lock");
+        for attempt in 0..250 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Ok(SyncLock(path)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if attempt == 249 {
+                        anyhow::bail!(
+                            "another blueline recall sync holds {}; refusing to race it",
+                            path.display()
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => return Err(anyhow::anyhow!("creating {}: {e}", path.display())),
+            }
+        }
+        unreachable!("the loop either returns or bails")
+    }
+}
+
+impl Drop for SyncLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 fn index_size_within_cap(len: usize) -> bool {
@@ -699,48 +780,71 @@ mod tests {
         panic!("could not pad snapshot to {total_len} bytes");
     }
 
+    fn far_future() -> std::time::SystemTime {
+        std::time::SystemTime::now() + std::time::Duration::from_secs(3600)
+    }
+
+    fn set_mtime(path: &std::path::Path, mtime: std::time::SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+    }
+
     #[test]
     fn cached_load_hits_on_same_mtime_and_misses_on_change() {
-        use std::time::Duration;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("recall_snapshot.json");
 
-        fn set_mtime(path: &std::path::Path, mtime: std::time::SystemTime) {
-            std::fs::File::options()
-                .write(true)
-                .open(path)
-                .unwrap()
-                .set_modified(mtime)
-                .unwrap();
-        }
-
-        // A miss always rereads the file: anchor the mtime away from any
-        // cached entry, future-dated so even a concurrent population of the
-        // process-global cache cannot collide with it.
-        let probe_a = synced_tagged(11, "phase-a");
-        std::fs::write(&path, serde_json::to_string(&probe_a).unwrap()).unwrap();
-        let anchor = match SNAPSHOT_CACHE.get() {
-            Some((cached_at, _)) => *cached_at + Duration::from_secs(60),
-            None => std::time::SystemTime::now() + Duration::from_secs(60),
-        };
-        set_mtime(&path, anchor);
-        assert_eq!(cached_load(&path).unwrap(), Some(probe_a));
-
-        // The cache is definitely populated now (set-once: pre-existing or
-        // stored by the miss above), so rewinding the mtime to the cached
-        // entry must return the cached snapshot without rereading the file.
-        let (cached_at, cached) = SNAPSHOT_CACHE.get().cloned().unwrap();
+        // A miss always rereads, whatever the cache holds.
         let probe_b = synced_tagged(12, "phase-b");
-        assert_ne!(cached, Some(probe_b.clone()));
         std::fs::write(&path, serde_json::to_string(&probe_b).unwrap()).unwrap();
-        set_mtime(&path, cached_at);
-        assert_eq!(cached_load(&path).unwrap(), cached);
+        set_mtime(&path, far_future());
+        assert_eq!(cached_load(&path).unwrap(), Some(probe_b));
 
-        // A changed mtime reloads: the fresh file wins over the cache.
-        let probe_c = synced_tagged(13, "phase-c");
+        // A rewrite with the same timestamp but different content is picked
+        // up, because the stamp carries the length as well. This is the case
+        // a timestamp-only key gets wrong on a coarse clock.
+        let probe_c = synced_tagged(13, "phase-c-a");
         std::fs::write(&path, serde_json::to_string(&probe_c).unwrap()).unwrap();
-        set_mtime(&path, cached_at + Duration::from_secs(60));
-        assert_eq!(cached_load(&path).unwrap(), Some(probe_c));
+        let pinned = far_future();
+        set_mtime(&path, pinned);
+        assert_eq!(cached_load(&path).unwrap(), Some(probe_c.clone()));
+        let probe_d = synced_tagged(14, "phase-d-longer-content");
+        std::fs::write(&path, serde_json::to_string(&probe_d).unwrap()).unwrap();
+        set_mtime(&path, pinned);
+        assert_eq!(
+            cached_load(&path).unwrap(),
+            Some(probe_d),
+            "a same-mtime rewrite with different content must be reloaded"
+        );
+    }
+
+    /// Two snapshot paths must not share a cache entry even when they carry
+    /// the same timestamp. Serving another data directory's index here would
+    /// be a trust bug, not a performance one.
+    #[test]
+    fn cache_is_keyed_by_path_not_only_by_timestamp() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let path_a = a.path().join("recall_snapshot.json");
+        let path_b = b.path().join("recall_snapshot.json");
+        let snap_a = synced_tagged(21, "dir-a");
+        let snap_b = synced_tagged(22, "dir-b");
+        std::fs::write(&path_a, serde_json::to_string(&snap_a).unwrap()).unwrap();
+        std::fs::write(&path_b, serde_json::to_string(&snap_b).unwrap()).unwrap();
+        // Identical mtime on both.
+        let pinned = far_future();
+        set_mtime(&path_a, pinned);
+        set_mtime(&path_b, pinned);
+        assert_eq!(cached_load(&path_a).unwrap(), Some(snap_a));
+        assert_eq!(
+            cached_load(&path_b).unwrap(),
+            Some(snap_b),
+            "a second data directory must not serve the first one's index"
+        );
     }
 
     #[test]
@@ -1214,5 +1318,112 @@ mod tests {
         let response = String::from_utf8_lossy(&response).to_string();
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
         assert!(response.ends_with("ok"), "{response}");
+    }
+
+    /// The temp name used to be `recall_snapshot.json.tmp-<pid>`, a fully
+    /// predictable path, and `fs::write` follows a symlink. A link planted in
+    /// the data directory turned a sync into an arbitrary-file overwrite.
+    ///
+    /// This runs the sync in a re-executed child, because the vulnerable name
+    /// is derived from the pid of whichever process syncs. A test that plants
+    /// the link from the parent plants a name the child never uses, so it
+    /// passes against the code it is meant to catch.
+    #[test]
+    fn sync_does_not_follow_a_planted_symlink_in_the_data_directory() {
+        let data_dir = tempfile::tempdir().unwrap();
+        std::fs::write(data_dir.path().join("victim.txt"), b"original").unwrap();
+        let (url, handle) =
+            serve_recall_once(serde_json::to_vec(&recall_snapshot(42, 1_700_000_000)).unwrap());
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "sync_child_planted_symlink", "--nocapture"])
+            .env("BLUELINE_DATA_DIR", data_dir.path())
+            .env("BLUELINE_TEST_URL", &url)
+            .output()
+            .unwrap();
+        handle.join().unwrap();
+        assert!(
+            out.status.success(),
+            "child sync failed:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(data_dir.path().join("victim.txt")).unwrap(),
+            "original",
+            "a sync followed a planted symlink and overwrote its target"
+        );
+        assert!(
+            data_dir.path().join("recall_snapshot.json").is_file(),
+            "the snapshot itself must still be written"
+        );
+    }
+
+    /// Child half of the symlink test above, re-executed as its own process so
+    /// the planted name matches the pid that actually syncs.
+    #[test]
+    #[ignore = "re-executed by sync_does_not_follow_a_planted_symlink"]
+    fn sync_child_planted_symlink() {
+        let Ok(url) = std::env::var("BLUELINE_TEST_URL") else {
+            return;
+        };
+        let data = std::path::PathBuf::from(std::env::var("BLUELINE_DATA_DIR").unwrap());
+        let victim = data.join("victim.txt");
+        std::fs::write(&victim, b"original").unwrap();
+        let planted = data
+            .join("recall_snapshot.json")
+            .with_extension(format!("json.tmp-{}", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+        sync(&url).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "original",
+            "the sync followed a planted symlink and overwrote its target"
+        );
+    }
+
+    /// Two syncs that both pass the sequence check must not be able to write
+    /// out of order. The lock spans the whole read-compare-write, so the second
+    /// writer sees the first one's sequence and refuses.
+    #[test]
+    fn sync_locks_the_compare_and_write() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let held = SyncLock::acquire(data_dir.path()).unwrap();
+        assert!(
+            data_dir.path().join("recall_snapshot.lock").exists(),
+            "the lock file must be visible to another process"
+        );
+
+        let (url, handle) =
+            serve_recall_once(serde_json::to_vec(&recall_snapshot(42, 1_700_000_000)).unwrap());
+        let out = blueline_cmd(data_dir.path())
+            .args(["recall", "sync", "--url", &url])
+            .output()
+            .unwrap();
+        handle.join().unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("refusing to race"),
+            "a contended sync must fail loudly, got: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        drop(held);
+        assert!(
+            !data_dir.path().join("recall_snapshot.lock").exists(),
+            "the lock must be released on drop, including the error path"
+        );
+    }
+
+    #[test]
+    fn sync_lock_times_out_loudly_rather_than_proceeding() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let _held = SyncLock::acquire(data_dir.path()).unwrap();
+        let Err(err) = SyncLock::acquire(data_dir.path()) else {
+            panic!("a held lock must not be acquirable");
+        };
+        assert!(
+            err.to_string().contains("refusing to race"),
+            "a contended lock must fail loudly, got {err}"
+        );
     }
 }
