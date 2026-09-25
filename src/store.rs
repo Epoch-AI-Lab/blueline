@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
@@ -179,21 +180,42 @@ const EXPECTED_SCHEMA: &[(&str, &str)] = &[
     ("audit_log", "ecosystem"),
 ];
 
+/// Columns whose *default* decides trust, with the type they must declare.
+/// `signature_valid` is here for the same reason as `clean`: it feeds
+/// `registry_signature_present`, which `require_signatures` gates on. The
+/// other flags are not included because nothing reads them, or because their
+/// default is an expression that no exact-match check should pin.
+const TRUST_BEARING_COLUMNS: &[(&str, &str, &str)] = &[
+    ("known_clean", "clean", "INTEGER"),
+    ("provenance_cache", "signature_valid", "INTEGER"),
+];
+
 /// Refuse to open a database whose tables do not carry every column the store
 /// queries. Names the file and the first thing missing, so a user staring at
 /// this knows which file to move aside rather than what went wrong internally.
 fn verify_schema(conn: &rusqlite::Connection, path: &Path) -> Result<(), BluelineError> {
     let mut stmt = conn
         .prepare(
-            "SELECT m.name, p.name FROM sqlite_master m, pragma_table_info(m.name) p
+            "SELECT m.name, p.name, p.type, p.[notnull], p.dflt_value
+             FROM sqlite_master m, pragma_table_info(m.name) p
              WHERE m.type = 'table'",
         )
         .map_err(|e| BluelineError::Store(format!("inspecting schema: {e}")))?;
-    let present: std::collections::HashSet<(String, String)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+    let shapes: HashMap<(String, String), ColumnShape> = stmt
+        .query_map([], |row| {
+            Ok((
+                (row.get(0)?, row.get(1)?),
+                ColumnShape {
+                    ty: row.get(2)?,
+                    notnull: row.get::<_, i64>(3)? != 0,
+                    default: row.get(4)?,
+                },
+            ))
+        })
         .map_err(|e| BluelineError::Store(format!("reading schema: {e}")))?
-        .collect::<Result<HashSet<_>, _>>()
+        .collect::<Result<HashMap<_, _>, _>>()
         .map_err(|e| BluelineError::Store(format!("reading schema: {e}")))?;
+    let present: HashSet<(String, String)> = shapes.keys().cloned().collect();
 
     let missing: Vec<String> = EXPECTED_SCHEMA
         .iter()
@@ -208,7 +230,43 @@ fn verify_schema(conn: &rusqlite::Connection, path: &Path) -> Result<(), Bluelin
             EXPECTED_SCHEMA.len()
         )));
     }
+
+    // Names alone are not enough. A column whose default decides trust is
+    // checked as well: `record_verified` never supplies `clean`, so a
+    // `DEFAULT 1` there means a package nobody approved is written straight
+    // into the set `list_clean_versions` treats as approved baselines.
+    for (table, column, want_type) in TRUST_BEARING_COLUMNS {
+        let key = ((*table).to_string(), (*column).to_string());
+        let shape = shapes.get(&key).ok_or_else(|| {
+            BluelineError::Store(format!(
+                "{} is not a usable blueline store: {table}.{column} is missing",
+                path.display()
+            ))
+        })?;
+        // Parsed rather than string-compared, so '', 'yes', NULL and a
+        // parenthesised (0) are all rejected along with a literal 1.
+        let default = shape
+            .default
+            .as_deref()
+            .and_then(|d| d.trim().parse::<i64>().ok());
+        if !shape.ty.eq_ignore_ascii_case(want_type) || !shape.notnull || default != Some(0) {
+            return Err(BluelineError::Store(format!(
+                "{} is not a usable blueline store: {table}.{column} is {}                  {} default {:?}, expected {want_type} NOT NULL DEFAULT 0; a store that                  blesses by default would approve releases nobody reviewed; move the file                  aside to start a new one",
+                path.display(),
+                shape.ty,
+                if shape.notnull { "NOT NULL" } else { "NULL" },
+                shape.default,
+            )));
+        }
+    }
     Ok(())
+}
+
+/// One column's declared shape, as `pragma_table_info` reports it.
+struct ColumnShape {
+    ty: String,
+    notnull: bool,
+    default: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1045,6 +1103,52 @@ mod tests {
             MIGRATIONS.len() as i64,
             "the refused schema must not claim the target version"
         );
+    }
+
+    #[test]
+    fn open_refuses_a_tampered_trust_bearing_default() {
+        // `record_verified` never supplies `clean`, so a column defaulting to
+        // 1 would write a never-approved package straight into the set
+        // `list_clean_versions` hands back as an approved baseline. Names alone
+        // do not catch it: every column is present.
+        for (table, column, from, to) in [
+            (
+                "known_clean",
+                "clean",
+                "clean       INTEGER NOT NULL DEFAULT 0",
+                "clean       INTEGER NOT NULL DEFAULT 1",
+            ),
+            (
+                "provenance_cache",
+                "signature_valid",
+                "signature_valid  INTEGER NOT NULL DEFAULT 0",
+                "signature_valid  INTEGER NOT NULL DEFAULT 1",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join(format!("{column}.db"));
+            {
+                let mut conn = rusqlite::Connection::open(&db_path).unwrap();
+                Migrations::new(MIGRATIONS.iter().map(|s| M::up(s)).collect())
+                    .to_latest(&mut conn)
+                    .unwrap();
+                conn.pragma_update(None, "writable_schema", true).unwrap();
+                conn.execute(
+                    "UPDATE sqlite_master SET sql = replace(sql, ?1, ?2) WHERE name = ?3",
+                    rusqlite::params![from, to, table],
+                )
+                .unwrap();
+            }
+            let err = BaselineStore::open_at(&db_path)
+                .map(|_| ())
+                .expect_err(&format!(
+                    "a tampered {table}.{column} default must be refused"
+                ));
+            assert!(
+                err.to_string().contains(&format!("{table}.{column}")),
+                "the refusal must name the column: {err}"
+            );
+        }
     }
 
     #[test]
