@@ -2207,6 +2207,55 @@ fn render_known_list(values: &[FoldedValue]) -> Vec<String> {
         .collect()
 }
 
+/// R29: dependencies the PKGBUILD declares that .SRCINFO does not list.
+///
+/// The AUR dependency delta comes from the committed .SRCINFO, but makepkg
+/// executes the PKGBUILD, so a release can add a dependency to one and leave
+/// the other alone and the reviewed set is not the installed one. Names only:
+/// a constraint changed in both files is the other half of the divergence and
+/// belongs to the manifest delta. Placed in `review_roots` rather than
+/// `check` so the benign corpus gate, which has no .SRCINFO fixtures, is
+/// unaffected.
+fn check_r29_depends_vs_srcinfo(
+    folded: &FoldedPkgbuild,
+    srcinfo_deps: &std::collections::BTreeMap<String, String>,
+) -> Vec<PkgFinding> {
+    let mut missing = Vec::new();
+    // `depends_<pkgname>` too: a split package declares its own, and comparing
+    // only the bare `depends` array would fire on every one of them.
+    for prefix in ["depends", "makedepends"] {
+        for (_, values) in arrays_matching(folded, prefix) {
+            for value in values {
+                // A value we cannot resolve is already disclosed by R15/R16; it
+                // is not evidence of divergence.
+                let Some(text) = known_text(value) else {
+                    continue;
+                };
+                let Some(name) = crate::manifest::dep_name(text) else {
+                    continue;
+                };
+                if !srcinfo_deps.contains_key(&name) {
+                    missing.push(name);
+                }
+            }
+        }
+    }
+    missing.sort();
+    missing.dedup();
+    if missing.is_empty() {
+        return Vec::new();
+    }
+    vec![PkgFinding {
+        rule_id: "R29_PKGBUILD_DEPENDS_NOT_IN_SRCINFO".to_string(),
+        severity: VerdictBand::High,
+        evidence: format!(
+            "the PKGBUILD declares dependencies the committed .SRCINFO does not list, so the \
+             reviewed dependency set is not the installed one: {}",
+            missing.join(", ")
+        ),
+    }]
+}
+
 fn check_r19_pair(baseline: &FoldedPkgbuild, target: &FoldedPkgbuild) -> Vec<PkgFinding> {
     let mut base_keys: Vec<String> = arrays_matching(baseline, "validpgpkeys")
         .iter()
@@ -2343,6 +2392,7 @@ fn rule_title(rule_id: &str) -> &str {
         "R17_BUILD_TIME_NETWORK" => "Network fetch at build time",
         "R18_HOMOGLYPH" => "Suspicious unicode in PKGBUILD",
         "R19_VALIDPGPKEYS_CHANGE" => "Validpgpkeys changed since baseline",
+        "R29_PKGBUILD_DEPENDS_NOT_IN_SRCINFO" => "PKGBUILD dependency not in .SRCINFO",
         "R20_INSTALL_HOOK_CHANGE" => "Install or hook file changed",
         "R21_UNPINNED_VCS_SOURCE" => "Unpinned VCS source",
         "R22_CONDITIONAL_EXECUTION" => "Conditional execution guard",
@@ -2421,6 +2471,18 @@ pub fn review_roots(
     };
     for item in check(&target_folded) {
         push(&mut findings, &item);
+    }
+    // R29. The AUR dependency delta comes from the committed .SRCINFO, but
+    // makepkg executes the PKGBUILD, so a release can add a dependency to the
+    // one and leave the other alone and the reviewed set is not the installed
+    // one. Placed here rather than in `check` so the benign corpus gate, which
+    // has no .SRCINFO fixtures, is unaffected.
+    if let Ok(srcinfo) = std::fs::read_to_string(target_root.join(".SRCINFO"))
+        && let Ok(info) = crate::manifest::parse_aur_srcinfo(&srcinfo)
+    {
+        for item in check_r29_depends_vs_srcinfo(&target_folded, &info.deps) {
+            push(&mut findings, &item);
+        }
     }
     if let Some(base_raw) = baseline_pkgbuild {
         match parse_pkgbuild(base_raw) {
@@ -3167,6 +3229,59 @@ mod tests {
         assert_eq!(
             strip_comment("echo '# not a comment'"),
             "echo '# not a comment'"
+        );
+    }
+
+    #[test]
+    fn r29_fires_when_the_pkgbuild_declares_a_dependency_srcinfo_omits() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("PKGBUILD"),
+            "pkgname=demo\npkgver=1.0\npkgrel=1\ndepends=('glibc' 'backdoor-git')\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(".SRCINFO"),
+            "pkgbase = demo\n\tpkgver = 1.0\n\tpkgrel = 1\n\tdepends = glibc\n",
+        )
+        .unwrap();
+        let findings = review_roots(dir.path(), None, &empty_delta());
+        let r29: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "R29_PKGBUILD_DEPENDS_NOT_IN_SRCINFO")
+            .collect();
+        assert_eq!(r29.len(), 1, "the divergence must be reported once");
+        assert_eq!(r29[0].severity, VerdictBand::High);
+        assert!(
+            r29[0].description.contains("backdoor-git"),
+            "the undeclared dependency must be named: {}",
+            r29[0].description
+        );
+        assert!(
+            !r29[0].description.contains("glibc"),
+            "a dependency both files agree on is not a divergence"
+        );
+    }
+
+    #[test]
+    fn r29_stays_quiet_when_the_two_files_agree() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("PKGBUILD"),
+            "pkgname=demo\npkgver=1.0\ndepends=('glibc' 'gcc')\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(".SRCINFO"),
+            "pkgbase = demo\n\tpkgver = 1.0\n\tdepends = glibc\n\tdepends = gcc\n",
+        )
+        .unwrap();
+        let findings = review_roots(dir.path(), None, &empty_delta());
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == "R29_PKGBUILD_DEPENDS_NOT_IN_SRCINFO"),
+            "agreement must not fire: {findings:?}"
         );
     }
 

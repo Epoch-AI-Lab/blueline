@@ -396,7 +396,7 @@ fn split_srcinfo_pair(line: &str, lineno: usize) -> Result<(String, String), Blu
 /// The package name of an AUR dependency expression
 /// (`go>=1.21`, `sqlite3`, `mesa=24.0`): everything before the first
 /// version-relation character.
-fn dep_name(dep: &str) -> Option<String> {
+pub(crate) fn dep_name(dep: &str) -> Option<String> {
     let name = dep.split(['<', '>', '=']).next()?.trim();
     if name.is_empty() {
         None
