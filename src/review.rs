@@ -1026,6 +1026,84 @@ fn package_json_path(root: &std::path::Path) -> std::path::PathBuf {
 mod tests {
     use super::*;
 
+    fn hint_verdict(findings: Vec<crate::verdict::Finding>) -> crate::verdict::Verdict {
+        crate::verdict::Verdict {
+            name: "pkg".to_string(),
+            target_version: "1.1.0".to_string(),
+            baseline_version: Some("1.0.0".to_string()),
+            integrity: "sha512:aa".to_string(),
+            ecosystem: crate::registry::Ecosystem::Npm,
+            band: crate::verdict::VerdictBand::Medium,
+            risk_score: 10,
+            findings,
+            diff_summary: crate::verdict::DiffSummary {
+                files_added: 0,
+                files_removed: 0,
+                files_modified: 0,
+                lines_added: 0,
+                lines_deleted: 0,
+            },
+            trust_sources: None,
+            recursive: Vec::new(),
+        }
+    }
+
+    fn finding(rule_id: &str, severity: crate::verdict::VerdictBand) -> crate::verdict::Finding {
+        crate::verdict::Finding {
+            rule_id: rule_id.to_string(),
+            severity,
+            title: rule_id.to_string(),
+            description: rule_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn bootstrap_hint_offers_the_policy_rule_only_when_nothing_else_is_wrong() {
+        let r07 = "R07_UNREVIEWED_PREDECESSOR_BASELINE";
+        let alone = bootstrap_hint(&hint_verdict(vec![finding(
+            r07,
+            crate::verdict::VerdictBand::Medium,
+        )]))
+        .expect("R07 always produces a hint");
+        assert!(
+            alone.contains("allow_unreviewed_baseline = true"),
+            "with only the missing baseline, the policy escape must be offered: {alone}"
+        );
+
+        // A real finding above Low rides along with R07 often enough that the
+        // hint must not send the user to a policy rule that cannot clear it.
+        for severity in [
+            crate::verdict::VerdictBand::Medium,
+            crate::verdict::VerdictBand::High,
+            crate::verdict::VerdictBand::Block,
+        ] {
+            let mixed = bootstrap_hint(&hint_verdict(vec![
+                finding(r07, crate::verdict::VerdictBand::Medium),
+                finding("R01_LIFECYCLE_SCRIPT_ADDED", severity),
+            ]))
+            .expect("R07 always produces a hint");
+            assert!(
+                !mixed.contains("allow_unreviewed_baseline = true"),
+                "{severity:?} alongside R07 must not advertise the escape: {mixed}"
+            );
+            assert!(
+                mixed.contains("Address the findings above first"),
+                "{severity:?} alongside R07 must point at the real risk: {mixed}"
+            );
+        }
+
+        // A Low finding is not "other risk": the escape still applies.
+        let low_mix = bootstrap_hint(&hint_verdict(vec![
+            finding(r07, crate::verdict::VerdictBand::Medium),
+            finding("R06_FIRST_SIGHTING", crate::verdict::VerdictBand::Low),
+        ]))
+        .expect("R07 always produces a hint");
+        assert!(
+            low_mix.contains("allow_unreviewed_baseline = true"),
+            "Low findings must not suppress the escape: {low_mix}"
+        );
+    }
+
     #[test]
     fn baseline_unreadable_finding_is_high() {
         let f = baseline_unreadable_finding();
