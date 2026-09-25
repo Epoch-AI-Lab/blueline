@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A `.SRCINFO` that declares the same dependency twice now keeps both
+  expressions. A split package repeats the pkgbase `depends` inside its own
+  `pkgname` block, and the parser overwrote rather than merged, so a
+  constraint could change invisibly. The union is sorted and deduped, so an
+  unchanged set renders identically on both sides of a diff. The existing
+  test asserted the last expression read, which was the defect.
+
 - AUR dependency changes are now read from the PKGBUILD as well as the
   committed `.SRCINFO`. The dependency delta came from `.SRCINFO` alone,
   while `makepkg` executes the PKGBUILD, so a release could add
