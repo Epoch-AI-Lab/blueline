@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- AUR dependency changes are now read from the PKGBUILD as well as the
+  committed `.SRCINFO`. The dependency delta came from `.SRCINFO` alone,
+  while `makepkg` executes the PKGBUILD, so a release could add
+  `depends=('backdoor-git')` to the PKGBUILD, leave `.SRCINFO` untouched,
+  and produce no finding at all. `R29_PKGBUILD_DEPENDS_NOT_IN_SRCINFO` fires
+  at HIGH when the PKGBUILD names a dependency the `.SRCINFO` does not. Split
+  packages (`depends_<pkgname>`) are in scope, since comparing only the bare
+  `depends` array would fire on every one of them. The rule lives in
+  `review_roots` rather than `check` so the 139-fixture benign corpus gate,
+  which has no `.SRCINFO`, stays as it was.
+
 - A lockfile entry's declared `name` is no longer trusted over its address. A
   different name at the same `node_modules/...` key and version was counted
   unchanged, so the new package was never evaluated. Under `node_modules`, a
