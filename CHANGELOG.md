@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Opening the store now verifies the schema itself instead of trusting
+  `PRAGMA user_version`. A database file carrying the right version counter
+  with the wrong shape behind it opened successfully and then failed partway
+  through a review with a confusing missing-column error. Every table and
+  column the store queries is checked on open, the check is unconditional, and
+  the refusal names the file and what is missing so a user knows what to move
+  aside. The version-counter guess it replaces also decided lost migration
+  races, which the schema check now decides directly.
 - `agent gate` now refuses an unreviewable invocation shape before it resolves
   any operand. A command carrying a registry override (or any other hard-deny
   shape) used to be scanned, then still reviewed, downloading tarballs from the
@@ -20,11 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   10s connect ceiling and a 30s per-read/write ceiling. No whole-request
   timeout is set, because `ureq` lets it override the per-operation values, and
   response size stays bounded by `RegistryLimits` as before.
-- Concurrent first runs against one data directory no longer fail. Migrations
-  accept a store another process already brought to the target schema instead
-  of surfacing the loser's `table already exists`, and `record_verified`
+- Concurrent first runs against one data directory no longer fail. `record_verified`
   inserts-then-verifies rather than checking-then-inserting, which removed a
-  primary-key collision between two reviewers recording the same package.
+  primary-key collision between two reviewers recording the same package; the
+  schema check above absorbs the matching creation race.
 - The unreviewed-baseline refusal hint now names the
   `allow_unreviewed_baseline = true` policy rule alongside the
   predecessor-approval command, and warns that walking the chain costs one run
@@ -34,6 +41,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   such as `../etc` is refused instead of served.
 
 ### Changed
+
+- `AGENTS.md` and `ARCHITECTURE.md` now state the defect policy explicitly:
+  a bug is fixed even when it predates the branch, "pre-existing" is not a
+  reason to leave it live, and a fix without a test that fails without it is
+  a guess. Both record why, using this store bug as the worked example.
+
 
 - Docs refresh: `ROADMAP.md` marks the local-first recall index shipped
   (hosted API stays under Someday); `ARCHITECTURE.md` drops the stale
