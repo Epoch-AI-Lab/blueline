@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The MCP stdio server bounds its request lines and survives a bad one. It
+  read with `lines()`, which has no per-line cap, so a request containing no
+  newline grew without limit; and a non-UTF-8 line broke the loop into a
+  clean exit 0, telling the host the gate had succeeded while an in-flight
+  request went unanswered. Lines are now capped at 64 KiB (an oversized one
+  is answered and the server exits nonzero, since newline framing cannot be
+  resynchronised) and a non-UTF-8 line is answered with a parse error while
+  the server keeps serving.
+
 - Provenance is no longer reported as verified when nothing was verified.
   Blueline base64-decoded the in-toto statement, compared the subject digest
   to the bytes under review, and returned `Verified` with a hardcoded SLSA
