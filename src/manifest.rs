@@ -342,7 +342,22 @@ pub fn parse_aur_srcinfo(raw: &str) -> Result<SrcInfo, BluelineError> {
                         format!("line {lineno}: dependency `{value}` has no package name"),
                     )
                 })?;
-                deps.insert(name, value);
+                // Union, never overwrite. A split package repeats the
+                // pkgbase depends inside its own pkgname block, so a
+                // last-wins insert silently dropped every expression but the
+                // last one read, and a constraint could change invisibly.
+                // Sorted and deduped so an unchanged set renders identically on
+                // both sides of a diff and produces no spurious delta.
+                let merged = match deps.get(&name) {
+                    None => value,
+                    Some(prev) => {
+                        let mut set: std::collections::BTreeSet<&str> =
+                            prev.split_whitespace().collect();
+                        set.insert(value.as_str());
+                        set.into_iter().collect::<Vec<_>>().join(" ")
+                    }
+                };
+                deps.insert(name, merged);
             }
             _ => {}
         }
@@ -635,13 +650,46 @@ std = []
     }
 
     #[test]
+    fn srcinfo_keeps_every_expression_for_one_name() {
+        let src =
+            parse_aur_srcinfo("pkgbase = x\n\tpkgver = 1\n\tdepends = foo>=2.0\n\tdepends = foo\n")
+                .unwrap();
+        assert_eq!(src.deps["foo"], "foo foo>=2.0");
+    }
+
+    #[test]
+    fn srcinfo_depend_and_makedepend_do_not_overwrite_each_other() {
+        let src = parse_aur_srcinfo(
+            "pkgbase = x\n\tpkgver = 1\n\tdepends = git\n\tmakedepends = git>=2.30\n",
+        )
+        .unwrap();
+        assert_eq!(src.deps["git"], "git git>=2.30");
+    }
+
+    #[test]
+    fn srcinfo_union_is_order_independent() {
+        let a =
+            parse_aur_srcinfo("pkgbase = x\n\tpkgver = 1\n\tdepends = foo>=2.0\n\tdepends = foo\n")
+                .unwrap();
+        let b =
+            parse_aur_srcinfo("pkgbase = x\n\tpkgver = 1\n\tdepends = foo\n\tdepends = foo>=2.0\n")
+                .unwrap();
+        assert_eq!(
+            a.deps["foo"], b.deps["foo"],
+            "the diff must not depend on the order the file was written in"
+        );
+    }
+
+    #[test]
     fn parses_srcinfo_version_and_merged_deps() {
         let src = parse_aur_srcinfo(&sample_srcinfo()).unwrap();
         assert_eq!(src.pkgbase, "yay");
         assert_eq!(src.version, "12.4.2-1");
         assert_eq!(src.deps.len(), 3);
         assert_eq!(src.deps["go"], "go>=1.21");
-        assert_eq!(src.deps["pacman"], "pacman>=6.1");
+        // The fixture declares pacman twice; both expressions are kept. This used
+        // to assert the last one read, which is the defect.
+        assert_eq!(src.deps["pacman"], "pacman pacman>=6.1");
         assert_eq!(src.deps["git"], "git");
 
         let view = read_aur_srcinfo_view(&sample_srcinfo());
