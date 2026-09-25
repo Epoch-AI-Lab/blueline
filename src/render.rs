@@ -263,7 +263,11 @@ pub fn render_text_to_string(verdict: &Verdict, delta: &Delta) -> String {
 
         if let Some(ref prov) = ts.provenance {
             let (prov_label, prov_color) = match prov.status {
-                crate::provenance::ProvenanceStatus::Verified => (
+                crate::provenance::ProvenanceStatus::Attested => (
+                    "[ ATTESTED ] subject digest matched; signature NOT verified".to_string(),
+                    Color::Yellow,
+                ),
+                crate::provenance::ProvenanceStatus::CryptographicallyVerified => (
                     format!("[ SLSA Level {} ] Verified Builder", prov.slsa_level),
                     Color::Green,
                 ),
@@ -292,7 +296,7 @@ pub fn render_text_to_string(verdict: &Verdict, delta: &Delta) -> String {
             if prov.registry_signature_present {
                 table.add_row(vec![
                     Cell::new("Registry Signature").fg(Color::White),
-                    Cell::new("[ VALID ] Signed by npm Registry").fg(Color::Green),
+                    Cell::new("[ PRESENT ] registry signature (not verified)").fg(Color::Green),
                 ]);
             }
         }

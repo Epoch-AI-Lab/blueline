@@ -101,61 +101,8 @@ pub fn evaluate_with_trust(
         }
     }
 
-    // Provenance Findings (Phase 2)
     if let Some(prov_rep) = provenance {
-        if prov_rep.status == ProvenanceStatus::FailedMismatch {
-            findings.push(Finding {
-                rule_id: "P03_PROVENANCE_DIGEST_MISMATCH".into(),
-                severity: VerdictBand::Block,
-                title: "Provenance digest mismatch".into(),
-                description: prov_rep.message.clone().unwrap_or_else(|| {
-                    "Tarball SHA512 does not match in-toto attestation subject digest".into()
-                }),
-            });
-        }
-
-        if (policy.policy.require_provenance || policy.provenance.require_provenance)
-            && prov_rep.status != ProvenanceStatus::Verified
-        {
-            findings.push(Finding {
-                rule_id: "P03_PROVENANCE_REQUIRED_MISSING".into(),
-                severity: VerdictBand::Block,
-                title: "Required build provenance missing".into(),
-                description:
-                    "Policy requires verified SLSA build provenance, but none was present.".into(),
-            });
-        }
-
-        if policy.provenance.require_signatures && !prov_rep.registry_signature_present {
-            findings.push(Finding {
-                rule_id: "P03_SIGNATURE_REQUIRED_MISSING".into(),
-                severity: VerdictBand::Block,
-                title: "Required registry signature missing".into(),
-                description:
-                    "Policy requires npm registry signatures, but no valid signature was attached."
-                        .into(),
-            });
-        }
-
-        if !policy.provenance.allowed_repositories.is_empty()
-            && let Some(ref repo) = prov_rep.source_repo
-        {
-            let allowed = policy
-                .provenance
-                .allowed_repositories
-                .iter()
-                .any(|a| is_repo_allowed(repo, a));
-            if !allowed {
-                findings.push(Finding {
-                    rule_id: "P03_UNAUTHORIZED_BUILD_REPO".into(),
-                    severity: VerdictBand::Block,
-                    title: format!("Unauthorized source repository `{repo}`"),
-                    description:
-                        "The build provenance repository is not in the allowed repositories list."
-                            .into(),
-                });
-            }
-        }
+        findings.extend(provenance_findings(prov_rep, policy));
     }
 
     // R01: Lifecycle scripts
@@ -1837,6 +1784,92 @@ pub fn is_repo_allowed(provenance_repo: &str, allowed_pattern: &str) -> bool {
     false
 }
 
+/// Every rule that reads the provenance report. Split out from the main
+/// evaluation so the policy gate can be tested on a report alone.
+fn provenance_findings(
+    prov_rep: &crate::provenance::ProvenanceReport,
+    policy: &Policy,
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+
+    if prov_rep.status == ProvenanceStatus::FailedMismatch {
+        findings.push(Finding {
+            rule_id: "P03_PROVENANCE_DIGEST_MISMATCH".into(),
+            severity: VerdictBand::Block,
+            title: "Provenance digest mismatch".into(),
+            description: prov_rep.message.clone().unwrap_or_else(|| {
+                "Tarball SHA512 does not match in-toto attestation subject digest".into()
+            }),
+        });
+    }
+
+    // Policy asked for verified provenance. This build cannot verify one:
+    // it compares a subject digest and never checks a DSSE signature or a
+    // Sigstore chain, so anything short of `CryptographicallyVerified`
+    // refuses rather than quietly downgrading the requirement to a digest
+    // comparison. The description says so, because "missing" is not why.
+    if (policy.policy.require_provenance || policy.provenance.require_provenance)
+        && prov_rep.status != ProvenanceStatus::CryptographicallyVerified
+    {
+        let why = if prov_rep.status == ProvenanceStatus::Attested {
+            "a build statement was published and its subject digest matched, but this build \
+                 verifies no DSSE signature or Sigstore certificate chain, so it cannot confirm \
+                 who published it"
+        } else {
+            "none was present"
+        };
+        findings.push(Finding {
+            rule_id: "P03_PROVENANCE_REQUIRED_MISSING".into(),
+            severity: VerdictBand::Block,
+            title: "Required build provenance not verified".into(),
+            description: format!("Policy requires verified SLSA build provenance, but {why}."),
+        });
+    } else if prov_rep.status == ProvenanceStatus::Attested {
+        // Score-neutral, so this discloses without gating anything.
+        findings.push(Finding {
+            rule_id: "P03_PROVENANCE_NOT_CRYPTO_VERIFIED".into(),
+            severity: VerdictBand::Low,
+            title: "Build provenance attested, not cryptographically verified".into(),
+            description:
+                "A build statement was published and its subject digest matched these bytes, but \
+                     no signature or certificate chain was checked."
+                    .into(),
+        });
+    }
+
+    if policy.provenance.require_signatures && !prov_rep.registry_signature_present {
+        findings.push(Finding {
+            rule_id: "P03_SIGNATURE_REQUIRED_MISSING".into(),
+            severity: VerdictBand::Block,
+            title: "Required registry signature missing".into(),
+            description:
+                "Policy requires npm registry signatures, but no valid signature was attached."
+                    .into(),
+        });
+    }
+
+    if !policy.provenance.allowed_repositories.is_empty()
+        && let Some(ref repo) = prov_rep.source_repo
+    {
+        let allowed = policy
+            .provenance
+            .allowed_repositories
+            .iter()
+            .any(|a| is_repo_allowed(repo, a));
+        if !allowed {
+            findings.push(Finding {
+                rule_id: "P03_UNAUTHORIZED_BUILD_REPO".into(),
+                severity: VerdictBand::Block,
+                title: format!("Unauthorized source repository `{repo}`"),
+                description:
+                    "The build provenance repository is not in the allowed repositories list."
+                        .into(),
+            });
+        }
+    }
+    findings
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1995,6 +2028,61 @@ mod tests {
         // A value shorter than every prefix must not slice out of range.
         assert!(!is_non_semver_url("x"));
         assert!(!is_non_semver_url("gi"));
+    }
+
+    #[test]
+    fn require_provenance_refuses_an_attestation_we_cannot_verify() {
+        // Policy asked for verified provenance. An attestation is not that, and
+        // silently accepting it would downgrade a block-grade policy to a
+        // digest comparison without saying so.
+        let mut policy = Policy::default();
+        policy.policy.require_provenance = true;
+        let report = crate::provenance::ProvenanceReport {
+            status: crate::provenance::ProvenanceStatus::Attested,
+            slsa_level: 0,
+            builder_id: Some("https://github.com/actions/runner".into()),
+            source_repo: Some("git+https://github.com/acme/pkg".into()),
+            commit_sha: Some("a".repeat(40)),
+            workflow_path: Some(".github/workflows/release.yml".into()),
+            registry_signature_present: true,
+            registry_signature_key_id: None,
+            message: None,
+        };
+        let findings = provenance_findings(&report, &policy);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == "P03_PROVENANCE_REQUIRED_MISSING"
+                    && f.severity == VerdictBand::Block),
+            "an attestation must not satisfy require_provenance: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn attestation_disclosure_cannot_move_the_verdict() {
+        let policy = Policy::default();
+        let report = crate::provenance::ProvenanceReport {
+            status: crate::provenance::ProvenanceStatus::Attested,
+            slsa_level: 0,
+            builder_id: None,
+            source_repo: None,
+            commit_sha: None,
+            workflow_path: None,
+            registry_signature_present: false,
+            registry_signature_key_id: None,
+            message: None,
+        };
+        let findings = provenance_findings(&report, &policy);
+        let disclosure: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "P03_PROVENANCE_NOT_CRYPTO_VERIFIED")
+            .collect();
+        assert_eq!(disclosure.len(), 1, "the disclosure is always emitted");
+        assert_eq!(disclosure[0].severity, VerdictBand::Low);
+        assert!(
+            findings.iter().all(|f| f.severity <= VerdictBand::Low),
+            "with no policy requiring it, an attestation must gate nothing: {findings:?}"
+        );
     }
 
     #[test]
@@ -2844,7 +2932,7 @@ mod tests {
             .push("github.com/trusted-org/".into());
 
         let prov_untrusted_repo = ProvenanceReport {
-            status: ProvenanceStatus::Verified,
+            status: ProvenanceStatus::Attested,
             slsa_level: 3,
             builder_id: Some("https://github.com/actions/runner".into()),
             source_repo: Some("https://github.com/attacker-org/malicious".into()),
