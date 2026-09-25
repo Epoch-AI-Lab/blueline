@@ -201,7 +201,13 @@ fn decide(
     // gated command line, so it cannot deny here — but it changes where
     // the install fetches from. Disclose it in the verdict reason and the
     // audit trail. Names only; values are never read or stored.
-    let env_keys: Vec<String> = std::env::vars().map(|(k, _)| k).collect();
+    // `vars()` panics on a non-UTF-8 entry. At a hook boundary a panic is
+    // exit 101, and hosts treat anything but exit 2 as non-blocking, so a
+    // single odd variable in the environment would let the install run
+    // ungated. Names only, and lossy so nothing here can panic.
+    let env_keys: Vec<String> = std::env::vars_os()
+        .map(|(k, _)| k.to_string_lossy().into_owned())
+        .collect();
     let redirect_env = install_ref::redirect_env_present(env_keys.iter().map(String::as_str));
     let env_note = exported_redirect_note(&redirect_env);
     let refs = install_ref::scan_line(command);

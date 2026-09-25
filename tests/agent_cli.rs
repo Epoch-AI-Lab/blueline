@@ -351,3 +351,43 @@ fn gate_refuses_a_registry_override_without_touching_the_registry() {
         .unwrap();
     assert_eq!(known, 0, "a refused command must not record evidence");
 }
+
+#[cfg(unix)]
+#[test]
+fn gate_denies_rather_than_panicking_on_a_non_unicode_environment() {
+    use std::os::unix::ffi::OsStrExt;
+
+    // A genuinely invalid UTF-8 byte, not a replacement char, so this actually
+    // reaches the code path `env::vars()` panics on. At a hook boundary a
+    // panic is exit 101, and Claude Code and Cursor treat any exit other than
+    // 2 as non-blocking, so one odd variable would let the install proceed
+    // ungated. The gate must answer with its documented code instead.
+    let data_dir = tempfile::tempdir().unwrap();
+    let output = Command::cargo_bin("blueline")
+        .unwrap()
+        .args([
+            "agent",
+            "gate",
+            "--command",
+            "npm install risky@1.0.0",
+            "--registry",
+            "http://127.0.0.1:1",
+        ])
+        .env("BLUELINE_DATA_DIR", data_dir.path())
+        .env(
+            "BLUELINE_TEST_NONUNICODE",
+            std::ffi::OsStr::from_bytes(b"\xff\xfe"),
+        )
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_ne!(
+        output.status.code(),
+        Some(101),
+        "the gate must not panic on a hostile environment: {stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "no panic may reach the hook host: {stderr}"
+    );
+}

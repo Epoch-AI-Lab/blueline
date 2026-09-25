@@ -232,10 +232,16 @@ impl Snapshot {
 /// match elsewhere where separators are significant.
 fn names_match(ecosystem: Ecosystem, indexed: &str, queried: &str) -> bool {
     match ecosystem {
+        // PEP 503 for PyPI, ASCII case folding for npm and crates.io. Both
+        // registries fold case on publish, so a curator who writes `React` or
+        // `Serde` means the same package the reviewer queries. Without this
+        // the entry validates and then never fires, which is the worst shape
+        // a revocation can have: present, trusted, inert.
         Ecosystem::PyPi => {
             crate::version::canonicalize_name(indexed) == crate::version::canonicalize_name(queried)
         }
-        _ => indexed == queried,
+        Ecosystem::Npm | Ecosystem::Cargo => indexed.eq_ignore_ascii_case(queried),
+        Ecosystem::Aur => indexed == queried,
     }
 }
 
@@ -840,6 +846,19 @@ mod tests {
                 "npm entry `{name}` must still be refused"
             );
         }
+    }
+
+    #[test]
+    fn names_match_folds_case_where_the_registry_folds_it() {
+        // npm and crates.io both lowercase on publish, so a curator's
+        // capitalised spelling must still fire against the queried name.
+        assert!(names_match(Ecosystem::Npm, "React", "react"));
+        assert!(names_match(Ecosystem::Npm, "@Scope/Pkg", "@scope/pkg"));
+        assert!(names_match(Ecosystem::Cargo, "Serde", "serde"));
+        // AUR pkgbases are case sensitive.
+        assert!(!names_match(Ecosystem::Aur, "Yay", "yay"));
+        // A genuinely different name must not match.
+        assert!(!names_match(Ecosystem::Npm, "react-dom", "react"));
     }
 
     #[test]

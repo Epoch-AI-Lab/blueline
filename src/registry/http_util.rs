@@ -9,24 +9,23 @@ use ureq::Agent;
 
 use crate::error::BluelineError;
 
-/// Ceiling on establishing the connection. A black-holed host trips this long
-/// before the request does.
+/// Ceiling on establishing the connection. Applied alongside the whole-request
+/// deadline below, because `ureq` derives read and write timeouts from that
+/// deadline rather than from the per-operation settings.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Ceiling on a single socket read or write. This is what catches a peer that
-/// accepts the connection and then stalls. `ureq` lets a whole-request
-/// `.timeout()` override these per-operation values, so none is set: overall
-/// size is already bounded by `RegistryLimits`, and a stall is a liveness
-/// problem rather than a size one. Setting a global timeout here would restore
-/// the 90-second stall this exists to remove.
-const IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// Ceiling on one registry request end to end. This is the only thing bounding
+/// a peer that dribbles a byte every few seconds: a per-read ceiling alone
+/// cannot, since every individual read stays inside it. Generous because a
+/// large tarball legitimately takes a while, and because `ureq` 2.x cannot
+/// express both a short per-operation stall guard and a long total budget.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Shared agent for every registry adapter. Redirects stay off so each hop can
 /// be SSRF-validated by `follow_redirects` instead of followed blindly.
 pub fn registry_agent(user_agent: &str) -> Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(CONNECT_TIMEOUT)
-        .timeout_read(IO_TIMEOUT)
-        .timeout_write(IO_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
         .user_agent(user_agent)
         .redirects(0)
         .build()

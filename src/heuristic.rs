@@ -734,12 +734,14 @@ fn is_non_semver_url(v: &str) -> bool {
         "link:",
         "npm:",
     ];
+    // Byte-slice comparison, not `v[..p.len()]`. A dependency value is
+    // attacker-controlled and `p.len()` lands mid-character for anything
+    // multi-byte, which panics the whole review instead of returning a
+    // verdict. `get(..)` on a byte slice is bounds-checked and cannot panic.
     PREFIXES.iter().any(|&p| {
-        if v.len() >= p.len() {
-            v[..p.len()].eq_ignore_ascii_case(p)
-        } else {
-            false
-        }
+        v.as_bytes()
+            .get(..p.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(p.as_bytes()))
     })
 }
 
@@ -1970,6 +1972,29 @@ mod tests {
                 .iter()
                 .any(|f| f.rule_id == "R02_OPAQUE_LARGE_FILE_ADDED")
         );
+    }
+
+    #[test]
+    fn non_semver_url_check_survives_multibyte_input() {
+        // Byte-slicing by prefix length panicked on any value whose prefix
+        // length landed inside a character, which is every multi-byte
+        // dependency value in a manifest.
+        for v in [
+            "\u{1F4A9}",
+            "git\u{1F4A9}://x",
+            "https://example/\u{1F4A9}",
+            "\u{00E9}git",
+            "npm:",
+            "npm:./x",
+        ] {
+            let _ = is_non_semver_url(v);
+        }
+        assert!(is_non_semver_url("git+https://x"));
+        assert!(is_non_semver_url("GIT+HTTPS://x"));
+        assert!(!is_non_semver_url("1.2.3"));
+        // A value shorter than every prefix must not slice out of range.
+        assert!(!is_non_semver_url("x"));
+        assert!(!is_non_semver_url("gi"));
     }
 
     #[test]
