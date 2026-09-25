@@ -237,3 +237,24 @@ Known bypasses stay documented in the README.
   postinstall. Need an allowlist-by-maintainer or "review once, remember" flow.
 - **Lockfile vs manifest:** `review` diffs a single package; `ci` must diff the
   whole lockfile. Two code paths — `ci` is Phase 3, not Phase 1.
+
+## 5. Defect policy
+
+A defect is a defect regardless of when it arrived. "Pre-existing", "out of
+scope", and "unrelated to this diff" describe the diff, not the bug, and none
+of them is a reason to leave a hole in a tool whose whole promise is failing
+loud on doubt.
+
+Two consequences worth stating because they are easy to get wrong:
+
+- **The store verifies its own schema.** `PRAGMA user_version` records how many
+  migrations ran, not that they produced the schema the store queries. Opening
+  checks every table and column in `EXPECTED_SCHEMA` directly
+  (`src/store.rs::verify_schema`), so a file carrying a correct version counter
+  with the wrong shape behind it is refused at open rather than failing
+  mid-review on a missing column. The check is unconditional, so it also
+  decides a lost migration race rather than a counter read.
+- **A fix without a test that fails without it is a guess.** Mutation testing is
+  the check on that: a surviving mutant is a gap in the suite, not a flake.
+  Re-introduce the mutation, watch the test catch it, then restore.
+
