@@ -1,3 +1,5 @@
+const MAX_REQUEST_LINE_BYTES: usize = 64 * 1024;
+
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 
@@ -83,63 +85,123 @@ pub fn run_stdio(
 
     eprintln!("blueline-mcp: starting stdio server loop (ready for JSON-RPC 2.0)");
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("blueline-mcp: error reading stdin: {e}");
-                break;
-            }
+    for line in reader.split(b'\n') {
+        let line = match next_request_line(line) {
+            Ok(Some(l)) => l,
+            // A clean end of stream is a normal shutdown.
+            Ok(None) => break,
+            // A stream error is fatal, unlike a decode error. Falling through
+            // to a clean exit told the host the gate succeeded while an
+            // in-flight request went unanswered.
+            Err(e) => return Err(anyhow::anyhow!("reading MCP stdin: {e}")),
         };
-
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let request: JsonRpcRequest = match serde_json::from_str(trimmed) {
-            Ok(req) => req,
-            Err(e) => {
-                let err_resp = JsonRpcResponse {
-                    jsonrpc: "2.0",
-                    id: serde_json::Value::Null,
-                    result: None,
-                    error: Some(JsonRpcError::parse_error(format!("Parse error: {e}"))),
-                };
-                let resp_str = serde_json::to_string(&err_resp)?;
-                writeln!(stdout, "{resp_str}")?;
-                stdout.flush()?;
+        match line {
+            RequestLine::Skip => continue,
+            RequestLine::Oversize => {
+                write_error(
+                    &mut stdout,
+                    &format!("request exceeds {MAX_REQUEST_LINE_BYTES} bytes; refusing"),
+                )?;
+                // Framing is newline-delimited, so an oversized line cannot be
+                // resynchronised. A host must treat a dead blueline-mcp as a
+                // denial; see the same reasoning in agent.rs.
+                return Err(anyhow::anyhow!(
+                    "MCP request exceeds {MAX_REQUEST_LINE_BYTES} bytes; refusing"
+                ));
+            }
+            RequestLine::InvalidUtf8 => {
+                // One bad request must not kill the server.
+                write_error(&mut stdout, "request is not valid UTF-8")?;
                 continue;
             }
-        };
+            RequestLine::Text(t) => {
+                let line = t;
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
 
-        // Notifications don't require responses
-        if request.id.is_none() {
-            continue;
+                let request: JsonRpcRequest = match serde_json::from_str(trimmed) {
+                    Ok(req) => req,
+                    Err(e) => {
+                        let err_resp = JsonRpcResponse {
+                            jsonrpc: "2.0",
+                            id: serde_json::Value::Null,
+                            result: None,
+                            error: Some(JsonRpcError::parse_error(format!("Parse error: {e}"))),
+                        };
+                        let resp_str = serde_json::to_string(&err_resp)?;
+                        writeln!(stdout, "{resp_str}")?;
+                        stdout.flush()?;
+                        continue;
+                    }
+                };
+
+                // Notifications don't require responses
+                if request.id.is_none() {
+                    continue;
+                }
+
+                let id = request.id.unwrap_or(serde_json::Value::Null);
+                let resp =
+                    match handle_request(&request.method, request.params, bases, &store, &policy) {
+                        Ok(result) => JsonRpcResponse {
+                            jsonrpc: "2.0",
+                            id,
+                            result: Some(result),
+                            error: None,
+                        },
+                        Err(err) => JsonRpcResponse {
+                            jsonrpc: "2.0",
+                            id,
+                            result: None,
+                            error: Some(err),
+                        },
+                    };
+
+                let resp_str = serde_json::to_string(&resp)?;
+                writeln!(stdout, "{resp_str}")?;
+                stdout.flush()?;
+            }
         }
-
-        let id = request.id.unwrap_or(serde_json::Value::Null);
-        let resp = match handle_request(&request.method, request.params, bases, &store, &policy) {
-            Ok(result) => JsonRpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(result),
-                error: None,
-            },
-            Err(err) => JsonRpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: None,
-                error: Some(err),
-            },
-        };
-
-        let resp_str = serde_json::to_string(&resp)?;
-        writeln!(stdout, "{resp_str}")?;
-        stdout.flush()?;
     }
 
     eprintln!("blueline-mcp: shutting down stdio server loop");
+    Ok(())
+}
+
+/// One framed line off the MCP stdin stream, already length-checked and
+/// decoded.
+enum RequestLine {
+    Skip,
+    Text(String),
+    Oversize,
+    InvalidUtf8,
+}
+
+fn next_request_line(raw: std::io::Result<Vec<u8>>) -> std::io::Result<Option<RequestLine>> {
+    let raw = raw?;
+    Ok(Some(if raw.len() > MAX_REQUEST_LINE_BYTES {
+        RequestLine::Oversize
+    } else {
+        match String::from_utf8(raw) {
+            Ok(text) if text.trim().is_empty() => RequestLine::Skip,
+            Ok(text) => RequestLine::Text(text),
+            Err(_) => RequestLine::InvalidUtf8,
+        }
+    }))
+}
+
+fn write_error<W: Write>(out: &mut W, message: &str) -> anyhow::Result<()> {
+    let resp = JsonRpcResponse {
+        jsonrpc: "2.0",
+        id: serde_json::Value::Null,
+        result: None,
+        error: Some(JsonRpcError::parse_error(message.to_string())),
+    };
+    let text = serde_json::to_string(&resp)?;
+    writeln!(out, "{text}")?;
+    out.flush()?;
     Ok(())
 }
 
@@ -750,6 +812,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resp.get("isClean").unwrap(), &json!(true));
+    }
+
+    #[test]
+    fn oversized_request_line_is_refused_rather_than_buffered() {
+        let big = vec![b'a'; MAX_REQUEST_LINE_BYTES + 1];
+        assert!(matches!(
+            next_request_line(Ok(big)),
+            Ok(Some(RequestLine::Oversize))
+        ));
+        let at_cap = vec![b'a'; MAX_REQUEST_LINE_BYTES];
+        assert!(matches!(
+            next_request_line(Ok(at_cap)),
+            Ok(Some(RequestLine::Text(_)))
+        ));
+    }
+
+    #[test]
+    fn non_utf8_line_is_flagged_and_a_blank_one_skipped() {
+        assert!(matches!(
+            next_request_line(Ok(vec![b'{', 0xff, 0xfe])),
+            Ok(Some(RequestLine::InvalidUtf8))
+        ));
+        assert!(matches!(
+            next_request_line(Ok(b"   \n".to_vec())),
+            Ok(Some(RequestLine::Skip))
+        ));
+        assert!(matches!(
+            next_request_line(Ok(Vec::new())),
+            Ok(Some(RequestLine::Skip))
+        ));
     }
 
     #[test]
