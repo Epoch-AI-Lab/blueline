@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Opening the store now checks the declared shape of the columns whose
+  default decides trust, not only their names. `record_verified` never
+  supplies `clean`, so a database declaring `clean INTEGER NOT NULL
+  DEFAULT 1` would write a package nobody approved straight into the set
+  that `list_clean_versions` hands back as an approved baseline, while
+  every column name still checked out. `known_clean.clean` and
+  `provenance_cache.signature_valid` are now required to be `INTEGER NOT
+  NULL DEFAULT 0`; the default is parsed as an integer so `''`, `NULL`,
+  `'yes'` and a parenthesised `(0)` are refused too.
+- Tar extraction refuses a repeated path and a directory entry that declares
+  a payload. A repeated path was unpacked twice and the second copy
+  overwrote the first, so the tree blueline diffed depended on entry order;
+  the check is on the normalized path, since `a/b` and `a//b` are the same
+  destination. A directory's declared bytes were decompressed in full while
+  counting as zero against every cap, and no tar writer emits them.
+
 - The PKGBUILD tokenizer no longer loses the rest of a file to a parameter
   expansion. `${#N}` and `${x#prefix}` are shell expansions, but a `#` after
   `{` was read as the start of a comment, which both truncated the line and
