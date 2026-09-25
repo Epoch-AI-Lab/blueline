@@ -492,34 +492,34 @@ fn calculate_advisory_severity(
 }
 
 #[cfg(test)]
-/// A cached report must not be served while the policy says fail closed.
-/// It did, which returned a possibly month-old answer as if it were fresh,
-/// and a stale CLEAN report produces neither hits nor a staleness
-/// disclosure, so it read as a clean pass.
-#[test]
-fn fail_closed_network_outranks_a_stale_cached_report() {
-    let mut policy = Policy::default();
-    policy.policy.fail_closed_network = true;
-    let stale = AdvisoryReport {
-        status: AdvisoryStatus::Clean,
-        hits: Vec::new(),
-        source: "cache".to_string(),
-        message: None,
-    };
-    let result = fallback_or_fail(Some(stale.clone()), &policy, "osv unreachable");
-    assert!(
-        result.is_err(),
-        "fail_closed_network must not be satisfied by a cached report"
-    );
-
-    // Without the policy the fallback is still the answer.
-    let mut lenient = Policy::default();
-    lenient.policy.fail_closed_network = false;
-    assert!(fallback_or_fail(Some(stale), &lenient, "osv unreachable").is_ok());
-}
-
 mod tests {
     use super::*;
+
+    /// A cached report must not be served while the policy says fail closed.
+    /// It did, which returned a possibly month-old answer as if it were fresh,
+    /// and a stale CLEAN report produces neither hits nor a staleness
+    /// disclosure, so it read as a clean pass.
+    #[test]
+    fn fail_closed_network_outranks_a_stale_cached_report() {
+        let mut policy = Policy::default();
+        policy.policy.fail_closed_network = true;
+        let stale = AdvisoryReport {
+            status: AdvisoryStatus::Clean,
+            hits: Vec::new(),
+            source: "cache".to_string(),
+            message: None,
+        };
+        let result = fallback_or_fail(Some(stale.clone()), &policy, "osv unreachable");
+        assert!(
+            result.is_err(),
+            "fail_closed_network must not be satisfied by a cached report"
+        );
+
+        // Without the policy the fallback is still the answer.
+        let mut lenient = Policy::default();
+        lenient.policy.fail_closed_network = false;
+        assert!(fallback_or_fail(Some(stale), &lenient, "osv unreachable").is_ok());
+    }
 
     #[test]
     fn parses_empty_response_as_clean() {
