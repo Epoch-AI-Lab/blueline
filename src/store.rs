@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
@@ -135,6 +136,81 @@ const MIGRATIONS: &[&str] = &[
     ",
 ];
 
+/// Every table and column `BaselineStore` depends on. `PRAGMA user_version`
+/// records how many migrations ran, not that they produced this schema: a file
+/// carrying the right counter with nothing behind it otherwise opens happily
+/// and fails much later, mid-review, complaining about a missing column. The
+/// store is the trust anchor, so opening checks the thing itself.
+const EXPECTED_SCHEMA: &[(&str, &str)] = &[
+    ("known_clean", "ecosystem"),
+    ("known_clean", "name"),
+    ("known_clean", "version"),
+    ("known_clean", "integrity"),
+    ("known_clean", "clean"),
+    ("known_clean", "reviewed_at"),
+    ("advisory_cache", "ecosystem"),
+    ("advisory_cache", "package"),
+    ("advisory_cache", "version"),
+    ("advisory_cache", "advisories_json"),
+    ("advisory_cache", "hit_count"),
+    ("advisory_cache", "has_blocking_advisory"),
+    ("advisory_cache", "fetched_at"),
+    ("advisory_cache", "expires_at"),
+    ("provenance_cache", "ecosystem"),
+    ("provenance_cache", "package"),
+    ("provenance_cache", "version"),
+    ("provenance_cache", "builder_id"),
+    ("provenance_cache", "source_repo"),
+    ("provenance_cache", "commit_sha"),
+    ("provenance_cache", "workflow_path"),
+    ("provenance_cache", "slsa_level"),
+    ("provenance_cache", "signature_valid"),
+    ("provenance_cache", "verified_at"),
+    ("audit_log", "id"),
+    ("audit_log", "package"),
+    ("audit_log", "version"),
+    ("audit_log", "integrity"),
+    ("audit_log", "action"),
+    ("audit_log", "score"),
+    ("audit_log", "verdict"),
+    ("audit_log", "decided_by"),
+    ("audit_log", "notes"),
+    ("audit_log", "decided_at"),
+    ("audit_log", "ecosystem"),
+];
+
+/// Refuse to open a database whose tables do not carry every column the store
+/// queries. Names the file and the first thing missing, so a user staring at
+/// this knows which file to move aside rather than what went wrong internally.
+fn verify_schema(conn: &rusqlite::Connection, path: &Path) -> Result<(), BluelineError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT m.name, p.name FROM sqlite_master m, pragma_table_info(m.name) p
+             WHERE m.type = 'table'",
+        )
+        .map_err(|e| BluelineError::Store(format!("inspecting schema: {e}")))?;
+    let present: std::collections::HashSet<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|e| BluelineError::Store(format!("reading schema: {e}")))?
+        .collect::<Result<HashSet<_>, _>>()
+        .map_err(|e| BluelineError::Store(format!("reading schema: {e}")))?;
+
+    let missing: Vec<String> = EXPECTED_SCHEMA
+        .iter()
+        .filter(|(table, column)| !present.contains(&((*table).to_string(), (*column).to_string())))
+        .map(|(table, column)| format!("{table}.{column}"))
+        .collect();
+    if !missing.is_empty() {
+        return Err(BluelineError::Store(format!(
+            "{} is not a usable blueline store: {} missing (expected {}); move the file aside to start a new one",
+            path.display(),
+            missing.join(", "),
+            EXPECTED_SCHEMA.len()
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedAdvisories {
     pub advisories_json: String,
@@ -249,22 +325,20 @@ impl BaselineStore {
             .map_err(|e| BluelineError::Store(format!("enabling WAL: {e}")))?;
 
         let migrations = Migrations::new(MIGRATIONS.iter().map(|sql| M::up(sql)).collect());
-        if let Err(e) = migrations.to_latest(&mut conn) {
-            // Each migration runs in its own deferred transaction, so two
-            // processes opening a fresh store can both read the pre-migration
-            // version and then collide on `CREATE TABLE`. Losing that race is
-            // not a fault: if the schema now sits at the target version, the
-            // winner applied every migration and this store is usable.
-            let applied: i64 = conn
-                .query_row("PRAGMA user_version", [], |row| row.get(0))
-                .map_err(|pe| {
-                    BluelineError::Store(format!(
-                        "applying migrations: {e}; reading schema version: {pe}"
-                    ))
-                })?;
-            if applied != MIGRATIONS.len() as i64 {
-                return Err(BluelineError::Store(format!("applying migrations: {e}")));
-            }
+        // A lost creation race is the expected cause of a migration failure:
+        // each migration runs in its own deferred transaction, so two processes
+        // opening a fresh store can both read the pre-migration version and
+        // then collide on CREATE TABLE. Whether the store is usable is decided
+        // by the schema itself, not by the version counter, so the migration
+        // error text is only surfaced when the schema check also fails.
+        let migration_error = migrations.to_latest(&mut conn).err();
+        if let Err(schema_error) = verify_schema(&conn, path) {
+            return Err(match migration_error {
+                Some(e) => {
+                    BluelineError::Store(format!("applying migrations: {e}; {schema_error}"))
+                }
+                None => schema_error,
+            });
         }
 
         Ok(Self { conn })
@@ -971,6 +1045,76 @@ mod tests {
             MIGRATIONS.len() as i64,
             "the refused schema must not claim the target version"
         );
+    }
+
+    #[test]
+    fn open_refuses_a_version_counter_that_contradicts_the_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("liar.db");
+        // A database whose user_version claims the target while carrying none
+        // of its tables. Trusting the counter opens this happily and then
+        // fails mid-review on a missing column.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.pragma_update(None, "user_version", MIGRATIONS.len() as i64)
+                .unwrap();
+        }
+        let err = BaselineStore::open_at(&db_path)
+            .map(|_| ())
+            .expect_err("a lying version counter must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("known_clean.ecosystem"),
+            "the error must name what is missing: {message}"
+        );
+        assert!(
+            message.contains(&db_path.display().to_string()),
+            "the error must name the file to move aside: {message}"
+        );
+    }
+
+    #[test]
+    fn open_refuses_a_table_that_exists_with_the_wrong_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wrongshape.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            // Right name, wrong shape: the v1 two-column table.
+            conn.execute_batch(
+                "CREATE TABLE known_clean (name TEXT, version TEXT);
+                 CREATE TABLE audit_log (id INTEGER PRIMARY KEY);
+                 CREATE TABLE advisory_cache (package TEXT);
+                 CREATE TABLE provenance_cache (package TEXT);",
+            )
+            .unwrap();
+        }
+        let err = BaselineStore::open_at(&db_path)
+            .map(|_| ())
+            .expect_err("a wrong-shaped table must be refused");
+        assert!(
+            err.to_string().contains("integrity"),
+            "the error must name the missing column: {err}"
+        );
+    }
+
+    #[test]
+    fn open_accepts_every_legacy_schema_it_can_migrate() {
+        // Each intermediate version must still open, since the store is
+        // expected to migrate forward rather than refuse.
+        for take in 1..MIGRATIONS.len() {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join(format!("v{take}.db"));
+            {
+                let mut conn = rusqlite::Connection::open(&db_path).unwrap();
+                Migrations::new(MIGRATIONS.iter().take(take).map(|s| M::up(s)).collect())
+                    .to_latest(&mut conn)
+                    .unwrap();
+            }
+            assert!(
+                BaselineStore::open_at(&db_path).is_ok(),
+                "schema v{take} must migrate forward and open"
+            );
+        }
     }
 
     #[test]
