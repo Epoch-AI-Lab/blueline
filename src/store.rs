@@ -284,12 +284,12 @@ impl BaselineStore {
         version: &str,
         checksum: &Checksum,
     ) -> Result<(), BluelineError> {
-        // Insert-or-ignore first rather than reading then writing: a
-        // check-then-insert lets two processes both observe an absent row and
-        // then collide on the primary key. The digest comparison happens after,
-        // so losing the insert race still ends in the same fail-closed answer.
-        let inserted = self
-            .conn
+        // Insert-if-absent is atomic, so two processes recording the same
+        // package cannot collide on the primary key. The row is then read back
+        // and checked unconditionally: a row already present must carry the
+        // same digest, so losing the insert race ends on exactly the same
+        // fail-closed answer as any other mismatched record.
+        self.conn
             .prepare_cached(
                 "INSERT INTO known_clean (ecosystem, name, version, integrity)
                  VALUES (?1, ?2, ?3, ?4)
@@ -303,9 +303,6 @@ impl BaselineStore {
                 checksum.to_display()
             ])
             .map_err(|e| BluelineError::Store(format!("recording {name}@{version}: {e}")))?;
-        if inserted > 0 {
-            return Ok(());
-        }
 
         let existing = self
             .stored_integrity(ecosystem, name, version)?
@@ -944,6 +941,35 @@ mod tests {
                 .get::<_, i64>(0))
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn open_fails_closed_when_migrations_cannot_reach_the_target_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("blocked.db");
+        // A pre-existing table of the right name but the wrong shape makes the
+        // first migration fail. The user_version guard exists to absorb a lost
+        // creation race, not to excuse a schema that never reached the target,
+        // so this must still error.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch("CREATE TABLE known_clean (wrong_column TEXT)")
+                .unwrap();
+        }
+        let result = BaselineStore::open_at(&db_path);
+        assert!(
+            result.is_err(),
+            "a schema stuck below the target must not be waved through"
+        );
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let applied: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_ne!(
+            applied,
+            MIGRATIONS.len() as i64,
+            "the refused schema must not claim the target version"
         );
     }
 
