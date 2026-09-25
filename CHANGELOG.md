@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `agent gate` no longer panics on a non-UTF-8 environment variable. It read
+  the environment with `std::env::vars()`, which unwraps every entry, so one
+  odd variable exited 101 — and hook hosts treat any exit other than 2 as
+  non-blocking, meaning the install would have run ungated. Names now come
+  from `vars_os` converted lossily, so the gate denies with its documented code.
+- The heuristic engine no longer panics on a multi-byte dependency value. The
+  non-semver-URL check byte-sliced the value by prefix length, so any manifest
+  carrying a dependency such as `"💩"` crashed the whole review instead of
+  returning a verdict. The comparison is a bounds-checked byte-slice now.
+- Recall lookups fold case for npm and crates.io, not only validation. A
+  curator writing `React` or `Serde` produced an entry that validated and then
+  never matched the queried name, which is the worst shape a revocation can
+  take: present, trusted, and inert. AUR pkgbases stay case-sensitive.
+- The registry agent keeps a whole-request deadline again. Dropping it for
+  per-read timeouts fixed a 90-second stall but left total transfer time
+  unbounded, because a peer dribbling one byte per interval keeps every read
+  inside its own ceiling. The 10s connect ceiling and the 90s total both
+  remain; `ureq` 2.x cannot express a short stall guard and a long budget at
+  once.
 - The AUR test fixture clones over a `file://` URL instead of a bare local
   path. Git ignores `--depth` on a local clone and falls back to copying loose
   objects one at a time, so `history_walk_caps_at_200_commits_and_states_truncation`
