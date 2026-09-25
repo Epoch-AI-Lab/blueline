@@ -1182,10 +1182,20 @@ mod tests {
     }
 
     impl AurGitFixture {
+        /// A file:// URL, not a bare path. Git ignores `--depth` on a local
+        /// clone and falls back to copying loose objects one at a time, which
+        /// is the path that intermittently fails on a repo with a few hundred
+        /// commits. Over a real transport git honours the depth and fetches a
+        /// packfile, which is both faster and what the adapter does against
+        /// the AUR itself.
+        fn git_base(&self) -> String {
+            format!("file://{}", self.fixtures.display())
+        }
+
         fn registry(&self) -> AurRegistry {
             AurRegistry::with_bases(
                 &self.server.base,
-                self.fixtures.to_str().unwrap(),
+                &self.git_base(),
                 RegistryLimits::default(),
             )
         }
@@ -1830,11 +1840,14 @@ mod tests {
             integrity: Some(integrity.clone()),
         };
 
+        let base = fx.git_base();
         for url in [
             format!("git+https://evil.example/yay.git#{hash}"),
             format!("git+/tmp/evil/yay.git#{hash}"),
-            format!("git+{}/yay#{}", fx.fixtures.display(), hash),
-            format!("git+{}/../evil.git#{}", fx.fixtures.display(), hash),
+            format!("git+{base}/yay#{hash}"),
+            format!("git+{base}/../evil.git#{hash}"),
+            // A sibling base that merely shares a prefix must not pass the pin.
+            format!("git+{base}-evil/yay.git#{hash}"),
         ] {
             let err = reg
                 .fetch_verified(&pkg(url.clone()))
@@ -1848,7 +1861,7 @@ mod tests {
 
         // Under the base the pin passes; with no such repo the failure is
         // the clone itself, not the pin.
-        let url = format!("git+{}/nosuchpkg.git#{}", fx.fixtures.display(), hash);
+        let url = format!("git+{base}/nosuchpkg.git#{hash}");
         let err = reg.fetch_verified(&pkg(url)).unwrap_err().to_string();
         assert!(err.contains("git clone failed"), "unexpected error: {err}");
     }
