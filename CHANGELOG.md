@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The AUR test fixture clones over a `file://` URL instead of a bare local
+  path. Git ignores `--depth` on a local clone and falls back to copying loose
+  objects one at a time, so `history_walk_caps_at_200_commits_and_states_truncation`
+  failed roughly one run in twelve with `failed to copy file to
+  .git/objects/...`. Over a real transport git honours the depth and fetches a
+  packfile, which is what the adapter does against the AUR itself. Thirty
+  consecutive runs pass, up from eleven in twelve. The clone-URL pin test also
+  gained a sibling-base case, since a base that only shares a prefix must not
+  pass the pin.
 - Opening the store now verifies the schema itself instead of trusting
   `PRAGMA user_version`. A database file carrying the right version counter
   with the wrong shape behind it opened successfully and then failed partway
