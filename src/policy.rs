@@ -347,6 +347,12 @@ pub struct CiPolicyConfig {
     pub max_evaluations: usize,
     /// Whether to evaluate devDependencies (default: true).
     pub include_dev: bool,
+    /// Permit requirements.txt options that redirect pip away from the
+    /// reviewed graph (`--index-url`, `-r`, `-c`, ...). Off by default,
+    /// because blueline models only pinned `name==version` lines and cannot
+    /// follow an alternative index, an extra requirements file, or a
+    /// constraints file. On, they are disclosed rather than refused.
+    pub allow_requirements_options: bool,
 }
 
 impl Default for CiPolicyConfig {
@@ -355,6 +361,7 @@ impl Default for CiPolicyConfig {
             fail_on: "high".to_string(),
             max_evaluations: 100,
             include_dev: true,
+            allow_requirements_options: false,
         }
     }
 }

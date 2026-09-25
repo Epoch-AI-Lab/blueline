@@ -247,8 +247,11 @@ pub fn evaluate_lockfile_diff(
             integrity_map,
         )
     } else if is_pypi {
-        let base_pkgs = crate::lockfile::parse_requirements_txt_packages(base_content)?;
-        let head_pkgs = crate::lockfile::parse_requirements_txt_packages(head_content)?;
+        let allow_options = policy.ci.allow_requirements_options;
+        let base_pkgs =
+            crate::lockfile::parse_requirements_txt_packages(base_content, allow_options)?;
+        let head_pkgs =
+            crate::lockfile::parse_requirements_txt_packages(head_content, allow_options)?;
         let mut integrity_map = std::collections::HashMap::new();
         for pkg in head_pkgs.values() {
             if let Some(integ) = &pkg.integrity {
@@ -1096,7 +1099,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(pypi_empty, "");
-        assert!(crate::lockfile::parse_requirements_txt_packages(&pypi_empty).is_ok());
+        assert!(crate::lockfile::parse_requirements_txt_packages(&pypi_empty, false).is_ok());
         let aur_empty = extract_base_lockfile(
             "HEAD",
             Path::new("aur.missing-for-test-xyz.lock"),
