@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `blueline ci` on a requirements file no longer ignores options that change
+  which packages pip installs. `-r`, `-e`, `-c`, `--index-url`,
+  `--extra-index-url`, `--find-links` and friends were skipped, so the gate
+  reviewed the pinned lines and certified a graph that was never the one
+  installed. They are refused, per token, so a flag trailing a spec is caught
+  too. `[ci] allow_requirements_options = true` opts in for mirrored-index
+  files, which is a real pattern; the test that previously asserted the
+  options were skipped was pinning the defect.
+
 - The SSRF guard now runs where the hostname becomes an address. It resolved
   a name once for validation while the HTTP client resolved it again for the
   connection, so a name answering publicly and then privately passed the check
