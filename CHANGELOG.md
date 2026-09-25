@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A lockfile entry's declared `name` is no longer trusted over its address. A
+  different name at the same `node_modules/...` key and version was counted
+  unchanged, so the new package was never evaluated. Under `node_modules`, a
+  declared name that differs from the directory is an npm alias, and npm
+  records the real source in `resolved`, so the two must now agree; a
+  mismatch, or a mismatch with no `resolved` at all, fails closed. Every
+  honest alias still parses.
+
 - `blueline ci` on a requirements file no longer ignores options that change
   which packages pip installs. `-r`, `-e`, `-c`, `--index-url`,
   `--extra-index-url`, `--find-links` and friends were skipped, so the gate
