@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The PKGBUILD tokenizer no longer loses the rest of a file to a parameter
+  expansion. `${#N}` and `${x#prefix}` are shell expansions, but a `#` after
+  `{` was read as the start of a comment, which both truncated the line and
+  left the brace uncounted. The unbalanced depth counter then swallowed every
+  later top-level assignment into the first function body, so R11 through R20
+  all went dark on a PKGBUILD that skips checksum verification, with no
+  disclosure. Both the comment stripper and the function-body extractor now
+  track `${...}` as one unit.
+
 - The npm dogfood CI gate no longer swallows a real risk verdict. The scan
   step runs with `continue-on-error` because this repo legitimately BLOCKs on
   itself, but the health script only checked which packages were evaluated,
