@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The install scanner no longer lets four classes of registry redirect
+  through: npm alias schemes `file:`, `link:`, `npm:` and `workspace:`
+  (which name a payload no registry vouches for, and which previously
+  matched no rule and were dropped entirely), `pip` redirect flags in
+  `--flag=value` form (npm already handled `=`, pip did not, so
+  `--index-url=https://...` was reviewed against PyPI and installed from
+  the attacker's index), `npm ci`, and `cargo --registry`. All are now
+  denied on shape before any operand is resolved.
+
 - `agent gate` no longer panics on a non-UTF-8 environment variable. It read
   the environment with `std::env::vars()`, which unwraps every entry, so one
   odd variable exited 101 — and hook hosts treat any exit other than 2 as
