@@ -460,7 +460,10 @@ fn reviews_delta_against_predecessor_baseline() {
 fn install_delegates_to_npm_with_ignore_scripts() {
     let temp_dir = tempfile::tempdir().unwrap();
     let log_file = temp_dir.path().join("npm_args.log");
-    let mock_npm = temp_dir.path().join("mock-npm.sh");
+    // The real npm is found on PATH under its own name.
+    let bin_dir = temp_dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let mock_npm = bin_dir.join("npm");
     std::fs::write(
         &mock_npm,
         format!(
@@ -469,10 +472,24 @@ fn install_delegates_to_npm_with_ignore_scripts() {
         ),
     )
     .unwrap();
+    // npm_execpath points somewhere else entirely. It is environment-supplied
+    // and must never decide which program runs.
+    let hostile = temp_dir.path().join("hostile.sh");
+    let hostile_marker = temp_dir.path().join("hostile_ran");
+    std::fs::write(
+        &hostile,
+        format!(
+            "#!/bin/sh\ntouch \"{}\"\nexit 0\n",
+            hostile_marker.display()
+        ),
+    )
+    .unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&mock_npm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for p in [&mock_npm, &hostile] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
 
     let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -550,9 +567,22 @@ fn install_delegates_to_npm_with_ignore_scripts() {
             "--save-dev",
         ])
         .env("BLUELINE_DATA_DIR", data_dir.path())
-        .env("npm_execpath", mock_npm.to_str().unwrap())
+        .env("npm_execpath", hostile.to_str().unwrap())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin_dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
         .assert()
         .success();
+
+    assert!(
+        !hostile_marker.exists(),
+        "npm_execpath must never choose the program that runs"
+    );
 
     let logged_args = std::fs::read_to_string(&log_file).unwrap();
     assert!(
