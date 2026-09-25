@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `blueline install` no longer takes its program from `npm_execpath`. That
+  variable decides which binary runs, and it is environment-supplied;
+  `TODO.md` already records it as user-controllable and unfit for a security
+  decision, but the install path was built to trust it. `NODE` chose the
+  interpreter for the same reason. The real npm is now resolved from PATH
+  through the same helper the shims use, which also excludes the shim
+  directory so a shimmed PATH cannot recurse. When no real npm is found the
+  install fails rather than falling back.
+- The install path also read its environment with `vars()`, which panics on a
+  non-UTF-8 entry, and now uses `vars_os()`.
+
 - The MCP stdio server bounds its request lines and survives a bad one. It
   read with `lines()`, which has no per-line cap, so a request containing no
   newline grew without limit; and a non-UTF-8 line broke the loop into a
