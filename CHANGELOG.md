@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The SSRF guard now runs where the hostname becomes an address. It resolved
+  a name once for validation while the HTTP client resolved it again for the
+  connection, so a name answering publicly and then privately passed the check
+  and connected to loopback, RFC1918, or a metadata address. The registry
+  agent now carries a validating resolver, so the address that is checked and
+  the address that is connected to are the same answer by construction. No new
+  dependency: `ureq` already exposes a resolver seam. Addresses are validated
+  per call rather than pinned, because the agent is long-lived in the MCP
+  server. The configured registry base stays exempt, since pointing a review
+  at a local fixture registry is supported.
+
 - A `ci.fail_on` typo now refuses the policy instead of weakening the gate.
   `fail_on = "blockk"` parsed fine and fell back to `HIGH`, so a policy meant
   to block turned into one that failed at high. The `--fail-on` flag already
