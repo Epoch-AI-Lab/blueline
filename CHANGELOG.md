@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The npm dogfood CI gate no longer swallows a real risk verdict. The scan
+  step runs with `continue-on-error` because this repo legitimately BLOCKs on
+  itself, but the health script only checked which packages were evaluated,
+  never the bands, so a HIGH or BLOCK finding in an otherwise healthy delta
+  reported success. The report is now gated on its own findings.
+- The mutation-testing aggregate fails instead of reporting `skipped`. Without
+  `always()` plus an explicit result check, GitHub skips the job when a shard
+  fails, and a skipped required check counts as satisfied.
+- The cargo dogfood job reads the base ref through the environment instead of
+  `${{ }}` interpolation, and reads the full changed-file list before matching,
+  so a branch named `main$(id)` cannot inject a command and a `git diff |
+  grep -q` SIGPIPE under `pipefail` can no longer skip the gate.
+
 - The install scanner no longer lets four classes of registry redirect
   through: npm alias schemes `file:`, `link:`, `npm:` and `workspace:`
   (which name a payload no registry vouches for, and which previously
