@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A `ci.fail_on` typo now refuses the policy instead of weakening the gate.
+  `fail_on = "blockk"` parsed fine and fell back to `HIGH`, so a policy meant
+  to block turned into one that failed at high. The `--fail-on` flag already
+  refused the same spelling; the policy key did not. Band parsing is now one
+  shared function used by both.
+- `R04_DEPENDENCY_MODIFIED` fires on a range-to-range dependency change, not
+  only when the new value is a URL. A plain `1.4.1` to `1.4.2` produced no
+  finding of any band, which is the shape a dependency-takeover payload takes
+  when the attacker re-pins to a compromised patch release. It is disclosed at
+  `LOW`, which is score-neutral and cannot move a verdict, because a benign
+  patch bump is the common case and this fires on every one of them. Moving
+  off a URL is now covered as the mirror of the redirect it already caught.
+- The diff engine no longer aborts on a non-UTF-8 filename. Trees were keyed
+  by a lossy string and that string was joined back onto the root to read the
+  file, so any name with invalid UTF-8 failed the whole review with "No such
+  file or directory", and two names differing only in those bytes collided
+  into one. Trees are keyed by path now; the report fields still carry a
+  display string.
+
 - `fail_closed_network` now stops the review. A failed advisory lookup was
   collapsed into an `unverified` report, which carries no hits, so the
   heuristic produced no finding and the verdict came out identical to a clean
