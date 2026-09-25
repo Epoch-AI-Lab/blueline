@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `fail_closed_network` now stops the review. A failed advisory lookup was
+  collapsed into an `unverified` report, which carries no hits, so the
+  heuristic produced no finding and the verdict came out identical to a clean
+  pass. It is now `R09_ADVISORY_UNVERIFIED` at HIGH, raised at the boundary
+  that discarded it so `review`, `ci`, `agent` and `mcp` all inherit it. A
+  check that is merely switched off by policy stays silent, so `check_advisories
+  = false` is unaffected. The flag also outranks the cached report now: a
+  stale CLEAN cache entry produced neither a hit nor a staleness disclosure,
+  so it read exactly like a fresh clean pass.
+
 - `blueline install` no longer takes its program from `npm_execpath`. That
   variable decides which binary runs, and it is environment-supplied;
   `TODO.md` already records it as user-controllable and unfit for a security
