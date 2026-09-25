@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `blueline recall sync` no longer writes through a planted symlink. The
+  temporary file was named after the process id, so its path was fully
+  predictable and `fs::write` follows a symlink: a link in the data
+  directory turned a sync into an overwrite of any file the user could
+  write. The write now goes to an `O_EXCL` tempfile, is flushed, and is
+  renamed into place.
+- Concurrent `recall sync` runs are serialised by a lock spanning the
+  read-compare-write. Two syncs could both pass the sequence check and
+  then land out of order, leaving a stale snapshot in place. A sync that
+  cannot take the lock within five seconds now fails loudly instead of
+  racing.
+- The recall snapshot cache is keyed by path as well as timestamp, and
+  carries the file length. A `OnceLock` froze at the first snapshot it
+  saw, so the cache stopped hitting exactly when the file changed, and
+  two data directories sharing a timestamp could serve each other's
+  index.
+
 - A `.SRCINFO` that declares the same dependency twice now keeps both
   expressions. A split package repeats the pkgbase `depends` inside its own
   `pkgname` block, and the parser overwrote rather than merged, so a
