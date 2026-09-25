@@ -110,14 +110,30 @@ pub fn parse_lockfile_packages(
                 continue;
             };
 
-            let name = if let Some(pkg_name) = pkg.name {
-                pkg_name
-            } else {
-                extract_package_name_from_path(&path)
+            let key_name = extract_package_name_from_path(&path);
+            let name = match pkg.name {
+                Some(n) if n.is_empty() => key_name.clone(),
+                Some(n) => n,
+                None => key_name.clone(),
             };
 
             if name.is_empty() {
                 continue;
+            }
+
+            // Under node_modules, a declared name that differs from the
+            // directory is an npm alias, and npm records the real source in
+            // `resolved`. Requiring those to agree rejects a hand-edited entry
+            // pointing one package at another, while every honest alias
+            // passes. A mismatch with no `resolved` has no honest explanation.
+            if path.contains("node_modules/") && name != key_name {
+                let resolved = pkg.resolved.as_deref().unwrap_or_default();
+                if !resolved_names_package(resolved, &name) {
+                    return Err(LockfileError::InvalidData(format!(
+                        "`{path}` declares name `{name}` but its resolved URL is `{resolved}`; \
+                         refusing to review an entry whose identity is ambiguous"
+                    )));
+                }
             }
 
             let entry = PackageEntry {
@@ -187,6 +203,23 @@ fn walk_v1_dependencies(
 fn extract_package_name_from_path(path: &str) -> String {
     let name_part = path.rsplit("node_modules/").next().unwrap_or(path);
     name_part.trim_end_matches('/').to_string()
+}
+
+/// Does an npm `resolved` URL name the package it claims to? `resolved` plus
+/// `integrity` is what npm actually fetches, so it, not the directory name,
+/// is the install identity.
+fn resolved_names_package(resolved: &str, name: &str) -> bool {
+    if resolved.is_empty() {
+        return false;
+    }
+    let Some(last) = resolved.rsplit('/').next() else {
+        return false;
+    };
+    // `<name>-<version>.tgz`, where a scoped name keeps its slash.
+    let stem = last.strip_suffix(".tgz").unwrap_or(last);
+    let unscoped = name.rsplit('/').next().unwrap_or(name);
+    stem.strip_prefix(unscoped)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
 }
 
 fn normalize_node_modules_path(path: &str) -> String {
@@ -507,7 +540,13 @@ pub fn compute_delta_from_maps(
                     head_iter.next();
                 }
                 std::cmp::Ordering::Equal => {
-                    if b_val.version != h_val.version || b_val.integrity != h_val.integrity {
+                    // A different package name at a stable key and version is a
+                    // swap, not an unchanged entry. It was counted as
+                    // unchanged, so the new name was never reviewed.
+                    if b_val.version != h_val.version
+                        || b_val.integrity != h_val.integrity
+                        || b_val.name != h_val.name
+                    {
                         upgraded.push(PackageUpgrade {
                             name: h_val.name.clone(),
                             old_version: b_val.version.clone(),
@@ -1098,6 +1137,59 @@ urllib3==2.1.0 # trailing comment
         assert!(err.contains("line 1: unpinned range `requests>=2.0.0`"));
         assert!(err.contains("line 3: unpinned range `pytest~=7.0`"));
         assert!(err.contains("line 4: unpinned package `black`"));
+    }
+
+    #[test]
+    fn a_name_swap_at_the_same_key_and_version_is_an_upgrade() {
+        let mut b = BTreeMap::new();
+        let mut h = BTreeMap::new();
+        let entry = |name: &str| PackageEntry {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            integrity: Some("sha512-aa".to_string()),
+            resolved: None,
+            is_dev: false,
+        };
+        b.insert("node_modules/pinned".to_string(), entry("good"));
+        h.insert("node_modules/pinned".to_string(), entry("evil"));
+        let delta = compute_delta_from_maps(&b, &h);
+        assert_eq!(
+            delta.upgraded.len(),
+            1,
+            "a different package at a reviewed address must be evaluated"
+        );
+        assert_eq!(delta.upgraded[0].name, "evil");
+    }
+
+    #[test]
+    fn an_entry_whose_name_disagrees_with_its_resolved_url_is_refused() {
+        let json = r#"{"lockfileVersion":3,"packages":{
+            "node_modules/foo":{"name":"bar","version":"1.0.0",
+                "resolved":"https://registry.npmjs.org/evil/-/evil-1.0.0.tgz"}}}"#;
+        let err = parse_lockfile_packages(json).unwrap_err().to_string();
+        assert!(
+            err.contains("identity is ambiguous"),
+            "a name pointing at a different tarball must be refused: {err}"
+        );
+    }
+
+    #[test]
+    fn a_real_npm_alias_still_parses() {
+        // `"foo": "npm:bar@1.0.0"` makes npm record name `bar` under the
+        // directory `foo`, so a strict name==directory check would reject
+        // every aliased dependency in the wild.
+        let json = r#"{"lockfileVersion":3,"packages":{
+            "node_modules/foo":{"name":"bar","version":"1.0.0",
+                "resolved":"https://registry.npmjs.org/bar/-/bar-1.0.0.tgz"}}}"#;
+        let pkgs = parse_lockfile_packages(json).unwrap();
+        assert_eq!(pkgs["node_modules/foo"].name, "bar");
+    }
+
+    #[test]
+    fn a_name_mismatch_with_no_resolved_url_is_refused() {
+        let json = r#"{"lockfileVersion":3,"packages":{
+            "node_modules/foo":{"name":"bar","version":"1.0.0"}}}"#;
+        assert!(parse_lockfile_packages(json).is_err());
     }
 
     #[test]
