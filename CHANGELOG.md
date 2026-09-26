@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A yanked PyPI release now shows the registry's stated reason on the card
+  instead of only that a withdrawal happened. The reason was fetched and dropped
+  at the `Release` conversion, so R08/R09 could report "yanked" with no cause.
+  Remote text is sanitized to a single line and bounded before it reaches a
+  terminal; a release yanked with PEP 592's bare `true` now reads "no reason
+  published" rather than implying a cause it does not have.
+- `[provenance] require_signatures` is satisfiable on the npm lane. The key
+  gated on a registry signature block that was never read from the packument, so
+  setting it blocked every npm review unconditionally: fail-closed, but a check
+  that could never pass. The block is now read for the resolved version and
+  reaches the provenance report. Presence is still all that is checked — nothing
+  verifies the signature, and the card still says "not verified".
+
+### Removed
+- `BaselineResolution::display_summary`, which had no caller outside its own
+  test.
+- The extraction section of `ARCHITECTURE.md` claimed a Landlock sandbox,
+  capability drop, seccomp filter and open-FD cap. No such code exists and
+  `Cargo.lock` carries none of those crates. The claim is now marked as planned
+  and the document says plainly that the parser-level budget is what bounds a
+  hostile archive today.
+
 - The MCP stdio server validates the JSON-RPC `jsonrpc` member. `"jsonrpc":"1.0"`,
   or a request with the member absent, was accepted; 2.0 is now required and a
   bad request gets the existing parse-error response without killing the

@@ -96,10 +96,14 @@ Every tarball and registry response is fully untrusted. The `extract` stage enfo
   onto a path already written (`a//b` and `a/b` are one entry, and the second
   would otherwise overwrite the first); setuid/setgid bits are stripped. Pin
   `tar` ≥ 0.4.45.
-- **Sandbox the step:** run extract + diff in a Landlock-restricted child
-  (read-only host FS, write only to the sandbox temp dir), capability-dropped,
-  optionally seccomp-filtered, non-root. Linux uses Landlock; macOS/Windows fall
-  back to the parser-level bounds above plus a dedicated non-writable temp dir.
+- **Sandbox the step (planned, not implemented):** the intent is to run extract
+  + diff in a Landlock-restricted child (read-only host FS, write only to the
+  sandbox temp dir), capability-dropped, optionally seccomp-filtered, non-root,
+  with macOS/Windows falling back to the parser-level bounds above plus a
+  dedicated non-writable temp dir. No Landlock, seccomp, `cap-std` or
+  capability-drop code exists in `src/` today, and `Cargo.lock` carries none of
+  those crates. What actually bounds a hostile archive is the parser-level
+  budget above; there is no OS-level confinement behind it.
 - **Treat extracted bytes as hostile:** the extracted `package.json` (`scripts`,
   `dependencies`) is diffed/flagged as attack surface, not trusted.
 
@@ -112,7 +116,7 @@ Every tarball and registry response is fully untrusted. The `extract` stage enfo
 | D1 | Rust core + Node shim                               | Security-critical path in a memory-safe, single-binary language; Node only for `npx` ergonomics. |
 | D2 | Local deterministic heuristic first                 | Transparent, auditable, offline. Hosted ML *refines* score when token present — never required. Keeps "the wedge stays open" honest. |
 | D3 | One registry deep, `Registry` trait seam, then four | Deepen one registry first; avoid speculative multi-registry code. npm, crates.io, PyPI, and review-only AUR now share the seam. |
-| D4 | Read-only sandbox extraction + integrity verify     | Core safety invariant. Verify sha512/signature *before* extract; bound size/entry/FD; reject symlinks/special files; Landlock-sandbox the step. Package code never runs. |
+| D4 | Read-only sandbox extraction + integrity verify     | Core safety invariant. Verify sha512/signature *before* extract; bound size/entry; reject symlinks/special files; Landlock-sandbox the step (planned). Package code never runs. |
 | D5 | Baseline = last known-clean version                 | Source: locally installed version in `node_modules` → else previous version in registry list (neutral verdict on first sighting). Overrides persisted in SQLite. |
 | D6 | Revocation = OSV + GitHub Advisory cache            | Reuse the open vulnerability corpus; paid tier adds human-verified recall (hosted index). |
 | D7 | Stable `Verdict` JSON schema                        | Same struct feeds CLI card, CI comment, and MCP tool. One source of truth.|
@@ -215,7 +219,7 @@ Known bypasses stay documented in the README.
 | `thresholds` | `max_low_score` (19), `max_medium_score` (49), `block_score` (80) |
 | `policy` | `require_provenance`, `block_unreviewed_scripts`, `allow_git_dependencies`, `check_advisories`, `fail_closed_network` |
 | `advisories` | `block_on_malware`, `block_on_critical_cve`, cache TTLs |
-| `provenance` | `require_provenance`, `require_signatures`, builders/repos |
+| `provenance` | `require_provenance`, `require_signatures`, `allowed_builders`, `allowed_repositories` (the last two enforced at Block) |
 | `allowlist.packages` | exact `name` (+optional `ecosystem`), `allowed_scripts`, `allow_unreviewed_baseline` |
 | `blocklist` | glob `packages` (+optional `ecosystem`), `maintainers` |
 | `ci` | `fail_on`, `max_evaluations`, `include_dev` |
