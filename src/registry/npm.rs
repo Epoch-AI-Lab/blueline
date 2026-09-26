@@ -225,6 +225,18 @@ impl Registry for NpmRegistry {
             .or_else(|| versions.last())
             .map(|v| v.to_string()))
     }
+
+    /// npm publishes the signature block on the release's own `dist`, so it
+    /// is read back for the exact version under review and not for whatever
+    /// `latest` points at. An unreadable packument yields `None`, which the
+    /// signature policy treats as absent.
+    fn release_signatures(&self, pkg: &Package) -> Option<serde_json::Value> {
+        let packument = self.packument(&pkg.name).ok()?;
+        packument
+            .versions
+            .get(&pkg.version)
+            .and_then(|meta| meta.dist.signatures.clone())
+    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -316,6 +328,11 @@ struct VersionMeta {
 struct Dist {
     tarball: String,
     integrity: Option<String>,
+    /// The registry's signature block for this artifact, when it publishes
+    /// one. Kept as raw JSON because the provenance engine only reads
+    /// presence and key id, and a stricter shape here would refuse a packument
+    /// over a field the check does not use.
+    signatures: Option<serde_json::Value>,
 }
 
 #[cfg(test)]
@@ -338,6 +355,7 @@ mod tests {
                         dist: Dist {
                             tarball: String::new(),
                             integrity: None,
+                            signatures: None,
                         },
                     };
                     (v.to_string(), vm)
@@ -842,6 +860,61 @@ mod tests {
         };
         let err = reg.fetch_url_verified(&pkg_over).unwrap_err();
         assert!(err.to_string().contains("too many redirects"));
+
+        let _ = handle.join();
+    }
+
+    /// The signature block the registry publishes next to the artifact was
+    /// never deserialized, so `[provenance] require_signatures` gated on a
+    /// value that was hard-wired absent and could never be satisfied on this
+    /// lane. It is read for the exact version under review.
+    #[test]
+    fn release_signatures_reads_the_blocks_for_the_resolved_version_only() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let _ = listener.set_nonblocking(true);
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_millis(600) {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 1024];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    if req.contains("GET /signed ") {
+                        let body = format!(
+                            r#"{{"name":"signed","dist-tags":{{"latest":"2.0.0"}},"versions":{{"1.0.0":{{"name":"signed","version":"1.0.0","dist":{{"tarball":"http://127.0.0.1:{port}/one.tgz","integrity":null,"signatures":[{{"keyid":"SHA256:one","sig":"c2lnMQ=="}}]}}}},"2.0.0":{{"name":"signed","version":"2.0.0","dist":{{"tarball":"http://127.0.0.1:{port}/two.tgz","integrity":null}}}}}}}}"#
+                        );
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    }
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        });
+
+        let reg = NpmRegistry::new(&base);
+        let signed = reg.resolve("signed", "1.0.0").unwrap();
+        let sigs = reg
+            .release_signatures(&signed)
+            .expect("1.0.0 publishes a signature block");
+        assert_eq!(
+            sigs,
+            serde_json::json!([{ "keyid": "SHA256:one", "sig": "c2lnMQ==" }])
+        );
+        // The block belongs to 1.0.0. Reading `latest` instead would vouch for
+        // a different release than the one under review.
+        let unsigned = reg.resolve("signed", "2.0.0").unwrap();
+        assert_eq!(reg.release_signatures(&unsigned), None);
 
         let _ = handle.join();
     }

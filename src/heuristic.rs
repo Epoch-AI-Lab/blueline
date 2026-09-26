@@ -39,13 +39,42 @@ pub fn evaluate_with_policy(
         delta,
         is_unreviewed_baseline,
         false,
+        None,
         false,
+        None,
         false,
         None,
         policy,
         None,
         None,
     )
+}
+
+/// Cap on the registry-stated withdrawal reason rendered into a card. The
+/// text is remote and a card is not a buffer.
+const MAX_YANKED_REASON_CHARS: usize = 200;
+
+/// The registry's own words for a withdrawal, as one bounded line.
+///
+/// Registry text reaches a terminal, so it goes through the single-line
+/// sanitizer (escape sequences out, newlines flattened) before it is
+/// truncated. A release withdrawn without a stated reason says exactly that,
+/// rather than reading as if a cause had been given.
+fn yanked_reason_clause(reason: Option<&str>) -> String {
+    let stated = reason
+        .map(crate::render::sanitize_single_line)
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty());
+    match stated {
+        Some(line) => {
+            let mut out: String = line.chars().take(MAX_YANKED_REASON_CHARS).collect();
+            if out.len() < line.len() {
+                out.push('…');
+            }
+            format!(" (registry-stated reason: `{out}`)")
+        }
+        None => " (no reason published)".to_string(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -56,7 +85,9 @@ pub fn evaluate_with_trust(
     delta: &Delta,
     is_unreviewed_baseline: bool,
     prior_release_yanked: bool,
+    prior_yanked_reason: Option<&str>,
     target_release_yanked: bool,
+    target_yanked_reason: Option<&str>,
     author_changed: bool,
     release_author: Option<&str>,
     policy: &Policy,
@@ -440,8 +471,9 @@ pub fn evaluate_with_trust(
             severity: VerdictBand::Medium,
             title: format!("Release immediately preceding `{}` was yanked", delta.target_version),
             description: format!(
-                "The release immediately before `{}` (`{prior_ver}`) was yanked from the registry. Yanked releases are a common supply-chain attack cleanup signal; the diff anchor may be older than expected.",
-                delta.target_version
+                "The release immediately before `{}` (`{prior_ver}`) was yanked from the registry{}. Yanked releases are a common supply-chain attack cleanup signal; the diff anchor may be older than expected.",
+                delta.target_version,
+                yanked_reason_clause(prior_yanked_reason)
             ),
         });
     }
@@ -453,8 +485,9 @@ pub fn evaluate_with_trust(
             severity: VerdictBand::Medium,
             title: format!("Target release `{}` was yanked", delta.target_version),
             description: format!(
-                "The target release `{}` is marked as yanked on the registry. Yanked releases are often withdrawn due to critical bugs or security compromises.",
-                delta.target_version
+                "The target release `{}` is marked as yanked on the registry{}. Yanked releases are often withdrawn due to critical bugs or security compromises.",
+                delta.target_version,
+                yanked_reason_clause(target_yanked_reason)
             ),
         });
     }
@@ -2856,7 +2889,9 @@ mod tests {
             &delta,
             false,
             false,
+            None,
             false,
+            None,
             false,
             None,
             &Policy::default(),
@@ -2915,7 +2950,9 @@ mod tests {
             &delta,
             false,
             false,
+            None,
             false,
+            None,
             false,
             None,
             &Policy::default(),
@@ -2961,7 +2998,9 @@ mod tests {
             &delta,
             false,
             false,
+            None,
             false,
+            None,
             false,
             None,
             &Policy::default(),
@@ -3009,7 +3048,9 @@ mod tests {
             &delta,
             false,
             false,
+            None,
             false,
+            None,
             false,
             None,
             &policy,
@@ -3050,7 +3091,9 @@ mod tests {
             &delta,
             false,
             false,
+            None,
             false,
+            None,
             false,
             None,
             &policy_repo,
@@ -3373,7 +3416,9 @@ mod tests {
             &delta,
             false,
             true,
+            None,
             false,
+            None,
             false,
             None,
             &Policy::default(),
@@ -3405,7 +3450,9 @@ mod tests {
             &delta,
             false,
             false,
+            None,
             true,
+            None,
             false,
             None,
             &Policy::default(),
@@ -3426,6 +3473,114 @@ mod tests {
         assert_eq!(verdict.band, VerdictBand::Medium);
     }
 
+    fn yanked_finding_description(
+        prior_yanked: bool,
+        prior_reason: Option<&str>,
+        target_yanked: bool,
+        target_reason: Option<&str>,
+        rule_id: &str,
+    ) -> String {
+        let verdict = evaluate_with_trust(
+            "test-pkg",
+            Ecosystem::PyPi,
+            "sha256:abc",
+            &yanked_delta(),
+            false,
+            prior_yanked,
+            prior_reason,
+            target_yanked,
+            target_reason,
+            false,
+            None,
+            &Policy::default(),
+            None,
+            None,
+        );
+        verdict
+            .findings
+            .iter()
+            .find(|f| f.rule_id == rule_id)
+            .unwrap_or_else(|| panic!("expected {rule_id}"))
+            .description
+            .clone()
+    }
+
+    /// The withdrawal reason is registry text, so it reaches a card through
+    /// the sanitizer: no escape sequence survives, and no newline either,
+    /// because a reason that can start a line can fake one.
+    #[test]
+    fn yanked_reason_is_sanitized_before_it_reaches_the_card() {
+        let hostile = "\x1b[31mCRITICAL\x1b[0m wheel is broken\nsecond line\t\x1b]8;;https://evil.example\x07";
+        for rule_id in ["R08_YANKED_PREDECESSOR", "R09_YANKED_TARGET"] {
+            let desc =
+                yanked_finding_description(true, Some(hostile), true, Some(hostile), rule_id);
+            assert!(!desc.contains('\x1b'), "{rule_id} kept an escape: {desc:?}");
+            assert!(!desc.contains('\n'), "{rule_id} kept a newline: {desc:?}");
+            assert!(!desc.contains('\t'), "{rule_id} kept a tab: {desc:?}");
+            assert!(
+                desc.contains("registry-stated reason: `CRITICAL wheel is broken second line"),
+                "{rule_id} dropped the stated reason: {desc:?}"
+            );
+            assert!(
+                !desc.contains("evil.example"),
+                "{rule_id} kept an OSC payload: {desc:?}"
+            );
+        }
+    }
+
+    /// A withdrawal the registry gave no cause for must read as exactly that.
+    /// Rendering it as a cause is how a card tells a reviewer something the
+    /// registry never said.
+    #[test]
+    fn a_yanked_release_with_no_published_reason_says_so() {
+        for rule_id in ["R08_YANKED_PREDECESSOR", "R09_YANKED_TARGET"] {
+            let desc = yanked_finding_description(true, None, true, None, rule_id);
+            assert!(
+                desc.contains("(no reason published)"),
+                "{rule_id} must disclose the absent reason: {desc:?}"
+            );
+            assert!(
+                !desc.contains("registry-stated reason"),
+                "{rule_id} invented a cause: {desc:?}"
+            );
+            assert!(
+                desc.contains("was yanked") || desc.contains("marked as yanked"),
+                "{rule_id} lost the withdrawal itself: {desc:?}"
+            );
+        }
+    }
+
+    /// A reason is a sentence on a card, not a buffer. A registry that
+    /// publishes a megabyte of it must not be able to flood the render.
+    #[test]
+    fn an_oversized_yanked_reason_is_truncated() {
+        let long = "yanked because ".to_string() + &"x".repeat(10_000);
+        let desc =
+            yanked_finding_description(true, Some(&long), true, Some(&long), "R09_YANKED_TARGET");
+        assert!(
+            desc.chars().count() < 600,
+            "card text must stay bounded, got {} chars",
+            desc.chars().count()
+        );
+        assert!(desc.contains('…'), "truncation must be visible: {desc:?}");
+    }
+
+    /// A reason made only of escapes and control characters sanitizes to
+    /// nothing, which is the absence of a cause and says so rather than
+    /// rendering an empty quote.
+    #[test]
+    fn a_yanked_reason_that_sanitizes_away_reads_as_no_reason() {
+        let desc = yanked_finding_description(
+            true,
+            None,
+            true,
+            Some("\x1b[31m\x1b[0m"),
+            "R09_YANKED_TARGET",
+        );
+        assert!(desc.contains("(no reason published)"), "{desc:?}");
+        assert!(!desc.contains("reason: ``"), "{desc:?}");
+    }
+
     #[test]
     fn no_yanked_predecessor_finding_when_prior_is_live() {
         let delta = yanked_delta();
@@ -3436,7 +3591,9 @@ mod tests {
             &delta,
             false,
             false,
+            None,
             false,
+            None,
             false,
             None,
             &Policy::default(),
@@ -3463,7 +3620,9 @@ mod tests {
             &delta,
             false,
             false,
+            None,
             false,
+            None,
             true,
             None,
             &Policy::default(),
@@ -3494,7 +3653,9 @@ mod tests {
             &delta,
             false,
             false,
+            None,
             false,
+            None,
             false,
             None,
             &Policy::default(),
@@ -3536,7 +3697,9 @@ mod tests {
             &delta,
             false,
             false,
+            None,
             false,
+            None,
             false,
             None,
             &Policy::default(),
@@ -3589,7 +3752,9 @@ maintainers = ["badactor@example.com"]
             &delta,
             false,
             false,
+            None,
             false,
+            None,
             false,
             Some("badactor@example.com"),
             &policy,
@@ -3646,7 +3811,9 @@ maintainers = ["  BadActor@Example.com "]
             &delta,
             false,
             false,
+            None,
             false,
+            None,
             false,
             Some("badactor@example.com"),
             &policy,
@@ -3699,7 +3866,9 @@ maintainers = ["badactor@example.com"]
                 &delta,
                 false,
                 false,
+                None,
                 false,
+                None,
                 false,
                 author,
                 &policy,
@@ -3890,7 +4059,9 @@ allowed_builders = ["github.com/slsa-framework/slsa-github-generator/generic"]
                 &delta,
                 false,
                 false,
+                None,
                 false,
+                None,
                 false,
                 None,
                 &policy,
@@ -3957,7 +4128,9 @@ allowed_builders = [
                 &delta,
                 false,
                 false,
+                None,
                 false,
+                None,
                 false,
                 None,
                 &policy,

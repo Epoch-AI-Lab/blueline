@@ -1,3 +1,6 @@
+use std::any::Any;
+use std::collections::BTreeMap;
+
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
@@ -195,8 +198,74 @@ pub struct Release {
     pub publish_time: Option<i64>,
 }
 
+/// The withdrawal reasons a registry publishes, keyed by version.
+///
+/// `Release` carries the boolean; the cause is the fact that tells a reviewer
+/// what to do next, and it is remote text that ends up on a card, so it is
+/// carried verbatim here and sanitized where it is rendered.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct YankedReasons {
+    by_version: BTreeMap<String, String>,
+}
+
+impl YankedReasons {
+    /// Record the reason one registry gave for withdrawing a version. A blank
+    /// reason is the absence of a cause, not a cause, so it is dropped.
+    pub fn record(&mut self, version: &str, reason: &str) {
+        let reason = reason.trim();
+        if !reason.is_empty() {
+            self.by_version
+                .insert(version.to_string(), reason.to_string());
+        }
+    }
+
+    /// The stated reason for `version`, when the registry published one.
+    pub fn get(&self, version: &str) -> Option<&str> {
+        self.by_version.get(version).map(String::as_str)
+    }
+}
+
+/// PEP 592 lets a registry withdraw a release with the bare boolean `true`,
+/// which states no cause. The PyPI adapter carries that form as the word
+/// `yanked`, so that its reason is `Some` exactly when the release is
+/// withdrawn; that stand-in is not a cause, and rendering it as one would tell
+/// a reviewer the registry said something it never said.
+const YANKED_WITHOUT_A_CAUSE: &str = "yanked";
+
+/// The release list for `name` plus the withdrawal reason each release
+/// carries, in one read.
+///
+/// `Registry::list_releases` is implemented per adapter and its record has
+/// nowhere to put a reason, so the adapter whose registry publishes one is
+/// recognized here and read through its own accessor. Everything else takes
+/// the same plain list it always did, with no reasons to report.
+pub fn releases_with_reasons(
+    registry: &dyn Registry,
+    name: &str,
+) -> Result<(Vec<Release>, YankedReasons), BluelineError> {
+    let Some(pypi) = (registry as &dyn Any).downcast_ref::<pypi::PyPIRegistry>() else {
+        return Ok((registry.list_releases(name)?, YankedReasons::default()));
+    };
+    let published = pypi.list_releases_with_reasons(name)?;
+    let mut reasons = YankedReasons::default();
+    let mut releases = Vec::with_capacity(published.len());
+    for release in published {
+        if let Some(reason) = &release.yanked_reason
+            && reason != YANKED_WITHOUT_A_CAUSE
+        {
+            reasons.record(&release.version, reason);
+        }
+        releases.push(Release::from(release));
+    }
+    Ok((releases, reasons))
+}
+
 /// Seam for future registries (PyPI, cargo). npm is the only full impl for now.
-pub trait Registry {
+///
+/// `Any` is a supertrait so a caller holding a `&dyn Registry` can recover the
+/// concrete adapter when one of them publishes something the seam cannot
+/// carry (see `releases_with_reasons`).
+pub trait Registry: Any {
     /// Which ecosystem this registry serves.
     fn ecosystem(&self) -> Ecosystem;
 
@@ -222,6 +291,17 @@ pub trait Registry {
     /// without per-release authorship return `None`, which the trust engine
     /// treats as "unknown" rather than as a signal.
     fn release_author(&self, _pkg: &Package) -> Option<String> {
+        None
+    }
+
+    /// The registry's own signature block for this exact release, as
+    /// published next to the artifact (npm `dist.signatures`).
+    ///
+    /// Presence, never validity: nothing here verifies a signature, and a
+    /// registry that publishes none — or whose metadata could not be read —
+    /// returns `None` rather than a guess, so a policy that requires
+    /// signatures keeps refusing.
+    fn release_signatures(&self, _pkg: &Package) -> Option<serde_json::Value> {
         None
     }
 }
@@ -295,5 +375,153 @@ mod tests {
         assert_eq!(Ecosystem::Cargo.key(), "cargo");
         assert_eq!(Ecosystem::PyPi.key(), "pypi");
         assert_eq!(Ecosystem::Aur.key(), "aur");
+    }
+
+    /// A blank reason is the absence of a cause. Recording it as `Some("")`
+    /// would render an empty quote on the card and read like a cause.
+    #[test]
+    fn blank_reasons_are_not_recorded_as_causes() {
+        let mut reasons = YankedReasons::default();
+        reasons.record("1.0.0", "   ");
+        assert_eq!(reasons.get("1.0.0"), None);
+        reasons.record("2.0.0", "  broken wheel  ");
+        assert_eq!(reasons.get("2.0.0"), Some("broken wheel"));
+        assert_eq!(reasons.get("3.0.0"), None);
+    }
+
+    /// The reason is registry text with no bound on it, so it is kept as the
+    /// registry spelled it and bounded where it is rendered, not here.
+    #[test]
+    fn a_registry_can_publish_an_oversized_reason() {
+        let mut reasons = YankedReasons::default();
+        reasons.record("1.0.0", &"x".repeat(100_000));
+        assert_eq!(reasons.get("1.0.0").map(str::len), Some(100_000));
+    }
+
+    struct NoReasonRegistry;
+
+    impl Registry for NoReasonRegistry {
+        fn ecosystem(&self) -> Ecosystem {
+            Ecosystem::Npm
+        }
+        fn resolve(&self, name: &str, version: &str) -> Result<Package, BluelineError> {
+            Ok(Package {
+                name: name.to_string(),
+                version: version.to_string(),
+                tarball_url: "https://example.com/x.tgz".to_string(),
+                integrity: Some(Checksum::parse(TEST_SRI)?),
+            })
+        }
+        fn fetch_tarball(&self, _pkg: &Package) -> Result<Vec<u8>, BluelineError> {
+            Ok(vec![])
+        }
+        fn list_versions(&self, _name: &str) -> Result<Vec<semver::Version>, BluelineError> {
+            Ok(vec![semver::Version::parse("1.0.0").map_err(|e| {
+                BluelineError::Manifest("x".into(), e.to_string())
+            })?])
+        }
+        fn list_releases(&self, _name: &str) -> Result<Vec<Release>, BluelineError> {
+            Ok(vec![Release {
+                version: "1.0.0".into(),
+                yanked: true,
+                publish_time: None,
+            }])
+        }
+        fn default_version(&self, _name: &str) -> Result<Option<String>, BluelineError> {
+            Ok(Some("1.0.0".into()))
+        }
+    }
+
+    /// A registry that publishes no reason takes the same read it always took,
+    /// with nothing to report. This lane is not PyPI, so the release list comes
+    /// from the plain seam.
+    #[test]
+    fn a_registry_without_reasons_reports_none() {
+        let (releases, reasons) = releases_with_reasons(&NoReasonRegistry, "pkg").unwrap();
+        assert_eq!(releases.len(), 1);
+        assert!(releases[0].yanked);
+        assert_eq!(reasons.get("1.0.0"), None);
+    }
+
+    /// The point of the seam: PyPI's PEP 592 reason was read off the index and
+    /// dropped at `From<PyPiRelease> for Release`, so the one field that says
+    /// *why* a release was withdrawn never reached a caller.
+    #[test]
+    fn pypi_releases_carry_the_registry_stated_reason() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let _server = std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let path = String::from_utf8_lossy(&buf[..n])
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .to_string();
+                    let body = if path == "/simple/demo/" {
+                        serde_json::json!({
+                            "name": "demo",
+                            "versions": ["1.0.0", "2.0.0", "3.0.0"],
+                            "files": [
+                                {
+                                    "filename": "demo-1.0.0-py3-none-any.whl",
+                                    "url": "https://example.com/demo-1.0.0.whl",
+                                    "hashes": {"sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+                                    "yanked": false
+                                },
+                                {
+                                    "filename": "demo-2.0.0-py3-none-any.whl",
+                                    "url": "https://example.com/demo-2.0.0.whl",
+                                    "hashes": {"sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+                                    "yanked": "critical vulnerability, no upgrade path"
+                                },
+                                {
+                                    "filename": "demo-3.0.0-py3-none-any.whl",
+                                    "url": "https://example.com/demo-3.0.0.whl",
+                                    "hashes": {"sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+                                    "yanked": true
+                                }
+                            ]
+                        })
+                        .to_string()
+                    } else {
+                        "not found".to_string()
+                    };
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.pypi.simple.v1+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(body.as_bytes());
+                });
+            }
+        });
+
+        let registry = pypi::PyPIRegistry::new(&base);
+        let (releases, reasons) = releases_with_reasons(&registry, "demo").unwrap();
+        assert_eq!(releases.len(), 3);
+        let live = releases.iter().find(|r| r.version == "1.0.0").unwrap();
+        assert!(!live.yanked);
+        let withdrawn = releases.iter().find(|r| r.version == "2.0.0").unwrap();
+        assert!(withdrawn.yanked);
+        assert_eq!(
+            reasons.get("2.0.0"),
+            Some("critical vulnerability, no upgrade path"),
+            "the registry's own words for the withdrawal must reach the caller"
+        );
+        assert_eq!(reasons.get("1.0.0"), None);
+        // PEP 592's bare `true` withdraws without stating a cause, and the
+        // adapter spells that form `yanked`. Standing in a tautology for a
+        // cause would put "the registry said `yanked`" on the card.
+        let boolean_form = releases.iter().find(|r| r.version == "3.0.0").unwrap();
+        assert!(boolean_form.yanked);
+        assert_eq!(reasons.get("3.0.0"), None);
     }
 }

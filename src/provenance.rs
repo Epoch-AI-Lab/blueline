@@ -648,4 +648,57 @@ mod tests {
             "a check that could not run is not the same as nothing being published"
         );
     }
+
+    /// What `registry_signature_present` is built from. The npm lane used to
+    /// pass no block at all, so this was `false` on every review and
+    /// `require_signatures` could never be satisfied there; it is presence
+    /// only, and never a verification.
+    #[test]
+    fn a_published_signature_block_marks_the_registry_signature_present() {
+        let signatures = serde_json::json!([
+            {"keyid": "SHA256:abc", "sig": "c2ln"},
+            {"keyid": "SHA256:def", "sig": "c2lnMg=="},
+        ]);
+        let report = inspect_provenance(
+            "pkg",
+            "1.0.0",
+            &ck("tarball"),
+            Some(&signatures),
+            "http://127.0.0.1:9",
+            None,
+            &Policy::default(),
+        );
+        assert!(
+            report.registry_signature_present,
+            "a published block is what satisfies require_signatures"
+        );
+        assert_eq!(
+            report.registry_signature_key_id.as_deref(),
+            Some("SHA256:abc")
+        );
+    }
+
+    /// No block, or one that is not a signature list, leaves the gate shut.
+    #[test]
+    fn an_absent_or_unusable_signature_block_leaves_the_gate_shut() {
+        for signatures in [
+            None,
+            Some(serde_json::json!({})),
+            Some(serde_json::json!([])),
+        ] {
+            let report = inspect_provenance(
+                "pkg",
+                "1.0.0",
+                &ck("tarball"),
+                signatures.as_ref(),
+                "http://127.0.0.1:9",
+                None,
+                &Policy::default(),
+            );
+            assert!(
+                !report.registry_signature_present,
+                "{signatures:?} must not satisfy require_signatures"
+            );
+        }
+    }
 }
