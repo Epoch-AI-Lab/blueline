@@ -44,13 +44,6 @@ pub struct Delta {
     pub modified_lifecycle_scripts: Vec<String>,
     pub new_dependencies: Vec<(String, String)>,
     pub modified_dependencies: Vec<(String, String, String)>,
-    /// Baseline dependencies absent from the target. Deliberately not a finding
-    /// on its own — a drop shrinks the install graph, so there is no risk to
-    /// score. It is kept only as the input a *swap* rule needs (a removal
-    /// paired with a near-identical addition is a typosquat, and nothing
-    /// compares the two sets today); the exhaustive `Delta { .. }` literals
-    /// outside this module are what still block deleting it.
-    pub removed_dependencies: Vec<String>,
     pub binding_gyp_added: bool,
 }
 
@@ -208,7 +201,6 @@ pub fn compute_delta(
 
     let mut new_dependencies = Vec::new();
     let mut modified_dependencies = Vec::new();
-    let mut removed_dependencies = Vec::new();
 
     let target_deps = collect_all_dependencies(target_manifest);
     if let Some(base_m) = baseline_manifest {
@@ -220,11 +212,6 @@ pub fn compute_delta(
                 }
             } else {
                 new_dependencies.push((dep.clone(), ver.clone()));
-            }
-        }
-        for dep in base_deps.keys() {
-            if !target_deps.contains_key(dep) {
-                removed_dependencies.push(dep.clone());
             }
         }
     } else {
@@ -257,7 +244,6 @@ pub fn compute_delta(
         modified_lifecycle_scripts,
         new_dependencies,
         modified_dependencies,
-        removed_dependencies,
         binding_gyp_added,
     })
 }

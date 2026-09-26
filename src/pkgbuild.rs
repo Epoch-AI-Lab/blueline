@@ -2703,7 +2703,6 @@ mod tests {
             modified_lifecycle_scripts: Vec::new(),
             new_dependencies: Vec::new(),
             modified_dependencies: Vec::new(),
-            removed_dependencies: Vec::new(),
             binding_gyp_added: false,
         }
     }

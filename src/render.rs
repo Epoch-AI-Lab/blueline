@@ -485,7 +485,6 @@ mod tests {
             modified_lifecycle_scripts: vec!["preinstall".into()],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
         let verdict = crate::verdict::Verdict {

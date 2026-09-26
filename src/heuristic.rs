@@ -1970,7 +1970,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
 
@@ -2015,7 +2014,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
 
@@ -2065,7 +2063,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
 
@@ -2223,7 +2220,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: true,
         };
 
@@ -2283,7 +2279,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![("malicious-pkg".into(), "ssh://git@host/repo".into())],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
 
@@ -2327,7 +2322,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
 
@@ -2365,7 +2359,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
 
@@ -2402,7 +2395,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
         let unreviewed = Delta {
@@ -2488,7 +2480,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
 
@@ -2576,7 +2567,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
 
@@ -2617,7 +2607,6 @@ mod tests {
                 "0.7.1".into(),
                 "https://evil.com/cookie.tgz".into(),
             )],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
 
@@ -2703,7 +2692,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
 
@@ -2735,7 +2723,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
 
@@ -2782,7 +2769,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
 
@@ -2845,7 +2831,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
 
@@ -2905,7 +2890,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
 
@@ -2965,7 +2949,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
 
@@ -3012,7 +2995,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
 
@@ -3377,7 +3359,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         }
     }
@@ -3546,7 +3527,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
         let verdict = evaluate_with_trust(
@@ -3600,7 +3580,6 @@ maintainers = ["badactor@example.com"]
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
         let verdict = evaluate_with_trust(
@@ -3658,7 +3637,6 @@ maintainers = ["  BadActor@Example.com "]
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
         let verdict = evaluate_with_trust(
@@ -3711,7 +3689,6 @@ maintainers = ["badactor@example.com"]
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
         for author in [None, Some("gooddev@example.com")] {

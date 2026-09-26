@@ -486,3 +486,13 @@ Slices (each independently green, small commits, CHANGELOG entry per slice):
   serde_json@1.0.151 LOW, npx launcher cold start verified)
 
 Mark each campaign's box `[x]` in the same branch when it lands.
+
+- A removed dependency is currently not scored at all: `compute_delta` used to
+  compute `removed_dependencies` and nothing ever read it, so the field is gone
+  and a dependency *drop* produces no finding. A bare drop shrinks the install
+  graph, so on its own that is defensible. The pair worth scoring is a **swap**:
+  a name in the removed set alongside a near-identical name in the added set
+  (normalized, or edit distance 1) is a rename under a new name, which is the
+  shape of a typosquat. `R04_DEPENDENCY_ADDED` and `R04_DEPENDENCY_MODIFIED`
+  both exist; a swap rule would need its own id and its own false-positive budget,
+  because honestly swapping a dead dependency for a maintained fork is common.
