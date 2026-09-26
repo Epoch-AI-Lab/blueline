@@ -59,7 +59,6 @@ pub struct AurInfo {
 #[derive(Debug, Deserialize)]
 struct AurRpcResponse {
     #[serde(rename = "version")]
-    #[allow(dead_code)]
     version: u8,
     #[serde(rename = "type")]
     result_type: String,

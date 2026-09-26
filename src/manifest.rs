@@ -37,12 +37,13 @@ const LIFECYCLE_SCRIPTS: [&str; 22] = [
 ];
 
 /// Typed view of the extracted `package.json`. The `scripts` / dependency
-/// fields are attack surface — parsed strictly, never executed. The unused
-/// fields feed the Phase 1 heuristic (maintainer/dep/script delta); they are
-/// parsed now so the type is stable and validated.
+/// fields are attack surface — parsed strictly, never executed. `name` and
+/// `version` stay `String` under `#[serde(default)]` rather than `Option`, so
+/// an omitted field surfaces as an empty string the caller has to judge (the
+/// review step refuses an empty or mismatched declared *name*) instead of a
+/// `None` that reads as "nothing declared, nothing to check".
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
 pub struct PackageJson {
     #[serde(default)]
     pub name: String,

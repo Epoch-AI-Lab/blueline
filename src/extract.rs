@@ -1042,27 +1042,6 @@ mod wheel_tests {
         buf.into_inner()
     }
 
-    #[allow(dead_code)]
-    fn make_wheel_with_unix_mode(
-        entries: &[(&str, &[u8], zip::CompressionMethod, u32)],
-    ) -> Vec<u8> {
-        let mut buf = Cursor::new(Vec::new());
-        let mut zw = zip::ZipWriter::new(&mut buf);
-        for (name, data, method, mode) in entries {
-            let opts = SimpleFileOptions::default()
-                .compression_method(*method)
-                .unix_permissions(*mode);
-            if name.ends_with('/') {
-                zw.add_directory(*name, opts).unwrap();
-            } else {
-                zw.start_file(*name, opts).unwrap();
-                zw.write_all(data).unwrap();
-            }
-        }
-        zw.finish().unwrap();
-        buf.into_inner()
-    }
-
     #[test]
     fn extracts_plain_files() {
         let bytes = make_wheel(&[

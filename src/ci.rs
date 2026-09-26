@@ -595,10 +595,6 @@ pub fn render_text_summary_to_string(report: &CiReport) -> String {
     out
 }
 
-pub fn render_text_summary(report: &CiReport) {
-    print!("{}", render_text_summary_to_string(report));
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

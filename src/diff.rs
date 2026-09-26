@@ -44,19 +44,14 @@ pub struct Delta {
     pub modified_lifecycle_scripts: Vec<String>,
     pub new_dependencies: Vec<(String, String)>,
     pub modified_dependencies: Vec<(String, String, String)>,
-    #[allow(dead_code)]
+    /// Baseline dependencies absent from the target. Deliberately not a finding
+    /// on its own — a drop shrinks the install graph, so there is no risk to
+    /// score. It is kept only as the input a *swap* rule needs (a removal
+    /// paired with a near-identical addition is a typosquat, and nothing
+    /// compares the two sets today); the exhaustive `Delta { .. }` literals
+    /// outside this module are what still block deleting it.
     pub removed_dependencies: Vec<String>,
-    #[allow(dead_code)]
     pub binding_gyp_added: bool,
-}
-
-impl Delta {
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.files_added.is_empty()
-            && self.files_removed.is_empty()
-            && self.files_modified.is_empty()
-    }
 }
 
 pub fn compute_delta(
@@ -283,8 +278,6 @@ fn collect_all_dependencies(manifest: &PackageJson) -> BTreeMap<String, String> 
 
 #[derive(Debug, Clone)]
 struct DiskFileMeta {
-    #[allow(dead_code)]
-    size: u64,
     hash: [u8; 32],
     kind: FileKind,
     is_executable: bool,
@@ -318,7 +311,6 @@ fn scan_tree(root: &Path) -> Result<BTreeMap<PathBuf, DiskFileMeta>, BluelineErr
             files.insert(
                 rel,
                 DiskFileMeta {
-                    size: bytes.len() as u64,
                     hash,
                     kind,
                     is_executable,

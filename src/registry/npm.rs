@@ -299,7 +299,6 @@ fn summarize_versions(packument: &Packument) -> String {
 
 #[derive(Debug, Deserialize)]
 struct Packument {
-    #[allow(dead_code)]
     name: String,
     #[serde(rename = "dist-tags")]
     dist_tags: BTreeMap<String, String>,
