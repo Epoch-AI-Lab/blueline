@@ -294,15 +294,15 @@ fn evaluate_with_registry<V: VersionInfo>(
         Ecosystem::Aur => None,
     };
 
+    let target_author = registry.release_author(&target_pkg);
     let author_changed = {
-        let target_author = registry.release_author(&target_pkg);
         let baseline_author = baseline_res
             .resolution
             .package()
             .and_then(|p| registry.release_author(p));
         // Unknown authorship on either side is "no signal", never a finding.
         matches!(
-            (baseline_author, target_author),
+            (baseline_author, target_author.clone()),
             (Some(base), Some(target)) if base != target
         )
     };
@@ -316,6 +316,7 @@ fn evaluate_with_registry<V: VersionInfo>(
         baseline_res.prior_release_yanked,
         baseline_res.target_release_yanked,
         author_changed,
+        target_author.as_deref(),
         policy,
         Some(&advisories),
         provenance.as_ref(),

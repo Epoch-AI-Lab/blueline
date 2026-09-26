@@ -804,6 +804,29 @@ impl AurRegistry {
     }
 }
 
+impl AurRegistry {
+    /// The commit author email of the pinned commit (self-declared AUR
+    /// identity). Failures degrade to `None` = "unknown" by design.
+    fn commit_author(&self, pkg: &Package) -> Option<String> {
+        let (clone_url, commit) = parse_git_tarball_url(&pkg.tarball_url).ok()?;
+        self.pin_clone_url(&clone_url).ok()?;
+        let repo_path = self.cached_repo(&clone_url).ok()?;
+        verify_commit_exists(&repo_path, &commit).ok()?;
+        let text = git_text(
+            Some(&repo_path),
+            &["log", "-1", "--format=%ae", &commit],
+            MAX_GIT_SMALL_OUTPUT_BYTES,
+        )
+        .ok()?;
+        let email = text.trim();
+        if email.is_empty() || email.chars().any(char::is_control) {
+            None
+        } else {
+            Some(email.to_string())
+        }
+    }
+}
+
 impl Registry for AurRegistry {
     fn ecosystem(&self) -> Ecosystem {
         Ecosystem::Aur
@@ -847,24 +870,23 @@ impl Registry for AurRegistry {
         Ok(self.list_releases(name)?.last().map(|r| r.version.clone()))
     }
 
-    /// The commit author email of the pinned commit (self-declared AUR
-    /// identity). Failures degrade to `None` = "unknown" by design.
+    /// The publishing identity of a release, preferring the per-release commit
+    /// author and falling back to the maintainer the RPC declares.
+    ///
+    /// Both channels existed and only one was read. The RPC `Maintainer` field
+    /// is registry-asserted, is present even when git history is unavailable,
+    /// and is the identity `[blocklist] maintainers` is written against, so a
+    /// package whose clone cannot be pinned was invisible to the blocklist.
     fn release_author(&self, pkg: &Package) -> Option<String> {
-        let (clone_url, commit) = parse_git_tarball_url(&pkg.tarball_url).ok()?;
-        self.pin_clone_url(&clone_url).ok()?;
-        let repo_path = self.cached_repo(&clone_url).ok()?;
-        verify_commit_exists(&repo_path, &commit).ok()?;
-        let text = git_text(
-            Some(&repo_path),
-            &["log", "-1", "--format=%ae", &commit],
-            MAX_GIT_SMALL_OUTPUT_BYTES,
-        )
-        .ok()?;
-        let email = text.trim();
-        if email.is_empty() || email.chars().any(char::is_control) {
+        if let Some(email) = self.commit_author(pkg) {
+            return Some(email);
+        }
+        let declared = self.rpc.info(&pkg.name).ok()?.maintainer?;
+        let trimmed = declared.trim();
+        if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
             None
         } else {
-            Some(email.to_string())
+            Some(trimmed.to_string())
         }
     }
 }

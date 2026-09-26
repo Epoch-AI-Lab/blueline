@@ -41,6 +41,7 @@ pub fn evaluate_with_policy(
         false,
         false,
         false,
+        None,
         policy,
         None,
         None,
@@ -57,6 +58,7 @@ pub fn evaluate_with_trust(
     prior_release_yanked: bool,
     target_release_yanked: bool,
     author_changed: bool,
+    release_author: Option<&str>,
     policy: &Policy,
     advisories: Option<&AdvisoryReport>,
     provenance: Option<&ProvenanceReport>,
@@ -70,6 +72,23 @@ pub fn evaluate_with_trust(
             severity: VerdictBand::Block,
             title: format!("Package `{name}` is blocked by policy"),
             description: "The package matches an active blocklist rule in blueline.toml.".into(),
+        });
+    }
+
+    // P04: the publishing identity is on the blocklist. `is_maintainer_blocked`
+    // existed and was never called, so `[blocklist] maintainers` parsed,
+    // validated, and then did nothing: a policy that asserts a protection and
+    // gets none, with no warning anywhere.
+    if let Some(author) = release_author
+        && policy.is_maintainer_blocked(author)
+    {
+        findings.push(Finding {
+            rule_id: "P04_MAINTAINER_BLOCKED".into(),
+            severity: VerdictBand::Block,
+            title: format!("Maintainer `{author}` is blocked by policy"),
+            description:
+                "The publishing identity of this release matches an active blocklist entry in blueline.toml."
+                    .into(),
         });
     }
 
@@ -2820,6 +2839,7 @@ mod tests {
             false,
             false,
             false,
+            None,
             &Policy::default(),
             Some(&adv),
             None,
@@ -2879,6 +2899,7 @@ mod tests {
             false,
             false,
             false,
+            None,
             &Policy::default(),
             Some(&adv),
             None,
@@ -2925,6 +2946,7 @@ mod tests {
             false,
             false,
             false,
+            None,
             &Policy::default(),
             None,
             Some(&prov),
@@ -2973,6 +2995,7 @@ mod tests {
             false,
             false,
             false,
+            None,
             &policy,
             None,
             Some(&prov_missing),
@@ -3013,6 +3036,7 @@ mod tests {
             false,
             false,
             false,
+            None,
             &policy_repo,
             None,
             Some(&prov_untrusted_repo),
@@ -3336,6 +3360,7 @@ mod tests {
             true,
             false,
             false,
+            None,
             &Policy::default(),
             None,
             None,
@@ -3367,6 +3392,7 @@ mod tests {
             false,
             true,
             false,
+            None,
             &Policy::default(),
             None,
             None,
@@ -3397,6 +3423,7 @@ mod tests {
             false,
             false,
             false,
+            None,
             &Policy::default(),
             None,
             None,
@@ -3423,6 +3450,7 @@ mod tests {
             false,
             false,
             true,
+            None,
             &Policy::default(),
             None,
             None,
@@ -3453,6 +3481,7 @@ mod tests {
             false,
             false,
             false,
+            None,
             &Policy::default(),
             None,
             None,
@@ -3495,6 +3524,7 @@ mod tests {
             false,
             false,
             false,
+            None,
             &Policy::default(),
             None,
             None,
@@ -3507,5 +3537,171 @@ mod tests {
             "ordinary AUR versions must not trip R05, got {:?}",
             verdict.findings
         );
+    }
+    /// `[blocklist] maintainers` parsed, validated, and was then never read:
+    /// `is_maintainer_blocked` had no caller outside its own test. A policy
+    /// asserting a protection got none, silently. A release published by a
+    /// blocklisted identity must now block.
+    #[test]
+    fn blocked_maintainer_blocks_the_release() {
+        let policy = Policy::from_toml_str(
+            r#"
+[blocklist]
+maintainers = ["badactor@example.com"]
+"#,
+        )
+        .unwrap();
+        let delta = Delta {
+            baseline_version: Some("1.0.0".into()),
+            target_version: "1.0.1".into(),
+            files_added: vec![],
+            files_removed: vec![],
+            files_modified: vec![],
+            total_lines_added: 0,
+            total_lines_deleted: 0,
+            new_executables: vec![],
+            new_binaries: vec![],
+            modified_binaries: vec![],
+            new_lifecycle_scripts: vec![],
+            modified_lifecycle_scripts: vec![],
+            new_dependencies: vec![],
+            modified_dependencies: vec![],
+            removed_dependencies: vec![],
+            binding_gyp_added: false,
+        };
+        let verdict = evaluate_with_trust(
+            "pkg",
+            Ecosystem::Npm,
+            "verified (sha512)",
+            &delta,
+            false,
+            false,
+            false,
+            false,
+            Some("badactor@example.com"),
+            &policy,
+            None,
+            None,
+        );
+        assert_eq!(verdict.band, VerdictBand::Block);
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "P04_MAINTAINER_BLOCKED"),
+            "expected P04_MAINTAINER_BLOCKED, got {:?}",
+            verdict
+                .findings
+                .iter()
+                .map(|f| &f.rule_id)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Identity comparison is case- and whitespace-insensitive on both sides,
+    /// so a blocklist entry cannot be sidestepped by capitalisation.
+    #[test]
+    fn blocked_maintainer_match_ignores_case_and_padding() {
+        let policy = Policy::from_toml_str(
+            r#"
+[blocklist]
+maintainers = ["  BadActor@Example.com "]
+"#,
+        )
+        .unwrap();
+        let delta = Delta {
+            baseline_version: Some("1.0.0".into()),
+            target_version: "1.0.1".into(),
+            files_added: vec![],
+            files_removed: vec![],
+            files_modified: vec![],
+            total_lines_added: 0,
+            total_lines_deleted: 0,
+            new_executables: vec![],
+            new_binaries: vec![],
+            modified_binaries: vec![],
+            new_lifecycle_scripts: vec![],
+            modified_lifecycle_scripts: vec![],
+            new_dependencies: vec![],
+            modified_dependencies: vec![],
+            removed_dependencies: vec![],
+            binding_gyp_added: false,
+        };
+        let verdict = evaluate_with_trust(
+            "pkg",
+            Ecosystem::Npm,
+            "verified (sha512)",
+            &delta,
+            false,
+            false,
+            false,
+            false,
+            Some("badactor@example.com"),
+            &policy,
+            None,
+            None,
+        );
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "P04_MAINTAINER_BLOCKED"),
+            "a padded, differently-cased blocklist entry must still match"
+        );
+    }
+
+    /// An unlisted identity, and an absent identity, must both stay clean. A
+    /// registry that exposes no authorship is a disclosed no-signal, not a
+    /// finding and not a block.
+    #[test]
+    fn unlisted_or_absent_author_is_not_a_finding() {
+        let policy = Policy::from_toml_str(
+            r#"
+[blocklist]
+maintainers = ["badactor@example.com"]
+"#,
+        )
+        .unwrap();
+        let delta = Delta {
+            baseline_version: Some("1.0.0".into()),
+            target_version: "1.0.1".into(),
+            files_added: vec![],
+            files_removed: vec![],
+            files_modified: vec![],
+            total_lines_added: 0,
+            total_lines_deleted: 0,
+            new_executables: vec![],
+            new_binaries: vec![],
+            modified_binaries: vec![],
+            new_lifecycle_scripts: vec![],
+            modified_lifecycle_scripts: vec![],
+            new_dependencies: vec![],
+            modified_dependencies: vec![],
+            removed_dependencies: vec![],
+            binding_gyp_added: false,
+        };
+        for author in [None, Some("gooddev@example.com")] {
+            let verdict = evaluate_with_trust(
+                "pkg",
+                Ecosystem::Npm,
+                "verified (sha512)",
+                &delta,
+                false,
+                false,
+                false,
+                false,
+                author,
+                &policy,
+                None,
+                None,
+            );
+            assert!(
+                !verdict
+                    .findings
+                    .iter()
+                    .any(|f| f.rule_id == "P04_MAINTAINER_BLOCKED"),
+                "author {author:?} must not produce P04"
+            );
+        }
     }
 }
