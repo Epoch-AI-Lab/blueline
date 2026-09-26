@@ -7,6 +7,360 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- A yanked PyPI release now shows the registry's stated reason on the card
+  instead of only that a withdrawal happened. The reason was fetched and dropped
+  at the `Release` conversion, so R08/R09 could report "yanked" with no cause.
+  Remote text is sanitized to a single line and bounded before it reaches a
+  terminal; a release yanked with PEP 592's bare `true` now reads "no reason
+  published" rather than implying a cause it does not have.
+- `[provenance] require_signatures` is satisfiable on the npm lane. The key
+  gated on a registry signature block that was never read from the packument, so
+  setting it blocked every npm review unconditionally: fail-closed, but a check
+  that could never pass. The block is now read for the resolved version and
+  reaches the provenance report. Presence is still all that is checked — nothing
+  verifies the signature, and the card still says "not verified".
+
+### Removed
+- `BaselineResolution::display_summary`, which had no caller outside its own
+  test.
+- The extraction section of `ARCHITECTURE.md` claimed a Landlock sandbox,
+  capability drop, seccomp filter and open-FD cap. No such code exists and
+  `Cargo.lock` carries none of those crates. The claim is now marked as planned
+  and the document says plainly that the parser-level budget is what bounds a
+  hostile archive today.
+
+- The MCP stdio server validates the JSON-RPC `jsonrpc` member. `"jsonrpc":"1.0"`,
+  or a request with the member absent, was accepted; 2.0 is now required and a
+  bad request gets the existing parse-error response without killing the
+  server.
+- An OSV advisory's declared `severity[].type` is now read. A CVSS v2 vector is
+  the one score string with no self-identifying prefix, so the declared type
+  was the only thing that said how to read it; v2 vectors were silently
+  unscored. v2 base scores are computed per the v2.0 equation and checked
+  against NVD reference vectors. When a source declares its own severity band
+  *and* carries a score, the strongest of the two now wins, where the score
+  path previously returned first and could under-report a source that labelled
+  itself CRITICAL. CVSS v4 is still unscored and falls through as before.
+- The PyPI Simple API is paginated in reality and `meta.next` was parsed and
+  ignored, so a truncated page was indistinguishable from a complete one. A
+  release whose live artifact sat on page two was reported as having only its
+  withdrawn file. Pages are now walked, with a single byte budget across the
+  walk, a 16-page cap, loop detection, and a same-scheme-and-host check on
+  every `next` link. A chain that outlives the cap is an error, never a prefix.
+- A yanked PyPI release now carries the registry's stated reason instead of
+  dropping it, so R08/R09 can explain a withdrawal rather than only reporting
+  that one happened.
+- `[provenance] allowed_builders` is enforced. It parsed, validated, and was
+  then never read, so a policy pinning trusted Sigstore builders asserted a
+  restriction and applied none. A release naming a builder outside the list is
+  now `P03_UNAUTHORIZED_BUILD_BUILDER` at Block, mirroring
+  `allowed_repositories`.
+- `[policy] allow_git_dependencies` is wired. It was also parsed and never read.
+  The non-semver dependency findings are now lowered from High to Medium when it
+  is set, never suppressed: the finding stays visible and its description says
+  policy lowered it. Medium rather than Low, because a Low finding is
+  score-neutral and would render as a clean auto-approve, hiding the dependency
+  behind a passing verdict.
+
+### Removed
+- `Policy::calculate_band`, which had no caller outside its own test and
+  disagreed with the live band ladder: it was a pure function of score, while
+  the production ladder is monotonic and never lowers an already-raised band. A
+  package with one High finding and 25 points is High in production and Medium
+  through `calculate_band`. Wiring it in as written would have silently weakened
+  severity. The two identical inline copies of the ladder are now one shared
+  helper, so they cannot drift.
+- Dead code that made the codebase look safer than it was: `Delta::is_empty`
+  (zero callers, and its semantics were wrong for an "unchanged" check anyway),
+  `DiskFileMeta.size` (written, never read, already re-derived by
+  `classify_bytes`), an unused wheel test helper, and an unreferenced
+  `ci::render_text_summary` print wrapper.
+- Three `#[allow(dead_code)]` suppressions that were hiding live checks from
+  the compiler: `Packument.name` (guards `validate_package_name`),
+  `AurRpcResponse.version` (guards the RPC protocol version), and
+  `Delta.binding_gyp_added` (drives a Block-severity native-build trigger), plus
+  a blanket suppression on `PackageJson`. If any of those checks were deleted,
+  the build would have stayed silent.
+
+- `[blocklist] maintainers` now blocks. The key parsed, validated, and was then
+  never read: `is_maintainer_blocked` had no caller outside its own test, so a
+  policy could assert a protection and silently get none. A release published by
+  a blocklisted identity is now a `P04_MAINTAINER_BLOCKED` block. The AUR
+  adapter also reads the maintainer the RPC declares as a second identity
+  channel, so a package whose clone cannot be pinned is no longer invisible to
+  the blocklist.
+
+- npm and cargo reviews now bind the name the archive declares to the name the
+  registry resolved. Only the AUR lane checked, and the check is the one that
+  matters: `package_json_path` descends into a single top-level directory, so
+  a tarball rooted at `evil/` was read as `evil/package.json` and the name it
+  declared was discarded. The allowlist, the blocklist and the baseline key are
+  all keyed on the resolved name while the bytes that install are the
+  attacker's, so a package that lied about its own identity passed exact-match
+  allowlisting. A manifest with no `name` at all, which deserialised to `""`
+  through `#[serde(default)]`, reviewed cleanly and is now refused.
+
+- `blueline recall sync` no longer writes through a planted symlink. The
+  temporary file was named after the process id, so its path was fully
+  predictable and `fs::write` follows a symlink: a link in the data
+  directory turned a sync into an overwrite of any file the user could
+  write. The write now goes to an `O_EXCL` tempfile, is flushed, and is
+  renamed into place.
+- Concurrent `recall sync` runs are serialised by a lock spanning the
+  read-compare-write. Two syncs could both pass the sequence check and
+  then land out of order, leaving a stale snapshot in place. A sync that
+  cannot take the lock within five seconds now fails loudly instead of
+  racing.
+- The recall snapshot cache is keyed by path as well as timestamp, and
+  carries the file length. A `OnceLock` froze at the first snapshot it
+  saw, so the cache stopped hitting exactly when the file changed, and
+  two data directories sharing a timestamp could serve each other's
+  index.
+
+- A `.SRCINFO` that declares the same dependency twice now keeps both
+  expressions. A split package repeats the pkgbase `depends` inside its own
+  `pkgname` block, and the parser overwrote rather than merged, so a
+  constraint could change invisibly. The union is sorted and deduped, so an
+  unchanged set renders identically on both sides of a diff. The existing
+  test asserted the last expression read, which was the defect.
+
+- AUR dependency changes are now read from the PKGBUILD as well as the
+  committed `.SRCINFO`. The dependency delta came from `.SRCINFO` alone,
+  while `makepkg` executes the PKGBUILD, so a release could add
+  `depends=('backdoor-git')` to the PKGBUILD, leave `.SRCINFO` untouched,
+  and produce no finding at all. `R29_PKGBUILD_DEPENDS_NOT_IN_SRCINFO` fires
+  at HIGH when the PKGBUILD names a dependency the `.SRCINFO` does not. Split
+  packages (`depends_<pkgname>`) are in scope, since comparing only the bare
+  `depends` array would fire on every one of them. The rule lives in
+  `review_roots` rather than `check` so the 139-fixture benign corpus gate,
+  which has no `.SRCINFO`, stays as it was.
+
+- A lockfile entry's declared `name` is no longer trusted over its address. A
+  different name at the same `node_modules/...` key and version was counted
+  unchanged, so the new package was never evaluated. Under `node_modules`, a
+  declared name that differs from the directory is an npm alias, and npm
+  records the real source in `resolved`, so the two must now agree; a
+  mismatch, or a mismatch with no `resolved` at all, fails closed. Every
+  honest alias still parses.
+
+- `blueline ci` on a requirements file no longer ignores options that change
+  which packages pip installs. `-r`, `-e`, `-c`, `--index-url`,
+  `--extra-index-url`, `--find-links` and friends were skipped, so the gate
+  reviewed the pinned lines and certified a graph that was never the one
+  installed. They are refused, per token, so a flag trailing a spec is caught
+  too. `[ci] allow_requirements_options = true` opts in for mirrored-index
+  files, which is a real pattern; the test that previously asserted the
+  options were skipped was pinning the defect.
+
+- The SSRF guard now runs where the hostname becomes an address. It resolved
+  a name once for validation while the HTTP client resolved it again for the
+  connection, so a name answering publicly and then privately passed the check
+  and connected to loopback, RFC1918, or a metadata address. The registry
+  agent now carries a validating resolver, so the address that is checked and
+  the address that is connected to are the same answer by construction. No new
+  dependency: `ureq` already exposes a resolver seam. Addresses are validated
+  per call rather than pinned, because the agent is long-lived in the MCP
+  server. The configured registry base stays exempt, since pointing a review
+  at a local fixture registry is supported.
+
+- A `ci.fail_on` typo now refuses the policy instead of weakening the gate.
+  `fail_on = "blockk"` parsed fine and fell back to `HIGH`, so a policy meant
+  to block turned into one that failed at high. The `--fail-on` flag already
+  refused the same spelling; the policy key did not. Band parsing is now one
+  shared function used by both.
+- `R04_DEPENDENCY_MODIFIED` fires on a range-to-range dependency change, not
+  only when the new value is a URL. A plain `1.4.1` to `1.4.2` produced no
+  finding of any band, which is the shape a dependency-takeover payload takes
+  when the attacker re-pins to a compromised patch release. It is disclosed at
+  `LOW`, which is score-neutral and cannot move a verdict, because a benign
+  patch bump is the common case and this fires on every one of them. Moving
+  off a URL is now covered as the mirror of the redirect it already caught.
+- The diff engine no longer aborts on a non-UTF-8 filename. Trees were keyed
+  by a lossy string and that string was joined back onto the root to read the
+  file, so any name with invalid UTF-8 failed the whole review with "No such
+  file or directory", and two names differing only in those bytes collided
+  into one. Trees are keyed by path now; the report fields still carry a
+  display string.
+
+- `fail_closed_network` now stops the review. A failed advisory lookup was
+  collapsed into an `unverified` report, which carries no hits, so the
+  heuristic produced no finding and the verdict came out identical to a clean
+  pass. It is now `R09_ADVISORY_UNVERIFIED` at HIGH, raised at the boundary
+  that discarded it so `review`, `ci`, `agent` and `mcp` all inherit it. A
+  check that is merely switched off by policy stays silent, so `check_advisories
+  = false` is unaffected. The flag also outranks the cached report now: a
+  stale CLEAN cache entry produced neither a hit nor a staleness disclosure,
+  so it read exactly like a fresh clean pass.
+
+- `blueline install` no longer takes its program from `npm_execpath`. That
+  variable decides which binary runs, and it is environment-supplied;
+  `TODO.md` already records it as user-controllable and unfit for a security
+  decision, but the install path was built to trust it. `NODE` chose the
+  interpreter for the same reason. The real npm is now resolved from PATH
+  through the same helper the shims use, which also excludes the shim
+  directory so a shimmed PATH cannot recurse. When no real npm is found the
+  install fails rather than falling back.
+- The install path also read its environment with `vars()`, which panics on a
+  non-UTF-8 entry, and now uses `vars_os()`.
+
+- The MCP stdio server bounds its request lines and survives a bad one. It
+  read with `lines()`, which has no per-line cap, so a request containing no
+  newline grew without limit; and a non-UTF-8 line broke the loop into a
+  clean exit 0, telling the host the gate had succeeded while an in-flight
+  request went unanswered. Lines are now capped at 64 KiB (an oversized one
+  is answered and the server exits nonzero, since newline framing cannot be
+  resynchronised) and a non-UTF-8 line is answered with a parse error while
+  the server keeps serving.
+
+- Provenance is no longer reported as verified when nothing was verified.
+  Blueline base64-decoded the in-toto statement, compared the subject digest
+  to the bytes under review, and returned `Verified` with a hardcoded SLSA
+  level 3. No DSSE signature and no Sigstore certificate chain was ever
+  checked, yet `require_provenance` accepted the result and the card rendered
+  it green. The status is now `Attested` with no earned level, the renderer
+  says the signature is not verified, and `require_provenance` requires
+  actual cryptographic verification, which this build does not perform and
+  therefore refuses. **Behaviour change:** a policy with
+  `require_provenance = true` now blocks every release until Sigstore
+  verification is implemented, which needs a dependency that has not been
+  approved. An attestation that no policy requires is disclosed at `LOW`,
+  which cannot move a verdict.
+
+- Opening the store now checks the declared shape of the columns whose
+  default decides trust, not only their names. `record_verified` never
+  supplies `clean`, so a database declaring `clean INTEGER NOT NULL
+  DEFAULT 1` would write a package nobody approved straight into the set
+  that `list_clean_versions` hands back as an approved baseline, while
+  every column name still checked out. `known_clean.clean` and
+  `provenance_cache.signature_valid` are now required to be `INTEGER NOT
+  NULL DEFAULT 0`; the default is parsed as an integer so `''`, `NULL`,
+  `'yes'` and a parenthesised `(0)` are refused too.
+- Tar extraction refuses a repeated path and a directory entry that declares
+  a payload. A repeated path was unpacked twice and the second copy
+  overwrote the first, so the tree blueline diffed depended on entry order;
+  the check is on the normalized path, since `a/b` and `a//b` are the same
+  destination. A directory's declared bytes were decompressed in full while
+  counting as zero against every cap, and no tar writer emits them.
+
+- The PKGBUILD tokenizer no longer loses the rest of a file to a parameter
+  expansion. `${#N}` and `${x#prefix}` are shell expansions, but a `#` after
+  `{` was read as the start of a comment, which both truncated the line and
+  left the brace uncounted. The unbalanced depth counter then swallowed every
+  later top-level assignment into the first function body, so R11 through R20
+  all went dark on a PKGBUILD that skips checksum verification, with no
+  disclosure. Both the comment stripper and the function-body extractor now
+  track `${...}` as one unit.
+
+- The npm dogfood CI gate no longer swallows a real risk verdict. The scan
+  step runs with `continue-on-error` because this repo legitimately BLOCKs on
+  itself, but the health script only checked which packages were evaluated,
+  never the bands, so a HIGH or BLOCK finding in an otherwise healthy delta
+  reported success. The report is now gated on its own findings.
+- The mutation-testing aggregate fails instead of reporting `skipped`. Without
+  `always()` plus an explicit result check, GitHub skips the job when a shard
+  fails, and a skipped required check counts as satisfied.
+- The cargo dogfood job reads the base ref through the environment instead of
+  `${{ }}` interpolation, and reads the full changed-file list before matching,
+  so a branch named `main$(id)` cannot inject a command and a `git diff |
+  grep -q` SIGPIPE under `pipefail` can no longer skip the gate.
+
+- The install scanner no longer lets four classes of registry redirect
+  through: npm alias schemes `file:`, `link:`, `npm:` and `workspace:`
+  (which name a payload no registry vouches for, and which previously
+  matched no rule and were dropped entirely), `pip` redirect flags in
+  `--flag=value` form (npm already handled `=`, pip did not, so
+  `--index-url=https://...` was reviewed against PyPI and installed from
+  the attacker's index), `npm ci`, and `cargo --registry`. All are now
+  denied on shape before any operand is resolved.
+
+- `agent gate` no longer panics on a non-UTF-8 environment variable. It read
+  the environment with `std::env::vars()`, which unwraps every entry, so one
+  odd variable exited 101 — and hook hosts treat any exit other than 2 as
+  non-blocking, meaning the install would have run ungated. Names now come
+  from `vars_os` converted lossily, so the gate denies with its documented code.
+- The heuristic engine no longer panics on a multi-byte dependency value. The
+  non-semver-URL check byte-sliced the value by prefix length, so any manifest
+  carrying a dependency such as `"💩"` crashed the whole review instead of
+  returning a verdict. The comparison is a bounds-checked byte-slice now.
+- Recall lookups fold case for npm and crates.io, not only validation. A
+  curator writing `React` or `Serde` produced an entry that validated and then
+  never matched the queried name, which is the worst shape a revocation can
+  take: present, trusted, and inert. AUR pkgbases stay case-sensitive.
+- The registry agent keeps a whole-request deadline again. Dropping it for
+  per-read timeouts fixed a 90-second stall but left total transfer time
+  unbounded, because a peer dribbling one byte per interval keeps every read
+  inside its own ceiling. The 10s connect ceiling and the 90s total both
+  remain; `ureq` 2.x cannot express a short stall guard and a long budget at
+  once.
+- The AUR test fixture clones over a `file://` URL instead of a bare local
+  path. Git ignores `--depth` on a local clone and falls back to copying loose
+  objects one at a time, so `history_walk_caps_at_200_commits_and_states_truncation`
+  failed roughly one run in twelve with `failed to copy file to
+  .git/objects/...`. Over a real transport git honours the depth and fetches a
+  packfile, which is what the adapter does against the AUR itself. Thirty
+  consecutive runs pass, up from eleven in twelve. The clone-URL pin test also
+  gained a sibling-base case, since a base that only shares a prefix must not
+  pass the pin.
+- Opening the store now verifies the schema itself instead of trusting
+  `PRAGMA user_version`. A database file carrying the right version counter
+  with the wrong shape behind it opened successfully and then failed partway
+  through a review with a confusing missing-column error. Every table and
+  column the store queries is checked on open, the check is unconditional, and
+  the refusal names the file and what is missing so a user knows what to move
+  aside. The version-counter guess it replaces also decided lost migration
+  races, which the schema check now decides directly.
+- `agent gate` now refuses an unreviewable invocation shape before it resolves
+  any operand. A command carrying a registry override (or any other hard-deny
+  shape) used to be scanned, then still reviewed, downloading tarballs from the
+  registry the command was explicitly redirecting away from and writing
+  evidence rows for an install that never ran. The denial is unchanged and
+  still exit 2; only the wasted and misleading work is gone.
+- Registry requests no longer stall for 90 seconds against a peer that accepts
+  the connection and then goes quiet. All four adapters share one agent with a
+  10s connect ceiling and a 30s per-read/write ceiling. No whole-request
+  timeout is set, because `ureq` lets it override the per-operation values, and
+  response size stays bounded by `RegistryLimits` as before.
+- Concurrent first runs against one data directory no longer fail. `record_verified`
+  inserts-then-verifies rather than checking-then-inserting, which removed a
+  primary-key collision between two reviewers recording the same package; the
+  schema check above absorbs the matching creation race.
+- The unreviewed-baseline refusal hint now names the
+  `allow_unreviewed_baseline = true` policy rule alongside the
+  predecessor-approval command, and warns that walking the chain costs one run
+  per version back. The README quickstart documents the same onboarding path.
+- Recall snapshots validate each entry's package name against its own
+  ecosystem grammar instead of a shared character class, so a path-shaped name
+  such as `../etc` is refused instead of served. npm names are compared
+  case-insensitively, since npm folds case on publish and packages published
+  before that rule still carry capitals; otherwise a single legacy spelling
+  would refuse the whole index and silently stop every revocation in it from
+  blocking.
+
+### Changed
+
+- `AGENTS.md` and `ARCHITECTURE.md` now state the defect policy explicitly:
+  a bug is fixed even when it predates the branch, "pre-existing" is not a
+  reason to leave it live, and a fix without a test that fails without it is
+  a guess. Both record why, using this store bug as the worked example.
+
+
+- Docs refresh: `ROADMAP.md` marks the local-first recall index shipped
+  (hosted API stays under Someday); `ARCHITECTURE.md` drops the stale
+  Phase-0/1 notes, lists the full R00–R28 heuristic inventory, and records
+  the recursion (D12), local-first recall (D13), and agent-enforcement
+  (D14) decisions.
+- Mutation testing now covers the verdict path: `heuristic.rs`, `diff.rs`,
+  `advisory.rs`, `provenance.rs`, `verdict.rs`, and the crates.io / AUR /
+  `http_util` / registry-mod files join the `--file` scope in both mutants
+  jobs.
+- The `blueline-ci` composite action downloads the checksum-verified
+  prebuilt release binary (new `version` input, default `latest`) instead
+  of `cargo run --release` on every run; `build-from-source: true`
+  preserves the source build for unreleased code, and this repo's dogfood
+  job pins it.
+
 ## [0.3.1] - 2026-09-21
 
 ### Added

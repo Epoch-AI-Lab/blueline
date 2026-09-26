@@ -57,4 +57,4 @@ they get built only when there's demand for them.
 - [x] npm/npx CLI wrapper
 - [x] GitHub Action + CI check
 - [x] MCP tool (agent hook)
-- [ ] Revocation index + recall API
+- [x] Revocation index + recall API (local-first, self-hostable; hosted API stays in Someday)

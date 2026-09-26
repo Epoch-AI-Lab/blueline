@@ -76,6 +76,9 @@ jobs:
         id: scan
         continue-on-error: true
         with:
+          # PR code is unreleased, so the action must build it from source:
+          # downloading the latest release binary would scan with stale logic.
+          build-from-source: true
           # First-party packages legitimately ship binaries and process-exec
           # primitives with no registry baseline, so fail-closed scanning
           # reports BLOCK on ourselves and CI runners keep no approval store.
@@ -108,14 +111,31 @@ jobs:
           # never gated.
           unknown = names - expected
           assert not unknown, f"scanner evaluated unknown packages: {unknown}"
+
+          # continue-on-error above is deliberate (we BLOCK on ourselves), so
+          # the report is the only place a real risk verdict is visible. A BLOCK
+          # in a delta that is otherwise healthy is a genuine finding and must
+          # fail here, or the gate reports success while reviewing nothing.
+          blocking = [
+              (i["name"], i["new_version"], i["verdict"]["band"])
+              for i in r["items"]
+              if i["verdict"]["band"] in ("HIGH", "BLOCK")
+          ]
+          for name, version, band in blocking:
+              print(f"  !! {name}@{version}: {band}")
+
           if r["total_evaluated"] == 0:
               print("dogfood scanner healthy: empty lockfile delta, nothing to evaluate")
-              sys.exit(0)
+          else:
+              print(f"dogfood scanner healthy: evaluated {r['total_evaluated']}, "
+                    f"unchanged {r['unchanged_count']}, max band {r['max_band']}")
+              for item in r["items"]:
+                  print(f"  {item['name']}@{item['new_version']}: {item['verdict']['band']}")
 
-          print(f"dogfood scanner healthy: evaluated {r['total_evaluated']}, "
-                f"unchanged {r['unchanged_count']}, max band {r['max_band']}")
-          for item in r["items"]:
-              print(f"  {item['name']}@{item['new_version']}: {item['verdict']['band']}")
+          assert not blocking, (
+              "dogfood gate: our own distribution produced "
+              f"{len(blocking)} HIGH/BLOCK findings: {blocking}"
+          )
           EOF
       - uses: actions/upload-artifact@v4
         if: always()
@@ -134,9 +154,18 @@ jobs:
       - uses: swatinem/rust-cache@v2
       - name: Check Cargo.lock changed vs base
         id: changed
+        env:
+          BASE_BRANCH: ${{ github.base_ref }}
         run: |
-          BASE="origin/${{ github.base_ref }}"
-          if git diff --name-only "$BASE"...HEAD | grep -qE '(^|/)Cargo\.lock$'; then
+          # The base ref reaches the shell through the environment, never
+          # through `${{ }}` interpolation: a branch may legally be named
+          # something like `main$(id)`, and an interpolated one would run.
+          BASE="origin/$BASE_BRANCH"
+          # Read the whole list before matching. `git diff | grep -q` can take
+          # SIGPIPE under `pipefail` once grep has its answer, which turns a
+          # lockfile change into a silent skip of the cargo gate.
+          CHANGED="$(git diff --name-only "$BASE"...HEAD)"
+          if printf '%s\n' "$CHANGED" | grep -qE '(^|/)Cargo\.lock$'; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
@@ -144,8 +173,10 @@ jobs:
           fi
       - name: Run blueline on Cargo.lock (cargo)
         if: steps.changed.outputs.changed == 'true'
+        env:
+          BASE_BRANCH: ${{ github.base_ref }}
         run: |
-          BASE_REF="origin/${{ github.base_ref }}"
+          BASE_REF="origin/$BASE_BRANCH"
           if git show "$BASE_REF:blueline.toml" > /tmp/base_blueline.toml 2>/dev/null; then
             POLICY_ARG="--policy /tmp/base_blueline.toml"
           else
@@ -194,6 +225,10 @@ jobs:
             --file src/mcp.rs --file src/install_ref.rs --file src/recursive.rs \
             --file src/agent.rs --file src/recall.rs --file src/shim.rs \
             --file src/pkgbuild.rs --file src/render.rs --file src/policy.rs \
+            --file src/heuristic.rs --file src/diff.rs --file src/advisory.rs \
+            --file src/provenance.rs --file src/verdict.rs \
+            --file src/registry/cratesio.rs --file src/registry/aur.rs \
+            --file src/registry/http_util.rs --file src/registry/mod.rs \
             --in-place --baseline=skip --timeout 30
       - uses: actions/upload-artifact@v4
         if: always()
@@ -204,11 +239,21 @@ jobs:
   mutants-pr-aggregate:
     name: Mutation testing (PR diff)
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    if: always() && github.event_name == 'pull_request'
     needs: [mutants-pr]
     steps:
-      - name: All shards passed
-        run: echo "All 16 mutation testing shards completed successfully."
+      # Without always(), GitHub SKIPS this job when any shard fails, and a
+      # skipped required check counts as satisfied. The result is then read
+      # explicitly so a failed, cancelled, or timed-out shard fails the gate.
+      - name: Every shard must have succeeded
+        env:
+          RESULT: ${{ needs.mutants-pr.result }}
+        run: |
+          if [ "$RESULT" != "success" ]; then
+            echo "::error::mutation testing shards reported '$RESULT'"
+            exit 1
+          fi
+          echo "All 16 mutation testing shards completed successfully."
 
   # Sharded across 16 parallel runners for push to main.
   mutants:
@@ -244,6 +289,10 @@ jobs:
             --file src/mcp.rs --file src/install_ref.rs --file src/recursive.rs \
             --file src/agent.rs --file src/recall.rs --file src/shim.rs \
             --file src/pkgbuild.rs --file src/render.rs --file src/policy.rs \
+            --file src/heuristic.rs --file src/diff.rs --file src/advisory.rs \
+            --file src/provenance.rs --file src/verdict.rs \
+            --file src/registry/cratesio.rs --file src/registry/aur.rs \
+            --file src/registry/http_util.rs --file src/registry/mod.rs \
             --in-place --baseline=skip --timeout 30
       - uses: actions/upload-artifact@v4
         if: always()

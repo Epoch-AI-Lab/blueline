@@ -10,7 +10,14 @@ use crate::store::BaselineStore;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProvenanceStatus {
-    Verified,
+    /// A build statement was published and its subject digest matched the
+    /// bytes under review. No DSSE signature and no Sigstore certificate chain
+    /// were checked, so this is not a statement about who built it.
+    Attested,
+    /// Reserved for a real Sigstore verification path, which needs a
+    /// dependency this project has not approved. Nothing produces it yet, and
+    /// `require_provenance` deliberately refuses everything short of it.
+    CryptographicallyVerified,
     Unverified,
     Missing,
     FailedMismatch,
@@ -60,7 +67,7 @@ impl ProvenanceReport {
 
     pub fn unverified(msg: &str) -> Self {
         Self {
-            status: ProvenanceStatus::Missing,
+            status: ProvenanceStatus::Unverified,
             slsa_level: 0,
             builder_id: None,
             source_repo: None,
@@ -192,8 +199,9 @@ pub fn parse_attestation_payload(
     }
 
     Ok(ProvenanceReport {
-        status: ProvenanceStatus::Verified,
-        slsa_level: 3,
+        status: ProvenanceStatus::Attested,
+        // No signature was checked, so no SLSA level is earned.
+        slsa_level: 0,
         builder_id,
         source_repo,
         commit_sha,
@@ -232,8 +240,10 @@ pub fn inspect_provenance(
         && let Ok(Some(cached)) = store.get_cached_provenance(Ecosystem::Npm, package, version)
     {
         return ProvenanceReport {
-            status: ProvenanceStatus::Verified,
-            slsa_level: cached.slsa_level,
+            status: ProvenanceStatus::Attested,
+            // Cached rows written before this change may carry a level that
+            // was never earned, so it is not read back.
+            slsa_level: 0,
             builder_id: cached.builder_id,
             source_repo: cached.source_repo,
             commit_sha: cached.commit_sha,
@@ -335,7 +345,7 @@ pub fn parse_pypi_provenance_json(
             {
                 had_attestations = true;
                 let mut report = parse_attestation_payload(&payload_b64, expected_integrity)?;
-                if report.status == ProvenanceStatus::Verified {
+                if report.status == ProvenanceStatus::Attested {
                     report.message = Some(
                         "PEP 740 attestation verified (crypto verification not performed)".into(),
                     );
@@ -353,7 +363,7 @@ pub fn parse_pypi_provenance_json(
     {
         had_attestations = true;
         let mut report = parse_attestation_payload(&payload_b64, expected_integrity)?;
-        if report.status == ProvenanceStatus::Verified {
+        if report.status == ProvenanceStatus::Attested {
             report.message =
                 Some("PEP 740 attestation verified (crypto verification not performed)".into());
             return Ok(report);
@@ -388,8 +398,10 @@ pub fn inspect_provenance_pypi(
         && let Ok(Some(cached)) = store.get_cached_provenance(Ecosystem::PyPi, package, version)
     {
         return ProvenanceReport {
-            status: ProvenanceStatus::Verified,
-            slsa_level: cached.slsa_level,
+            status: ProvenanceStatus::Attested,
+            // Cached rows written before this change may carry a level that
+            // was never earned, so it is not read back.
+            slsa_level: 0,
             builder_id: cached.builder_id,
             source_repo: cached.source_repo,
             commit_sha: cached.commit_sha,
@@ -422,7 +434,7 @@ pub fn inspect_provenance_pypi(
         if reader.read_to_string(&mut body).is_ok() {
             match parse_pypi_provenance_json(&body, expected_integrity) {
                 Ok(report) => {
-                    if report.status == ProvenanceStatus::Verified
+                    if report.status == ProvenanceStatus::Attested
                         && let Some(store) = store
                     {
                         let _ = store.record_provenance(
@@ -498,8 +510,10 @@ mod tests {
         let b64 = base64::engine::general_purpose::STANDARD.encode(intoto_json.as_bytes());
         let report = parse_attestation_payload(&b64, &expected).unwrap();
 
-        assert_eq!(report.status, ProvenanceStatus::Verified);
-        assert_eq!(report.slsa_level, 3);
+        assert_eq!(report.status, ProvenanceStatus::Attested);
+        // The fixture carries a matching subject digest and no signature, so
+        // no SLSA level is earned. This assertion used to be 3.
+        assert_eq!(report.slsa_level, 0);
         assert_eq!(
             report.builder_id.as_deref(),
             Some("https://github.com/actions/runner")
@@ -596,12 +610,95 @@ mod tests {
         );
 
         let report = parse_pypi_provenance_json(&bundle_json, &expected_sha256).unwrap();
-        assert_eq!(report.status, ProvenanceStatus::Verified);
+        assert_eq!(report.status, ProvenanceStatus::Attested);
         assert!(
             report
                 .message
                 .unwrap()
                 .contains("crypto verification not performed")
         );
+    }
+    #[test]
+    fn an_attestation_never_claims_an_slsa_level() {
+        // A statement with no signatures and no verification material at all
+        // must not come back claiming a build level.
+        let expected = ck("level-zero");
+        let statement = r#"{
+            "_type": "https://in-toto.io/Statement/v1",
+            "subject": [{"name": "pkg", "digest": {"sha512": "__HEX__"}}],
+            "predicateType": "https://slsa.dev/provenance/v0.1",
+            "predicate": {"builder": {"id": "https://github.com/actions/runner"}}
+        }"#;
+        let statement = statement.replace("__HEX__", &expected.value_hex);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(statement.as_bytes());
+        let report = parse_attestation_payload(&b64, &expected).unwrap();
+        assert_eq!(report.status, ProvenanceStatus::Attested);
+        assert_eq!(
+            report.slsa_level, 0,
+            "no signature was checked, so no level is earned"
+        );
+    }
+
+    #[test]
+    fn unverified_is_distinguishable_from_missing() {
+        let report = ProvenanceReport::unverified("boom");
+        assert_eq!(
+            report.status,
+            ProvenanceStatus::Unverified,
+            "a check that could not run is not the same as nothing being published"
+        );
+    }
+
+    /// What `registry_signature_present` is built from. The npm lane used to
+    /// pass no block at all, so this was `false` on every review and
+    /// `require_signatures` could never be satisfied there; it is presence
+    /// only, and never a verification.
+    #[test]
+    fn a_published_signature_block_marks_the_registry_signature_present() {
+        let signatures = serde_json::json!([
+            {"keyid": "SHA256:abc", "sig": "c2ln"},
+            {"keyid": "SHA256:def", "sig": "c2lnMg=="},
+        ]);
+        let report = inspect_provenance(
+            "pkg",
+            "1.0.0",
+            &ck("tarball"),
+            Some(&signatures),
+            "http://127.0.0.1:9",
+            None,
+            &Policy::default(),
+        );
+        assert!(
+            report.registry_signature_present,
+            "a published block is what satisfies require_signatures"
+        );
+        assert_eq!(
+            report.registry_signature_key_id.as_deref(),
+            Some("SHA256:abc")
+        );
+    }
+
+    /// No block, or one that is not a signature list, leaves the gate shut.
+    #[test]
+    fn an_absent_or_unusable_signature_block_leaves_the_gate_shut() {
+        for signatures in [
+            None,
+            Some(serde_json::json!({})),
+            Some(serde_json::json!([])),
+        ] {
+            let report = inspect_provenance(
+                "pkg",
+                "1.0.0",
+                &ck("tarball"),
+                signatures.as_ref(),
+                "http://127.0.0.1:9",
+                None,
+                &Policy::default(),
+            );
+            assert!(
+                !report.registry_signature_present,
+                "{signatures:?} must not satisfy require_signatures"
+            );
+        }
     }
 }

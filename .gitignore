@@ -16,3 +16,5 @@ marketing/
 packages/@kridaydave/binary-*/blueline
 packages/@kridaydave/binary-*/blueline.exe
 *.tgz
+
+.useit/

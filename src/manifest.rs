@@ -37,12 +37,13 @@ const LIFECYCLE_SCRIPTS: [&str; 22] = [
 ];
 
 /// Typed view of the extracted `package.json`. The `scripts` / dependency
-/// fields are attack surface — parsed strictly, never executed. The unused
-/// fields feed the Phase 1 heuristic (maintainer/dep/script delta); they are
-/// parsed now so the type is stable and validated.
+/// fields are attack surface — parsed strictly, never executed. `name` and
+/// `version` stay `String` under `#[serde(default)]` rather than `Option`, so
+/// an omitted field surfaces as an empty string the caller has to judge (the
+/// review step refuses an empty or mismatched declared *name*) instead of a
+/// `None` that reads as "nothing declared, nothing to check".
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
 pub struct PackageJson {
     #[serde(default)]
     pub name: String,
@@ -342,7 +343,22 @@ pub fn parse_aur_srcinfo(raw: &str) -> Result<SrcInfo, BluelineError> {
                         format!("line {lineno}: dependency `{value}` has no package name"),
                     )
                 })?;
-                deps.insert(name, value);
+                // Union, never overwrite. A split package repeats the
+                // pkgbase depends inside its own pkgname block, so a
+                // last-wins insert silently dropped every expression but the
+                // last one read, and a constraint could change invisibly.
+                // Sorted and deduped so an unchanged set renders identically on
+                // both sides of a diff and produces no spurious delta.
+                let merged = match deps.get(&name) {
+                    None => value,
+                    Some(prev) => {
+                        let mut set: std::collections::BTreeSet<&str> =
+                            prev.split_whitespace().collect();
+                        set.insert(value.as_str());
+                        set.into_iter().collect::<Vec<_>>().join(" ")
+                    }
+                };
+                deps.insert(name, merged);
             }
             _ => {}
         }
@@ -396,7 +412,7 @@ fn split_srcinfo_pair(line: &str, lineno: usize) -> Result<(String, String), Blu
 /// The package name of an AUR dependency expression
 /// (`go>=1.21`, `sqlite3`, `mesa=24.0`): everything before the first
 /// version-relation character.
-fn dep_name(dep: &str) -> Option<String> {
+pub(crate) fn dep_name(dep: &str) -> Option<String> {
     let name = dep.split(['<', '>', '=']).next()?.trim();
     if name.is_empty() {
         None
@@ -635,13 +651,46 @@ std = []
     }
 
     #[test]
+    fn srcinfo_keeps_every_expression_for_one_name() {
+        let src =
+            parse_aur_srcinfo("pkgbase = x\n\tpkgver = 1\n\tdepends = foo>=2.0\n\tdepends = foo\n")
+                .unwrap();
+        assert_eq!(src.deps["foo"], "foo foo>=2.0");
+    }
+
+    #[test]
+    fn srcinfo_depend_and_makedepend_do_not_overwrite_each_other() {
+        let src = parse_aur_srcinfo(
+            "pkgbase = x\n\tpkgver = 1\n\tdepends = git\n\tmakedepends = git>=2.30\n",
+        )
+        .unwrap();
+        assert_eq!(src.deps["git"], "git git>=2.30");
+    }
+
+    #[test]
+    fn srcinfo_union_is_order_independent() {
+        let a =
+            parse_aur_srcinfo("pkgbase = x\n\tpkgver = 1\n\tdepends = foo>=2.0\n\tdepends = foo\n")
+                .unwrap();
+        let b =
+            parse_aur_srcinfo("pkgbase = x\n\tpkgver = 1\n\tdepends = foo\n\tdepends = foo>=2.0\n")
+                .unwrap();
+        assert_eq!(
+            a.deps["foo"], b.deps["foo"],
+            "the diff must not depend on the order the file was written in"
+        );
+    }
+
+    #[test]
     fn parses_srcinfo_version_and_merged_deps() {
         let src = parse_aur_srcinfo(&sample_srcinfo()).unwrap();
         assert_eq!(src.pkgbase, "yay");
         assert_eq!(src.version, "12.4.2-1");
         assert_eq!(src.deps.len(), 3);
         assert_eq!(src.deps["go"], "go>=1.21");
-        assert_eq!(src.deps["pacman"], "pacman>=6.1");
+        // The fixture declares pacman twice; both expressions are kept. This used
+        // to assert the last one read, which is the defect.
+        assert_eq!(src.deps["pacman"], "pacman pacman>=6.1");
         assert_eq!(src.deps["git"], "git");
 
         let view = read_aur_srcinfo_view(&sample_srcinfo());

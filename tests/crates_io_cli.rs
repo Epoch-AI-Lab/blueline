@@ -76,19 +76,23 @@ fn serve(mut stream: TcpStream, routes: &Routes) {
 
 /// Build a gzipped tar shaped like a packed `.crate`: one top-level
 /// `{root_name}/` holding a Cargo.toml and a source file.
-fn make_crate_bytes(root_name: &str) -> Vec<u8> {
+/// `root_dir` is `{name}-{version}`, the single top-level directory a published
+/// crate is unpacked from. `package_name` is what `[package] name` declares,
+/// which is the bare crate name. A review refuses when the two disagree, so a
+/// fixture cannot reuse the directory name for both.
+fn make_crate_bytes(root_dir: &str, package_name: &str) -> Vec<u8> {
     let encoder = flate2::write::GzEncoder::new(Vec::new(), Compression::default());
     let mut builder = tar::Builder::new(encoder);
-    let manifest = format!("[package]\nname = \"{root_name}\"\nedition = \"2021\"\n");
+    let manifest = format!("[package]\nname = \"{package_name}\"\nedition = \"2021\"\n");
     append_file(
         &mut builder,
-        &format!("{root_name}/Cargo.toml"),
+        &format!("{root_dir}/Cargo.toml"),
         manifest.as_bytes(),
         false,
     );
     append_file(
         &mut builder,
-        &format!("{root_name}/src/lib.rs"),
+        &format!("{root_dir}/src/lib.rs"),
         b"pub fn f() {}\n",
         false,
     );
@@ -178,7 +182,7 @@ fn install_refuses_cargo_before_any_network_use() {
 fn review_cargo_first_sighting_renders_ecosystem_and_sha256() {
     let name = "serde-json";
     let version = "1.0.210";
-    let crate_bytes = make_crate_bytes(&format!("{name}-{version}"));
+    let crate_bytes = make_crate_bytes(&format!("{name}-{version}"), name);
     let cksum = sha256_hex(&crate_bytes);
 
     let fixture = Fixture::spawn(move |base| Routes {
@@ -233,9 +237,9 @@ fn review_cargo_skips_yanked_predecessor_and_emits_r08() {
     let name = "yanker";
     let target = "1.0.2";
     // Immediate prior (1.0.1) is yanked; the diff anchor falls back to 1.0.0.
-    let c0 = make_crate_bytes(&format!("{name}-1.0.0"));
-    let c1 = make_crate_bytes(&format!("{name}-1.0.1"));
-    let c2 = make_crate_bytes(&format!("{name}-{target}"));
+    let c0 = make_crate_bytes(&format!("{name}-1.0.0"), name);
+    let c1 = make_crate_bytes(&format!("{name}-1.0.1"), name);
+    let c2 = make_crate_bytes(&format!("{name}-{target}"), name);
 
     let fixture = Fixture::spawn(move |base| Routes {
         config: format!(r#"{{"dl":"{base}","api":"{base}"}}"#),
@@ -291,7 +295,7 @@ fn review_cargo_skips_yanked_predecessor_and_emits_r08() {
 fn review_cargo_rejects_checksum_mismatch() {
     let name = "badsum";
     let version = "0.1.0";
-    let crate_bytes = make_crate_bytes(name);
+    let crate_bytes = make_crate_bytes(name, name);
     let wrong_cksum = "b".repeat(64);
 
     let fixture = Fixture::spawn(move |base| Routes {
@@ -324,7 +328,7 @@ fn review_cargo_rejects_wrong_root_directory() {
     let name = "roothijack";
     let version = "2.0.0";
     // Valid checksum, but the archive unpacks to a different root name.
-    let crate_bytes = make_crate_bytes("totally-other-2.0.0");
+    let crate_bytes = make_crate_bytes("totally-other-2.0.0", "totally-other");
 
     let fixture = Fixture::spawn(move |base| Routes {
         config: format!(r#"{{"dl":"{base}"}}"#),

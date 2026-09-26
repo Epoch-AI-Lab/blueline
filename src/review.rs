@@ -245,21 +245,30 @@ fn evaluate_with_registry<V: VersionInfo>(
         _ => None,
     };
 
-    let advisories = crate::advisory::fetch_advisories(
+    // The error is kept rather than collapsed into the report. An operator who
+    // set `fail_closed_network` asked for exactly this to stop the review, and
+    // as an `unverified` report it produced no finding at all, so the verdict
+    // came out the same as a clean advisory pass. It becomes a finding below.
+    let (advisories, advisory_error) = match crate::advisory::fetch_advisories(
         &target_pkg.name,
         &target_pkg.version,
         ecosystem,
         Some(store),
         policy,
-    )
-    .unwrap_or_else(|e| crate::advisory::AdvisoryReport::unverified(&e.to_string()));
+    ) {
+        Ok(report) => (report, None),
+        Err(e) => (
+            crate::advisory::AdvisoryReport::unverified(&e.to_string()),
+            Some(e.to_string()),
+        ),
+    };
 
     let provenance = match ecosystem {
         Ecosystem::Npm => Some(crate::provenance::inspect_provenance(
             &target_pkg.name,
             &target_pkg.version,
             &checksum,
-            None,
+            registry.release_signatures(&target_pkg).as_ref(),
             &registry_base,
             Some(store),
             policy,
@@ -285,15 +294,15 @@ fn evaluate_with_registry<V: VersionInfo>(
         Ecosystem::Aur => None,
     };
 
+    let target_author = registry.release_author(&target_pkg);
     let author_changed = {
-        let target_author = registry.release_author(&target_pkg);
         let baseline_author = baseline_res
             .resolution
             .package()
             .and_then(|p| registry.release_author(p));
         // Unknown authorship on either side is "no signal", never a finding.
         matches!(
-            (baseline_author, target_author),
+            (baseline_author, target_author.clone()),
             (Some(base), Some(target)) if base != target
         )
     };
@@ -305,8 +314,11 @@ fn evaluate_with_registry<V: VersionInfo>(
         &delta,
         is_unreviewed,
         baseline_res.prior_release_yanked,
+        baseline_res.prior_yanked_reason.as_deref(),
         baseline_res.target_release_yanked,
+        baseline_res.target_yanked_reason.as_deref(),
         author_changed,
+        target_author.as_deref(),
         policy,
         Some(&advisories),
         provenance.as_ref(),
@@ -353,6 +365,19 @@ fn evaluate_with_registry<V: VersionInfo>(
             };
             crate::heuristic::apply_extra_findings(&mut verdict, vec![finding], policy);
         }
+    }
+
+    if let Some(detail) = advisory_error {
+        let finding = crate::verdict::Finding {
+            rule_id: "R09_ADVISORY_UNVERIFIED".to_string(),
+            severity: crate::verdict::VerdictBand::High,
+            title: "Advisory source unavailable".to_string(),
+            description: format!(
+                "the advisory lookup failed and policy is configured to fail closed, so \
+                 revocation coverage for this release is unknown: {detail}"
+            ),
+        };
+        crate::heuristic::apply_extra_findings(&mut verdict, vec![finding], policy);
     }
 
     // Recursive review pass: every install reference the payload carries
@@ -510,6 +535,29 @@ fn prepare_extracted_root(
             }
         }
     };
+    // Every lane that parses a manifest from the archive must bind the name it
+    // declares to the name the registry resolved. `package_json_path` resolves
+    // through `find_package_prefix`, which descends into a single top-level
+    // directory, so a tarball rooted at `evil/` was read as `evil/package.json`
+    // and its declared name discarded. The allowlist, blocklist and baseline
+    // key are all evaluated against the resolved name while the installed
+    // bytes are the attacker's, which defeats exact-match allowlisting for a
+    // package that lies about its own identity.
+    if !matches!(ecosystem, Ecosystem::PyPi) && manifest.name != canonical_name {
+        return Err(crate::error::BluelineError::Manifest(
+            canonical_name.to_string(),
+            format!(
+                "archive manifest declares `{}` but the review resolved `{canonical_name}`; refusing to review",
+                manifest.name
+            ),
+        ));
+    }
+    if manifest.name.trim().is_empty() {
+        return Err(crate::error::BluelineError::Manifest(
+            canonical_name.to_string(),
+            "archive manifest declares an empty name; refusing to review".to_string(),
+        ));
+    }
     Ok((root, manifest))
 }
 
@@ -548,8 +596,24 @@ fn bootstrap_hint(verdict: &crate::verdict::Verdict) -> Option<String> {
         let base = &crate::render::sanitize_single_line(
             verdict.baseline_version.as_deref().unwrap_or("unknown"),
         );
+        let other_risk = verdict.findings.iter().any(|f| {
+            f.rule_id != "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+                && f.rule_id != "R06_FIRST_SIGHTING"
+                && f.severity > crate::verdict::VerdictBand::Low
+        });
+        let remedy = if other_risk {
+            "Address the findings above first; a baseline allowlist rule will not clear them."
+                .to_string()
+        } else {
+            format!(
+                "Run `blueline review {name}@{base}` to approve it, or add an [[allowlist.packages]] rule for this \
+                 package with `allow_unreviewed_baseline = true` to blueline.toml. Walking the chain one version \
+                 at a time works, but a package with a long release history needs one run per version back to the \
+                 first."
+            )
+        };
         Some(format!(
-            "hint: baseline `{name}@{base}` was never approved locally. Approve it when prompted during an interactive `blueline review`, or run `blueline review {name}@{base}` directly."
+            "hint: baseline `{name}@{base}` was never approved locally. {remedy}"
         ))
     } else if verdict
         .findings
@@ -1010,6 +1074,92 @@ fn package_json_path(root: &std::path::Path) -> std::path::PathBuf {
 mod tests {
     use super::*;
 
+    fn hint_verdict(findings: Vec<crate::verdict::Finding>) -> crate::verdict::Verdict {
+        crate::verdict::Verdict {
+            name: "pkg".to_string(),
+            target_version: "1.1.0".to_string(),
+            baseline_version: Some("1.0.0".to_string()),
+            integrity: "sha512:aa".to_string(),
+            ecosystem: crate::registry::Ecosystem::Npm,
+            band: crate::verdict::VerdictBand::Medium,
+            risk_score: 10,
+            findings,
+            diff_summary: crate::verdict::DiffSummary {
+                files_added: 0,
+                files_removed: 0,
+                files_modified: 0,
+                lines_added: 0,
+                lines_deleted: 0,
+            },
+            trust_sources: None,
+            recursive: Vec::new(),
+        }
+    }
+
+    fn finding(rule_id: &str, severity: crate::verdict::VerdictBand) -> crate::verdict::Finding {
+        crate::verdict::Finding {
+            rule_id: rule_id.to_string(),
+            severity,
+            title: rule_id.to_string(),
+            description: rule_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn bootstrap_hint_offers_the_policy_rule_only_when_nothing_else_is_wrong() {
+        let r07 = "R07_UNREVIEWED_PREDECESSOR_BASELINE";
+        let alone = bootstrap_hint(&hint_verdict(vec![finding(
+            r07,
+            crate::verdict::VerdictBand::Medium,
+        )]))
+        .expect("R07 always produces a hint");
+        assert!(
+            alone.contains("allow_unreviewed_baseline = true"),
+            "with only the missing baseline, the policy escape must be offered: {alone}"
+        );
+
+        // A real finding above Low rides along with R07 often enough that the
+        // hint must not send the user to a policy rule that cannot clear it.
+        for severity in [
+            crate::verdict::VerdictBand::Medium,
+            crate::verdict::VerdictBand::High,
+            crate::verdict::VerdictBand::Block,
+        ] {
+            let mixed = bootstrap_hint(&hint_verdict(vec![
+                finding(r07, crate::verdict::VerdictBand::Medium),
+                finding("R01_LIFECYCLE_SCRIPT_ADDED", severity),
+            ]))
+            .expect("R07 always produces a hint");
+            assert!(
+                !mixed.contains("allow_unreviewed_baseline = true"),
+                "{severity:?} alongside R07 must not advertise the escape: {mixed}"
+            );
+            assert!(
+                mixed.contains("Address the findings above first"),
+                "{severity:?} alongside R07 must point at the real risk: {mixed}"
+            );
+        }
+
+        // A Low finding is not "other risk": the escape still applies. The
+        // rule id must be one the predicate does not already exclude, or this
+        // case would pass even if the comparison were off by a band.
+        for low_rule in [
+            "R04_DEPENDENCY_MODIFIED",
+            "R00_PKGBUILD_SCOPE",
+            "R02_BINARY_BLOB_MODIFIED",
+        ] {
+            let low_mix = bootstrap_hint(&hint_verdict(vec![
+                finding(r07, crate::verdict::VerdictBand::Medium),
+                finding(low_rule, crate::verdict::VerdictBand::Low),
+            ]))
+            .expect("R07 always produces a hint");
+            assert!(
+                low_mix.contains("allow_unreviewed_baseline = true"),
+                "a Low {low_rule} must not suppress the escape: {low_mix}"
+            );
+        }
+    }
+
     #[test]
     fn baseline_unreadable_finding_is_high() {
         let f = baseline_unreadable_finding();
@@ -1340,6 +1490,91 @@ mod tests {
             "unexpected error: {err}"
         );
     }
+
+    /// `package_json_path` descends into a single top-level directory, so a
+    /// tarball rooted at `evil/` was read as `evil/package.json` and its
+    /// declared name never compared to the resolved one. The allowlist, the
+    /// blocklist and the baseline key are all keyed on the resolved name while
+    /// the installed bytes are the attacker's, so a package that lies about
+    /// its own identity passed exact-match allowlisting.
+    #[test]
+    fn prepare_extracted_root_refuses_npm_name_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("evil")).unwrap();
+        std::fs::write(
+            dir.path().join("evil/package.json"),
+            br#"{"name":"evil","version":"1.0.0","scripts":{"postinstall":"node x.js"}}"#,
+        )
+        .unwrap();
+        let err = prepare_extracted_root(dir.path(), Ecosystem::Npm, "innocent", "1.0.0")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "archive manifest declares `evil` but the review resolved `innocent`; refusing to review"
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// An absent `name` deserialises to `""` through `#[serde(default)]`, so a
+    /// manifest with no name at all used to review cleanly.
+    #[test]
+    fn prepare_extracted_root_refuses_a_missing_manifest_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("package")).unwrap();
+        std::fs::write(
+            dir.path().join("package/package.json"),
+            br#"{"version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let err = prepare_extracted_root(dir.path(), Ecosystem::Npm, "nameless", "1.0.0")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("refusing to review"),
+            "a manifest with no name must be refused, got: {err}"
+        );
+    }
+
+    /// The same binding for cargo, where `[package] name` was never read. The
+    /// root check passes because the directory is named for the resolved
+    /// package; the manifest inside it still declares something else.
+    #[test]
+    fn prepare_extracted_root_refuses_cargo_name_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("demo-crate-1.0.0");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"other-crate\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+        let err = prepare_extracted_root(dir.path(), Ecosystem::Cargo, "demo-crate", "1.0.0")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "archive manifest declares `other-crate` but the review resolved `demo-crate`; refusing to review"
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A matching name is the happy path and must not regress into a refusal.
+    #[test]
+    fn prepare_extracted_root_accepts_a_matching_npm_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("package")).unwrap();
+        std::fs::write(
+            dir.path().join("package/package.json"),
+            br#"{"name":"demo","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let (_root, manifest) =
+            prepare_extracted_root(dir.path(), Ecosystem::Npm, "demo", "1.0.0").unwrap();
+        assert_eq!(manifest.name, "demo");
+    }
 }
 
 #[cfg(test)]
@@ -1352,6 +1587,8 @@ mod recursive_tests {
     struct FakeRegistry {
         packages: HashMap<String, String>,
         fetches: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        /// The signature block this registry publishes per release, if any.
+        signatures: Option<serde_json::Value>,
     }
 
     impl FakeRegistry {
@@ -1360,6 +1597,12 @@ mod recursive_tests {
                 packages,
                 std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             )
+        }
+
+        fn with_signatures(packages: &[(&str, &str)], signatures: serde_json::Value) -> Self {
+            let mut reg = Self::new(packages);
+            reg.signatures = Some(signatures);
+            reg
         }
 
         fn with_counter(
@@ -1372,6 +1615,7 @@ mod recursive_tests {
                     .map(|(k, v)| (k.to_string(), v.to_string()))
                     .collect(),
                 fetches,
+                signatures: None,
             }
         }
 
@@ -1439,6 +1683,9 @@ mod recursive_tests {
                 .iter()
                 .map(|v| v.to_string())
                 .next_back())
+        }
+        fn release_signatures(&self, _pkg: &Package) -> Option<serde_json::Value> {
+            self.signatures.clone()
         }
     }
 
@@ -1569,16 +1816,330 @@ mod recursive_tests {
         spec: &str,
         policy: &Policy,
     ) -> (crate::verdict::Verdict, u32) {
+        let registry = FakeRegistry::new(packages);
+        use std::sync::atomic::Ordering;
+        let fetches = registry.fetches.clone();
+        let verdict = evaluate_with_fake(registry, spec, policy);
+        (verdict, fetches.load(Ordering::SeqCst))
+    }
+
+    fn evaluate_with_fake(
+        registry: FakeRegistry,
+        spec: &str,
+        policy: &Policy,
+    ) -> crate::verdict::Verdict {
         let (name, version) = spec.split_once('@').unwrap();
         let store_dir = tempfile::tempdir().unwrap();
         let store = BaselineStore::open_at(&store_dir.path().join("t.db")).unwrap();
         let mut ctx = ReviewContext::new(policy, fixture_bases());
-        let registry = std::rc::Rc::new(FakeRegistry::new(packages));
+        let registry = std::rc::Rc::new(registry);
         ctx.inject_registry(Ecosystem::Npm, registry.clone());
         let (verdict, _, _, _) =
             evaluate_package(name, version, Ecosystem::Npm, &store, policy, &mut ctx).unwrap();
-        use std::sync::atomic::Ordering;
-        (verdict, registry.fetches.load(Ordering::SeqCst))
+        verdict
+    }
+
+    /// Serves a PEP 691 Simple index for one package plus the artifact bytes
+    /// it points at, and 404s everything else (which is what the provenance
+    /// endpoint gets, so the report is a clean `Missing`).
+    struct MockIndex {
+        base: String,
+        _handle: std::thread::JoinHandle<()>,
+    }
+
+    impl MockIndex {
+        fn spawn<F>(name: &str, routes: F) -> Self
+        where
+            F: FnOnce(&str) -> (String, Vec<(String, Vec<u8>)>) + Send + 'static,
+        {
+            use std::io::{Read, Write};
+            use std::net::TcpListener;
+            use std::sync::Arc;
+
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let index = Arc::new(routes(&base));
+            let index_path = format!("/simple/{name}/");
+            let handle = std::thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    let index = index.clone();
+                    let index_path = index_path.clone();
+                    std::thread::spawn(move || {
+                        let mut stream = stream;
+                        let mut buf = [0u8; 4096];
+                        let n = stream.read(&mut buf).unwrap_or(0);
+                        let path = String::from_utf8_lossy(&buf[..n])
+                            .lines()
+                            .next()
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .unwrap_or("/")
+                            .to_string();
+                        if path == index_path {
+                            let body = index.0.clone();
+                            let head = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.pypi.simple.v1+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = stream.write_all(head.as_bytes());
+                            let _ = stream.write_all(body.as_bytes());
+                        } else if let Some((_, bytes)) = index
+                            .1
+                            .iter()
+                            .find(|(p, _)| *p == path.trim_start_matches('/'))
+                        {
+                            let head = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                bytes.len()
+                            );
+                            let _ = stream.write_all(head.as_bytes());
+                            let _ = stream.write_all(bytes);
+                        } else {
+                            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        }
+                    });
+                }
+            });
+            Self {
+                base,
+                _handle: handle,
+            }
+        }
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    /// The withdrawal reason travels the whole way: PEP 592 `data-yanked` on
+    /// the Simple index → the release list the review reads → the baseline
+    /// selection → the finding a reviewer reads. Before this, the reason was
+    /// dropped at `From<PyPiRelease> for Release` and the card said only
+    /// "yanked".
+    #[test]
+    fn pypi_yanked_reasons_reach_the_card() {
+        let sdist =
+            |version: &str| build_sdist_tarball(&format!("Name: demo\nVersion: {version}\n"));
+        let prior = sdist("1.1.0");
+        let target = sdist("1.2.0");
+
+        let server = MockIndex::spawn("demo", move |base| {
+            let entry = |version: &str, bytes: &[u8], yanked: serde_json::Value| {
+                let filename = format!("demo-{version}.tar.gz");
+                serde_json::json!({
+                    "filename": filename,
+                    "url": format!("{base}/packages/{filename}"),
+                    "hashes": {"sha256": sha256_hex(bytes)},
+                    "yanked": yanked,
+                })
+            };
+            let index = serde_json::json!({
+                "name": "demo",
+                "versions": ["1.0.0", "1.1.0", "1.2.0"],
+                "files": [
+                    entry("1.0.0", &sdist("1.0.0"), serde_json::json!(false)),
+                    entry("1.1.0", &prior, serde_json::json!("critical vulnerability, no upgrade path")),
+                    // A hostile reason: escape bytes and a newline in registry text.
+                    entry("1.2.0", &target, serde_json::json!("\u{1b}[31mdemo is compromised\u{1b}[0m\nsecond line")),
+                ]
+            });
+            (
+                index.to_string(),
+                vec![
+                    ("packages/demo-1.0.0.tar.gz".to_string(), sdist("1.0.0")),
+                    ("packages/demo-1.2.0.tar.gz".to_string(), target),
+                ],
+            )
+        });
+
+        let policy = no_advisory_policy();
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&store_dir.path().join("t.db")).unwrap();
+        let mut bases = fixture_bases();
+        bases.pypi = server.base.clone();
+        let mut ctx = ReviewContext::new(&policy, bases);
+        let (verdict, _, _, _) =
+            evaluate_package("demo", "1.2.0", Ecosystem::PyPi, &store, &policy, &mut ctx).unwrap();
+
+        let finding = |rule_id: &str| {
+            verdict
+                .findings
+                .iter()
+                .find(|f| f.rule_id == rule_id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "expected {rule_id}, got {:?}",
+                        verdict
+                            .findings
+                            .iter()
+                            .map(|f| &f.rule_id)
+                            .collect::<Vec<_>>()
+                    )
+                })
+                .description
+                .clone()
+        };
+
+        let r08 = finding("R08_YANKED_PREDECESSOR");
+        assert!(
+            r08.contains("registry-stated reason: `critical vulnerability, no upgrade path`"),
+            "the registry's reason for the withdrawn predecessor must reach the card: {r08}"
+        );
+        let r09 = finding("R09_YANKED_TARGET");
+        assert!(
+            !r09.contains('\x1b'),
+            "escape bytes reached the card: {r09:?}"
+        );
+        assert!(!r09.contains('\n'), "a newline reached the card: {r09:?}");
+        assert!(
+            r09.contains("registry-stated reason: `demo is compromised second line`"),
+            "the registry's reason for the withdrawn target must reach the card: {r09}"
+        );
+    }
+
+    /// A package whose withdrawn release carries no reason says so on the
+    /// card rather than reading as if a cause had been given.
+    #[test]
+    fn a_pypi_yank_without_a_reason_says_no_reason_published() {
+        let sdist =
+            |version: &str| build_sdist_tarball(&format!("Name: demo\nVersion: {version}\n"));
+        let target = sdist("1.1.0");
+        let server = MockIndex::spawn("demo", move |base| {
+            let entry = |version: &str, bytes: &[u8], yanked: serde_json::Value| {
+                let filename = format!("demo-{version}.tar.gz");
+                serde_json::json!({
+                    "filename": filename,
+                    "url": format!("{base}/packages/{filename}"),
+                    "hashes": {"sha256": sha256_hex(bytes)},
+                    "yanked": yanked,
+                })
+            };
+            let index = serde_json::json!({
+                "name": "demo",
+                "versions": ["1.0.0", "1.1.0"],
+                "files": [
+                    entry("1.0.0", &sdist("1.0.0"), serde_json::json!(false)),
+                    // PEP 592's boolean form: withdrawn, with no cause stated.
+                    entry("1.1.0", &target, serde_json::json!(true)),
+                ]
+            });
+            (
+                index.to_string(),
+                vec![
+                    ("packages/demo-1.0.0.tar.gz".to_string(), sdist("1.0.0")),
+                    ("packages/demo-1.1.0.tar.gz".to_string(), target),
+                ],
+            )
+        });
+
+        let policy = no_advisory_policy();
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&store_dir.path().join("t.db")).unwrap();
+        let mut bases = fixture_bases();
+        bases.pypi = server.base.clone();
+        let mut ctx = ReviewContext::new(&policy, bases);
+        let (verdict, _, _, _) =
+            evaluate_package("demo", "1.1.0", Ecosystem::PyPi, &store, &policy, &mut ctx).unwrap();
+        let r09 = verdict
+            .findings
+            .iter()
+            .find(|f| f.rule_id == "R09_YANKED_TARGET")
+            .expect("the target is withdrawn")
+            .description
+            .clone();
+        assert!(r09.contains("(no reason published)"), "{r09}");
+        assert!(!r09.contains("registry-stated reason"), "{r09}");
+    }
+
+    fn signature_policy() -> Policy {
+        let mut policy = no_advisory_policy();
+        policy.provenance.require_signatures = true;
+        policy
+    }
+
+    /// `require_signatures` gated on `registry_signature_present`, which the
+    /// npm lane hard-wired to false: the review passed `None` for the
+    /// signatures, the packument never deserialized `dist.signatures`, and the
+    /// provenance report cached `has_sig` as false. Every npm review was
+    /// blocked by the key, and no setting could satisfy it. With the block read
+    /// off the resolved release, a published signature satisfies it.
+    #[test]
+    fn require_signatures_is_satisfiable_when_the_registry_publishes_a_block() {
+        let policy = signature_policy();
+        let verdict = evaluate_with_fake(
+            FakeRegistry::with_signatures(
+                &[("signed@1.0.0", r#"{"name":"signed","version":"1.0.0"}"#)],
+                serde_json::json!([{ "keyid": "SHA256:abc", "sig": "c2ln" }]),
+            ),
+            "signed@1.0.0",
+            &policy,
+        );
+        assert!(
+            !verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "P03_SIGNATURE_REQUIRED_MISSING"),
+            "a published signature must satisfy the key: {:?}",
+            verdict
+                .findings
+                .iter()
+                .map(|f| (&f.rule_id, f.severity))
+                .collect::<Vec<_>>()
+        );
+        assert_ne!(verdict.band, crate::verdict::VerdictBand::Block);
+    }
+
+    /// The absent case is the fail-closed one and must be unchanged: no
+    /// published block, no satisfaction.
+    #[test]
+    fn require_signatures_still_blocks_when_no_block_is_published() {
+        let policy = signature_policy();
+        let verdict = evaluate_with_fake(
+            FakeRegistry::new(&[("unsigned@1.0.0", r#"{"name":"unsigned","version":"1.0.0"}"#)]),
+            "unsigned@1.0.0",
+            &policy,
+        );
+        let finding = verdict
+            .findings
+            .iter()
+            .find(|f| f.rule_id == "P03_SIGNATURE_REQUIRED_MISSING")
+            .expect("a policy that requires signatures must refuse the unsigned");
+        assert_eq!(finding.severity, crate::verdict::VerdictBand::Block);
+        assert_eq!(verdict.band, crate::verdict::VerdictBand::Block);
+    }
+
+    /// With the key unset, a published block is disclosed rather than gating
+    /// anything: the card says a signature exists, and still says it was not
+    /// verified.
+    #[test]
+    fn a_published_signature_without_the_policy_key_is_not_a_gate() {
+        let policy = no_advisory_policy();
+        let verdict = evaluate_with_fake(
+            FakeRegistry::with_signatures(
+                &[("signed@1.0.0", r#"{"name":"signed","version":"1.0.0"}"#)],
+                serde_json::json!([{ "keyid": "SHA256:abc", "sig": "c2ln" }]),
+            ),
+            "signed@1.0.0",
+            &policy,
+        );
+        assert!(
+            !verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "P03_SIGNATURE_REQUIRED_MISSING"),
+            "{:?}",
+            verdict.findings
+        );
+        let prov = verdict
+            .trust_sources
+            .as_ref()
+            .and_then(|t| t.provenance.as_ref())
+            .expect("the npm lane reports provenance");
+        assert!(prov.registry_signature_present);
+        assert_eq!(
+            prov.registry_signature_key_id.as_deref(),
+            Some("SHA256:abc")
+        );
     }
 
     #[test]

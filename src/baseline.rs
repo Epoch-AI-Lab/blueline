@@ -1,5 +1,5 @@
 use crate::error::BluelineError;
-use crate::registry::{Checksum, Package, Registry, Release};
+use crate::registry::{Checksum, Package, Registry, Release, releases_with_reasons};
 use crate::store::BaselineStore;
 use crate::version::VersionInfo;
 
@@ -21,8 +21,13 @@ pub struct BaselineSelection {
     /// The release immediately preceding the target is yanked. Supply-chain
     /// signal regardless of which anchor won (feeds R08_YANKED_PREDECESSOR).
     pub prior_release_yanked: bool,
+    /// Why the registry withdrew that prior release, when it says. `None` is
+    /// the registry publishing no reason, not an unknown one.
+    pub prior_yanked_reason: Option<String>,
     /// The target release itself is yanked on the registry (feeds R09_YANKED_TARGET).
     pub target_release_yanked: bool,
+    /// Why the registry withdrew the target, when it says.
+    pub target_yanked_reason: Option<String>,
 }
 
 impl BaselineResolution {
@@ -34,32 +39,23 @@ impl BaselineResolution {
             BaselineResolution::FirstSighting => None,
         }
     }
-
-    #[allow(dead_code)]
-    pub fn display_summary(&self) -> String {
-        match self {
-            BaselineResolution::LocalApproved(p) => format!("{} (approved locally)", p.version),
-            BaselineResolution::RegistryPredecessor(p) => {
-                format!("{} (registry predecessor; unreviewed)", p.version)
-            }
-            BaselineResolution::FirstSighting => {
-                "none (first sighting / initial release)".to_string()
-            }
-        }
-    }
 }
 
-pub fn resolve_baseline<R: Registry + ?Sized, V: VersionInfo>(
+pub fn resolve_baseline<V: VersionInfo>(
     name: &str,
     target_ver: &V,
-    registry: &R,
+    registry: &dyn Registry,
     store: &BaselineStore,
 ) -> Result<BaselineSelection, BluelineError> {
-    let all_releases = registry.list_releases(name)?;
-    let target_release_yanked = all_releases
+    let (all_releases, yanked_reasons) = releases_with_reasons(registry, name)?;
+    let target_release = all_releases
         .iter()
-        .find(|r| V::parse(&r.version).ok().as_ref() == Some(target_ver))
-        .is_some_and(|r| r.yanked);
+        .find(|r| V::parse(&r.version).ok().as_ref() == Some(target_ver));
+    let target_release_yanked = target_release.is_some_and(|r| r.yanked);
+    let target_yanked_reason = target_release
+        .filter(|r| r.yanked)
+        .and_then(|r| yanked_reasons.get(&r.version))
+        .map(String::from);
 
     let mut eligible: Vec<(V, Release)> = all_releases
         .into_iter()
@@ -67,7 +63,20 @@ pub fn resolve_baseline<R: Registry + ?Sized, V: VersionInfo>(
         .filter(|(v, _)| v.baseline_eligible_for(target_ver))
         .collect();
     eligible.sort_by(|a, b| a.0.cmp(&b.0));
-    let prior_release_yanked = eligible.last().is_some_and(|(_, r)| r.yanked);
+    let prior = eligible.last();
+    let prior_release_yanked = prior.is_some_and(|(_, r)| r.yanked);
+    let prior_yanked_reason = prior
+        .filter(|(_, r)| r.yanked)
+        .and_then(|(_, r)| yanked_reasons.get(&r.version))
+        .map(String::from);
+
+    let selection = |resolution| BaselineSelection {
+        resolution,
+        prior_release_yanked,
+        target_release_yanked,
+        prior_yanked_reason: prior_yanked_reason.clone(),
+        target_yanked_reason: target_yanked_reason.clone(),
+    };
 
     let clean_versions = store.list_clean_versions::<V>(registry.ecosystem(), name)?;
 
@@ -79,11 +88,7 @@ pub fn resolve_baseline<R: Registry + ?Sized, V: VersionInfo>(
             match registry.resolve(name, &clean_ver.canonical()) {
                 Ok(pkg) => match (&pkg.integrity, &stored_checksum) {
                     (Some(reg_integ), Ok(stored)) if *reg_integ == *stored => {
-                        return Ok(BaselineSelection {
-                            resolution: BaselineResolution::LocalApproved(pkg),
-                            prior_release_yanked,
-                            target_release_yanked,
-                        });
+                        return Ok(selection(BaselineResolution::LocalApproved(pkg)));
                     }
                     (Some(reg_integ), _) => {
                         return Err(BluelineError::Verification(format!(
@@ -104,9 +109,10 @@ pub fn resolve_baseline<R: Registry + ?Sized, V: VersionInfo>(
                     // stored-clean version is yanked/missing from the registry,
                     // so we keep looking at older clean versions. A package-wide
                     // 404 (the whole package removed) is gated earlier at
-                    // `list_releases(name)?` above and fails closed there — it
-                    // must never reach this loop, so do NOT reinterpret Manifest
-                    // as a benign "skip the candidate" for a missing package.
+                    // `releases_with_reasons(..)?` above and fails closed there
+                    // — it must never reach this loop, so do NOT reinterpret
+                    // Manifest as a benign "skip the candidate" for a missing
+                    // package.
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -124,18 +130,10 @@ pub fn resolve_baseline<R: Registry + ?Sized, V: VersionInfo>(
 
     if let Some(pred_str) = predecessor_version {
         let pkg = registry.resolve(name, &pred_str)?;
-        return Ok(BaselineSelection {
-            resolution: BaselineResolution::RegistryPredecessor(pkg),
-            prior_release_yanked,
-            target_release_yanked,
-        });
+        return Ok(selection(BaselineResolution::RegistryPredecessor(pkg)));
     }
 
-    Ok(BaselineSelection {
-        resolution: BaselineResolution::FirstSighting,
-        prior_release_yanked,
-        target_release_yanked,
-    })
+    Ok(selection(BaselineResolution::FirstSighting))
 }
 
 #[cfg(test)]
@@ -428,38 +426,132 @@ mod tests {
         let res = resolve_baseline("pkg", &target, &registry, &store).unwrap();
         assert!(res.target_release_yanked);
         assert!(res.prior_release_yanked);
+        // This registry publishes no reason, so there is none to report: a
+        // withdrawn release must not inherit a cause nobody stated.
+        assert_eq!(res.prior_yanked_reason, None);
+        assert_eq!(res.target_yanked_reason, None);
 
         let target_stable = semver::Version::parse("1.0.0").unwrap();
         let res2 = resolve_baseline("pkg", &target_stable, &registry, &store).unwrap();
         assert!(!res2.target_release_yanked);
         assert!(!res2.prior_release_yanked);
+        assert_eq!(res2.prior_yanked_reason, None);
+        assert_eq!(res2.target_yanked_reason, None);
     }
 
+    /// A release that is not withdrawn never carries a reason: a reason next
+    /// to a live release would read as a cause for a withdrawal that did not
+    /// happen. This is the default state for every registry that publishes no
+    /// reason at all, npm among them.
     #[test]
-    fn baseline_display_summary_formats_all_variants() {
-        let local = BaselineResolution::LocalApproved(crate::registry::Package {
-            name: "pkg".to_string(),
-            version: "1.0.0".to_string(),
-            tarball_url: "https://example.com/pkg-1.0.0.tgz".to_string(),
-            integrity: None,
-        });
-        assert_eq!(local.display_summary(), "1.0.0 (approved locally)");
+    fn a_live_release_never_carries_a_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
+        let server = MockSimpleIndex::spawn("live", &[]);
+        let registry = crate::registry::pypi::PyPIRegistry::new(&server.base);
+        let target = crate::version::Pep440Version::parse("1.0.0").unwrap();
+        let res = resolve_baseline("live", &target, &registry, &store).unwrap();
+        assert!(!res.prior_release_yanked);
+        assert!(!res.target_release_yanked);
+        assert_eq!(res.prior_yanked_reason, None);
+        assert_eq!(res.target_yanked_reason, None);
+    }
 
-        let reg = BaselineResolution::RegistryPredecessor(crate::registry::Package {
-            name: "pkg".to_string(),
-            version: "0.9.0".to_string(),
-            tarball_url: "https://example.com/pkg-0.9.0.tgz".to_string(),
-            integrity: None,
-        });
-        assert_eq!(
-            reg.display_summary(),
-            "0.9.0 (registry predecessor; unreviewed)"
-        );
+    /// The reason the registry published for the withdrawn predecessor and for
+    /// the withdrawn target, filled at the same sites that set the booleans.
+    /// Before this, a reviewer saw "yanked" and nothing about why.
+    #[test]
+    fn registry_stated_yanked_reasons_reach_the_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
+        let server = MockSimpleIndex::spawn("demo", &["1.1.0 broken wheel", "1.2.0 security bug"]);
+        let registry = crate::registry::pypi::PyPIRegistry::new(&server.base);
+        let target = crate::version::Pep440Version::parse("1.2.0").unwrap();
+        let res = resolve_baseline("demo", &target, &registry, &store).unwrap();
 
-        let first = BaselineResolution::FirstSighting;
-        assert_eq!(
-            first.display_summary(),
-            "none (first sighting / initial release)"
-        );
+        assert!(res.prior_release_yanked);
+        assert_eq!(res.prior_yanked_reason.as_deref(), Some("broken wheel"));
+        assert!(res.target_release_yanked);
+        assert_eq!(res.target_yanked_reason.as_deref(), Some("security bug"));
+        // The anchor is the highest non-yanked release, which is not the one
+        // the reason belongs to.
+        match &res.resolution {
+            BaselineResolution::RegistryPredecessor(p) => assert_eq!(p.version, "1.0.0"),
+            other => panic!("expected predecessor 1.0.0, got {other:?}"),
+        }
+    }
+
+    /// Serves a PEP 691 Simple index for one package: `1.0.0` live, and each
+    /// `yanked` argument naming a version to withdraw with that reason. Only
+    /// the index is needed — baseline resolution resolves a predecessor
+    /// without downloading it.
+    struct MockSimpleIndex {
+        base: String,
+        _handle: std::thread::JoinHandle<()>,
+    }
+
+    impl MockSimpleIndex {
+        fn spawn(name: &str, yanked: &[&str]) -> Self {
+            use std::io::{Read, Write};
+            use std::net::TcpListener;
+
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let name = name.to_string();
+            let yanked: Vec<String> = yanked.iter().map(|s| s.to_string()).collect();
+            let handle = std::thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    let (name, yanked) = (name.clone(), yanked.clone());
+                    std::thread::spawn(move || {
+                        let mut stream = stream;
+                        let mut buf = [0u8; 4096];
+                        let n = stream.read(&mut buf).unwrap_or(0);
+                        let path = String::from_utf8_lossy(&buf[..n])
+                            .lines()
+                            .next()
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .unwrap_or("/")
+                            .to_string();
+                        let mut versions = vec!["1.0.0".to_string()];
+                        let mut files = vec![serde_json::json!({
+                            "filename": format!("{name}-1.0.0.tar.gz"),
+                            "url": format!("http://example.invalid/{name}-1.0.0.tar.gz"),
+                            "hashes": {"sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+                            "yanked": false,
+                        })];
+                        for entry in &yanked {
+                            let (version, reason) = entry.split_once(' ').unwrap();
+                            versions.push(version.to_string());
+                            files.push(serde_json::json!({
+                                "filename": format!("{name}-{version}.tar.gz"),
+                                "url": format!("http://example.invalid/{name}-{version}.tar.gz"),
+                                "hashes": {"sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+                                "yanked": reason,
+                            }));
+                        }
+                        let body = if path == format!("/simple/{name}/") {
+                            serde_json::json!({
+                                "name": name,
+                                "versions": versions,
+                                "files": files,
+                            })
+                            .to_string()
+                        } else {
+                            "not found".to_string()
+                        };
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.pypi.simple.v1+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(head.as_bytes());
+                        let _ = stream.write_all(body.as_bytes());
+                    });
+                }
+            });
+            Self {
+                base,
+                _handle: handle,
+            }
+        }
     }
 }

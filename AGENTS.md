@@ -27,6 +27,12 @@ passes locally it passes CI. The toolchain is pinned in `rust-toolchain.toml`
 - Read `ARCHITECTURE.md` before touching module boundaries.
 - After each merged PR, add an entry to `CHANGELOG.md` under `[Unreleased]`
   in the same branch.
+- Fix a bug you found, even when it predates the current branch. "Pre-existing",
+  "out of scope", "unrelated to this diff", and "would widen the PR" are not
+  reasons to leave a defect live in a fail-closed tool. Age is a fact about when
+  a bug arrived, not an argument for keeping it. If a fix genuinely belongs in
+  its own change, say so and open that change in the same session — do not
+  report the finding and stop.
 
 **Ask first**
 - Adding a dependency — propose it and wait for a decision.
@@ -38,6 +44,8 @@ passes locally it passes CI. The toolchain is pinned in `rust-toolchain.toml`
 - New `unwrap()`/`expect()` on untrusted input. Unreachable-reference unwraps
   in database loops are the only acceptable case; everything else must error.
 - Skipping the CI gate. If CI breaks, fix it in the same branch.
+- Shipping a fix you could not verify. A patch with no test that fails without
+  it is a guess. Re-introduce the bug, watch the test catch it, then restore.
 
 ## Conventions
 - Do NOT USE Other languages to code. Use your harness tools

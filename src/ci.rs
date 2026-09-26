@@ -247,8 +247,11 @@ pub fn evaluate_lockfile_diff(
             integrity_map,
         )
     } else if is_pypi {
-        let base_pkgs = crate::lockfile::parse_requirements_txt_packages(base_content)?;
-        let head_pkgs = crate::lockfile::parse_requirements_txt_packages(head_content)?;
+        let allow_options = policy.ci.allow_requirements_options;
+        let base_pkgs =
+            crate::lockfile::parse_requirements_txt_packages(base_content, allow_options)?;
+        let head_pkgs =
+            crate::lockfile::parse_requirements_txt_packages(head_content, allow_options)?;
         let mut integrity_map = std::collections::HashMap::new();
         for pkg in head_pkgs.values() {
             if let Some(integ) = &pkg.integrity {
@@ -471,18 +474,7 @@ fn extract_base_lockfile(
 }
 
 fn parse_band_str(s: &str) -> Option<VerdictBand> {
-    let t = s.trim();
-    if t.eq_ignore_ascii_case("low") {
-        Some(VerdictBand::Low)
-    } else if t.eq_ignore_ascii_case("medium") {
-        Some(VerdictBand::Medium)
-    } else if t.eq_ignore_ascii_case("high") {
-        Some(VerdictBand::High)
-    } else if t.eq_ignore_ascii_case("block") {
-        Some(VerdictBand::Block)
-    } else {
-        None
-    }
+    VerdictBand::parse(s)
 }
 
 fn is_missing_base_error(stderr: &str) -> bool {
@@ -601,10 +593,6 @@ pub fn render_text_summary_to_string(report: &CiReport) -> String {
     }
     out.push_str("=======================================================\n");
     out
-}
-
-pub fn render_text_summary(report: &CiReport) {
-    print!("{}", render_text_summary_to_string(report));
 }
 
 #[cfg(test)]
@@ -1107,7 +1095,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(pypi_empty, "");
-        assert!(crate::lockfile::parse_requirements_txt_packages(&pypi_empty).is_ok());
+        assert!(crate::lockfile::parse_requirements_txt_packages(&pypi_empty, false).is_ok());
         let aur_empty = extract_base_lockfile(
             "HEAD",
             Path::new("aur.missing-for-test-xyz.lock"),

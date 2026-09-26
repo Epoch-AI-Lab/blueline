@@ -131,6 +131,15 @@ impl Policy {
 
     /// Validate internal policy consistency and invariants.
     pub fn validate(&self) -> Result<(), BluelineError> {
+        // A typo here used to fall back to HIGH, so `fail_on = "blockk"`
+        // quietly weakened a gate instead of refusing the policy. The CLI flag
+        // already refused the same typo; the policy key did not.
+        if crate::verdict::VerdictBand::parse(&self.ci.fail_on).is_none() {
+            return Err(BluelineError::Policy(format!(
+                "invalid ci policy: fail_on ({}) is not one of low, medium, high, block",
+                self.ci.fail_on
+            )));
+        }
         if self.thresholds.max_low_score > self.thresholds.max_medium_score {
             return Err(BluelineError::Policy(format!(
                 "invalid thresholds: max_low_score ({}) cannot exceed max_medium_score ({})",
@@ -176,20 +185,6 @@ impl Policy {
         Ok(())
     }
 
-    /// Determine the verdict band given an accumulated score and hard block flag.
-    #[allow(dead_code)]
-    pub fn calculate_band(&self, score: u32, has_block_latch: bool) -> VerdictBand {
-        if has_block_latch || score >= self.thresholds.block_score {
-            VerdictBand::Block
-        } else if score > self.thresholds.max_medium_score {
-            VerdictBand::High
-        } else if score > self.thresholds.max_low_score {
-            VerdictBand::Medium
-        } else {
-            VerdictBand::Low
-        }
-    }
-
     /// Check if a package name matches any blocked package pattern for the
     /// given ecosystem. Rules without an `ecosystem` field match all.
     pub fn is_package_blocked(&self, name: &str, ecosystem: Ecosystem) -> bool {
@@ -200,7 +195,6 @@ impl Policy {
     }
 
     /// Check if a maintainer email is on the blocklist.
-    #[allow(dead_code)]
     pub fn is_maintainer_blocked(&self, email: &str) -> bool {
         let email_trimmed = email.trim().to_lowercase();
         self.blocklist
@@ -267,7 +261,9 @@ pub struct GeneralPolicyConfig {
     pub require_provenance: bool,
     /// Block on newly added lifecycle scripts when no baseline approval exists (default true).
     pub block_unreviewed_scripts: bool,
-    /// Allow non-registry git/http dependencies without blocking (default false).
+    /// Lower the band of non-registry (git/http/ssh/`npm:`/`file:`/`link:`)
+    /// dependency findings from HIGH to MEDIUM. The findings stay visible; they
+    /// are never suppressed (default false).
     pub allow_git_dependencies: bool,
     /// Query and check OSV vulnerability advisories (default true).
     pub check_advisories: bool,
@@ -338,6 +334,12 @@ pub struct CiPolicyConfig {
     pub max_evaluations: usize,
     /// Whether to evaluate devDependencies (default: true).
     pub include_dev: bool,
+    /// Permit requirements.txt options that redirect pip away from the
+    /// reviewed graph (`--index-url`, `-r`, `-c`, ...). Off by default,
+    /// because blueline models only pinned `name==version` lines and cannot
+    /// follow an alternative index, an extra requirements file, or a
+    /// constraints file. On, they are disclosed rather than refused.
+    pub allow_requirements_options: bool,
 }
 
 impl Default for CiPolicyConfig {
@@ -346,6 +348,7 @@ impl Default for CiPolicyConfig {
             fail_on: "high".to_string(),
             max_evaluations: 100,
             include_dev: true,
+            allow_requirements_options: false,
         }
     }
 }
@@ -576,20 +579,6 @@ block_score = 101
     }
 
     #[test]
-    fn calculates_bands_correctly() {
-        let p = Policy::default();
-        assert_eq!(p.calculate_band(0, false), VerdictBand::Low);
-        assert_eq!(p.calculate_band(19, false), VerdictBand::Low);
-        assert_eq!(p.calculate_band(20, false), VerdictBand::Medium);
-        assert_eq!(p.calculate_band(49, false), VerdictBand::Medium);
-        assert_eq!(p.calculate_band(50, false), VerdictBand::High);
-        assert_eq!(p.calculate_band(79, false), VerdictBand::High);
-        assert_eq!(p.calculate_band(80, false), VerdictBand::Block);
-        assert_eq!(p.calculate_band(100, false), VerdictBand::Block);
-        assert_eq!(p.calculate_band(5, true), VerdictBand::Block);
-    }
-
-    #[test]
     fn glob_matching_patterns() {
         assert!(glob_match("*", "anything"));
         assert!(glob_match("evil-*", "evil-pkg"));
@@ -600,6 +589,28 @@ block_score = 101
         assert!(glob_match("*middle*", "some-middle-name"));
         assert!(glob_match("exact", "exact"));
         assert!(!glob_match("exact", "exact-not"));
+    }
+
+    #[test]
+    fn rejects_an_unparseable_ci_fail_on() {
+        for bad in ["blockk", "", "medium-high", "  "] {
+            let toml = format!("[ci]\nfail_on = \"{bad}\"\n");
+            assert!(
+                Policy::from_toml_str(&toml).is_err(),
+                "fail_on = {bad:?} must be refused rather than silently weakened"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_ci_fail_on_case_and_whitespace_insensitively() {
+        for good in ["low", "HIGH", "  Block  ", "Medium"] {
+            let toml = format!("[ci]\nfail_on = \"{good}\"\n");
+            assert!(
+                Policy::from_toml_str(&toml).is_ok(),
+                "fail_on = {good:?} must stay valid"
+            );
+        }
     }
 
     #[test]

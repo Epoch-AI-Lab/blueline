@@ -110,14 +110,30 @@ pub fn parse_lockfile_packages(
                 continue;
             };
 
-            let name = if let Some(pkg_name) = pkg.name {
-                pkg_name
-            } else {
-                extract_package_name_from_path(&path)
+            let key_name = extract_package_name_from_path(&path);
+            let name = match pkg.name {
+                Some(n) if n.is_empty() => key_name.clone(),
+                Some(n) => n,
+                None => key_name.clone(),
             };
 
             if name.is_empty() {
                 continue;
+            }
+
+            // Under node_modules, a declared name that differs from the
+            // directory is an npm alias, and npm records the real source in
+            // `resolved`. Requiring those to agree rejects a hand-edited entry
+            // pointing one package at another, while every honest alias
+            // passes. A mismatch with no `resolved` has no honest explanation.
+            if path.contains("node_modules/") && name != key_name {
+                let resolved = pkg.resolved.as_deref().unwrap_or_default();
+                if !resolved_names_package(resolved, &name) {
+                    return Err(LockfileError::InvalidData(format!(
+                        "`{path}` declares name `{name}` but its resolved URL is `{resolved}`; \
+                         refusing to review an entry whose identity is ambiguous"
+                    )));
+                }
             }
 
             let entry = PackageEntry {
@@ -187,6 +203,23 @@ fn walk_v1_dependencies(
 fn extract_package_name_from_path(path: &str) -> String {
     let name_part = path.rsplit("node_modules/").next().unwrap_or(path);
     name_part.trim_end_matches('/').to_string()
+}
+
+/// Does an npm `resolved` URL name the package it claims to? `resolved` plus
+/// `integrity` is what npm actually fetches, so it, not the directory name,
+/// is the install identity.
+fn resolved_names_package(resolved: &str, name: &str) -> bool {
+    if resolved.is_empty() {
+        return false;
+    }
+    let Some(last) = resolved.rsplit('/').next() else {
+        return false;
+    };
+    // `<name>-<version>.tgz`, where a scoped name keeps its slash.
+    let stem = last.strip_suffix(".tgz").unwrap_or(last);
+    let unscoped = name.rsplit('/').next().unwrap_or(name);
+    stem.strip_prefix(unscoped)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
 }
 
 fn normalize_node_modules_path(path: &str) -> String {
@@ -289,6 +322,7 @@ const MAX_REQUIREMENTS_TXT_BYTES: usize = 10 * 1024 * 1024;
 /// - Comments (`#...`), blank lines, and options like `--index-url`, `--extra-index-url`, `-r` are skipped.
 pub fn parse_requirements_txt_packages(
     content: &str,
+    allow_options: bool,
 ) -> Result<BTreeMap<String, PackageEntry>, LockfileError> {
     if content.len() > MAX_REQUIREMENTS_TXT_BYTES {
         return Err(LockfileError::InvalidData(format!(
@@ -336,8 +370,19 @@ pub fn parse_requirements_txt_packages(
             continue;
         }
 
-        // Skip standalone flags: -i, --index-url, --extra-index-url, -r, --requirement, -f, --find-links, etc.
+        // An option that redirects pip changes which packages get installed,
+        // so reviewing the pinned lines alone certifies a graph nobody will
+        // install. Refused rather than skipped, unless policy opts in, and
+        // checked per token so a flag trailing a spec is caught too.
         if code_part.starts_with('-') && !code_part.starts_with("--hash") {
+            if !allow_options {
+                return Err(LockfileError::InvalidData(format!(
+                    "line {line_num}: unsupported requirements option `{code_part}`; blueline \
+                     models only pinned `name==version [--hash sha256:...]` lines and cannot \
+                     follow an alternative index, an extra requirements file, or a constraints \
+                     file. Set [ci] allow_requirements_options = true to review the pins anyway."
+                )));
+            }
             continue;
         }
 
@@ -495,7 +540,13 @@ pub fn compute_delta_from_maps(
                     head_iter.next();
                 }
                 std::cmp::Ordering::Equal => {
-                    if b_val.version != h_val.version || b_val.integrity != h_val.integrity {
+                    // A different package name at a stable key and version is a
+                    // swap, not an unchanged entry. It was counted as
+                    // unchanged, so the new name was never reviewed.
+                    if b_val.version != h_val.version
+                        || b_val.integrity != h_val.integrity
+                        || b_val.name != h_val.name
+                    {
                         upgraded.push(PackageUpgrade {
                             name: h_val.name.clone(),
                             old_version: b_val.version.clone(),
@@ -1065,7 +1116,7 @@ requests==2.31.0 \
 Flask==3.0.0 --hash sha256:1111111111111111111111111111111111111111111111111111111111111111
 urllib3==2.1.0 # trailing comment
 "#;
-        let pkgs = parse_requirements_txt_packages(content).unwrap();
+        let pkgs = parse_requirements_txt_packages(content, false).unwrap();
         assert_eq!(pkgs.len(), 3);
         assert_eq!(pkgs["requests"].version, "2.31.0");
         assert_eq!(
@@ -1080,7 +1131,7 @@ urllib3==2.1.0 # trailing comment
     #[test]
     fn rejects_unpinned_requirements_with_line_numbers() {
         let content = "requests>=2.0.0\nflask==3.0.0\npytest~=7.0\nblack\n";
-        let err = parse_requirements_txt_packages(content)
+        let err = parse_requirements_txt_packages(content, false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("line 1: unpinned range `requests>=2.0.0`"));
@@ -1089,15 +1140,94 @@ urllib3==2.1.0 # trailing comment
     }
 
     #[test]
-    fn requirements_txt_flags_and_edge_cases() {
-        let content = r#"
-# Flags to ignore
--i https://pypi.org/simple
---extra-index-url https://example.com/pypi
--r base.txt
---requirement other.txt
--f /path/to/wheels
+    fn a_name_swap_at_the_same_key_and_version_is_an_upgrade() {
+        let mut b = BTreeMap::new();
+        let mut h = BTreeMap::new();
+        let entry = |name: &str| PackageEntry {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            integrity: Some("sha512-aa".to_string()),
+            resolved: None,
+            is_dev: false,
+        };
+        b.insert("node_modules/pinned".to_string(), entry("good"));
+        h.insert("node_modules/pinned".to_string(), entry("evil"));
+        let delta = compute_delta_from_maps(&b, &h);
+        assert_eq!(
+            delta.upgraded.len(),
+            1,
+            "a different package at a reviewed address must be evaluated"
+        );
+        assert_eq!(delta.upgraded[0].name, "evil");
+    }
 
+    #[test]
+    fn an_entry_whose_name_disagrees_with_its_resolved_url_is_refused() {
+        let json = r#"{"lockfileVersion":3,"packages":{
+            "node_modules/foo":{"name":"bar","version":"1.0.0",
+                "resolved":"https://registry.npmjs.org/evil/-/evil-1.0.0.tgz"}}}"#;
+        let err = parse_lockfile_packages(json).unwrap_err().to_string();
+        assert!(
+            err.contains("identity is ambiguous"),
+            "a name pointing at a different tarball must be refused: {err}"
+        );
+    }
+
+    #[test]
+    fn a_real_npm_alias_still_parses() {
+        // `"foo": "npm:bar@1.0.0"` makes npm record name `bar` under the
+        // directory `foo`, so a strict name==directory check would reject
+        // every aliased dependency in the wild.
+        let json = r#"{"lockfileVersion":3,"packages":{
+            "node_modules/foo":{"name":"bar","version":"1.0.0",
+                "resolved":"https://registry.npmjs.org/bar/-/bar-1.0.0.tgz"}}}"#;
+        let pkgs = parse_lockfile_packages(json).unwrap();
+        assert_eq!(pkgs["node_modules/foo"].name, "bar");
+    }
+
+    #[test]
+    fn a_name_mismatch_with_no_resolved_url_is_refused() {
+        let json = r#"{"lockfileVersion":3,"packages":{
+            "node_modules/foo":{"name":"bar","version":"1.0.0"}}}"#;
+        assert!(parse_lockfile_packages(json).is_err());
+    }
+
+    #[test]
+    fn requirements_txt_flags_and_edge_cases() {
+        // Each of these redirects pip away from the graph blueline reviewed.
+        // Skipping them meant the gate certified pins that were never the ones
+        // installed, so they are refused instead. This assertion used to pin
+        // the permissive behaviour.
+        for opt in [
+            "-i https://pypi.org/simple",
+            "--index-url https://example.com/pypi",
+            "--extra-index-url https://example.com/pypi",
+            "-r base.txt",
+            "--requirement other.txt",
+            "-c constraints.txt",
+            "--constraint constraints.txt",
+            "-f /path/to/wheels",
+            "--find-links /path/to/wheels",
+            "-e .",
+            "--pre",
+            "--trusted-host example.com",
+        ] {
+            let file = format!("{opt}\nrequests==2.31.0\n");
+            let err = parse_requirements_txt_packages(&file, false)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(opt.split_whitespace().next().unwrap()),
+                "option `{opt}` must be refused by name: {err}"
+            );
+            // Opting in reviews the pins and discloses nothing.
+            assert!(
+                parse_requirements_txt_packages(&file, true).is_ok(),
+                "the policy escape must let a mirrored index through"
+            );
+        }
+
+        let content = r#"
 # Empty lines and comments with whitespace
    # leading space comment
    
@@ -1105,18 +1235,18 @@ requests==2.31.0 \
     --hash sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890 \
     --hash=sha256:1111111111111111111111111111111111111111111111111111111111111111
 "#;
-        let pkgs = parse_requirements_txt_packages(content).unwrap();
+        let pkgs = parse_requirements_txt_packages(content, false).unwrap();
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs["requests"].version, "2.31.0");
 
         // Trailing line continuation with no trailing newline
         let no_nl = "urllib3==2.1.0 \\\n  --hash sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
-        let pkgs2 = parse_requirements_txt_packages(no_nl).unwrap();
+        let pkgs2 = parse_requirements_txt_packages(no_nl, false).unwrap();
         assert_eq!(pkgs2["urllib3"].version, "2.1.0");
 
         // Missing hash value after `--hash`
         let missing_hash = "requests==2.31.0 --hash";
-        let err = parse_requirements_txt_packages(missing_hash).unwrap_err();
+        let err = parse_requirements_txt_packages(missing_hash, false).unwrap_err();
         assert!(
             matches!(err, LockfileError::InvalidData(msg) if msg.contains("missing hash value"))
         );
@@ -1130,11 +1260,11 @@ requests==2.31.0 \
         at_limit.push_str(&"a".repeat(remaining));
         at_limit.push('\n');
         assert_eq!(at_limit.len(), MAX_REQUIREMENTS_TXT_BYTES);
-        assert!(parse_requirements_txt_packages(&at_limit).is_ok());
+        assert!(parse_requirements_txt_packages(&at_limit, false).is_ok());
 
         let over_limit = format!("{at_limit}a");
         assert_eq!(over_limit.len(), MAX_REQUIREMENTS_TXT_BYTES + 1);
-        let err_over = parse_requirements_txt_packages(&over_limit).unwrap_err();
+        let err_over = parse_requirements_txt_packages(&over_limit, false).unwrap_err();
         assert!(
             matches!(err_over, LockfileError::InvalidData(msg) if msg.contains("exceeds maximum size"))
         );
@@ -1143,7 +1273,7 @@ requests==2.31.0 \
 
         let blanks_and_comments =
             "\n\n# comment 1\n   # comment 2\n\nflask==3.0.0\n\n# trailing comment\n";
-        let parsed = parse_requirements_txt_packages(blanks_and_comments).unwrap();
+        let parsed = parse_requirements_txt_packages(blanks_and_comments, false).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed["flask"].version, "3.0.0");
 
@@ -1154,7 +1284,7 @@ requests==2.31.0 \
             } else {
                 format!("pkg{op}1.0.0")
             };
-            let err = parse_requirements_txt_packages(&spec).unwrap_err();
+            let err = parse_requirements_txt_packages(&spec, false).unwrap_err();
             assert!(
                 matches!(err, LockfileError::InvalidData(msg) if msg.contains("unpinned range")),
                 "expected unpinned error for operator {op}"
@@ -1162,32 +1292,32 @@ requests==2.31.0 \
         }
 
         // Empty name or version
-        let err_noname = parse_requirements_txt_packages("==1.0.0").unwrap_err();
+        let err_noname = parse_requirements_txt_packages("==1.0.0", false).unwrap_err();
         assert!(
             matches!(err_noname, LockfileError::InvalidData(msg) if msg.contains("invalid requirement `==1.0.0`"))
         );
 
-        let err_nover = parse_requirements_txt_packages("pkg==").unwrap_err();
+        let err_nover = parse_requirements_txt_packages("pkg==", false).unwrap_err();
         assert!(
             matches!(err_nover, LockfileError::InvalidData(msg) if msg.contains("invalid requirement `pkg==`"))
         );
 
         // Unclosed extras bracket
-        let err_bracket = parse_requirements_txt_packages("pkg[extra==1.0.0").unwrap_err();
+        let err_bracket = parse_requirements_txt_packages("pkg[extra==1.0.0", false).unwrap_err();
         assert!(
             matches!(err_bracket, LockfileError::InvalidData(msg) if msg.contains("unclosed extras bracket"))
         );
 
         // Invalid hash hex character (64 chars but contains 'z')
         let bad_hex = format!("pkg==1.0.0 --hash=sha256:{}z", "a".repeat(63));
-        let err_hex = parse_requirements_txt_packages(&bad_hex).unwrap_err();
+        let err_hex = parse_requirements_txt_packages(&bad_hex, false).unwrap_err();
         assert!(
             matches!(err_hex, LockfileError::InvalidData(msg) if msg.contains("invalid sha256 hash length"))
         );
 
         // Trailing continuation line without subsequent non-slash line
         let trailing_cont = "pkg==1.0.0 \\\n";
-        let parsed_trailing = parse_requirements_txt_packages(trailing_cont).unwrap();
+        let parsed_trailing = parse_requirements_txt_packages(trailing_cont, false).unwrap();
         assert_eq!(parsed_trailing["pkg"].version, "1.0.0");
     }
 }

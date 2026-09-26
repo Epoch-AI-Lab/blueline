@@ -39,12 +39,42 @@ pub fn evaluate_with_policy(
         delta,
         is_unreviewed_baseline,
         false,
+        None,
         false,
+        None,
         false,
+        None,
         policy,
         None,
         None,
     )
+}
+
+/// Cap on the registry-stated withdrawal reason rendered into a card. The
+/// text is remote and a card is not a buffer.
+const MAX_YANKED_REASON_CHARS: usize = 200;
+
+/// The registry's own words for a withdrawal, as one bounded line.
+///
+/// Registry text reaches a terminal, so it goes through the single-line
+/// sanitizer (escape sequences out, newlines flattened) before it is
+/// truncated. A release withdrawn without a stated reason says exactly that,
+/// rather than reading as if a cause had been given.
+fn yanked_reason_clause(reason: Option<&str>) -> String {
+    let stated = reason
+        .map(crate::render::sanitize_single_line)
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty());
+    match stated {
+        Some(line) => {
+            let mut out: String = line.chars().take(MAX_YANKED_REASON_CHARS).collect();
+            if out.len() < line.len() {
+                out.push('…');
+            }
+            format!(" (registry-stated reason: `{out}`)")
+        }
+        None => " (no reason published)".to_string(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -55,8 +85,11 @@ pub fn evaluate_with_trust(
     delta: &Delta,
     is_unreviewed_baseline: bool,
     prior_release_yanked: bool,
+    prior_yanked_reason: Option<&str>,
     target_release_yanked: bool,
+    target_yanked_reason: Option<&str>,
     author_changed: bool,
+    release_author: Option<&str>,
     policy: &Policy,
     advisories: Option<&AdvisoryReport>,
     provenance: Option<&ProvenanceReport>,
@@ -70,6 +103,23 @@ pub fn evaluate_with_trust(
             severity: VerdictBand::Block,
             title: format!("Package `{name}` is blocked by policy"),
             description: "The package matches an active blocklist rule in blueline.toml.".into(),
+        });
+    }
+
+    // P04: the publishing identity is on the blocklist. `is_maintainer_blocked`
+    // existed and was never called, so `[blocklist] maintainers` parsed,
+    // validated, and then did nothing: a policy that asserts a protection and
+    // gets none, with no warning anywhere.
+    if let Some(author) = release_author
+        && policy.is_maintainer_blocked(author)
+    {
+        findings.push(Finding {
+            rule_id: "P04_MAINTAINER_BLOCKED".into(),
+            severity: VerdictBand::Block,
+            title: format!("Maintainer `{author}` is blocked by policy"),
+            description:
+                "The publishing identity of this release matches an active blocklist entry in blueline.toml."
+                    .into(),
         });
     }
 
@@ -101,61 +151,8 @@ pub fn evaluate_with_trust(
         }
     }
 
-    // Provenance Findings (Phase 2)
     if let Some(prov_rep) = provenance {
-        if prov_rep.status == ProvenanceStatus::FailedMismatch {
-            findings.push(Finding {
-                rule_id: "P03_PROVENANCE_DIGEST_MISMATCH".into(),
-                severity: VerdictBand::Block,
-                title: "Provenance digest mismatch".into(),
-                description: prov_rep.message.clone().unwrap_or_else(|| {
-                    "Tarball SHA512 does not match in-toto attestation subject digest".into()
-                }),
-            });
-        }
-
-        if (policy.policy.require_provenance || policy.provenance.require_provenance)
-            && prov_rep.status != ProvenanceStatus::Verified
-        {
-            findings.push(Finding {
-                rule_id: "P03_PROVENANCE_REQUIRED_MISSING".into(),
-                severity: VerdictBand::Block,
-                title: "Required build provenance missing".into(),
-                description:
-                    "Policy requires verified SLSA build provenance, but none was present.".into(),
-            });
-        }
-
-        if policy.provenance.require_signatures && !prov_rep.registry_signature_present {
-            findings.push(Finding {
-                rule_id: "P03_SIGNATURE_REQUIRED_MISSING".into(),
-                severity: VerdictBand::Block,
-                title: "Required registry signature missing".into(),
-                description:
-                    "Policy requires npm registry signatures, but no valid signature was attached."
-                        .into(),
-            });
-        }
-
-        if !policy.provenance.allowed_repositories.is_empty()
-            && let Some(ref repo) = prov_rep.source_repo
-        {
-            let allowed = policy
-                .provenance
-                .allowed_repositories
-                .iter()
-                .any(|a| is_repo_allowed(repo, a));
-            if !allowed {
-                findings.push(Finding {
-                    rule_id: "P03_UNAUTHORIZED_BUILD_REPO".into(),
-                    severity: VerdictBand::Block,
-                    title: format!("Unauthorized source repository `{repo}`"),
-                    description:
-                        "The build provenance repository is not in the allowed repositories list."
-                            .into(),
-                });
-            }
-        }
+        findings.extend(provenance_findings(prov_rep, policy));
     }
 
     // R01: Lifecycle scripts
@@ -339,46 +336,7 @@ pub fn evaluate_with_trust(
         }
     }
 
-    // R04: Dependency changes
-    if !delta.new_dependencies.is_empty() {
-        let deps_str = delta
-            .new_dependencies
-            .iter()
-            .map(|(d, v)| format!("{d}@{v}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let has_suspicious_url = delta
-            .new_dependencies
-            .iter()
-            .any(|(_, v)| is_non_semver_url(v));
-
-        findings.push(Finding {
-            rule_id: "R04_DEPENDENCY_ADDED".into(),
-            severity: if has_suspicious_url {
-                VerdictBand::High
-            } else {
-                VerdictBand::Medium
-            },
-            title: format!(
-                "{} new runtime dependencies added",
-                delta.new_dependencies.len()
-            ),
-            description: format!("Added dependencies: {deps_str}"),
-        });
-    }
-
-    for (dep, old_ver, new_ver) in &delta.modified_dependencies {
-        if is_non_semver_url(new_ver) {
-            findings.push(Finding {
-                rule_id: "R04_DEPENDENCY_MODIFIED".into(),
-                severity: VerdictBand::High,
-                title: format!("Dependency `{dep}` changed to non-semver URL"),
-                description: format!(
-                    "Dependency `{dep}` version modified from `{old_ver}` to suspicious URL `{new_ver}`."
-                ),
-            });
-        }
-    }
+    findings.extend(dependency_findings(delta, policy));
 
     // R05: Large diff anomaly on patch or non-standard semver
     if let Some(base_ver_str) = &delta.baseline_version {
@@ -513,8 +471,9 @@ pub fn evaluate_with_trust(
             severity: VerdictBand::Medium,
             title: format!("Release immediately preceding `{}` was yanked", delta.target_version),
             description: format!(
-                "The release immediately before `{}` (`{prior_ver}`) was yanked from the registry. Yanked releases are a common supply-chain attack cleanup signal; the diff anchor may be older than expected.",
-                delta.target_version
+                "The release immediately before `{}` (`{prior_ver}`) was yanked from the registry{}. Yanked releases are a common supply-chain attack cleanup signal; the diff anchor may be older than expected.",
+                delta.target_version,
+                yanked_reason_clause(prior_yanked_reason)
             ),
         });
     }
@@ -526,8 +485,9 @@ pub fn evaluate_with_trust(
             severity: VerdictBand::Medium,
             title: format!("Target release `{}` was yanked", delta.target_version),
             description: format!(
-                "The target release `{}` is marked as yanked on the registry. Yanked releases are often withdrawn due to critical bugs or security compromises.",
-                delta.target_version
+                "The target release `{}` is marked as yanked on the registry{}. Yanked releases are often withdrawn due to critical bugs or security compromises.",
+                delta.target_version,
+                yanked_reason_clause(target_yanked_reason)
             ),
         });
     }
@@ -606,10 +566,49 @@ pub fn evaluate_with_trust(
         });
     }
 
+    let (capped_score, band) = score_and_band(&findings, policy);
+
+    Verdict {
+        name: name.to_string(),
+        target_version: delta.target_version.clone(),
+        baseline_version: delta.baseline_version.clone(),
+        integrity: integrity.to_string(),
+        ecosystem,
+        band,
+        risk_score: capped_score,
+        findings,
+        diff_summary: DiffSummary {
+            files_added: delta.files_added.len(),
+            files_removed: delta.files_removed.len(),
+            files_modified: delta.files_modified.len(),
+            lines_added: delta.total_lines_added,
+            lines_deleted: delta.total_lines_deleted,
+        },
+        trust_sources: if advisories.is_some() || provenance.is_some() {
+            Some(TrustSources {
+                advisories: advisories.cloned(),
+                provenance: provenance.cloned(),
+            })
+        } else {
+            None
+        },
+        recursive: Vec::new(),
+    }
+}
+
+/// The one score/band ladder. Weights, `R06_FIRST_SIGHTING`'s heavier bump, and
+/// the threshold escalation are defined here so the initial evaluation and
+/// `apply_extra_findings` cannot drift apart.
+///
+/// The band is monotonic in the findings: it is raised, never lowered, so a
+/// verdict is never rated below a finding it contains. A pure score→band
+/// function is a weaker rule — one HIGH finding is 25 points, which is below
+/// `max_medium_score`, and such a function answers MEDIUM for it.
+fn score_and_band(findings: &[Finding], policy: &Policy) -> (u32, VerdictBand) {
     let mut score: u32 = 0;
     let mut band = VerdictBand::Low;
 
-    for f in &findings {
+    for f in findings {
         match f.severity {
             VerdictBand::Block => {
                 score = score.saturating_add(50);
@@ -647,32 +646,7 @@ pub fn evaluate_with_trust(
         band = VerdictBand::Medium;
     }
 
-    Verdict {
-        name: name.to_string(),
-        target_version: delta.target_version.clone(),
-        baseline_version: delta.baseline_version.clone(),
-        integrity: integrity.to_string(),
-        ecosystem,
-        band,
-        risk_score: capped_score,
-        findings,
-        diff_summary: DiffSummary {
-            files_added: delta.files_added.len(),
-            files_removed: delta.files_removed.len(),
-            files_modified: delta.files_modified.len(),
-            lines_added: delta.total_lines_added,
-            lines_deleted: delta.total_lines_deleted,
-        },
-        trust_sources: if advisories.is_some() || provenance.is_some() {
-            Some(TrustSources {
-                advisories: advisories.cloned(),
-                provenance: provenance.cloned(),
-            })
-        } else {
-            None
-        },
-        recursive: Vec::new(),
-    }
+    (capped_score, band)
 }
 
 /// Recompute band and score after late findings (e.g. PKGBUILD heuristics)
@@ -681,42 +655,7 @@ pub fn evaluate_with_trust(
 /// silently.
 pub fn apply_extra_findings(verdict: &mut Verdict, extra: Vec<Finding>, policy: &Policy) {
     verdict.findings.extend(extra);
-    let mut score: u32 = 0;
-    let mut band = VerdictBand::Low;
-    for f in &verdict.findings {
-        match f.severity {
-            VerdictBand::Block => {
-                score = score.saturating_add(50);
-                band = VerdictBand::Block;
-            }
-            VerdictBand::High => {
-                score = score.saturating_add(25);
-                if band < VerdictBand::High {
-                    band = VerdictBand::High;
-                }
-            }
-            VerdictBand::Medium => {
-                let add = if f.rule_id == "R06_FIRST_SIGHTING" {
-                    15
-                } else {
-                    10
-                };
-                score = score.saturating_add(add);
-                if band < VerdictBand::Medium {
-                    band = VerdictBand::Medium;
-                }
-            }
-            VerdictBand::Low => {}
-        }
-    }
-    let capped_score = score.min(100);
-    if capped_score >= policy.thresholds.block_score {
-        band = VerdictBand::Block;
-    } else if capped_score > policy.thresholds.max_medium_score && band < VerdictBand::High {
-        band = VerdictBand::High;
-    } else if capped_score > policy.thresholds.max_low_score && band < VerdictBand::Medium {
-        band = VerdictBand::Medium;
-    }
+    let (capped_score, band) = score_and_band(&verdict.findings, policy);
     verdict.band = band;
     verdict.risk_score = capped_score;
 }
@@ -734,12 +673,14 @@ fn is_non_semver_url(v: &str) -> bool {
         "link:",
         "npm:",
     ];
+    // Byte-slice comparison, not `v[..p.len()]`. A dependency value is
+    // attacker-controlled and `p.len()` lands mid-character for anything
+    // multi-byte, which panics the whole review instead of returning a
+    // verdict. `get(..)` on a byte slice is bounds-checked and cannot panic.
     PREFIXES.iter().any(|&p| {
-        if v.len() >= p.len() {
-            v[..p.len()].eq_ignore_ascii_case(p)
-        } else {
-            false
-        }
+        v.as_bytes()
+            .get(..p.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(p.as_bytes()))
     })
 }
 
@@ -1835,6 +1776,211 @@ pub fn is_repo_allowed(provenance_repo: &str, allowed_pattern: &str) -> bool {
     false
 }
 
+/// Suffix appended to a non-registry dependency finding that
+/// `[policy] allow_git_dependencies` lowered, so the reviewer can see the band
+/// was a policy choice and not the engine's own opinion.
+const GIT_DEP_POLICY_NOTICE: &str = " Band lowered to MEDIUM by `[policy] allow_git_dependencies`; the dependency is still disclosed.";
+
+/// Band for a finding about a non-registry (git/http/ssh/`npm:`/`file:`/
+/// `link:`) dependency. `allow_git_dependencies` lowers HIGH to MEDIUM; it
+/// never removes the finding. MEDIUM rather than LOW: LOW is score-neutral, so
+/// a LOW finding renders as a clean auto-approve and would hide the dependency
+/// behind a passing verdict. MEDIUM keeps it in the score and below the default
+/// `fail_on = "high"` gate.
+fn non_registry_dep_band(policy: &Policy) -> VerdictBand {
+    if policy.policy.allow_git_dependencies {
+        VerdictBand::Medium
+    } else {
+        VerdictBand::High
+    }
+}
+
+/// The dependency-change rules. Split out so a delta can be tested without
+/// building a whole verdict around it.
+fn dependency_findings(delta: &Delta, policy: &Policy) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    if !delta.new_dependencies.is_empty() {
+        let deps_str = delta
+            .new_dependencies
+            .iter()
+            .map(|(d, v)| format!("{d}@{v}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let has_suspicious_url = delta
+            .new_dependencies
+            .iter()
+            .any(|(_, v)| is_non_semver_url(v));
+        let mut description = format!("Added dependencies: {deps_str}");
+        if has_suspicious_url && policy.policy.allow_git_dependencies {
+            description.push_str(GIT_DEP_POLICY_NOTICE);
+        }
+
+        findings.push(Finding {
+            rule_id: "R04_DEPENDENCY_ADDED".into(),
+            severity: if has_suspicious_url {
+                non_registry_dep_band(policy)
+            } else {
+                VerdictBand::Medium
+            },
+            title: format!(
+                "{} new runtime dependencies added",
+                delta.new_dependencies.len()
+            ),
+            description,
+        });
+    }
+
+    for (dep, old_ver, new_ver) in &delta.modified_dependencies {
+        // Both directions. A change *from* a URL back to a range is the mirror
+        // of the redirect and was producing nothing.
+        if is_non_semver_url(new_ver) || is_non_semver_url(old_ver) {
+            let mut description = format!(
+                "Dependency `{dep}` version modified from `{old_ver}` to suspicious URL `{new_ver}`."
+            );
+            if policy.policy.allow_git_dependencies {
+                description.push_str(GIT_DEP_POLICY_NOTICE);
+            }
+            findings.push(Finding {
+                rule_id: "R04_DEPENDENCY_MODIFIED".into(),
+                severity: non_registry_dep_band(policy),
+                title: format!("Dependency `{dep}` changed to non-semver URL"),
+                description,
+            });
+        } else {
+            // A range-to-range change used to produce no finding at all, which
+            // is the shape a dependency-takeover payload takes when the
+            // attacker re-pins to a compromised patch release. LOW, because a
+            // benign patch bump is the overwhelmingly common case and this
+            // fires on every one of them; LOW is score-neutral and cannot move
+            // a band, so the cost is a disclosed line and not a gate.
+            findings.push(Finding {
+                rule_id: "R04_DEPENDENCY_MODIFIED".into(),
+                severity: VerdictBand::Low,
+                title: format!("Dependency `{dep}` version constraint changed"),
+                description: format!(
+                    "Dependency `{dep}` modified from `{old_ver}` to `{new_ver}`."
+                ),
+            });
+        }
+    }
+
+    findings
+}
+
+/// Every rule that reads the provenance report. Split out from the main
+/// evaluation so the policy gate can be tested on a report alone.
+fn provenance_findings(
+    prov_rep: &crate::provenance::ProvenanceReport,
+    policy: &Policy,
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+
+    if prov_rep.status == ProvenanceStatus::FailedMismatch {
+        findings.push(Finding {
+            rule_id: "P03_PROVENANCE_DIGEST_MISMATCH".into(),
+            severity: VerdictBand::Block,
+            title: "Provenance digest mismatch".into(),
+            description: prov_rep.message.clone().unwrap_or_else(|| {
+                "Tarball SHA512 does not match in-toto attestation subject digest".into()
+            }),
+        });
+    }
+
+    // Policy asked for verified provenance. This build cannot verify one:
+    // it compares a subject digest and never checks a DSSE signature or a
+    // Sigstore chain, so anything short of `CryptographicallyVerified`
+    // refuses rather than quietly downgrading the requirement to a digest
+    // comparison. The description says so, because "missing" is not why.
+    if (policy.policy.require_provenance || policy.provenance.require_provenance)
+        && prov_rep.status != ProvenanceStatus::CryptographicallyVerified
+    {
+        let why = if prov_rep.status == ProvenanceStatus::Attested {
+            "a build statement was published and its subject digest matched, but this build \
+                 verifies no DSSE signature or Sigstore certificate chain, so it cannot confirm \
+                 who published it"
+        } else {
+            "none was present"
+        };
+        findings.push(Finding {
+            rule_id: "P03_PROVENANCE_REQUIRED_MISSING".into(),
+            severity: VerdictBand::Block,
+            title: "Required build provenance not verified".into(),
+            description: format!("Policy requires verified SLSA build provenance, but {why}."),
+        });
+    } else if prov_rep.status == ProvenanceStatus::Attested {
+        // Score-neutral, so this discloses without gating anything.
+        findings.push(Finding {
+            rule_id: "P03_PROVENANCE_NOT_CRYPTO_VERIFIED".into(),
+            severity: VerdictBand::Low,
+            title: "Build provenance attested, not cryptographically verified".into(),
+            description:
+                "A build statement was published and its subject digest matched these bytes, but \
+                     no signature or certificate chain was checked."
+                    .into(),
+        });
+    }
+
+    if policy.provenance.require_signatures && !prov_rep.registry_signature_present {
+        findings.push(Finding {
+            rule_id: "P03_SIGNATURE_REQUIRED_MISSING".into(),
+            severity: VerdictBand::Block,
+            title: "Required registry signature missing".into(),
+            description:
+                "Policy requires npm registry signatures, but no valid signature was attached."
+                    .into(),
+        });
+    }
+
+    if !policy.provenance.allowed_repositories.is_empty()
+        && let Some(ref repo) = prov_rep.source_repo
+    {
+        let allowed = policy
+            .provenance
+            .allowed_repositories
+            .iter()
+            .any(|a| is_repo_allowed(repo, a));
+        if !allowed {
+            findings.push(Finding {
+                rule_id: "P03_UNAUTHORIZED_BUILD_REPO".into(),
+                severity: VerdictBand::Block,
+                title: format!("Unauthorized source repository `{repo}`"),
+                description:
+                    "The build provenance repository is not in the allowed repositories list."
+                        .into(),
+            });
+        }
+    }
+
+    // Same shape and same matcher as the repository allowlist: a builder id is
+    // a URI, and `is_repo_allowed` compares after normalizing the scheme,
+    // `git@`, a trailing `.git` and a `@ref`, then requires a path boundary.
+    // The pattern is the *tail* of the builder id, so a policy pins the id as
+    // reported (`…/slsa-github-generator/generic@v1`, which normalizes to
+    // `…/generic`). A shorter parent path does not match a builder sub-path:
+    // that refuses the release and prints the id, rather than admitting a
+    // builder the policy never named.
+    if !policy.provenance.allowed_builders.is_empty()
+        && let Some(ref builder) = prov_rep.builder_id
+    {
+        let allowed = policy
+            .provenance
+            .allowed_builders
+            .iter()
+            .any(|b| is_repo_allowed(builder, b));
+        if !allowed {
+            findings.push(Finding {
+                rule_id: "P03_UNAUTHORIZED_BUILD_BUILDER".into(),
+                severity: VerdictBand::Block,
+                title: format!("Unauthorized build platform `{builder}`"),
+                description: format!(
+                    "The build provenance names builder `{builder}`, which is not in the allowed builders list."
+                ),
+            });
+        }
+    }
+    findings
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1857,7 +2003,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
 
@@ -1902,7 +2047,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
 
@@ -1952,7 +2096,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
 
@@ -1969,6 +2112,120 @@ mod tests {
                 .findings
                 .iter()
                 .any(|f| f.rule_id == "R02_OPAQUE_LARGE_FILE_ADDED")
+        );
+    }
+
+    #[test]
+    fn non_semver_url_check_survives_multibyte_input() {
+        // Byte-slicing by prefix length panicked on any value whose prefix
+        // length landed inside a character, which is every multi-byte
+        // dependency value in a manifest.
+        for v in [
+            "\u{1F4A9}",
+            "git\u{1F4A9}://x",
+            "https://example/\u{1F4A9}",
+            "\u{00E9}git",
+            "npm:",
+            "npm:./x",
+        ] {
+            let _ = is_non_semver_url(v);
+        }
+        assert!(is_non_semver_url("git+https://x"));
+        assert!(is_non_semver_url("GIT+HTTPS://x"));
+        assert!(!is_non_semver_url("1.2.3"));
+        // A value shorter than every prefix must not slice out of range.
+        assert!(!is_non_semver_url("x"));
+        assert!(!is_non_semver_url("gi"));
+    }
+
+    #[test]
+    fn detects_a_dependency_change_that_is_not_a_url() {
+        let mut delta = Delta::default();
+        delta
+            .modified_dependencies
+            .push(("cookie".into(), "0.7.1".into(), "0.7.2".into()));
+        let findings = dependency_findings(&delta, &Policy::default());
+        let r04: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "R04_DEPENDENCY_MODIFIED")
+            .collect();
+        assert_eq!(r04.len(), 1, "a range-to-range change must be disclosed");
+        assert_eq!(
+            r04[0].severity,
+            VerdictBand::Low,
+            "it must stay score-neutral: a benign patch bump is the common case"
+        );
+    }
+
+    #[test]
+    fn detects_a_dependency_leaving_a_url() {
+        let mut delta = Delta::default();
+        delta.modified_dependencies.push((
+            "pkg".into(),
+            "https://x/pkg.tgz".into(),
+            "1.0.0".into(),
+        ));
+        let findings = dependency_findings(&delta, &Policy::default());
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == "R04_DEPENDENCY_MODIFIED" && f.severity == VerdictBand::High),
+            "moving off a URL is the mirror of the redirect and must be HIGH"
+        );
+    }
+
+    #[test]
+    fn require_provenance_refuses_an_attestation_we_cannot_verify() {
+        // Policy asked for verified provenance. An attestation is not that, and
+        // silently accepting it would downgrade a block-grade policy to a
+        // digest comparison without saying so.
+        let mut policy = Policy::default();
+        policy.policy.require_provenance = true;
+        let report = crate::provenance::ProvenanceReport {
+            status: crate::provenance::ProvenanceStatus::Attested,
+            slsa_level: 0,
+            builder_id: Some("https://github.com/actions/runner".into()),
+            source_repo: Some("git+https://github.com/acme/pkg".into()),
+            commit_sha: Some("a".repeat(40)),
+            workflow_path: Some(".github/workflows/release.yml".into()),
+            registry_signature_present: true,
+            registry_signature_key_id: None,
+            message: None,
+        };
+        let findings = provenance_findings(&report, &policy);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == "P03_PROVENANCE_REQUIRED_MISSING"
+                    && f.severity == VerdictBand::Block),
+            "an attestation must not satisfy require_provenance: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn attestation_disclosure_cannot_move_the_verdict() {
+        let policy = Policy::default();
+        let report = crate::provenance::ProvenanceReport {
+            status: crate::provenance::ProvenanceStatus::Attested,
+            slsa_level: 0,
+            builder_id: None,
+            source_repo: None,
+            commit_sha: None,
+            workflow_path: None,
+            registry_signature_present: false,
+            registry_signature_key_id: None,
+            message: None,
+        };
+        let findings = provenance_findings(&report, &policy);
+        let disclosure: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "P03_PROVENANCE_NOT_CRYPTO_VERIFIED")
+            .collect();
+        assert_eq!(disclosure.len(), 1, "the disclosure is always emitted");
+        assert_eq!(disclosure[0].severity, VerdictBand::Low);
+        assert!(
+            findings.iter().all(|f| f.severity <= VerdictBand::Low),
+            "with no policy requiring it, an attestation must gate nothing: {findings:?}"
         );
     }
 
@@ -1996,7 +2253,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: true,
         };
 
@@ -2056,7 +2312,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![("malicious-pkg".into(), "ssh://git@host/repo".into())],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
 
@@ -2100,7 +2355,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
 
@@ -2138,7 +2392,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
 
@@ -2175,7 +2428,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
         let unreviewed = Delta {
@@ -2261,7 +2513,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
 
@@ -2349,7 +2600,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
 
@@ -2390,7 +2640,6 @@ mod tests {
                 "0.7.1".into(),
                 "https://evil.com/cookie.tgz".into(),
             )],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
 
@@ -2476,7 +2725,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
 
@@ -2508,7 +2756,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
 
@@ -2555,7 +2802,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
 
@@ -2618,7 +2864,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
 
@@ -2644,8 +2889,11 @@ mod tests {
             &delta,
             false,
             false,
+            None,
             false,
+            None,
             false,
+            None,
             &Policy::default(),
             Some(&adv),
             None,
@@ -2677,7 +2925,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
 
@@ -2703,8 +2950,11 @@ mod tests {
             &delta,
             false,
             false,
+            None,
             false,
+            None,
             false,
+            None,
             &Policy::default(),
             Some(&adv),
             None,
@@ -2736,7 +2986,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
 
@@ -2749,8 +2998,11 @@ mod tests {
             &delta,
             false,
             false,
+            None,
             false,
+            None,
             false,
+            None,
             &Policy::default(),
             None,
             Some(&prov),
@@ -2782,7 +3034,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
 
@@ -2797,8 +3048,11 @@ mod tests {
             &delta,
             false,
             false,
+            None,
             false,
+            None,
             false,
+            None,
             &policy,
             None,
             Some(&prov_missing),
@@ -2819,7 +3073,7 @@ mod tests {
             .push("github.com/trusted-org/".into());
 
         let prov_untrusted_repo = ProvenanceReport {
-            status: ProvenanceStatus::Verified,
+            status: ProvenanceStatus::Attested,
             slsa_level: 3,
             builder_id: Some("https://github.com/actions/runner".into()),
             source_repo: Some("https://github.com/attacker-org/malicious".into()),
@@ -2837,8 +3091,11 @@ mod tests {
             &delta,
             false,
             false,
+            None,
             false,
+            None,
             false,
+            None,
             &policy_repo,
             None,
             Some(&prov_untrusted_repo),
@@ -3145,7 +3402,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         }
     }
@@ -3160,8 +3416,11 @@ mod tests {
             &delta,
             false,
             true,
+            None,
             false,
+            None,
             false,
+            None,
             &Policy::default(),
             None,
             None,
@@ -3191,8 +3450,11 @@ mod tests {
             &delta,
             false,
             false,
+            None,
             true,
+            None,
             false,
+            None,
             &Policy::default(),
             None,
             None,
@@ -3211,6 +3473,114 @@ mod tests {
         assert_eq!(verdict.band, VerdictBand::Medium);
     }
 
+    fn yanked_finding_description(
+        prior_yanked: bool,
+        prior_reason: Option<&str>,
+        target_yanked: bool,
+        target_reason: Option<&str>,
+        rule_id: &str,
+    ) -> String {
+        let verdict = evaluate_with_trust(
+            "test-pkg",
+            Ecosystem::PyPi,
+            "sha256:abc",
+            &yanked_delta(),
+            false,
+            prior_yanked,
+            prior_reason,
+            target_yanked,
+            target_reason,
+            false,
+            None,
+            &Policy::default(),
+            None,
+            None,
+        );
+        verdict
+            .findings
+            .iter()
+            .find(|f| f.rule_id == rule_id)
+            .unwrap_or_else(|| panic!("expected {rule_id}"))
+            .description
+            .clone()
+    }
+
+    /// The withdrawal reason is registry text, so it reaches a card through
+    /// the sanitizer: no escape sequence survives, and no newline either,
+    /// because a reason that can start a line can fake one.
+    #[test]
+    fn yanked_reason_is_sanitized_before_it_reaches_the_card() {
+        let hostile = "\x1b[31mCRITICAL\x1b[0m wheel is broken\nsecond line\t\x1b]8;;https://evil.example\x07";
+        for rule_id in ["R08_YANKED_PREDECESSOR", "R09_YANKED_TARGET"] {
+            let desc =
+                yanked_finding_description(true, Some(hostile), true, Some(hostile), rule_id);
+            assert!(!desc.contains('\x1b'), "{rule_id} kept an escape: {desc:?}");
+            assert!(!desc.contains('\n'), "{rule_id} kept a newline: {desc:?}");
+            assert!(!desc.contains('\t'), "{rule_id} kept a tab: {desc:?}");
+            assert!(
+                desc.contains("registry-stated reason: `CRITICAL wheel is broken second line"),
+                "{rule_id} dropped the stated reason: {desc:?}"
+            );
+            assert!(
+                !desc.contains("evil.example"),
+                "{rule_id} kept an OSC payload: {desc:?}"
+            );
+        }
+    }
+
+    /// A withdrawal the registry gave no cause for must read as exactly that.
+    /// Rendering it as a cause is how a card tells a reviewer something the
+    /// registry never said.
+    #[test]
+    fn a_yanked_release_with_no_published_reason_says_so() {
+        for rule_id in ["R08_YANKED_PREDECESSOR", "R09_YANKED_TARGET"] {
+            let desc = yanked_finding_description(true, None, true, None, rule_id);
+            assert!(
+                desc.contains("(no reason published)"),
+                "{rule_id} must disclose the absent reason: {desc:?}"
+            );
+            assert!(
+                !desc.contains("registry-stated reason"),
+                "{rule_id} invented a cause: {desc:?}"
+            );
+            assert!(
+                desc.contains("was yanked") || desc.contains("marked as yanked"),
+                "{rule_id} lost the withdrawal itself: {desc:?}"
+            );
+        }
+    }
+
+    /// A reason is a sentence on a card, not a buffer. A registry that
+    /// publishes a megabyte of it must not be able to flood the render.
+    #[test]
+    fn an_oversized_yanked_reason_is_truncated() {
+        let long = "yanked because ".to_string() + &"x".repeat(10_000);
+        let desc =
+            yanked_finding_description(true, Some(&long), true, Some(&long), "R09_YANKED_TARGET");
+        assert!(
+            desc.chars().count() < 600,
+            "card text must stay bounded, got {} chars",
+            desc.chars().count()
+        );
+        assert!(desc.contains('…'), "truncation must be visible: {desc:?}");
+    }
+
+    /// A reason made only of escapes and control characters sanitizes to
+    /// nothing, which is the absence of a cause and says so rather than
+    /// rendering an empty quote.
+    #[test]
+    fn a_yanked_reason_that_sanitizes_away_reads_as_no_reason() {
+        let desc = yanked_finding_description(
+            true,
+            None,
+            true,
+            Some("\x1b[31m\x1b[0m"),
+            "R09_YANKED_TARGET",
+        );
+        assert!(desc.contains("(no reason published)"), "{desc:?}");
+        assert!(!desc.contains("reason: ``"), "{desc:?}");
+    }
+
     #[test]
     fn no_yanked_predecessor_finding_when_prior_is_live() {
         let delta = yanked_delta();
@@ -3221,8 +3591,11 @@ mod tests {
             &delta,
             false,
             false,
+            None,
             false,
+            None,
             false,
+            None,
             &Policy::default(),
             None,
             None,
@@ -3247,8 +3620,11 @@ mod tests {
             &delta,
             false,
             false,
+            None,
             false,
+            None,
             true,
+            None,
             &Policy::default(),
             None,
             None,
@@ -3277,8 +3653,11 @@ mod tests {
             &delta,
             false,
             false,
+            None,
             false,
+            None,
             false,
+            None,
             &Policy::default(),
             None,
             None,
@@ -3309,7 +3688,6 @@ mod tests {
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
-            removed_dependencies: vec![],
             binding_gyp_added: false,
         };
         let verdict = evaluate_with_trust(
@@ -3319,8 +3697,11 @@ mod tests {
             &delta,
             false,
             false,
+            None,
             false,
+            None,
             false,
+            None,
             &Policy::default(),
             None,
             None,
@@ -3333,5 +3714,546 @@ mod tests {
             "ordinary AUR versions must not trip R05, got {:?}",
             verdict.findings
         );
+    }
+    /// `[blocklist] maintainers` parsed, validated, and was then never read:
+    /// `is_maintainer_blocked` had no caller outside its own test. A policy
+    /// asserting a protection got none, silently. A release published by a
+    /// blocklisted identity must now block.
+    #[test]
+    fn blocked_maintainer_blocks_the_release() {
+        let policy = Policy::from_toml_str(
+            r#"
+[blocklist]
+maintainers = ["badactor@example.com"]
+"#,
+        )
+        .unwrap();
+        let delta = Delta {
+            baseline_version: Some("1.0.0".into()),
+            target_version: "1.0.1".into(),
+            files_added: vec![],
+            files_removed: vec![],
+            files_modified: vec![],
+            total_lines_added: 0,
+            total_lines_deleted: 0,
+            new_executables: vec![],
+            new_binaries: vec![],
+            modified_binaries: vec![],
+            new_lifecycle_scripts: vec![],
+            modified_lifecycle_scripts: vec![],
+            new_dependencies: vec![],
+            modified_dependencies: vec![],
+            binding_gyp_added: false,
+        };
+        let verdict = evaluate_with_trust(
+            "pkg",
+            Ecosystem::Npm,
+            "verified (sha512)",
+            &delta,
+            false,
+            false,
+            None,
+            false,
+            None,
+            false,
+            Some("badactor@example.com"),
+            &policy,
+            None,
+            None,
+        );
+        assert_eq!(verdict.band, VerdictBand::Block);
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "P04_MAINTAINER_BLOCKED"),
+            "expected P04_MAINTAINER_BLOCKED, got {:?}",
+            verdict
+                .findings
+                .iter()
+                .map(|f| &f.rule_id)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Identity comparison is case- and whitespace-insensitive on both sides,
+    /// so a blocklist entry cannot be sidestepped by capitalisation.
+    #[test]
+    fn blocked_maintainer_match_ignores_case_and_padding() {
+        let policy = Policy::from_toml_str(
+            r#"
+[blocklist]
+maintainers = ["  BadActor@Example.com "]
+"#,
+        )
+        .unwrap();
+        let delta = Delta {
+            baseline_version: Some("1.0.0".into()),
+            target_version: "1.0.1".into(),
+            files_added: vec![],
+            files_removed: vec![],
+            files_modified: vec![],
+            total_lines_added: 0,
+            total_lines_deleted: 0,
+            new_executables: vec![],
+            new_binaries: vec![],
+            modified_binaries: vec![],
+            new_lifecycle_scripts: vec![],
+            modified_lifecycle_scripts: vec![],
+            new_dependencies: vec![],
+            modified_dependencies: vec![],
+            binding_gyp_added: false,
+        };
+        let verdict = evaluate_with_trust(
+            "pkg",
+            Ecosystem::Npm,
+            "verified (sha512)",
+            &delta,
+            false,
+            false,
+            None,
+            false,
+            None,
+            false,
+            Some("badactor@example.com"),
+            &policy,
+            None,
+            None,
+        );
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "P04_MAINTAINER_BLOCKED"),
+            "a padded, differently-cased blocklist entry must still match"
+        );
+    }
+
+    /// An unlisted identity, and an absent identity, must both stay clean. A
+    /// registry that exposes no authorship is a disclosed no-signal, not a
+    /// finding and not a block.
+    #[test]
+    fn unlisted_or_absent_author_is_not_a_finding() {
+        let policy = Policy::from_toml_str(
+            r#"
+[blocklist]
+maintainers = ["badactor@example.com"]
+"#,
+        )
+        .unwrap();
+        let delta = Delta {
+            baseline_version: Some("1.0.0".into()),
+            target_version: "1.0.1".into(),
+            files_added: vec![],
+            files_removed: vec![],
+            files_modified: vec![],
+            total_lines_added: 0,
+            total_lines_deleted: 0,
+            new_executables: vec![],
+            new_binaries: vec![],
+            modified_binaries: vec![],
+            new_lifecycle_scripts: vec![],
+            modified_lifecycle_scripts: vec![],
+            new_dependencies: vec![],
+            modified_dependencies: vec![],
+            binding_gyp_added: false,
+        };
+        for author in [None, Some("gooddev@example.com")] {
+            let verdict = evaluate_with_trust(
+                "pkg",
+                Ecosystem::Npm,
+                "verified (sha512)",
+                &delta,
+                false,
+                false,
+                None,
+                false,
+                None,
+                false,
+                author,
+                &policy,
+                None,
+                None,
+            );
+            assert!(
+                !verdict
+                    .findings
+                    .iter()
+                    .any(|f| f.rule_id == "P04_MAINTAINER_BLOCKED"),
+                "author {author:?} must not produce P04"
+            );
+        }
+    }
+
+    fn opaque_large_file(name: &str) -> FileChange {
+        FileChange {
+            relative_path: name.into(),
+            kind: FileKind::OpaqueTooLarge,
+            lines_added: 0,
+            lines_deleted: 0,
+            is_executable: false,
+            unified_diff: None,
+        }
+    }
+
+    fn opaque_large_file_delta(names: &[&str]) -> Delta {
+        Delta {
+            baseline_version: Some("1.0.0".into()),
+            target_version: "1.0.1".into(),
+            files_added: names.iter().map(|n| opaque_large_file(n)).collect(),
+            new_binaries: names.iter().map(|n| (*n).into()).collect(),
+            ..Delta::default()
+        }
+    }
+
+    /// The band is monotonic in the findings, not a pure function of the score.
+    /// `Policy::calculate_band` was a pure function of the score, disagreed with
+    /// this ladder the moment a HIGH finding's 25 points sat below
+    /// `max_medium_score`, and was dead code besides — the weakest spelling of a
+    /// rule and a live trap for the next reader. Pin the live ladder instead.
+    #[test]
+    fn live_band_ladder_is_monotonic_and_not_a_pure_function_of_score() {
+        // One HIGH finding: 25 points, and HIGH because a finding raised it.
+        let verdict = evaluate(
+            "test-pkg",
+            Ecosystem::Npm,
+            "sha512-x",
+            &opaque_large_file_delta(&["payload.bin"]),
+            false,
+        );
+        assert_eq!(verdict.risk_score, 25, "one HIGH finding is 25 points");
+        assert_eq!(
+            verdict.band,
+            VerdictBand::High,
+            "25 points is below max_medium_score, so a score-only map answers \
+             MEDIUM and would silently weaken every HIGH verdict"
+        );
+        assert!(
+            verdict.findings.iter().all(|f| verdict.band >= f.severity),
+            "the band is never below a finding's own severity: {:?}",
+            verdict.findings
+        );
+
+        // The deleted mapping, spelled out, so the disagreement stays visible.
+        let score_only = |score: u32, p: &Policy| {
+            if score >= p.thresholds.block_score {
+                VerdictBand::Block
+            } else if score > p.thresholds.max_medium_score {
+                VerdictBand::High
+            } else if score > p.thresholds.max_low_score {
+                VerdictBand::Medium
+            } else {
+                VerdictBand::Low
+            }
+        };
+        let policy = Policy::default();
+        assert_ne!(
+            score_only(verdict.risk_score, &policy),
+            verdict.band,
+            "production must not be answerable from the score alone"
+        );
+    }
+
+    /// The initial evaluation and `apply_extra_findings` were two copies of the
+    /// same score/band walk. `review` folds PKGBUILD heuristics in through the
+    /// second one, so a drift between the copies would rescore a verdict after
+    /// the reviewer had already seen it.
+    #[test]
+    fn extra_findings_score_on_the_same_ladder_as_the_initial_evaluation() {
+        let policy = Policy::default();
+        let high = |rule_id: &str| Finding {
+            rule_id: rule_id.into(),
+            severity: VerdictBand::High,
+            title: "late finding".into(),
+            description: "appended after evaluation".into(),
+        };
+
+        let mut late = evaluate(
+            "test-pkg",
+            Ecosystem::Npm,
+            "sha512-x",
+            &opaque_large_file_delta(&["a.bin"]),
+            false,
+        );
+        assert_eq!((late.band, late.risk_score), (VerdictBand::High, 25));
+        apply_extra_findings(
+            &mut late,
+            vec![high("R02_OPAQUE_LARGE_FILE_ADDED")],
+            &policy,
+        );
+        let native = evaluate(
+            "test-pkg",
+            Ecosystem::Npm,
+            "sha512-x",
+            &opaque_large_file_delta(&["a.bin", "b.bin"]),
+            false,
+        );
+        assert_eq!(native.risk_score, 50);
+        assert_eq!(
+            (late.band, late.risk_score),
+            (native.band, native.risk_score),
+            "a late finding must move band and score exactly as an in-evaluation one does"
+        );
+
+        // A late MEDIUM on top of a HIGH: 35 points stays HIGH only because the
+        // ladder is monotonic. A score-only map on both ladders would say MEDIUM.
+        let mut late_medium = evaluate(
+            "test-pkg",
+            Ecosystem::Npm,
+            "sha512-x",
+            &opaque_large_file_delta(&["a.bin"]),
+            false,
+        );
+        apply_extra_findings(
+            &mut late_medium,
+            vec![Finding {
+                rule_id: "R08_YANKED_PREDECESSOR".into(),
+                severity: VerdictBand::Medium,
+                title: "late finding".into(),
+                description: "appended after evaluation".into(),
+            }],
+            &policy,
+        );
+        assert_eq!(
+            (late_medium.band, late_medium.risk_score),
+            (VerdictBand::High, 35),
+            "a late MEDIUM must not lower a band a HIGH already raised"
+        );
+    }
+
+    /// `[provenance] allowed_builders` parsed, validated, and was never read, so
+    /// a policy pinning trusted Sigstore builders asserted a protection and got
+    /// none. Mirrors `allowed_repositories`: a builder outside the allowlist
+    /// BLOCKs, matched with the same path-boundary matcher, so a pinned builder
+    /// cannot be impersonated by a sibling path.
+    #[test]
+    fn unauthorized_build_builder_blocks_the_release() {
+        let policy = Policy::from_toml_str(
+            r#"
+[provenance]
+allowed_builders = ["github.com/slsa-framework/slsa-github-generator/generic"]
+"#,
+        )
+        .unwrap();
+        let delta = yanked_delta();
+        for builder in [
+            "https://github.com/attacker-org/builder",
+            "https://github.com/slsa-framework/slsa-github-generator-evil",
+            "https://github.com/slsa-framework/slsa-github-generator/generic-evil",
+        ] {
+            let prov = ProvenanceReport {
+                status: ProvenanceStatus::Attested,
+                slsa_level: 3,
+                builder_id: Some(builder.into()),
+                source_repo: Some("https://github.com/acme/pkg".into()),
+                commit_sha: Some("a".repeat(40)),
+                workflow_path: Some(".github/workflows/release.yml".into()),
+                registry_signature_present: true,
+                registry_signature_key_id: None,
+                message: None,
+            };
+            let verdict = evaluate_with_trust(
+                "pkg",
+                Ecosystem::Npm,
+                "verified (sha512)",
+                &delta,
+                false,
+                false,
+                None,
+                false,
+                None,
+                false,
+                None,
+                &policy,
+                None,
+                Some(&prov),
+            );
+            assert_eq!(verdict.band, VerdictBand::Block, "builder `{builder}`");
+            assert!(
+                verdict
+                    .findings
+                    .iter()
+                    .any(|f| f.rule_id == "P03_UNAUTHORIZED_BUILD_BUILDER"
+                        && f.severity == VerdictBand::Block),
+                "expected P03_UNAUTHORIZED_BUILD_BUILDER for `{builder}`, got {:?}",
+                verdict
+                    .findings
+                    .iter()
+                    .map(|f| &f.rule_id)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// The allowlist filters the builders a report names; it does not demand
+    /// that one be named. A builder inside the allowlist — pinned the way the
+    /// matcher reads it, as the id with or without its scheme and `@ref` — and a
+    /// report carrying no builder at all are both no-signal, exactly as an
+    /// absent `source_repo` is for `allowed_repositories`. `require_provenance`
+    /// is the key that refuses a release with no verified build.
+    #[test]
+    fn allowed_or_absent_builder_is_not_a_finding() {
+        let policy = Policy::from_toml_str(
+            r#"
+[provenance]
+allowed_builders = [
+  "https://github.com/slsa-framework/slsa-github-generator/generic@v1",
+  "https://github.com/actions/runner",
+]
+"#,
+        )
+        .unwrap();
+        let delta = yanked_delta();
+        for builder in [
+            Some("https://github.com/slsa-framework/slsa-github-generator/generic@v1"),
+            Some("https://github.com/slsa-framework/slsa-github-generator/generic"),
+            Some("https://github.com/actions/runner"),
+            None,
+        ] {
+            let prov = ProvenanceReport {
+                status: ProvenanceStatus::Attested,
+                slsa_level: 3,
+                builder_id: builder.map(str::to_string),
+                source_repo: Some("https://github.com/acme/pkg".into()),
+                commit_sha: Some("a".repeat(40)),
+                workflow_path: Some(".github/workflows/release.yml".into()),
+                registry_signature_present: true,
+                registry_signature_key_id: None,
+                message: None,
+            };
+            let verdict = evaluate_with_trust(
+                "pkg",
+                Ecosystem::Npm,
+                "verified (sha512)",
+                &delta,
+                false,
+                false,
+                None,
+                false,
+                None,
+                false,
+                None,
+                &policy,
+                None,
+                Some(&prov),
+            );
+            assert!(
+                !verdict
+                    .findings
+                    .iter()
+                    .any(|f| f.rule_id == "P03_UNAUTHORIZED_BUILD_BUILDER"),
+                "builder {builder:?} must not produce P03_UNAUTHORIZED_BUILD_BUILDER"
+            );
+            assert_eq!(verdict.band, VerdictBand::Low, "builder {builder:?}");
+        }
+    }
+
+    fn git_dependency_delta() -> Delta {
+        Delta {
+            baseline_version: Some("1.0.0".into()),
+            target_version: "1.0.1".into(),
+            new_dependencies: vec![("tool".into(), "git+https://github.com/acme/tool.git".into())],
+            modified_dependencies: vec![(
+                "cookie".into(),
+                "0.7.1".into(),
+                "https://evil.example/cookie.tgz".into(),
+            )],
+            ..Delta::default()
+        }
+    }
+
+    /// `[policy] allow_git_dependencies` parsed, defaulted to false, and was
+    /// never read: every non-registry (git/http/ssh) dependency stayed HIGH
+    /// whatever the policy said. The key lowers the band of those findings and
+    /// keeps them — LOW is score-neutral, so it would render as a clean
+    /// auto-approve and hide the dependency behind a passing verdict.
+    #[test]
+    fn allow_git_dependencies_lowers_git_dependency_findings_without_hiding_them() {
+        let strict = [
+            Policy::default(),
+            Policy::from_toml_str("[policy]\nallow_git_dependencies = false\n").unwrap(),
+        ];
+        for policy in &strict {
+            let verdict = evaluate_with_policy(
+                "test-pkg",
+                Ecosystem::Npm,
+                "sha512-x",
+                &git_dependency_delta(),
+                false,
+                policy,
+            );
+            assert_eq!(
+                (verdict.band, verdict.risk_score),
+                (VerdictBand::High, 50),
+                "without the key, non-registry dependencies are unchanged"
+            );
+            for rule_id in ["R04_DEPENDENCY_ADDED", "R04_DEPENDENCY_MODIFIED"] {
+                let finding = verdict
+                    .findings
+                    .iter()
+                    .find(|f| f.rule_id == rule_id)
+                    .unwrap_or_else(|| {
+                        panic!("{rule_id} must stay visible: {:?}", verdict.findings)
+                    });
+                assert_eq!(finding.severity, VerdictBand::High);
+                assert!(
+                    !finding.description.contains("allow_git_dependencies"),
+                    "nothing is downgraded when the key is off: {}",
+                    finding.description
+                );
+            }
+        }
+
+        let lenient = Policy::from_toml_str("[policy]\nallow_git_dependencies = true\n").unwrap();
+        let verdict = evaluate_with_policy(
+            "test-pkg",
+            Ecosystem::Npm,
+            "sha512-x",
+            &git_dependency_delta(),
+            false,
+            &lenient,
+        );
+        assert_eq!(
+            (verdict.band, verdict.risk_score),
+            (VerdictBand::Medium, 20),
+            "the findings are lowered, not dropped: 2 x MEDIUM is 20 points, not 0"
+        );
+        for rule_id in ["R04_DEPENDENCY_ADDED", "R04_DEPENDENCY_MODIFIED"] {
+            let finding = verdict
+                .findings
+                .iter()
+                .find(|f| f.rule_id == rule_id)
+                .unwrap_or_else(|| panic!("{rule_id} must stay visible: {:?}", verdict.findings));
+            assert_eq!(finding.severity, VerdictBand::Medium, "{rule_id}");
+            assert!(
+                finding.description.contains("allow_git_dependencies"),
+                "the finding must say policy lowered it: {}",
+                finding.description
+            );
+        }
+
+        // Registry dependencies are not what the key is about: a plain semver
+        // bump stays score-neutral either way.
+        let registry_only = Delta {
+            baseline_version: Some("1.0.0".into()),
+            target_version: "1.0.1".into(),
+            new_dependencies: vec![("left-pad".into(), "1.3.0".into())],
+            ..Delta::default()
+        };
+        let verdict = evaluate_with_policy(
+            "test-pkg",
+            Ecosystem::Npm,
+            "sha512-x",
+            &registry_only,
+            false,
+            &lenient,
+        );
+        let finding = verdict
+            .findings
+            .iter()
+            .find(|f| f.rule_id == "R04_DEPENDENCY_ADDED")
+            .unwrap_or_else(|| panic!("R04_DEPENDENCY_ADDED must stay visible"));
+        assert_eq!(finding.severity, VerdictBand::Medium);
+        assert!(!finding.description.contains("allow_git_dependencies"));
     }
 }

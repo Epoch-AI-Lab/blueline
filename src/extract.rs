@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io::{Cursor, Read, Write};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use crate::error::BluelineError;
 
@@ -34,6 +34,18 @@ pub struct ExtractStats {
     pub unpacked_bytes: u64,
 }
 
+/// One definition of "lands on the same file", shared by the tar and wheel
+/// paths. `Path::components` drops `CurDir` and collapses `a//b` to `a/b`, so a
+/// plain string comparison of the raw entry name would miss those duplicates
+/// and let the second one overwrite the first.
+fn normalized_entry_key(path: &Path) -> String {
+    path.components()
+        .filter(|c| !matches!(c, Component::CurDir))
+        .collect::<PathBuf>()
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Extract a gzipped tarball into `dest` under hard bounds.
 ///
 /// Safety invariants:
@@ -55,6 +67,7 @@ pub fn safe_extract(
 
     let mut stats = ExtractStats::default();
     let mut seen = 0usize;
+    let mut seen_paths: HashSet<String> = HashSet::new();
 
     for entry in entries {
         seen += 1;
@@ -105,6 +118,25 @@ pub fn safe_extract(
             .map_err(|e| BluelineError::Extraction(format!("unreadable entry path: {e}")))?
             .to_path_buf();
         validate_entry_path(&path).map_err(BluelineError::Extraction)?;
+
+        let normalized_key = normalized_entry_key(&path);
+        if !seen_paths.insert(normalized_key.clone()) {
+            return Err(BluelineError::Extraction(format!(
+                "duplicate entry `{}` (normalized `{normalized_key}`)",
+                path.display()
+            )));
+        }
+
+        if entry_type.is_dir() && size != 0 {
+            // No tar writer emits payload for a directory, and tar-rs cannot
+            // seek past one, so a declared size here is inflated in full while
+            // counting as zero against every byte cap. Refuse rather than
+            // count, which is what the wheel path already does.
+            return Err(BluelineError::ExtractionLimit(format!(
+                "directory entry `{}` declares {size} payload bytes",
+                path.display()
+            )));
+        }
 
         if entry_type.is_file() {
             if size > limits.max_entry_bytes {
@@ -197,12 +229,7 @@ pub fn safe_extract_wheel(
 
         validate_entry_path(&enclosed_path).map_err(BluelineError::Extraction)?;
 
-        let normalized_key = enclosed_path
-            .components()
-            .filter(|c| !matches!(c, std::path::Component::CurDir))
-            .collect::<std::path::PathBuf>()
-            .to_string_lossy()
-            .into_owned();
+        let normalized_key = normalized_entry_key(&enclosed_path);
         if !seen.insert(normalized_key.clone()) {
             return Err(BluelineError::Extraction(format!(
                 "duplicate entry `{raw_name}` (normalized `{normalized_key}`)"
@@ -464,6 +491,21 @@ mod tests {
         let chksum = format!("{:06o}\x00 ", sum);
         h[148..156].copy_from_slice(chksum.as_bytes());
         h.to_vec()
+    }
+
+    /// Same header with the ustar magic set. Without it tar-rs yields the
+    /// metadata entry to us, and our own cap applies; with it, tar-rs
+    /// consumes L/K/x headers inside its iterator, which is the path that
+    /// buffers the declared size. Tests of the metadata cap must use this.
+    fn raw_ustar_header(name: &str, typeflag: u8, size: u64) -> Vec<u8> {
+        let mut h = raw_header(name, typeflag, size, "", 0o644);
+        h[257..263].copy_from_slice(b"ustar\x00");
+        // Blank the checksum field before summing, or the old value is counted.
+        h[148..156].fill(b' ');
+        let sum: u64 = h.iter().map(|&b| u64::from(b)).sum();
+        let chksum = format!("{:06o}\x00 ", sum);
+        h[148..156].copy_from_slice(chksum.as_bytes());
+        h
     }
 
     fn raw_tarball(entries: &[(String, u8, &str)]) -> Vec<u8> {
@@ -773,6 +815,136 @@ mod tests {
     }
 
     #[test]
+    fn ustar_metadata_headers_are_capped() {
+        // Every ustar header kind that can carry a long name or an extended
+        // attribute, each declaring 256 MiB behind a small gzip. The report
+        // that these bypassed the per-entry cap did not reproduce: all four
+        // are refused by the existing metadata cap. This pins that, with the
+        // ustar magic set, which the older fixtures did not have.
+        use std::io::Write;
+        const PAYLOAD: usize = 256 * 1024 * 1024;
+        for (label, typeflag, meta_name) in [
+            ("pax-local", b'x', "PaxHeaders/demo"),
+            ("pax-global", b'g', "pax_global_header"),
+            ("gnu-longname", b'L', "././@LongLink"),
+            ("gnu-longlink", b'K', "././@LongLink"),
+        ] {
+            let mut out = Vec::new();
+            out.extend_from_slice(&raw_ustar_header(meta_name, typeflag, PAYLOAD as u64));
+            out.extend(std::iter::repeat_n(b'A', PAYLOAD));
+            out.extend_from_slice(&raw_ustar_header("package/demo", 0x30, 1));
+            out.push(b'z');
+            out.extend_from_slice(&[0u8; 1024]);
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            enc.write_all(&out).unwrap();
+            let tgz = enc.finish().unwrap();
+            assert!(
+                tgz.len() * 100 < PAYLOAD,
+                "[{label}] fixture must be far smaller than it declares"
+            );
+
+            let dir = tempfile::tempdir().unwrap();
+            match safe_extract(&tgz, dir.path(), &ExtractionLimits::default()) {
+                Ok(stats) => panic!(
+                    "[{label}] a {PAYLOAD}-byte metadata header was accepted \
+                     (files={})",
+                    stats.files
+                ),
+                Err(e) => assert!(
+                    matches!(e, BluelineError::ExtractionLimit(_)),
+                    "[{label}] must hit a declared cap, got {e:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn stream_budget_does_not_reject_a_header_heavy_archive() {
+        // The slack term exists for this: 1000 tiny entries need real header
+        // bytes, which a ratio on the compressed size cannot cover.
+        use std::io::Write;
+        let mut out = Vec::new();
+        for i in 0..1000 {
+            out.extend_from_slice(&raw_ustar_header(&format!("package/f{i}"), 0x30, 1));
+            out.push(b'x');
+            out.extend_from_slice(&[0u8; 511]);
+        }
+        out.extend_from_slice(&[0u8; 1024]);
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(&out).unwrap();
+        let tgz = enc.finish().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let stats = safe_extract(&tgz, dir.path(), &ExtractionLimits::default())
+            .expect("a legal header-heavy archive must still extract");
+        assert_eq!(stats.files, 1000);
+    }
+
+    #[test]
+    fn tar_duplicate_entry_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let tgz = raw_tarball_with_payload(&[
+            ("package/a.txt".into(), 0x30, b"first".to_vec()),
+            ("package/a.txt".into(), 0x30, b"second".to_vec()),
+        ]);
+        let err = safe_extract(&tgz, dir.path(), &ExtractionLimits::default()).unwrap_err();
+        assert!(
+            format!("{err}").contains("duplicate entry"),
+            "a repeated path must be refused, not silently overwritten: {err}"
+        );
+    }
+
+    #[test]
+    fn tar_duplicate_entry_that_normalizes_to_one_path_is_refused() {
+        // The case a string-keyed duplicate check misses: `a/b` and `a//b` are
+        // the same destination, so the second overwrites the first and the
+        // reviewed tree depends on entry order.
+        let dir = tempfile::tempdir().unwrap();
+        for second in ["package//a.txt", "./package/a.txt"] {
+            let tgz = raw_tarball_with_payload(&[
+                ("package/a.txt".into(), 0x30, b"first".to_vec()),
+                (second.into(), 0x30, b"second".to_vec()),
+            ]);
+            let err = safe_extract(&tgz, dir.path(), &ExtractionLimits::default())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("duplicate entry"),
+                "`{second}` normalizes onto an existing path and must be refused: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn tar_distinct_paths_still_extract() {
+        let dir = tempfile::tempdir().unwrap();
+        let tgz = raw_tarball_with_payload(&[
+            ("package/a.txt".into(), 0x30, b"a".to_vec()),
+            ("package/b.txt".into(), 0x30, b"b".to_vec()),
+            ("./package/c.txt".into(), 0x30, b"c".to_vec()),
+        ]);
+        let stats = safe_extract(&tgz, dir.path(), &ExtractionLimits::default()).unwrap();
+        assert_eq!(stats.files, 3, "distinct paths must not be confused");
+    }
+
+    #[test]
+    fn tar_directory_declaring_payload_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        // No tar writer emits payload for a directory, and tar-rs cannot seek
+        // past one, so a declared size is decompressed in full while counting
+        // as zero against every byte cap.
+        let tgz = raw_tarball_with_payload(&[
+            ("package/d".into(), 0x35, vec![b'A'; 64 * 1024]),
+            ("package/d/ok.txt".into(), 0x30, b"ok".to_vec()),
+        ]);
+        let err = safe_extract(&tgz, dir.path(), &ExtractionLimits::default()).unwrap_err();
+        assert!(
+            matches!(err, BluelineError::ExtractionLimit(_)),
+            "a directory with a declared payload must hit the byte budget, got {err:?}"
+        );
+    }
+
+    #[test]
     fn metadata_entry_size_limits() {
         let dir = tempfile::tempdir().unwrap();
         // Exact metadata cap 64 KiB succeeds
@@ -859,27 +1031,6 @@ mod wheel_tests {
         let mut zw = zip::ZipWriter::new(&mut buf);
         for (name, data, method) in entries {
             let opts = SimpleFileOptions::default().compression_method(*method);
-            if name.ends_with('/') {
-                zw.add_directory(*name, opts).unwrap();
-            } else {
-                zw.start_file(*name, opts).unwrap();
-                zw.write_all(data).unwrap();
-            }
-        }
-        zw.finish().unwrap();
-        buf.into_inner()
-    }
-
-    #[allow(dead_code)]
-    fn make_wheel_with_unix_mode(
-        entries: &[(&str, &[u8], zip::CompressionMethod, u32)],
-    ) -> Vec<u8> {
-        let mut buf = Cursor::new(Vec::new());
-        let mut zw = zip::ZipWriter::new(&mut buf);
-        for (name, data, method, mode) in entries {
-            let opts = SimpleFileOptions::default()
-                .compression_method(*method)
-                .unix_permissions(*mode);
             if name.ends_with('/') {
                 zw.add_directory(*name, opts).unwrap();
             } else {
