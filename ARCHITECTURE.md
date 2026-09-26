@@ -6,8 +6,8 @@ Blueline is a release-diff review desk for the package install line. It renders
 every release as a proof sheet and demands sign-off before the byte runs.
 
 **Hard rule: nothing executes until judged.** Tarballs are fetched, **integrity-verified
-(sha512 SRI + registry signature, fail closed)**, then extracted read-only into a
-sandboxed temp dir — never executed, diffed, and scored. The package's own code is
+(sha512 SRI, fail closed)**, then extracted read-only into a sandboxed temp dir —
+never executed, diffed, and scored. The package's own code is
 never run: even on approve, install proceeds with `npm install --ignore-scripts`,
 and any `postinstall`/`preinstall` script is surfaced for a *separate* human decision.
 
@@ -75,22 +75,33 @@ registry plugged in later without refactoring the engine.
 
 ### Extraction & untrusted-input safety
 Every tarball and registry response is fully untrusted. The `extract` stage enforces:
-- **Integrity first:** stream-hash the tarball during download and compare to the
-  registry `dist.integrity` (sha512) and `dist.shasum`; verify the npm registry
-  signature when present. Mismatch → `Verdict::Block` (fail closed) *before* extraction.
-- **Bounded extraction:** hard caps on total unpacked bytes (e.g. 50× tarball size),
-  entry count, per-entry size, open file descriptors, and a gzip decompress-ratio
-  monitor (bomb guard). The temp dir is an RAII guard removed on drop/panic.
+- **Integrity first:** download the tarball under a hard byte cap, then hash the
+  buffered bytes and compare to the registry `dist.integrity` (sha512); a missing
+  or non-sha512 `dist.integrity` is refused rather than downgraded. A mismatch
+  aborts the review with a verification error *before* extraction — no verdict is
+  produced, so there is nothing to approve or override.
+- **Bounded extraction:** hard *absolute* caps, not multiples of the tarball
+  size — entry count (100 000, checked before any write), per-entry unpacked
+  size (128 MiB, checked against the header and again against the bytes actually
+  written), and cumulative unpacked bytes (512 MiB). Tar metadata entries (GNU
+  long name/link, pax extensions) carry their own 64 KiB cap and count against
+  that total, so a long-name bomb cannot slip under it. A directory entry that
+  declares payload is refused. There is no decompress-ratio monitor and no
+  open-FD cap: the guard is the byte and entry budget, enforced on the declared
+  size *and* on the inflated stream. The temp dir is an RAII guard removed on
+  drop/panic.
 - **Reject dangerous entry types:** symlinks, hardlinks, and special files
-  (char/block device, FIFO, socket) are rejected by default; absolute paths and `..`
-  traversal are rejected; setuid/setgid bits are stripped. Pin `tar` ≥ 0.4.45 and
-  prefer `cap-std`'s `Dir` for beneath-root (RESOLVE_BENEATH) resolution.
+  (char/block device, FIFO, socket) are rejected by default; absolute paths, `..`
+  traversal, and drive prefixes are rejected, as is a second entry normalizing
+  onto a path already written (`a//b` and `a/b` are one entry, and the second
+  would otherwise overwrite the first); setuid/setgid bits are stripped. Pin
+  `tar` ≥ 0.4.45.
 - **Sandbox the step:** run extract + diff in a Landlock-restricted child
   (read-only host FS, write only to the sandbox temp dir), capability-dropped,
   optionally seccomp-filtered, non-root. Linux uses Landlock; macOS/Windows fall
   back to the parser-level bounds above plus a dedicated non-writable temp dir.
 - **Treat extracted bytes as hostile:** the extracted `package.json` (`scripts`,
-  `bin`, `dependencies`) is diffed/flagged as attack surface, not trusted.
+  `dependencies`) is diffed/flagged as attack surface, not trusted.
 
 ---
 

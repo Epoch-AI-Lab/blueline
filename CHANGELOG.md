@@ -9,6 +9,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The MCP stdio server validates the JSON-RPC `jsonrpc` member. `"jsonrpc":"1.0"`,
+  or a request with the member absent, was accepted; 2.0 is now required and a
+  bad request gets the existing parse-error response without killing the
+  server.
+- An OSV advisory's declared `severity[].type` is now read. A CVSS v2 vector is
+  the one score string with no self-identifying prefix, so the declared type
+  was the only thing that said how to read it; v2 vectors were silently
+  unscored. v2 base scores are computed per the v2.0 equation and checked
+  against NVD reference vectors. When a source declares its own severity band
+  *and* carries a score, the strongest of the two now wins, where the score
+  path previously returned first and could under-report a source that labelled
+  itself CRITICAL. CVSS v4 is still unscored and falls through as before.
+- The PyPI Simple API is paginated in reality and `meta.next` was parsed and
+  ignored, so a truncated page was indistinguishable from a complete one. A
+  release whose live artifact sat on page two was reported as having only its
+  withdrawn file. Pages are now walked, with a single byte budget across the
+  walk, a 16-page cap, loop detection, and a same-scheme-and-host check on
+  every `next` link. A chain that outlives the cap is an error, never a prefix.
+- A yanked PyPI release now carries the registry's stated reason instead of
+  dropping it, so R08/R09 can explain a withdrawal rather than only reporting
+  that one happened.
+- `[provenance] allowed_builders` is enforced. It parsed, validated, and was
+  then never read, so a policy pinning trusted Sigstore builders asserted a
+  restriction and applied none. A release naming a builder outside the list is
+  now `P03_UNAUTHORIZED_BUILD_BUILDER` at Block, mirroring
+  `allowed_repositories`.
+- `[policy] allow_git_dependencies` is wired. It was also parsed and never read.
+  The non-semver dependency findings are now lowered from High to Medium when it
+  is set, never suppressed: the finding stays visible and its description says
+  policy lowered it. Medium rather than Low, because a Low finding is
+  score-neutral and would render as a clean auto-approve, hiding the dependency
+  behind a passing verdict.
+
+### Removed
+- `Policy::calculate_band`, which had no caller outside its own test and
+  disagreed with the live band ladder: it was a pure function of score, while
+  the production ladder is monotonic and never lowers an already-raised band. A
+  package with one High finding and 25 points is High in production and Medium
+  through `calculate_band`. Wiring it in as written would have silently weakened
+  severity. The two identical inline copies of the ladder are now one shared
+  helper, so they cannot drift.
+- Dead code that made the codebase look safer than it was: `Delta::is_empty`
+  (zero callers, and its semantics were wrong for an "unchanged" check anyway),
+  `DiskFileMeta.size` (written, never read, already re-derived by
+  `classify_bytes`), an unused wheel test helper, and an unreferenced
+  `ci::render_text_summary` print wrapper.
+- Three `#[allow(dead_code)]` suppressions that were hiding live checks from
+  the compiler: `Packument.name` (guards `validate_package_name`),
+  `AurRpcResponse.version` (guards the RPC protocol version), and
+  `Delta.binding_gyp_added` (drives a Block-severity native-build trigger), plus
+  a blanket suppression on `PackageJson`. If any of those checks were deleted,
+  the build would have stayed silent.
+
 - `[blocklist] maintainers` now blocks. The key parsed, validated, and was then
   never read: `is_maintainer_blocked` had no caller outside its own test, so a
   policy could assert a protection and silently get none. A release published by
