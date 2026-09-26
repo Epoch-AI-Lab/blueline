@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `[blocklist] maintainers` now blocks. The key parsed, validated, and was then
+  never read: `is_maintainer_blocked` had no caller outside its own test, so a
+  policy could assert a protection and silently get none. A release published by
+  a blocklisted identity is now a `P04_MAINTAINER_BLOCKED` block. The AUR
+  adapter also reads the maintainer the RPC declares as a second identity
+  channel, so a package whose clone cannot be pinned is no longer invisible to
+  the blocklist.
+
 - npm and cargo reviews now bind the name the archive declares to the name the
   registry resolved. Only the AUR lane checked, and the check is the one that
   matters: `package_json_path` descends into a single top-level directory, so
