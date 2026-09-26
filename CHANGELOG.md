@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- npm and cargo reviews now bind the name the archive declares to the name the
+  registry resolved. Only the AUR lane checked, and the check is the one that
+  matters: `package_json_path` descends into a single top-level directory, so
+  a tarball rooted at `evil/` was read as `evil/package.json` and the name it
+  declared was discarded. The allowlist, the blocklist and the baseline key are
+  all keyed on the resolved name while the bytes that install are the
+  attacker's, so a package that lied about its own identity passed exact-match
+  allowlisting. A manifest with no `name` at all, which deserialised to `""`
+  through `#[serde(default)]`, reviewed cleanly and is now refused.
+
 - `blueline recall sync` no longer writes through a planted symlink. The
   temporary file was named after the process id, so its path was fully
   predictable and `fs::write` follows a symlink: a link in the data
