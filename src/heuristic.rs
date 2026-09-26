@@ -305,7 +305,7 @@ pub fn evaluate_with_trust(
         }
     }
 
-    findings.extend(dependency_findings(delta));
+    findings.extend(dependency_findings(delta, policy));
 
     // R05: Large diff anomaly on patch or non-standard semver
     if let Some(base_ver_str) = &delta.baseline_version {
@@ -533,10 +533,49 @@ pub fn evaluate_with_trust(
         });
     }
 
+    let (capped_score, band) = score_and_band(&findings, policy);
+
+    Verdict {
+        name: name.to_string(),
+        target_version: delta.target_version.clone(),
+        baseline_version: delta.baseline_version.clone(),
+        integrity: integrity.to_string(),
+        ecosystem,
+        band,
+        risk_score: capped_score,
+        findings,
+        diff_summary: DiffSummary {
+            files_added: delta.files_added.len(),
+            files_removed: delta.files_removed.len(),
+            files_modified: delta.files_modified.len(),
+            lines_added: delta.total_lines_added,
+            lines_deleted: delta.total_lines_deleted,
+        },
+        trust_sources: if advisories.is_some() || provenance.is_some() {
+            Some(TrustSources {
+                advisories: advisories.cloned(),
+                provenance: provenance.cloned(),
+            })
+        } else {
+            None
+        },
+        recursive: Vec::new(),
+    }
+}
+
+/// The one score/band ladder. Weights, `R06_FIRST_SIGHTING`'s heavier bump, and
+/// the threshold escalation are defined here so the initial evaluation and
+/// `apply_extra_findings` cannot drift apart.
+///
+/// The band is monotonic in the findings: it is raised, never lowered, so a
+/// verdict is never rated below a finding it contains. A pure score→band
+/// function is a weaker rule — one HIGH finding is 25 points, which is below
+/// `max_medium_score`, and such a function answers MEDIUM for it.
+fn score_and_band(findings: &[Finding], policy: &Policy) -> (u32, VerdictBand) {
     let mut score: u32 = 0;
     let mut band = VerdictBand::Low;
 
-    for f in &findings {
+    for f in findings {
         match f.severity {
             VerdictBand::Block => {
                 score = score.saturating_add(50);
@@ -574,32 +613,7 @@ pub fn evaluate_with_trust(
         band = VerdictBand::Medium;
     }
 
-    Verdict {
-        name: name.to_string(),
-        target_version: delta.target_version.clone(),
-        baseline_version: delta.baseline_version.clone(),
-        integrity: integrity.to_string(),
-        ecosystem,
-        band,
-        risk_score: capped_score,
-        findings,
-        diff_summary: DiffSummary {
-            files_added: delta.files_added.len(),
-            files_removed: delta.files_removed.len(),
-            files_modified: delta.files_modified.len(),
-            lines_added: delta.total_lines_added,
-            lines_deleted: delta.total_lines_deleted,
-        },
-        trust_sources: if advisories.is_some() || provenance.is_some() {
-            Some(TrustSources {
-                advisories: advisories.cloned(),
-                provenance: provenance.cloned(),
-            })
-        } else {
-            None
-        },
-        recursive: Vec::new(),
-    }
+    (capped_score, band)
 }
 
 /// Recompute band and score after late findings (e.g. PKGBUILD heuristics)
@@ -608,42 +622,7 @@ pub fn evaluate_with_trust(
 /// silently.
 pub fn apply_extra_findings(verdict: &mut Verdict, extra: Vec<Finding>, policy: &Policy) {
     verdict.findings.extend(extra);
-    let mut score: u32 = 0;
-    let mut band = VerdictBand::Low;
-    for f in &verdict.findings {
-        match f.severity {
-            VerdictBand::Block => {
-                score = score.saturating_add(50);
-                band = VerdictBand::Block;
-            }
-            VerdictBand::High => {
-                score = score.saturating_add(25);
-                if band < VerdictBand::High {
-                    band = VerdictBand::High;
-                }
-            }
-            VerdictBand::Medium => {
-                let add = if f.rule_id == "R06_FIRST_SIGHTING" {
-                    15
-                } else {
-                    10
-                };
-                score = score.saturating_add(add);
-                if band < VerdictBand::Medium {
-                    band = VerdictBand::Medium;
-                }
-            }
-            VerdictBand::Low => {}
-        }
-    }
-    let capped_score = score.min(100);
-    if capped_score >= policy.thresholds.block_score {
-        band = VerdictBand::Block;
-    } else if capped_score > policy.thresholds.max_medium_score && band < VerdictBand::High {
-        band = VerdictBand::High;
-    } else if capped_score > policy.thresholds.max_low_score && band < VerdictBand::Medium {
-        band = VerdictBand::Medium;
-    }
+    let (capped_score, band) = score_and_band(&verdict.findings, policy);
     verdict.band = band;
     verdict.risk_score = capped_score;
 }
@@ -1764,9 +1743,28 @@ pub fn is_repo_allowed(provenance_repo: &str, allowed_pattern: &str) -> bool {
     false
 }
 
+/// Suffix appended to a non-registry dependency finding that
+/// `[policy] allow_git_dependencies` lowered, so the reviewer can see the band
+/// was a policy choice and not the engine's own opinion.
+const GIT_DEP_POLICY_NOTICE: &str = " Band lowered to MEDIUM by `[policy] allow_git_dependencies`; the dependency is still disclosed.";
+
+/// Band for a finding about a non-registry (git/http/ssh/`npm:`/`file:`/
+/// `link:`) dependency. `allow_git_dependencies` lowers HIGH to MEDIUM; it
+/// never removes the finding. MEDIUM rather than LOW: LOW is score-neutral, so
+/// a LOW finding renders as a clean auto-approve and would hide the dependency
+/// behind a passing verdict. MEDIUM keeps it in the score and below the default
+/// `fail_on = "high"` gate.
+fn non_registry_dep_band(policy: &Policy) -> VerdictBand {
+    if policy.policy.allow_git_dependencies {
+        VerdictBand::Medium
+    } else {
+        VerdictBand::High
+    }
+}
+
 /// The dependency-change rules. Split out so a delta can be tested without
 /// building a whole verdict around it.
-fn dependency_findings(delta: &Delta) -> Vec<Finding> {
+fn dependency_findings(delta: &Delta, policy: &Policy) -> Vec<Finding> {
     let mut findings = Vec::new();
     if !delta.new_dependencies.is_empty() {
         let deps_str = delta
@@ -1779,11 +1777,15 @@ fn dependency_findings(delta: &Delta) -> Vec<Finding> {
             .new_dependencies
             .iter()
             .any(|(_, v)| is_non_semver_url(v));
+        let mut description = format!("Added dependencies: {deps_str}");
+        if has_suspicious_url && policy.policy.allow_git_dependencies {
+            description.push_str(GIT_DEP_POLICY_NOTICE);
+        }
 
         findings.push(Finding {
             rule_id: "R04_DEPENDENCY_ADDED".into(),
             severity: if has_suspicious_url {
-                VerdictBand::High
+                non_registry_dep_band(policy)
             } else {
                 VerdictBand::Medium
             },
@@ -1791,7 +1793,7 @@ fn dependency_findings(delta: &Delta) -> Vec<Finding> {
                 "{} new runtime dependencies added",
                 delta.new_dependencies.len()
             ),
-            description: format!("Added dependencies: {deps_str}"),
+            description,
         });
     }
 
@@ -1799,13 +1801,17 @@ fn dependency_findings(delta: &Delta) -> Vec<Finding> {
         // Both directions. A change *from* a URL back to a range is the mirror
         // of the redirect and was producing nothing.
         if is_non_semver_url(new_ver) || is_non_semver_url(old_ver) {
+            let mut description = format!(
+                "Dependency `{dep}` version modified from `{old_ver}` to suspicious URL `{new_ver}`."
+            );
+            if policy.policy.allow_git_dependencies {
+                description.push_str(GIT_DEP_POLICY_NOTICE);
+            }
             findings.push(Finding {
                 rule_id: "R04_DEPENDENCY_MODIFIED".into(),
-                severity: VerdictBand::High,
+                severity: non_registry_dep_band(policy),
                 title: format!("Dependency `{dep}` changed to non-semver URL"),
-                description: format!(
-                    "Dependency `{dep}` version modified from `{old_ver}` to suspicious URL `{new_ver}`."
-                ),
+                description,
             });
         } else {
             // A range-to-range change used to produce no finding at all, which
@@ -1908,6 +1914,34 @@ fn provenance_findings(
                 description:
                     "The build provenance repository is not in the allowed repositories list."
                         .into(),
+            });
+        }
+    }
+
+    // Same shape and same matcher as the repository allowlist: a builder id is
+    // a URI, and `is_repo_allowed` compares after normalizing the scheme,
+    // `git@`, a trailing `.git` and a `@ref`, then requires a path boundary.
+    // The pattern is the *tail* of the builder id, so a policy pins the id as
+    // reported (`…/slsa-github-generator/generic@v1`, which normalizes to
+    // `…/generic`). A shorter parent path does not match a builder sub-path:
+    // that refuses the release and prints the id, rather than admitting a
+    // builder the policy never named.
+    if !policy.provenance.allowed_builders.is_empty()
+        && let Some(ref builder) = prov_rep.builder_id
+    {
+        let allowed = policy
+            .provenance
+            .allowed_builders
+            .iter()
+            .any(|b| is_repo_allowed(builder, b));
+        if !allowed {
+            findings.push(Finding {
+                rule_id: "P03_UNAUTHORIZED_BUILD_BUILDER".into(),
+                severity: VerdictBand::Block,
+                title: format!("Unauthorized build platform `{builder}`"),
+                description: format!(
+                    "The build provenance names builder `{builder}`, which is not in the allowed builders list."
+                ),
             });
         }
     }
@@ -2080,7 +2114,7 @@ mod tests {
         delta
             .modified_dependencies
             .push(("cookie".into(), "0.7.1".into(), "0.7.2".into()));
-        let findings = dependency_findings(&delta);
+        let findings = dependency_findings(&delta, &Policy::default());
         let r04: Vec<_> = findings
             .iter()
             .filter(|f| f.rule_id == "R04_DEPENDENCY_MODIFIED")
@@ -2101,7 +2135,7 @@ mod tests {
             "https://x/pkg.tgz".into(),
             "1.0.0".into(),
         ));
-        let findings = dependency_findings(&delta);
+        let findings = dependency_findings(&delta, &Policy::default());
         assert!(
             findings
                 .iter()
@@ -3703,5 +3737,373 @@ maintainers = ["badactor@example.com"]
                 "author {author:?} must not produce P04"
             );
         }
+    }
+
+    fn opaque_large_file(name: &str) -> FileChange {
+        FileChange {
+            relative_path: name.into(),
+            kind: FileKind::OpaqueTooLarge,
+            lines_added: 0,
+            lines_deleted: 0,
+            is_executable: false,
+            unified_diff: None,
+        }
+    }
+
+    fn opaque_large_file_delta(names: &[&str]) -> Delta {
+        Delta {
+            baseline_version: Some("1.0.0".into()),
+            target_version: "1.0.1".into(),
+            files_added: names.iter().map(|n| opaque_large_file(n)).collect(),
+            new_binaries: names.iter().map(|n| (*n).into()).collect(),
+            ..Delta::default()
+        }
+    }
+
+    /// The band is monotonic in the findings, not a pure function of the score.
+    /// `Policy::calculate_band` was a pure function of the score, disagreed with
+    /// this ladder the moment a HIGH finding's 25 points sat below
+    /// `max_medium_score`, and was dead code besides — the weakest spelling of a
+    /// rule and a live trap for the next reader. Pin the live ladder instead.
+    #[test]
+    fn live_band_ladder_is_monotonic_and_not_a_pure_function_of_score() {
+        // One HIGH finding: 25 points, and HIGH because a finding raised it.
+        let verdict = evaluate(
+            "test-pkg",
+            Ecosystem::Npm,
+            "sha512-x",
+            &opaque_large_file_delta(&["payload.bin"]),
+            false,
+        );
+        assert_eq!(verdict.risk_score, 25, "one HIGH finding is 25 points");
+        assert_eq!(
+            verdict.band,
+            VerdictBand::High,
+            "25 points is below max_medium_score, so a score-only map answers \
+             MEDIUM and would silently weaken every HIGH verdict"
+        );
+        assert!(
+            verdict.findings.iter().all(|f| verdict.band >= f.severity),
+            "the band is never below a finding's own severity: {:?}",
+            verdict.findings
+        );
+
+        // The deleted mapping, spelled out, so the disagreement stays visible.
+        let score_only = |score: u32, p: &Policy| {
+            if score >= p.thresholds.block_score {
+                VerdictBand::Block
+            } else if score > p.thresholds.max_medium_score {
+                VerdictBand::High
+            } else if score > p.thresholds.max_low_score {
+                VerdictBand::Medium
+            } else {
+                VerdictBand::Low
+            }
+        };
+        let policy = Policy::default();
+        assert_ne!(
+            score_only(verdict.risk_score, &policy),
+            verdict.band,
+            "production must not be answerable from the score alone"
+        );
+    }
+
+    /// The initial evaluation and `apply_extra_findings` were two copies of the
+    /// same score/band walk. `review` folds PKGBUILD heuristics in through the
+    /// second one, so a drift between the copies would rescore a verdict after
+    /// the reviewer had already seen it.
+    #[test]
+    fn extra_findings_score_on_the_same_ladder_as_the_initial_evaluation() {
+        let policy = Policy::default();
+        let high = |rule_id: &str| Finding {
+            rule_id: rule_id.into(),
+            severity: VerdictBand::High,
+            title: "late finding".into(),
+            description: "appended after evaluation".into(),
+        };
+
+        let mut late = evaluate(
+            "test-pkg",
+            Ecosystem::Npm,
+            "sha512-x",
+            &opaque_large_file_delta(&["a.bin"]),
+            false,
+        );
+        assert_eq!((late.band, late.risk_score), (VerdictBand::High, 25));
+        apply_extra_findings(
+            &mut late,
+            vec![high("R02_OPAQUE_LARGE_FILE_ADDED")],
+            &policy,
+        );
+        let native = evaluate(
+            "test-pkg",
+            Ecosystem::Npm,
+            "sha512-x",
+            &opaque_large_file_delta(&["a.bin", "b.bin"]),
+            false,
+        );
+        assert_eq!(native.risk_score, 50);
+        assert_eq!(
+            (late.band, late.risk_score),
+            (native.band, native.risk_score),
+            "a late finding must move band and score exactly as an in-evaluation one does"
+        );
+
+        // A late MEDIUM on top of a HIGH: 35 points stays HIGH only because the
+        // ladder is monotonic. A score-only map on both ladders would say MEDIUM.
+        let mut late_medium = evaluate(
+            "test-pkg",
+            Ecosystem::Npm,
+            "sha512-x",
+            &opaque_large_file_delta(&["a.bin"]),
+            false,
+        );
+        apply_extra_findings(
+            &mut late_medium,
+            vec![Finding {
+                rule_id: "R08_YANKED_PREDECESSOR".into(),
+                severity: VerdictBand::Medium,
+                title: "late finding".into(),
+                description: "appended after evaluation".into(),
+            }],
+            &policy,
+        );
+        assert_eq!(
+            (late_medium.band, late_medium.risk_score),
+            (VerdictBand::High, 35),
+            "a late MEDIUM must not lower a band a HIGH already raised"
+        );
+    }
+
+    /// `[provenance] allowed_builders` parsed, validated, and was never read, so
+    /// a policy pinning trusted Sigstore builders asserted a protection and got
+    /// none. Mirrors `allowed_repositories`: a builder outside the allowlist
+    /// BLOCKs, matched with the same path-boundary matcher, so a pinned builder
+    /// cannot be impersonated by a sibling path.
+    #[test]
+    fn unauthorized_build_builder_blocks_the_release() {
+        let policy = Policy::from_toml_str(
+            r#"
+[provenance]
+allowed_builders = ["github.com/slsa-framework/slsa-github-generator/generic"]
+"#,
+        )
+        .unwrap();
+        let delta = yanked_delta();
+        for builder in [
+            "https://github.com/attacker-org/builder",
+            "https://github.com/slsa-framework/slsa-github-generator-evil",
+            "https://github.com/slsa-framework/slsa-github-generator/generic-evil",
+        ] {
+            let prov = ProvenanceReport {
+                status: ProvenanceStatus::Attested,
+                slsa_level: 3,
+                builder_id: Some(builder.into()),
+                source_repo: Some("https://github.com/acme/pkg".into()),
+                commit_sha: Some("a".repeat(40)),
+                workflow_path: Some(".github/workflows/release.yml".into()),
+                registry_signature_present: true,
+                registry_signature_key_id: None,
+                message: None,
+            };
+            let verdict = evaluate_with_trust(
+                "pkg",
+                Ecosystem::Npm,
+                "verified (sha512)",
+                &delta,
+                false,
+                false,
+                false,
+                false,
+                None,
+                &policy,
+                None,
+                Some(&prov),
+            );
+            assert_eq!(verdict.band, VerdictBand::Block, "builder `{builder}`");
+            assert!(
+                verdict
+                    .findings
+                    .iter()
+                    .any(|f| f.rule_id == "P03_UNAUTHORIZED_BUILD_BUILDER"
+                        && f.severity == VerdictBand::Block),
+                "expected P03_UNAUTHORIZED_BUILD_BUILDER for `{builder}`, got {:?}",
+                verdict
+                    .findings
+                    .iter()
+                    .map(|f| &f.rule_id)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// The allowlist filters the builders a report names; it does not demand
+    /// that one be named. A builder inside the allowlist — pinned the way the
+    /// matcher reads it, as the id with or without its scheme and `@ref` — and a
+    /// report carrying no builder at all are both no-signal, exactly as an
+    /// absent `source_repo` is for `allowed_repositories`. `require_provenance`
+    /// is the key that refuses a release with no verified build.
+    #[test]
+    fn allowed_or_absent_builder_is_not_a_finding() {
+        let policy = Policy::from_toml_str(
+            r#"
+[provenance]
+allowed_builders = [
+  "https://github.com/slsa-framework/slsa-github-generator/generic@v1",
+  "https://github.com/actions/runner",
+]
+"#,
+        )
+        .unwrap();
+        let delta = yanked_delta();
+        for builder in [
+            Some("https://github.com/slsa-framework/slsa-github-generator/generic@v1"),
+            Some("https://github.com/slsa-framework/slsa-github-generator/generic"),
+            Some("https://github.com/actions/runner"),
+            None,
+        ] {
+            let prov = ProvenanceReport {
+                status: ProvenanceStatus::Attested,
+                slsa_level: 3,
+                builder_id: builder.map(str::to_string),
+                source_repo: Some("https://github.com/acme/pkg".into()),
+                commit_sha: Some("a".repeat(40)),
+                workflow_path: Some(".github/workflows/release.yml".into()),
+                registry_signature_present: true,
+                registry_signature_key_id: None,
+                message: None,
+            };
+            let verdict = evaluate_with_trust(
+                "pkg",
+                Ecosystem::Npm,
+                "verified (sha512)",
+                &delta,
+                false,
+                false,
+                false,
+                false,
+                None,
+                &policy,
+                None,
+                Some(&prov),
+            );
+            assert!(
+                !verdict
+                    .findings
+                    .iter()
+                    .any(|f| f.rule_id == "P03_UNAUTHORIZED_BUILD_BUILDER"),
+                "builder {builder:?} must not produce P03_UNAUTHORIZED_BUILD_BUILDER"
+            );
+            assert_eq!(verdict.band, VerdictBand::Low, "builder {builder:?}");
+        }
+    }
+
+    fn git_dependency_delta() -> Delta {
+        Delta {
+            baseline_version: Some("1.0.0".into()),
+            target_version: "1.0.1".into(),
+            new_dependencies: vec![("tool".into(), "git+https://github.com/acme/tool.git".into())],
+            modified_dependencies: vec![(
+                "cookie".into(),
+                "0.7.1".into(),
+                "https://evil.example/cookie.tgz".into(),
+            )],
+            ..Delta::default()
+        }
+    }
+
+    /// `[policy] allow_git_dependencies` parsed, defaulted to false, and was
+    /// never read: every non-registry (git/http/ssh) dependency stayed HIGH
+    /// whatever the policy said. The key lowers the band of those findings and
+    /// keeps them — LOW is score-neutral, so it would render as a clean
+    /// auto-approve and hide the dependency behind a passing verdict.
+    #[test]
+    fn allow_git_dependencies_lowers_git_dependency_findings_without_hiding_them() {
+        let strict = [
+            Policy::default(),
+            Policy::from_toml_str("[policy]\nallow_git_dependencies = false\n").unwrap(),
+        ];
+        for policy in &strict {
+            let verdict = evaluate_with_policy(
+                "test-pkg",
+                Ecosystem::Npm,
+                "sha512-x",
+                &git_dependency_delta(),
+                false,
+                policy,
+            );
+            assert_eq!(
+                (verdict.band, verdict.risk_score),
+                (VerdictBand::High, 50),
+                "without the key, non-registry dependencies are unchanged"
+            );
+            for rule_id in ["R04_DEPENDENCY_ADDED", "R04_DEPENDENCY_MODIFIED"] {
+                let finding = verdict
+                    .findings
+                    .iter()
+                    .find(|f| f.rule_id == rule_id)
+                    .unwrap_or_else(|| {
+                        panic!("{rule_id} must stay visible: {:?}", verdict.findings)
+                    });
+                assert_eq!(finding.severity, VerdictBand::High);
+                assert!(
+                    !finding.description.contains("allow_git_dependencies"),
+                    "nothing is downgraded when the key is off: {}",
+                    finding.description
+                );
+            }
+        }
+
+        let lenient = Policy::from_toml_str("[policy]\nallow_git_dependencies = true\n").unwrap();
+        let verdict = evaluate_with_policy(
+            "test-pkg",
+            Ecosystem::Npm,
+            "sha512-x",
+            &git_dependency_delta(),
+            false,
+            &lenient,
+        );
+        assert_eq!(
+            (verdict.band, verdict.risk_score),
+            (VerdictBand::Medium, 20),
+            "the findings are lowered, not dropped: 2 x MEDIUM is 20 points, not 0"
+        );
+        for rule_id in ["R04_DEPENDENCY_ADDED", "R04_DEPENDENCY_MODIFIED"] {
+            let finding = verdict
+                .findings
+                .iter()
+                .find(|f| f.rule_id == rule_id)
+                .unwrap_or_else(|| panic!("{rule_id} must stay visible: {:?}", verdict.findings));
+            assert_eq!(finding.severity, VerdictBand::Medium, "{rule_id}");
+            assert!(
+                finding.description.contains("allow_git_dependencies"),
+                "the finding must say policy lowered it: {}",
+                finding.description
+            );
+        }
+
+        // Registry dependencies are not what the key is about: a plain semver
+        // bump stays score-neutral either way.
+        let registry_only = Delta {
+            baseline_version: Some("1.0.0".into()),
+            target_version: "1.0.1".into(),
+            new_dependencies: vec![("left-pad".into(), "1.3.0".into())],
+            ..Delta::default()
+        };
+        let verdict = evaluate_with_policy(
+            "test-pkg",
+            Ecosystem::Npm,
+            "sha512-x",
+            &registry_only,
+            false,
+            &lenient,
+        );
+        let finding = verdict
+            .findings
+            .iter()
+            .find(|f| f.rule_id == "R04_DEPENDENCY_ADDED")
+            .unwrap_or_else(|| panic!("R04_DEPENDENCY_ADDED must stay visible"));
+        assert_eq!(finding.severity, VerdictBand::Medium);
+        assert!(!finding.description.contains("allow_git_dependencies"));
     }
 }

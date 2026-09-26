@@ -185,20 +185,6 @@ impl Policy {
         Ok(())
     }
 
-    /// Determine the verdict band given an accumulated score and hard block flag.
-    #[allow(dead_code)]
-    pub fn calculate_band(&self, score: u32, has_block_latch: bool) -> VerdictBand {
-        if has_block_latch || score >= self.thresholds.block_score {
-            VerdictBand::Block
-        } else if score > self.thresholds.max_medium_score {
-            VerdictBand::High
-        } else if score > self.thresholds.max_low_score {
-            VerdictBand::Medium
-        } else {
-            VerdictBand::Low
-        }
-    }
-
     /// Check if a package name matches any blocked package pattern for the
     /// given ecosystem. Rules without an `ecosystem` field match all.
     pub fn is_package_blocked(&self, name: &str, ecosystem: Ecosystem) -> bool {
@@ -209,7 +195,6 @@ impl Policy {
     }
 
     /// Check if a maintainer email is on the blocklist.
-    #[allow(dead_code)]
     pub fn is_maintainer_blocked(&self, email: &str) -> bool {
         let email_trimmed = email.trim().to_lowercase();
         self.blocklist
@@ -276,7 +261,9 @@ pub struct GeneralPolicyConfig {
     pub require_provenance: bool,
     /// Block on newly added lifecycle scripts when no baseline approval exists (default true).
     pub block_unreviewed_scripts: bool,
-    /// Allow non-registry git/http dependencies without blocking (default false).
+    /// Lower the band of non-registry (git/http/ssh/`npm:`/`file:`/`link:`)
+    /// dependency findings from HIGH to MEDIUM. The findings stay visible; they
+    /// are never suppressed (default false).
     pub allow_git_dependencies: bool,
     /// Query and check OSV vulnerability advisories (default true).
     pub check_advisories: bool,
@@ -589,20 +576,6 @@ block_score = 80
 block_score = 101
 "#;
         assert!(Policy::from_toml_str(invalid_block_over_100).is_err());
-    }
-
-    #[test]
-    fn calculates_bands_correctly() {
-        let p = Policy::default();
-        assert_eq!(p.calculate_band(0, false), VerdictBand::Low);
-        assert_eq!(p.calculate_band(19, false), VerdictBand::Low);
-        assert_eq!(p.calculate_band(20, false), VerdictBand::Medium);
-        assert_eq!(p.calculate_band(49, false), VerdictBand::Medium);
-        assert_eq!(p.calculate_band(50, false), VerdictBand::High);
-        assert_eq!(p.calculate_band(79, false), VerdictBand::High);
-        assert_eq!(p.calculate_band(80, false), VerdictBand::Block);
-        assert_eq!(p.calculate_band(100, false), VerdictBand::Block);
-        assert_eq!(p.calculate_band(5, true), VerdictBand::Block);
     }
 
     #[test]
