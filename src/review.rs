@@ -532,6 +532,29 @@ fn prepare_extracted_root(
             }
         }
     };
+    // Every lane that parses a manifest from the archive must bind the name it
+    // declares to the name the registry resolved. `package_json_path` resolves
+    // through `find_package_prefix`, which descends into a single top-level
+    // directory, so a tarball rooted at `evil/` was read as `evil/package.json`
+    // and its declared name discarded. The allowlist, blocklist and baseline
+    // key are all evaluated against the resolved name while the installed
+    // bytes are the attacker's, which defeats exact-match allowlisting for a
+    // package that lies about its own identity.
+    if !matches!(ecosystem, Ecosystem::PyPi) && manifest.name != canonical_name {
+        return Err(crate::error::BluelineError::Manifest(
+            canonical_name.to_string(),
+            format!(
+                "archive manifest declares `{}` but the review resolved `{canonical_name}`; refusing to review",
+                manifest.name
+            ),
+        ));
+    }
+    if manifest.name.trim().is_empty() {
+        return Err(crate::error::BluelineError::Manifest(
+            canonical_name.to_string(),
+            "archive manifest declares an empty name; refusing to review".to_string(),
+        ));
+    }
     Ok((root, manifest))
 }
 
@@ -1463,6 +1486,91 @@ mod tests {
             ),
             "unexpected error: {err}"
         );
+    }
+
+    /// `package_json_path` descends into a single top-level directory, so a
+    /// tarball rooted at `evil/` was read as `evil/package.json` and its
+    /// declared name never compared to the resolved one. The allowlist, the
+    /// blocklist and the baseline key are all keyed on the resolved name while
+    /// the installed bytes are the attacker's, so a package that lies about
+    /// its own identity passed exact-match allowlisting.
+    #[test]
+    fn prepare_extracted_root_refuses_npm_name_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("evil")).unwrap();
+        std::fs::write(
+            dir.path().join("evil/package.json"),
+            br#"{"name":"evil","version":"1.0.0","scripts":{"postinstall":"node x.js"}}"#,
+        )
+        .unwrap();
+        let err = prepare_extracted_root(dir.path(), Ecosystem::Npm, "innocent", "1.0.0")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "archive manifest declares `evil` but the review resolved `innocent`; refusing to review"
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// An absent `name` deserialises to `""` through `#[serde(default)]`, so a
+    /// manifest with no name at all used to review cleanly.
+    #[test]
+    fn prepare_extracted_root_refuses_a_missing_manifest_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("package")).unwrap();
+        std::fs::write(
+            dir.path().join("package/package.json"),
+            br#"{"version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let err = prepare_extracted_root(dir.path(), Ecosystem::Npm, "nameless", "1.0.0")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("refusing to review"),
+            "a manifest with no name must be refused, got: {err}"
+        );
+    }
+
+    /// The same binding for cargo, where `[package] name` was never read. The
+    /// root check passes because the directory is named for the resolved
+    /// package; the manifest inside it still declares something else.
+    #[test]
+    fn prepare_extracted_root_refuses_cargo_name_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("demo-crate-1.0.0");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"other-crate\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+        let err = prepare_extracted_root(dir.path(), Ecosystem::Cargo, "demo-crate", "1.0.0")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "archive manifest declares `other-crate` but the review resolved `demo-crate`; refusing to review"
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A matching name is the happy path and must not regress into a refusal.
+    #[test]
+    fn prepare_extracted_root_accepts_a_matching_npm_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("package")).unwrap();
+        std::fs::write(
+            dir.path().join("package/package.json"),
+            br#"{"name":"demo","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let (_root, manifest) =
+            prepare_extracted_root(dir.path(), Ecosystem::Npm, "demo", "1.0.0").unwrap();
+        assert_eq!(manifest.name, "demo");
     }
 }
 
