@@ -1,4 +1,5 @@
 const MAX_REQUEST_LINE_BYTES: usize = 64 * 1024;
+const JSONRPC_VERSION: &str = "2.0";
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -13,7 +14,6 @@ use crate::store::BaselineStore;
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
-    #[allow(dead_code)]
     jsonrpc: Option<String>,
     id: Option<serde_json::Value>,
     method: String,
@@ -115,59 +115,90 @@ pub fn run_stdio(
                 continue;
             }
             RequestLine::Text(t) => {
-                let line = t;
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-
-                let request: JsonRpcRequest = match serde_json::from_str(trimmed) {
-                    Ok(req) => req,
-                    Err(e) => {
-                        let err_resp = JsonRpcResponse {
-                            jsonrpc: "2.0",
-                            id: serde_json::Value::Null,
-                            result: None,
-                            error: Some(JsonRpcError::parse_error(format!("Parse error: {e}"))),
-                        };
-                        let resp_str = serde_json::to_string(&err_resp)?;
-                        writeln!(stdout, "{resp_str}")?;
-                        stdout.flush()?;
-                        continue;
-                    }
-                };
-
-                // Notifications don't require responses
-                if request.id.is_none() {
-                    continue;
-                }
-
-                let id = request.id.unwrap_or(serde_json::Value::Null);
-                let resp =
-                    match handle_request(&request.method, request.params, bases, &store, &policy) {
-                        Ok(result) => JsonRpcResponse {
-                            jsonrpc: "2.0",
-                            id,
-                            result: Some(result),
-                            error: None,
-                        },
-                        Err(err) => JsonRpcResponse {
-                            jsonrpc: "2.0",
-                            id,
-                            result: None,
-                            error: Some(err),
-                        },
-                    };
-
-                let resp_str = serde_json::to_string(&resp)?;
-                writeln!(stdout, "{resp_str}")?;
-                stdout.flush()?;
+                serve_request_line(&t, &mut stdout, bases, &store, &policy)?;
             }
         }
     }
 
     eprintln!("blueline-mcp: shutting down stdio server loop");
     Ok(())
+}
+
+/// Answer one framed request line. A request this server refuses to act on
+/// (unparseable, wrong `jsonrpc` member) draws the same error shape and does
+/// not stop the loop: one bad request must not kill the server.
+fn serve_request_line<W: Write>(
+    line: &str,
+    out: &mut W,
+    bases: &crate::cli::RegistryBases,
+    store: &BaselineStore,
+    policy: &Policy,
+) -> anyhow::Result<()> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+
+    let request: JsonRpcRequest = match serde_json::from_str(trimmed) {
+        Ok(req) => req,
+        Err(e) => {
+            let err_resp = JsonRpcResponse {
+                jsonrpc: JSONRPC_VERSION,
+                id: serde_json::Value::Null,
+                result: None,
+                error: Some(JsonRpcError::parse_error(format!("Parse error: {e}"))),
+            };
+            let resp_str = serde_json::to_string(&err_resp)?;
+            writeln!(out, "{resp_str}")?;
+            out.flush()?;
+            return Ok(());
+        }
+    };
+
+    if let Err(err) = check_protocol_version(&request) {
+        write_error(out, &err.message)?;
+        return Ok(());
+    }
+    // Notifications don't require responses
+    if request.id.is_none() {
+        return Ok(());
+    }
+
+    let id = request.id.unwrap_or(serde_json::Value::Null);
+    let resp = match handle_request(&request.method, request.params, bases, store, policy) {
+        Ok(result) => JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION,
+            id,
+            result: Some(result),
+            error: None,
+        },
+        Err(err) => JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION,
+            id,
+            result: None,
+            error: Some(err),
+        },
+    };
+
+    let resp_str = serde_json::to_string(&resp)?;
+    writeln!(out, "{resp_str}")?;
+    out.flush()?;
+    Ok(())
+}
+
+/// JSON-RPC 2.0 requires the `jsonrpc` member to be exactly `"2.0"`. It used to
+/// be deserialized and dropped, so a `"1.0"` request — and a request with no
+/// `jsonrpc` member at all — was dispatched as a 2.0 call.
+fn check_protocol_version(req: &JsonRpcRequest) -> Result<(), JsonRpcError> {
+    match req.jsonrpc.as_deref() {
+        Some(JSONRPC_VERSION) => Ok(()),
+        Some(other) => Err(JsonRpcError::parse_error(format!(
+            "Invalid request: `jsonrpc` member must be \"{JSONRPC_VERSION}\", got `{other}`"
+        ))),
+        None => Err(JsonRpcError::parse_error(format!(
+            "Invalid request: missing `jsonrpc` member; JSON-RPC requires \"{JSONRPC_VERSION}\""
+        ))),
+    }
 }
 
 /// One framed line off the MCP stdin stream, already length-checked and
@@ -194,7 +225,7 @@ fn next_request_line(raw: std::io::Result<Vec<u8>>) -> std::io::Result<Option<Re
 
 fn write_error<W: Write>(out: &mut W, message: &str) -> anyhow::Result<()> {
     let resp = JsonRpcResponse {
-        jsonrpc: "2.0",
+        jsonrpc: JSONRPC_VERSION,
         id: serde_json::Value::Null,
         result: None,
         error: Some(JsonRpcError::parse_error(message.to_string())),
@@ -850,5 +881,57 @@ mod tests {
         assert_eq!(JsonRpcError::method_not_found("unknown").code, -32601);
         assert_eq!(JsonRpcError::invalid_params("bad param").code, -32602);
         assert_eq!(JsonRpcError::internal_error("fail").code, -32603);
+    }
+
+    /// JSON-RPC 2.0 requires `"jsonrpc":"2.0"`. The member was deserialized and
+    /// never read, so a `"1.0"` request and a request without the member were
+    /// both answered as ordinary 2.0 calls.
+    #[test]
+    fn rejects_wrong_or_absent_jsonrpc_member() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&temp.path().join("store.db")).unwrap();
+        let policy = Policy::default();
+        let bases = test_bases();
+
+        for (body, needle) in [
+            (
+                r#"{"jsonrpc":"1.0","id":1,"method":"ping"}"#,
+                "must be \"2.0\"",
+            ),
+            (r#"{"id":1,"method":"ping"}"#, "missing `jsonrpc` member"),
+        ] {
+            let mut out: Vec<u8> = Vec::new();
+            serve_request_line(body, &mut out, &bases, &store, &policy).unwrap();
+            let resp: serde_json::Value =
+                serde_json::from_str(String::from_utf8(out).unwrap().trim()).unwrap();
+            assert_eq!(resp["jsonrpc"], "2.0", "{body}");
+            assert_eq!(resp["id"], serde_json::Value::Null, "{body}");
+            assert_eq!(resp["error"]["code"], -32700, "{body}");
+            assert!(
+                resp["error"]["message"].as_str().unwrap().contains(needle),
+                "{body}: {resp}"
+            );
+            assert!(
+                resp.get("result").is_none(),
+                "a refused request must carry no result: {body}: {resp}"
+            );
+        }
+
+        // The declared version is answered normally, so the check is not a
+        // blanket refusal.
+        let mut out: Vec<u8> = Vec::new();
+        serve_request_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+            &mut out,
+            &bases,
+            &store,
+            &policy,
+        )
+        .unwrap();
+        let resp: serde_json::Value =
+            serde_json::from_str(String::from_utf8(out).unwrap().trim()).unwrap();
+        assert_eq!(resp["id"], 1);
+        assert_eq!(resp["result"], json!({}));
+        assert!(resp.get("error").is_none(), "{resp}");
     }
 }

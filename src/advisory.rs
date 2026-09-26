@@ -91,7 +91,6 @@ pub(crate) struct OsvVuln {
 #[derive(Debug, Deserialize)]
 pub(crate) struct OsvSeverity {
     #[serde(rename = "type")]
-    #[allow(dead_code)]
     pub(crate) severity_type: String,
     pub(crate) score: String,
 }
@@ -435,6 +434,88 @@ pub fn parse_cvss_vector(vector: &str) -> Option<f64> {
     Some(rounded)
 }
 
+/// Base score from a CVSS v2 vector string, per the CVSS v2.0 base equation
+/// (formula version 2.10):
+///
+/// ```text
+/// BaseScore = round_to_1_decimal(((0.6*Impact)+(0.4*Exploitability)-1.5)*f(Impact))
+/// Impact = 10.41*(1-(1-ConfImpact)*(1-IntegImpact)*(1-AvailImpact))
+/// Exploitability = 20*AccessVector*AccessComplexity*Authentication
+/// f(Impact) = 0 when Impact is 0, 1.176 otherwise
+/// ```
+///
+/// A v2 vector is the reason `OsvSeverity::severity_type` is read: unlike a v3
+/// vector it carries no `CVSS:3.x` prefix to identify it, so the declared type
+/// is the only thing that says how the string is to be read. Anything that is
+/// not a complete, well-formed v2 base vector scores as `None` rather than
+/// being guessed at.
+pub fn parse_cvss_v2_vector(vector: &str) -> Option<f64> {
+    let mut av: Option<f64> = None;
+    let mut ac: Option<f64> = None;
+    let mut au: Option<f64> = None;
+    let mut c: Option<f64> = None;
+    let mut i: Option<f64> = None;
+    let mut a: Option<f64> = None;
+
+    for part in vector.split('/') {
+        let mut kv = part.splitn(2, ':');
+        let k = kv.next()?;
+        let v = kv.next().unwrap_or_default();
+        let slot = match k {
+            "AV" => &mut av,
+            "AC" => &mut ac,
+            "Au" => &mut au,
+            "C" => &mut c,
+            "I" => &mut i,
+            "A" => &mut a,
+            // A v2 base vector has exactly six metrics. An unknown name means
+            // this is not one, and scoring it anyway is a guess.
+            _ => return None,
+        };
+        if slot.is_some() {
+            // A repeated metric is ambiguous, so it is not a vector.
+            return None;
+        }
+        // Matched per metric, not by value alone. A shared `(_, "P")` arm would
+        // accept `AV:P`, which is not a v2 access vector, and score it with the
+        // confidentiality-impact weight: a malformed vector scoring *lower* than
+        // a well-formed one is the wrong way to fail.
+        *slot = Some(match (k, v) {
+            ("AV", "L") => 0.395,
+            ("AV", "A") => 0.646,
+            ("AV", "N") => 1.0,
+            ("AC", "H") => 0.35,
+            ("AC", "M") => 0.61,
+            ("AC", "L") => 0.71,
+            ("Au", "M") => 0.45,
+            ("Au", "S") => 0.56,
+            ("Au", "N") => 0.704,
+            ("C" | "I" | "A", "N") => 0.0,
+            ("C" | "I" | "A", "P") => 0.275,
+            ("C" | "I" | "A", "C") => 0.660,
+            _ => return None,
+        });
+    }
+
+    let impact = 10.41 * (1.0 - (1.0 - c?) * (1.0 - i?) * (1.0 - a?));
+    let exploitability = 20.0 * av? * ac? * au?;
+    if impact <= 0.0 {
+        return Some(0.0);
+    }
+    let base_score = ((0.6 * impact) + (0.4 * exploitability) - 1.5) * 1.176;
+    // v2 rounds to nearest; the v3 `Roundup` used by `parse_cvss_vector` is a
+    // different function and rounds ties up.
+    Some((base_score.clamp(0.0, 10.0) * 10.0).round() / 10.0)
+}
+
+/// Whether an OSV `severity[].type` declares a CVSS v2 score. Compared
+/// case-insensitively because the member is attacker-shaped, but only the one
+/// spelling is scored: an unrecognised type is left unscored exactly as before,
+/// never scored as something it might not be.
+fn declares_cvss_v2(severity_type: &str) -> bool {
+    severity_type.trim().eq_ignore_ascii_case("CVSS_V2")
+}
+
 fn extract_cvss_score(v: &OsvVuln) -> Option<f64> {
     for s in &v.severity {
         // Parse explicit numeric float or full CVSS vector string
@@ -444,8 +525,43 @@ fn extract_cvss_score(v: &OsvVuln) -> Option<f64> {
         if let Some(score) = parse_cvss_vector(&s.score) {
             return Some(score);
         }
+        if declares_cvss_v2(&s.severity_type)
+            && let Some(score) = parse_cvss_v2_vector(&s.score)
+        {
+            return Some(score);
+        }
     }
     None
+}
+
+/// The band a numeric base score supports. Shared by every scoring path, so no
+/// threshold can drift between them.
+fn band_from_score(score: f64, policy: &Policy) -> VerdictBand {
+    if score >= 9.0 && policy.advisories.block_on_critical_cve {
+        VerdictBand::Block
+    } else if score >= 7.0 {
+        VerdictBand::High
+    } else if score >= 4.0 {
+        VerdictBand::Medium
+    } else {
+        VerdictBand::Low
+    }
+}
+
+/// The band a source's own severity label supports, when it is one of the four
+/// labels this tool knows. Anything else is not a signal.
+fn band_from_declared_severity(sev: &str, policy: &Policy) -> Option<VerdictBand> {
+    match sev.to_uppercase().as_str() {
+        "CRITICAL" => Some(if policy.advisories.block_on_critical_cve {
+            VerdictBand::Block
+        } else {
+            VerdictBand::High
+        }),
+        "HIGH" => Some(VerdictBand::High),
+        "MODERATE" | "MEDIUM" => Some(VerdictBand::Medium),
+        "LOW" => Some(VerdictBand::Low),
+        _ => None,
+    }
 }
 
 fn calculate_advisory_severity(
@@ -458,41 +574,59 @@ fn calculate_advisory_severity(
         return VerdictBand::Block;
     }
 
-    if let Some(score) = cvss {
-        if score >= 9.0 && policy.advisories.block_on_critical_cve {
-            return VerdictBand::Block;
-        } else if score >= 7.0 {
-            return VerdictBand::High;
-        } else if score >= 4.0 {
-            return VerdictBand::Medium;
-        } else {
-            return VerdictBand::Low;
-        }
-    }
+    // Every signal the advisory offers is read, and the strongest one wins
+    // (`VerdictBand` orders Low < Medium < High < Block). The score used to
+    // return early, so a source that also labelled its own advisory CRITICAL
+    // was reported at the score's band instead; reading a second signal can
+    // only raise the band here, never lower it.
+    let from_score = cvss.map(|score| band_from_score(score, policy));
+    let from_label = v
+        .database_specific
+        .as_ref()
+        .and_then(|db_spec| db_spec.severity.as_deref())
+        .and_then(|sev| band_from_declared_severity(sev, policy));
 
-    if let Some(ref db_spec) = v.database_specific
-        && let Some(ref sev) = db_spec.severity
-    {
-        match sev.to_uppercase().as_str() {
-            "CRITICAL" => {
-                if policy.advisories.block_on_critical_cve {
-                    return VerdictBand::Block;
-                } else {
-                    return VerdictBand::High;
-                }
-            }
-            "HIGH" => return VerdictBand::High,
-            "MODERATE" | "MEDIUM" => return VerdictBand::Medium,
-            "LOW" => return VerdictBand::Low,
-            _ => {}
-        }
+    match (from_score, from_label) {
+        (Some(a), Some(b)) => a.max(b),
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        (None, None) => VerdictBand::Medium,
     }
-
-    VerdictBand::Medium
 }
 
 #[cfg(test)]
 mod tests {
+    /// A v2 vector's metric values are per-metric. Matching them by value alone
+    /// let `AV:P` be scored with the partial-impact weight, so a malformed
+    /// vector scored 4.1 where the well-formed one scores 7.5 -- an advisory
+    /// under-reported because of a typo in attacker-shaped remote data.
+    #[test]
+    fn cvss_v2_rejects_a_value_that_is_not_valid_for_its_metric() {
+        for bad in [
+            "AV:P/AC:L/Au:N/C:P/I:P/A:P",
+            "AC:N/AV:L/Au:N/C:P/I:P/A:P",
+            "Au:C/AV:N/AC:L/C:P/I:P/A:P",
+            "AV:N/AC:L/Au:N/C:X/I:P/A:P",
+            "AV:N/AC:L/Au:N/C:P/I:P",
+        ] {
+            assert_eq!(
+                parse_cvss_v2_vector(bad),
+                None,
+                "`{bad}` is not a well-formed v2 base vector and must not score"
+            );
+        }
+    }
+
+    /// The well-formed vector the malformed one above was derived from must
+    /// keep its NVD score, so the stricter match did not break the real path.
+    #[test]
+    fn cvss_v2_still_scores_the_reference_vector() {
+        assert_eq!(
+            parse_cvss_v2_vector("AV:N/AC:L/Au:N/C:P/I:P/A:P"),
+            Some(7.5)
+        );
+    }
+
     use super::*;
 
     /// A cached report must not be served while the policy says fail closed.
@@ -556,6 +690,54 @@ mod tests {
         assert!(report.has_blocking());
     }
 
+    /// A CVSS v2 vector carries no prefix that says how to read it, the way a
+    /// v3 one starts `CVSS:3.x`, so the declared `severity` type is the only
+    /// thing that says the string is a v2 vector. It was read off the wire and
+    /// dropped, so a v2-only advisory scored nothing and fell to the Medium
+    /// default however critical its vector was.
+    #[test]
+    fn osv_cvss_v2_severity_type_is_scored_into_the_band() {
+        let json = r#"{
+            "vulns": [
+                {
+                    "id": "CVE-2002-0392",
+                    "summary": "Legacy advisory carrying only a CVSS v2 vector",
+                    "severity": [{"type": "CVSS_V2", "score": "AV:N/AC:L/Au:N/C:C/I:C/A:C"}]
+                }
+            ]
+        }"#;
+
+        let resp: OsvQueryResponse = serde_json::from_str(json).unwrap();
+        let report = parse_osv_response(resp, &Policy::default());
+        assert_eq!(report.hits.len(), 1);
+        assert_eq!(report.hits[0].cvss_score, Some(10.0));
+        assert_eq!(report.hits[0].severity, VerdictBand::Block);
+        assert!(report.has_blocking());
+    }
+
+    /// The guard on the guard: adding a second signal must never hand a
+    /// reviewer a weaker band than the one the strongest available signal
+    /// supports. A v2 vector that scores 5.0 must not talk a `CRITICAL`
+    /// database-specific rating down to MEDIUM.
+    #[test]
+    fn a_declared_band_is_never_overridden_by_a_lower_score() {
+        let json = r#"{
+            "vulns": [
+                {
+                    "id": "CVE-2011-3152",
+                    "summary": "Rated CRITICAL by the database, scored 6.4 by CVSS v2",
+                    "severity": [{"type": "CVSS_V2", "score": "AV:N/AC:L/Au:N/C:P/I:P/A:N"}],
+                    "database_specific": {"severity": "CRITICAL"}
+                }
+            ]
+        }"#;
+
+        let resp: OsvQueryResponse = serde_json::from_str(json).unwrap();
+        let report = parse_osv_response(resp, &Policy::default());
+        assert_eq!(report.hits[0].cvss_score, Some(6.4));
+        assert_eq!(report.hits[0].severity, VerdictBand::Block);
+    }
+
     #[test]
     fn osv_ecosystem_casing_matches_schema() {
         assert_eq!(osv_ecosystem(crate::registry::Ecosystem::Npm), "npm");
@@ -574,5 +756,77 @@ mod tests {
         let vector_high = "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N";
         let score_high = parse_cvss_vector(vector_high).unwrap();
         assert_eq!(score_high, 6.5);
+    }
+
+    /// Every vector here is one the NVD CVSS v2 calculator publishes a base
+    /// score for, so the equation is pinned against the reference rather than
+    /// against itself. The v2 base equation is not the v3 one: it carries the
+    /// `-1.5` term and the `f(Impact)` multiplier, and it rounds to nearest
+    /// where v3 rounds up.
+    #[test]
+    fn cvss_v2_base_scores_match_the_nvd_reference_vectors() {
+        for (vector, expected) in [
+            // CVE-2002-0392, the specification's own worked example.
+            ("AV:N/AC:L/Au:N/C:N/I:N/A:C", 7.8),
+            ("AV:N/AC:L/Au:N/C:C/I:C/A:C", 10.0),
+            // CVE-2011-3152.
+            ("AV:N/AC:L/Au:N/C:P/I:P/A:N", 6.4),
+            // CVE-2014-0160 (Heartbleed).
+            ("AV:N/AC:L/Au:N/C:P/I:N/A:N", 5.0),
+            // CVE-2022-22530.
+            ("AV:N/AC:L/Au:S/C:N/I:P/A:C", 7.5),
+            // No impact at all: f(Impact) is 0, so the score is 0.0.
+            ("AV:L/AC:H/Au:M/C:N/I:N/A:N", 0.0),
+        ] {
+            assert_eq!(parse_cvss_v2_vector(vector), Some(expected), "{vector}");
+        }
+    }
+
+    /// A v2 vector that is not a v2 vector scores as nothing rather than as a
+    /// guess. Each of these is unscored today too, so this pins that the new
+    /// path never invents a number.
+    #[test]
+    fn cvss_v2_vector_rejects_anything_that_is_not_one() {
+        for vector in [
+            // v3 vector: the self-identifying prefix, not a v2 metric set.
+            "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+            // Missing a metric, and one with no value.
+            "AV:N/AC:L/Au:N/C:C/I:C",
+            "AV:N/AC:L/Au:N/C:C/I:C/A:",
+            // Unknown metric value, unknown metric name, repeated metric.
+            "AV:N/AC:L/Au:N/C:C/I:C/A:X",
+            "AV:N/AC:L/Au:N/C:C/I:C/A:C/E:F/RL:OF/RC:C",
+            "AV:N/AC:N/AC:L/Au:N/C:C/I:C/A:C",
+            "",
+        ] {
+            assert_eq!(parse_cvss_v2_vector(vector), None, "{vector}");
+        }
+    }
+
+    /// The declared type is the only thing that says a vector without a
+    /// `CVSS:3.x` prefix is a v2 vector, so it is read to pick the parser. A
+    /// v2 vector under a type that is not `CVSS_V2` stays unscored.
+    #[test]
+    fn only_the_declared_cvss_v2_type_selects_the_v2_parser() {
+        let vector = "AV:N/AC:L/Au:N/C:C/I:C/A:C";
+        let with_type = |t: &str| {
+            serde_json::json!({
+                "vulns": [{
+                    "id": "CVE-2002-0392",
+                    "severity": [{"type": t, "score": vector}]
+                }]
+            })
+            .to_string()
+        };
+        let score_of = |t: &str| {
+            let resp: OsvQueryResponse = serde_json::from_str(&with_type(t)).unwrap();
+            parse_osv_response(resp, &Policy::default()).hits[0].cvss_score
+        };
+
+        assert_eq!(score_of("CVSS_V2"), Some(10.0));
+        // Same vector, a type that does not declare v2: unscored, which is the
+        // floor the Medium default then applies.
+        assert_eq!(score_of("CVSS_V3"), None);
+        assert_eq!(score_of("SOME_OTHER_SCALE"), None);
     }
 }
