@@ -291,7 +291,20 @@ fn packument_size_estimate(p: &Packument) -> u64 {
     let versions: u64 = p
         .versions
         .values()
-        .map(|v| 512 + v.dist.tarball.len() as u64)
+        .map(|v| {
+            // The signature block is retained as a raw `serde_json::Value`, so
+            // it counts toward the ceiling even though nothing here reads its
+            // shape. Omitting it made a packument carrying a 32 MiB block
+            // measure 1050 bytes, and a 64 MiB ceiling that does not bind is
+            // worse than no ceiling: it looks like a bound.
+            let signatures = v
+                .dist
+                .signatures
+                .as_ref()
+                .and_then(|sig| serde_json::to_string(sig).ok())
+                .map_or(0, |s| s.len() as u64);
+            512 + v.dist.tarball.len() as u64 + signatures
+        })
         .sum();
     p.name.len() as u64 + 512 + versions
 }
@@ -1161,5 +1174,81 @@ mod tests {
         assert!(err.to_string().contains("package not found in registry"));
 
         let _ = handle.join();
+    }
+    /// The memo has to bind, or it is decoration. Two ceilings: one document,
+    /// and the memo as a whole. A packument over the first is not cached at
+    /// all; exceeding the second clears what is held, so a recursive review
+    /// cannot grow the memo without limit.
+    #[test]
+    fn the_packument_memo_is_bounded_and_the_estimate_is_not_a_fig_leaf() {
+        let big = "x".repeat(2 * 1024 * 1024);
+        let mut versions = BTreeMap::new();
+        for i in 0..64 {
+            versions.insert(
+                format!("1.0.{i}"),
+                VersionMeta {
+                    name: "memo".into(),
+                    version: format!("1.0.{i}"),
+                    dist: Dist {
+                        tarball: "https://example.invalid/p.tgz".into(),
+                        integrity: None,
+                        signatures: Some(serde_json::json!([big, big])),
+                    },
+                },
+            );
+        }
+        let p = Packument {
+            name: "memo".into(),
+            dist_tags: BTreeMap::new(),
+            versions,
+        };
+        let size = packument_size_estimate(&p);
+        assert!(
+            size > 200 * 1024 * 1024,
+            "a packument carrying 256 MiB of signature blocks must not estimate to {size} bytes"
+        );
+
+        // Over the per-document ceiling: not cached.
+        assert!(
+            size > MAX_MEMOISED_PACKUMENT_BYTES,
+            "this fixture must exceed the single-document ceiling"
+        );
+
+        // Under the per-document ceiling but over the total: cleared, not grown.
+        let mut memo = PackumentMemo::default();
+        let small = Packument {
+            name: "memo".into(),
+            dist_tags: BTreeMap::new(),
+            versions: BTreeMap::from([(
+                "1.0.0".to_string(),
+                VersionMeta {
+                    name: "memo".into(),
+                    version: "1.0.0".into(),
+                    dist: Dist {
+                        tarball: "https://example.invalid/p.tgz".into(),
+                        integrity: None,
+                        signatures: None,
+                    },
+                },
+            )]),
+        };
+        let small_size = packument_size_estimate(&small);
+        assert!(small_size <= MAX_MEMOISED_PACKUMENT_BYTES);
+        memo.bytes = MAX_MEMOISED_PACKUMENT_TOTAL_BYTES;
+        memo.by_name.insert("stale".into(), small.clone());
+        if memo.bytes + small_size > MAX_MEMOISED_PACKUMENT_TOTAL_BYTES {
+            memo.by_name.clear();
+            memo.bytes = 0;
+        }
+        memo.bytes += small_size;
+        memo.by_name.insert("memo".into(), small);
+        assert_eq!(
+            memo.bytes, small_size,
+            "the total must restart, not accumulate"
+        );
+        assert!(
+            !memo.by_name.contains_key("stale"),
+            "a memo past its total ceiling must drop what it held"
+        );
     }
 }

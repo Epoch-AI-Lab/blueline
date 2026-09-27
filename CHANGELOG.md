@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The `[ci] allow_requirements_options` opt-in no longer drops the pin it was
+  asked to tolerate. The escape skipped the whole line, so
+  `requests==2.31.0 --index-url https://evil.example` left the reviewed graph with
+  no entry for `requests` at all — a fail-open wearing a disclosure's clothes.
+  Everything from the first non-hash option onward is now dropped and the spec
+  before it is parsed as normal, so the pin is reviewed and the redirect is
+  ignored. A `--hash` after the first redirecting option is lost, which makes
+  the line fail its hash check rather than pass unreviewed.
+
 - A decompressed-stream budget breach is now classified as a limit everywhere it
   can surface. It was recognised by matching an error message, which fails on
   the `unpack_in` path because tar-rs wraps I/O errors in a `TarError` whose
@@ -21,7 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   memo as a whole, mirroring the tarball memo in `ReviewContext`. A recursive
   review walks a dependency graph, and an unbounded memo is the one place that
   walk's memory grows without limit. An over-ceiling packument is not cached,
-  which costs a refetch and nothing else.
+  which costs a refetch and nothing else. The size estimate counts the retained
+  `dist.signatures` block, which is held as raw JSON: without it a packument
+  carrying a 32 MiB signature block measured 1050 bytes, and a ceiling that
+  does not bind is worse than none because it looks like a bound.
 
 - The CI composite Action no longer interpolates `${{ inputs.verify-attestation }}`
   into a shell body. Every other input already went through `env:`, for the

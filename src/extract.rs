@@ -121,15 +121,22 @@ fn budget_breached(err: &(dyn std::error::Error + 'static)) -> bool {
         .is_some_and(|inner| inner.downcast_ref::<BudgetExceeded>().is_some())
 }
 
-fn map_stream_error<E: std::error::Error + 'static>(context: &str, e: E) -> BluelineError {
-    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&e);
+fn budget_breach_in_chain<E: std::error::Error + 'static>(e: &E) -> bool {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(e);
     while let Some(err) = cause {
         if budget_breached(err) {
-            return BluelineError::ExtractionLimit(format!(
-                "{context}: the decompressed archive exceeds its budget"
-            ));
+            return true;
         }
         cause = err.source();
+    }
+    false
+}
+
+fn map_stream_error<E: std::error::Error + 'static>(context: &str, e: E) -> BluelineError {
+    if budget_breach_in_chain(&e) {
+        return BluelineError::ExtractionLimit(format!(
+            "{context}: the decompressed archive exceeds its budget"
+        ));
     }
     BluelineError::Extraction(format!("{context}: {e}"))
 }
@@ -1013,8 +1020,9 @@ mod tests {
     fn stream_budget_does_not_reject_a_header_heavy_archive() {
         // The budget is a headroom allowance, so the risk is that it is set too
         // tight and refuses an archive that is merely legal. 1000 entries of one
-        // byte each is the shape that stresses it: half the stream is 512-byte
-        // headers and padding, which no payload accounting sees.
+        // byte each is the shape that stresses it: 1023 of every 1024 bytes in
+        // the stream is a 512-byte header plus 511 bytes of padding, and no
+        // payload accounting sees any of it.
         use std::io::Write;
         let mut out = Vec::new();
         for i in 0..1000 {
@@ -1221,13 +1229,81 @@ mod tests {
         );
 
         // Wrapped the way tar-rs wraps it: TarError::source() yields the
-        // io::Error, which boxes the marker. Both depths must classify.
+        // io::Error, which boxes the marker, so the walk has to cross two
+        // levels. Asserted here with a stand-in chain because a real breach
+        // through `unpack_in` needs a multi-megabyte archive.
+        #[derive(Debug)]
+        struct Wrapper(std::io::Error);
+        impl std::fmt::Display for Wrapper {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("wrapped")
+            }
+        }
+        impl std::error::Error for Wrapper {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let two_deep = Wrapper(std::io::Error::other(BudgetExceeded));
+        assert!(
+            budget_breach_in_chain(&two_deep),
+            "a marker two levels down must still be found"
+        );
+        assert!(
+            matches!(
+                map_stream_error("ctx", two_deep),
+                BluelineError::ExtractionLimit(_)
+            ),
+            "a marker under a tar-rs-style wrapper is a limit, not a parse failure"
+        );
+
         let tar_err = tar::Archive::new(std::io::Cursor::new(b"not a tar".to_vec()))
             .unpack("nowhere")
             .unwrap_err();
         assert!(
             !budget_breached(&tar_err),
             "a real tar-rs error is not a breach"
+        );
+    }
+
+    /// A breach that happens while unpacking a file, rather than while reading
+    /// the next header, arrives through `entry.unpack_in` -- and tar-rs's
+    /// `TarError` there prints only its own description, so the budget's message
+    /// is gone and only the type-based walk can classify it. That path had no
+    /// test: deleting the walk left the whole suite green.
+    #[test]
+    fn a_breach_during_unpack_is_reported_as_a_limit() {
+        use std::io::Write;
+        // One file whose data is far larger than the stream budget, so the
+        // budget is exhausted partway through unpacking it rather than between
+        // entries. 32 MiB of data against a budget near 17 MiB.
+        let mut out = Vec::new();
+        out.extend_from_slice(&raw_header(
+            "package/big",
+            0x30,
+            32 * 1024 * 1024,
+            "",
+            0o644,
+        ));
+        out.extend(std::iter::repeat_n(b'A', 32 * 1024 * 1024));
+        out.extend_from_slice(&[0u8; 1024]);
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(&out).unwrap();
+        let tgz = enc.finish().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let err = safe_extract(
+            &tgz,
+            dir.path(),
+            &ExtractionLimits {
+                max_unpacked_bytes: 64 * 1024,
+                max_entries: 4,
+                max_entry_bytes: 64 * 1024 * 1024,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, BluelineError::ExtractionLimit(_)),
+            "a breach while unpacking a file must be a limit, got {err:?}"
         );
     }
 }

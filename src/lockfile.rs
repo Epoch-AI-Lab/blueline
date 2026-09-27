@@ -379,6 +379,7 @@ pub fn parse_requirements_txt_packages(
             continue;
         }
 
+        let mut code_part: String = code_part.to_string();
         // An option that redirects pip changes which packages get installed,
         // so reviewing the pinned lines alone certifies a graph nobody will
         // install. Refused rather than skipped, unless policy opts in, and
@@ -398,7 +399,26 @@ pub fn parse_requirements_txt_packages(
                      file. Set [ci] allow_requirements_options = true to review the pins anyway."
                 )));
             }
-            continue;
+            // The opt-in path must still review the pin on this line. Skipping
+            // the line outright meant `requests==2.31.0 --index-url ...` put
+            // nothing in the graph, so the package the line pins was never
+            // checked at all -- a fail-open dressed as a disclosure.
+            //
+            // Everything from the first non-hash option onward is dropped, and
+            // the spec before it is parsed as normal. Truncating is simpler
+            // and safer than picking option tokens out one at a time: whether
+            // `-r` consumes the next token is pip's business, and guessing
+            // wrong folds a path or a URL into a version. A `--hash` before
+            // the first redirecting option is kept, because that one is part of
+            // the pin. A `--hash` after it is lost, which makes the line fail
+            // its hash check rather than pass unreviewed.
+            if let Some(cut) = code_part
+                .split_whitespace()
+                .position(|tok| tok.starts_with('-') && !is_hash_option(tok))
+            {
+                let kept: Vec<&str> = code_part.split_whitespace().take(cut).collect();
+                code_part = kept.join(" ");
+            }
         }
 
         let tokens: Vec<&str> = code_part.split_whitespace().collect();
@@ -1232,10 +1252,18 @@ urllib3==2.1.0 # trailing comment
                 "option `{opt}` must be refused as an option, not as a version: {err}"
             );
             assert!(err.contains(flag), "the refusal must name `{flag}`: {err}");
-            // The opt-in stays an opt-in.
+            // The opt-in stays an opt-in -- and the pin on the same line must
+            // still be in the reviewed graph. Skipping the line outright
+            // returned Ok with an empty result, so a package the line pins was
+            // never checked at all. `is_ok()` alone is what let that pass.
+            let opted_in = parse_requirements_txt_packages(&file, true).unwrap();
             assert!(
-                parse_requirements_txt_packages(&file, true).is_ok(),
-                "the policy escape must let a trailing option through"
+                !opted_in.is_empty(),
+                "the opt-in path must still review the pin on the line: {file:?}"
+            );
+            assert!(
+                opted_in.values().any(|e| e.version == "2.31.0"),
+                "the pinned version must survive the opt-in: {opted_in:?}"
             );
         }
     }

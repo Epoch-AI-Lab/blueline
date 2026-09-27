@@ -100,7 +100,8 @@ Every tarball and registry response is fully untrusted. The `extract` stage enfo
   traversal, and drive prefixes are rejected, as is a second entry normalizing
   onto a path already written (`a//b` and `a/b` are one entry, and the second
   would otherwise overwrite the first); setuid/setgid bits are stripped. Pin
-  `tar` ≥ 0.4.45.
+  The manifest allows any `0.4.x`; `Cargo.lock` pins the exact version and CI
+  builds with `--locked`, so an unlocked local build can resolve a different one.
 - **Sandbox the step (planned, not implemented):** the intent is to run extract
   + diff in a Landlock-restricted child (read-only host FS, write only to the
   sandbox temp dir), capability-dropped, optionally seccomp-filtered, non-root,
