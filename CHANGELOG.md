@@ -22,8 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   no entry for `requests` at all — a fail-open wearing a disclosure's clothes.
   Everything from the first non-hash option onward is now dropped and the spec
   before it is parsed as normal, so the pin is reviewed and the redirect is
-  ignored. A `--hash` after the first redirecting option is lost, which makes
-  the line fail its hash check rather than pass unreviewed.
+  ignored. A `--hash` after the first redirecting option would also be lost, so
+  such a line is refused too: dropping it left the line with no integrity at all,
+  `R10_` never compared the declared hash, and it was neither verified nor
+  disclosed. An option-led line carrying an *unpinned* requirement is refused for
+  the same reason — dropping it let the gate pass a requirements.txt holding an
+  unpinned dependency, and the package read as removed rather than never-pinned.
 
 - A decompressed-stream budget breach is now classified as a limit everywhere it
   can surface. It was recognised by matching an error message, which fails on
