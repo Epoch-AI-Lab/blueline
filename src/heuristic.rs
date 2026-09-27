@@ -3830,8 +3830,9 @@ maintainers = ["  BadActor@Example.com "]
     }
 
     /// An unlisted identity, and an absent identity, must both stay clean. A
-    /// registry that exposes no authorship is a disclosed no-signal, not a
-    /// finding and not a block.
+    /// registry that exposes no authorship yields no `P04` at all, and nothing
+    /// discloses the absence — no finding, no card line, no warning — so it is a
+    /// silent no-signal, not a finding and not a block.
     #[test]
     fn unlisted_or_absent_author_is_not_a_finding() {
         let policy = Policy::from_toml_str(

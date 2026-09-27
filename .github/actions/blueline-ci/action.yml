@@ -47,6 +47,11 @@ runs:
       env:
         INPUT_VERSION: ${{ inputs.version }}
         INPUT_BUILD_FROM_SOURCE: ${{ inputs.build-from-source }}
+        # Wired explicitly. Actions does not expose a token as an env var on its
+        # own, so the authenticated branch below was dead code and every
+        # consumer took the unauthenticated path -- api.github.com rate-limits
+        # by IP, and runner IPs are shared.
+        GITHUB_TOKEN: ${{ github.token }}
       run: |
         set -euo pipefail
         OUT_DIR="${RUNNER_TEMP}/blueline-bin"

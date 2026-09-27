@@ -982,7 +982,7 @@ mod tests {
             reg.release_author(&pkg),
             None,
             "the npm lane supplies no publishing identity, so `[blocklist] maintainers` \
-             is a disclosed no-signal here rather than a pass"
+             is inert here: no P04, no card line, no warning"
         );
 
         let _ = handle.join();

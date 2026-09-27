@@ -942,13 +942,12 @@ mod tests {
     }
 
     /// The cap has to bound the read, not just the check. The old loop used
-    /// `split(b'\n')`, whose `read_until` pulls the whole line into a `Vec`
-    /// before anything looks at its length, so a peer that never sends a
-    /// newline made the server buffer as much as it cared to send. The
-    /// strongest observable proxy for "the buffer never grew to the size of
-    /// what was sent" is the byte count the source was drained by: a bounded
-    /// read stops within a few buffer-fills of the cap, an unbounded one
-    /// drains the stream to EOF.
+    /// `lines()`, which reads a whole line into an unbounded `String` before
+    /// anything looks at its length, so a peer that never sends a newline made
+    /// the server buffer as much as it cared to send. The strongest observable
+    /// proxy for "the buffer never grew to the size of what was sent" is the
+    /// byte count the source was drained by: a bounded read stops within a few
+    /// buffer-fills of the cap, an unbounded one drains the stream to EOF.
     #[test]
     fn newline_free_stream_is_refused_at_the_cap_without_reading_the_stream() {
         // Sized down so the accounting is tight rather than dominated by the

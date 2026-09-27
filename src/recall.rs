@@ -325,7 +325,11 @@ impl SyncedSnapshot {
 
     /// Epoch seconds past the snapshot's fetch time (client-side staleness).
     pub fn age_secs(&self) -> i64 {
-        (now_secs() - self.fetched_at).max(0)
+        self.age_secs_at(now_secs())
+    }
+
+    fn age_secs_at(&self, now: i64) -> i64 {
+        (now - self.fetched_at).max(0)
     }
 }
 
@@ -345,15 +349,36 @@ pub(crate) fn stale_band_at(
     let Some(synced) = cached_load(path)? else {
         return Ok(None);
     };
-    let max_age_secs = (policy.recall.max_age_hours as i64).saturating_mul(3600);
-    if synced.age_secs() > max_age_secs {
-        return Ok(Some(if policy.recall.block_on_stale {
+    Ok(stale_band_for(
+        &synced,
+        recall_max_age_secs(policy),
+        policy.recall.block_on_stale,
+        now_secs(),
+    ))
+}
+
+fn recall_max_age_secs(policy: &crate::policy::Policy) -> i64 {
+    (policy.recall.max_age_hours as i64).saturating_mul(3600)
+}
+
+/// The staleness decision with the clock handed in. A review asks this at a
+/// moment it does not choose, so pinning the boundary through the filesystem
+/// and a wall clock is a coin flip on second granularity: the arithmetic lives
+/// here, where a test can put the age exactly on the cap.
+fn stale_band_for(
+    synced: &SyncedSnapshot,
+    max_age_secs: i64,
+    block_on_stale: bool,
+    now: i64,
+) -> Option<crate::verdict::VerdictBand> {
+    if synced.age_secs_at(now) > max_age_secs {
+        return Some(if block_on_stale {
             crate::verdict::VerdictBand::Block
         } else {
             crate::verdict::VerdictBand::Medium
-        }));
+        });
     }
-    Ok(None)
+    None
 }
 
 /// Look up a package in the synced snapshot. Missing index → Ok(None).
@@ -372,6 +397,12 @@ pub fn lookup(
 /// validation, monotonic sequence check, atomic write. Sequence moves
 /// backward → refused.
 pub fn sync(url: &str) -> anyhow::Result<SyncedSnapshot> {
+    sync_within(url, LOCK_WAIT)
+}
+
+/// `lock_wait` is a parameter only so the tests can exercise the contended path
+/// in milliseconds. Production always passes `LOCK_WAIT`.
+fn sync_within(url: &str, lock_wait: std::time::Duration) -> anyhow::Result<SyncedSnapshot> {
     let url = format!("{}/revocations.json", url.trim_end_matches('/'));
     let agent = ureq::AgentBuilder::new()
         .timeout_read(std::time::Duration::from_secs(HTTP_READ_TIMEOUT_SECS))
@@ -409,7 +440,7 @@ pub fn sync(url: &str) -> anyhow::Result<SyncedSnapshot> {
     // and then land out of order, leaving 5 on disk after 6 was already there.
     // Nothing else reads `sequence`, so every later review would then trust the
     // rolled-back index and the revocations published at 6 would be invisible.
-    let _lock = SyncLock::acquire(parent)?;
+    let _lock = SyncLock::acquire_within(parent, lock_wait)?;
     if let Some(existing) = SyncedSnapshot::load()?
         && synced.snapshot.sequence < existing.snapshot.sequence
     {
@@ -453,9 +484,16 @@ const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 const LOCK_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(300);
 
 impl SyncLock {
+    #[cfg(test)]
     fn acquire(parent: &Path) -> anyhow::Result<Self> {
+        Self::acquire_within(parent, LOCK_WAIT)
+    }
+
+    /// `wait` is a parameter only so the tests can exercise the timeout path
+    /// in milliseconds. Production always passes `LOCK_WAIT`.
+    fn acquire_within(parent: &Path, wait: std::time::Duration) -> anyhow::Result<Self> {
         let path = parent.join("recall_snapshot.lock");
-        let deadline = std::time::Instant::now() + LOCK_WAIT;
+        let deadline = std::time::Instant::now() + wait;
         loop {
             match std::fs::OpenOptions::new()
                 .write(true)
@@ -570,6 +608,19 @@ pub fn serve(port: u16, index: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lock wait the tests use for the contended path. The production
+    /// default is `LOCK_WAIT` and is pinned to 30 s in
+    /// `sync_lock_times_out_loudly_rather_than_proceeding`; the timeout being
+    /// tested is the refusal, not the patience behind it, so paying 30 s of it
+    /// per test buys nothing.
+    const TEST_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+
+    /// The snapshot cache holds one process-wide entry, so a concurrent review
+    /// can evict the entry a cache test just primed and turn an observed hit
+    /// into an ordinary miss. Re-priming is cheap; the attempts bound a cache
+    /// that never hits.
+    const CACHE_HIT_ATTEMPTS: usize = 32;
 
     fn valid_snapshot() -> Snapshot {
         Snapshot {
@@ -868,6 +919,115 @@ mod tests {
             Some(probe_d),
             "a same-mtime rewrite with different content must be reloaded"
         );
+
+        // The hit, which is the half an assertion about the returned value
+        // cannot see: a hit and a re-read of an unchanged file return the same
+        // thing. The only way to tell them apart is to make the bytes on disk
+        // disagree with what a read would return and check the CACHED value
+        // comes back. The stamp is (mtime, len, ino), so a same-length rewrite
+        // with the mtime rewound lands exactly on the cached key -- and
+        // `fs::write` keeps the inode, so the whole key is preserved.
+        //
+        // The cache is one process-wide slot, so a review loading any other
+        // snapshot in between evicts this entry and the hit degrades to an
+        // ordinary miss, which is a correct outcome rather than a defect. The
+        // loop re-primes on that; a cache that never hits serves the on-disk
+        // bytes every time and runs out of attempts.
+        let cached = synced_tagged(15, "hit-01");
+        let on_disk = synced_tagged(15, "hit-02");
+        assert_eq!(
+            serde_json::to_string(&on_disk).unwrap().len(),
+            serde_json::to_string(&cached).unwrap().len(),
+            "the rewrite must keep the length or the stamp moves on its own"
+        );
+        let mut served = None;
+        for _ in 0..CACHE_HIT_ATTEMPTS {
+            std::fs::write(&path, serde_json::to_string(&cached).unwrap()).unwrap();
+            set_mtime(&path, pinned);
+            cached_load(&path).unwrap();
+            std::fs::write(&path, serde_json::to_string(&on_disk).unwrap()).unwrap();
+            set_mtime(&path, pinned);
+            served = cached_load(&path).unwrap();
+            if served == Some(cached.clone()) {
+                break;
+            }
+        }
+        assert_eq!(
+            served,
+            Some(cached),
+            "an unchanged (mtime, len, ino) must be served from the cache, not \
+             reread -- the file holds a different index of identical length"
+        );
+    }
+
+    /// What the process-wide cache currently holds, so a test can tell a miss
+    /// it caused from a miss another review caused by evicting the entry.
+    fn cache_entry() -> Option<CacheKey> {
+        SNAPSHOT_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|(key, _)| key.clone())
+    }
+
+    /// The stamp's inode half is the only thing standing between a review and a
+    /// replacement that preserves everything else: `cp -p`, `rsync --times` and
+    /// a tar or git extraction all hand over identical content length and
+    /// mtime from a different file. Nothing else in the suite moves the inode
+    /// -- `fs::write` keeps it -- so the test has to.
+    #[test]
+    #[cfg(unix)]
+    fn cache_misses_when_a_replacement_keeps_mtime_and_length_but_not_the_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recall_snapshot.json");
+        let pinned = far_future();
+        let original = synced_tagged(61, "inode-original");
+        let replacement = synced_tagged(62, "inode-replaced");
+        assert_eq!(
+            serde_json::to_string(&replacement).unwrap().len(),
+            serde_json::to_string(&original).unwrap().len(),
+            "the replacement must be a different index of exactly the same length"
+        );
+
+        let mut served = None;
+        for _ in 0..CACHE_HIT_ATTEMPTS {
+            std::fs::write(&path, serde_json::to_string(&original).unwrap()).unwrap();
+            set_mtime(&path, pinned);
+            assert_eq!(cached_load(&path).unwrap(), Some(original.clone()));
+            let before = stamp(&path);
+            if cache_entry() != Some((path.clone(), before)) {
+                // Another review loaded a snapshot in between and evicted the
+                // primed entry; without it there is nothing to catch, so prime
+                // again rather than conclude the stamp reloaded by accident.
+                continue;
+            }
+
+            // The replacement is a different file, so it has a different inode;
+            // `rename` over the target is what a `cp -p` restore or a package
+            // extraction does. The length and the mtime are copied onto it, so
+            // a timestamp-and-length key alone cannot see the swap.
+            let incoming = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+            std::fs::write(
+                incoming.path(),
+                serde_json::to_string(&replacement).unwrap(),
+            )
+            .unwrap();
+            incoming.persist(&path).unwrap();
+            set_mtime(&path, pinned);
+
+            let after = stamp(&path);
+            assert_eq!(before.0, after.0, "the mtime must be preserved");
+            assert_eq!(before.1, after.1, "the length must be preserved");
+            assert_ne!(before.2, after.2, "the inode must have changed");
+            served = cached_load(&path).unwrap();
+            break;
+        }
+        assert_eq!(
+            served,
+            Some(replacement),
+            "a replaced file carrying the old mtime and length must be reloaded; \
+             the stamp's inode half is what catches it"
+        );
     }
 
     /// Two snapshot paths must not share a cache entry even when they carry
@@ -1093,34 +1253,44 @@ mod tests {
     #[test]
     fn stale_band_pins_max_age_boundary() {
         let policy = crate::policy::Policy::default();
-        let max_age_secs = (policy.recall.max_age_hours as i64).saturating_mul(3600);
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("recall_snapshot.json");
-        let snap = valid_snapshot();
-        let write_at = |fetched_at: i64| {
-            let synced = SyncedSnapshot {
-                fetched_at,
-                url: "http://127.0.0.1:1".into(),
-                snapshot: snap.clone(),
-            };
-            std::fs::write(&path, serde_json::to_string(&synced).unwrap()).unwrap();
+        let max_age_secs = recall_max_age_secs(&policy);
+        let fetched_at = 1_700_000_000;
+        let synced = SyncedSnapshot {
+            fetched_at,
+            url: "http://127.0.0.1:1".into(),
+            snapshot: valid_snapshot(),
         };
-        let mut fresh_at_cap = false;
-        for _ in 0..8 {
-            write_at(now_secs() - max_age_secs);
-            if stale_band_at(&policy, &path).unwrap().is_none() {
-                fresh_at_cap = true;
-                break;
-            }
-        }
-        assert!(fresh_at_cap, "age exactly max_age_secs must be fresh");
-        write_at(now_secs() - max_age_secs - 1);
+        // The cap itself is fresh, one second past is stale, one second short is
+        // fresh. Pinned on the arithmetic with the clock handed in: doing this
+        // through the filesystem needed a retry loop to escape a same-second
+        // stamp collision, because a write that straddles a second boundary
+        // ages the snapshot by one and reads one second staler than it is.
         assert_eq!(
-            stale_band_at(&policy, &path).unwrap(),
+            stale_band_for(&synced, max_age_secs, false, fetched_at + max_age_secs),
+            None,
+            "age exactly max_age_secs must be fresh"
+        );
+        assert_eq!(
+            stale_band_for(&synced, max_age_secs, false, fetched_at + max_age_secs - 1),
+            None
+        );
+        assert_eq!(
+            stale_band_for(&synced, max_age_secs, false, fetched_at + max_age_secs + 1),
             Some(crate::verdict::VerdictBand::Medium)
         );
-        write_at(now_secs() - max_age_secs + 1);
-        assert!(stale_band_at(&policy, &path).unwrap().is_none());
+        assert_eq!(
+            stale_band_for(&synced, max_age_secs, true, fetched_at + max_age_secs + 1),
+            Some(crate::verdict::VerdictBand::Block),
+            "the escalation is on the same boundary as the band"
+        );
+        // A zero window still holds the exact instant it was fetched, and a
+        // snapshot stamped ahead of the clock never reads as stale.
+        assert_eq!(stale_band_for(&synced, 0, false, fetched_at), None);
+        assert_eq!(
+            stale_band_for(&synced, 0, false, fetched_at + 1),
+            Some(crate::verdict::VerdictBand::Medium)
+        );
+        assert_eq!(stale_band_for(&synced, 0, false, fetched_at - 60), None);
     }
 
     fn blueline_cmd(data_dir: &std::path::Path) -> assert_cmd::Command {
@@ -1458,11 +1628,16 @@ mod tests {
 
         let (url, handle) =
             serve_recall_once(serde_json::to_vec(&recall_snapshot(42, 1_700_000_000)).unwrap());
-        let out = blueline_cmd(data_dir.path())
-            .args(["recall", "sync", "--url", &url])
-            .output()
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "sync_child_contended_lock", "--nocapture"])
+            .env("BLUELINE_DATA_DIR", data_dir.path())
+            .env("BLUELINE_TEST_URL", &url)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .unwrap();
         handle.join().unwrap();
+        let out = child.wait_with_output().unwrap();
         assert_eq!(out.status.code(), Some(1));
         assert!(
             String::from_utf8_lossy(&out.stderr).contains("refusing to race"),
@@ -1477,17 +1652,42 @@ mod tests {
         );
     }
 
+    /// Child half of the contended-lock test, re-executed as its own process so
+    /// the lock is held by a different process than the one syncing. It waits
+    /// `TEST_LOCK_WAIT` rather than the production `LOCK_WAIT` for the same
+    /// reason the in-process test does: the wait under test is a refusal, and
+    /// refusing in 200 ms says exactly what refusing in 30 s says.
+    #[test]
+    #[ignore = "re-executed by sync_locks_the_compare_and_write"]
+    fn sync_child_contended_lock() {
+        let Ok(url) = std::env::var("BLUELINE_TEST_URL") else {
+            return;
+        };
+        if let Err(e) = sync_within(&url, TEST_LOCK_WAIT) {
+            eprintln!("{e:#}");
+            std::process::exit(1);
+        }
+    }
+
     #[test]
     fn sync_lock_times_out_loudly_rather_than_proceeding() {
+        // Production's patience is pinned here so lowering it in the tests
+        // cannot quietly lower it for users.
+        assert_eq!(LOCK_WAIT, std::time::Duration::from_secs(30));
+
         let data_dir = tempfile::tempdir().unwrap();
         let _held = SyncLock::acquire(data_dir.path()).unwrap();
-        let Err(err) = SyncLock::acquire(data_dir.path()) else {
+        let Err(err) = SyncLock::acquire_within(data_dir.path(), TEST_LOCK_WAIT) else {
             panic!("a held lock must not be acquirable");
         };
         assert!(
             err.to_string().contains("refusing to race"),
             "a contended lock must fail loudly, got {err}"
         );
+        // The refusal through `sync` itself needs a child process: `sync`
+        // resolves its path from the environment, so in-process it would lock
+        // and write the real data directory rather than the temp one.
+        // `sync_locks_the_compare_and_write` is that half.
     }
     /// The rollback this branch claimed to fix. Two syncs that both read the
     /// stored sequence before either writes: comparing first and locking

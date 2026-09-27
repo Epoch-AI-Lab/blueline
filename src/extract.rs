@@ -822,7 +822,12 @@ mod tests {
         // are refused by the existing metadata cap. This pins that, with the
         // ustar magic set, which the older fixtures did not have.
         use std::io::Write;
-        const PAYLOAD: usize = 256 * 1024 * 1024;
+        // The cap under test is 64 KiB, so 4 MiB is four orders of magnitude
+        // past it and still compresses to a few KB. The original 256 MiB
+        // built and gzipped a gigabyte across the four header kinds and cost
+        // ~21s of the suite's wall time, which is not a price worth paying for
+        // a test whose only question is "is this refused".
+        const PAYLOAD: usize = 4 * 1024 * 1024;
         for (label, typeflag, meta_name) in [
             ("pax-local", b'x', "PaxHeaders/demo"),
             ("pax-global", b'g', "pax_global_header"),

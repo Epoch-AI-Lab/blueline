@@ -1067,20 +1067,69 @@ mod tests {
         }
     }
 
+    /// A real race. Two sequential opens in one process contend with nothing,
+    /// so this runs every opener as its own thread, released onto the same
+    /// never-before-used data directory at once by a barrier: the directory
+    /// creation, the journal-mode switch and the migrations all happen under
+    /// contention, which is the only condition under which the WAL retry and
+    /// the migration-error handling do anything at all.
     #[test]
     fn concurrent_open_of_a_fresh_store_all_succeed() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("race.db");
+        const OPENERS: usize = 8;
+        const ROUNDS: usize = 6;
 
-        // A second opener must accept a store another process already brought
-        // to the target schema rather than surfacing that process's
-        // "table already exists" failure.
-        let first = BaselineStore::open_at(&db_path);
-        assert!(first.is_ok(), "first open failed: {}", err_of(&first));
-        let again = BaselineStore::open_at(&db_path);
-        assert!(again.is_ok(), "reopen failed: {}", err_of(&again));
-        drop(first);
-        drop(again);
+        for round in 0..ROUNDS {
+            let dir = tempfile::tempdir().unwrap();
+            // Never created before: the opener creates the data directory and
+            // the database inside it, so those creations are part of the race.
+            let data_dir = dir.path().join(format!("round-{round}"));
+            let db_path = data_dir.join("baseline.db");
+
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(OPENERS));
+            let handles: Vec<_> = (0..OPENERS)
+                .map(|opener| {
+                    let db_path = db_path.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        match BaselineStore::open_at(&db_path) {
+                            Ok(store) => {
+                                // A store that opened but cannot be queried is
+                                // not a store a review can use.
+                                store
+                                    .list_clean_versions::<semver::Version>(Ecosystem::Npm, "racer")
+                                    .map(|_| ())
+                                    .map_err(|e| format!("opener {opener}: query failed: {e:#}"))
+                            }
+                            Err(e) => Err(format!("opener {opener}: {e:#}")),
+                        }
+                    })
+                })
+                .collect();
+
+            let mut failures = Vec::new();
+            for handle in handles {
+                match handle.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => failures.push(e),
+                    Err(_) => failures.push(format!("round {round}: an opener panicked")),
+                }
+            }
+            assert!(
+                failures.is_empty(),
+                "every opener of a fresh store must succeed in round {round}: {failures:?}"
+            );
+
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let applied: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                applied,
+                MIGRATIONS.len() as i64,
+                "round {round} left a schema below the target version"
+            );
+        }
     }
 
     #[test]

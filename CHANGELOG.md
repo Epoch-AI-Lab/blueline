@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The dogfood CI health gate passed on an empty report. Every assertion held for
+  zero items, so a PR that changed `package-lock.json` and had the scan evaluate
+  nothing was reported healthy — the exact silent under-reporting the gate
+  exists to catch, and `continue-on-error` on the scan step left this script as
+  the only thing between a broken scanner and a green job. The job now checks
+  whether the lockfile changed, and a changed lockfile with an empty delta
+  fails. `total_evaluated == len(items)` was also a tautology of the report
+  writer and was replaced with a check that the summary's `max_band` agrees
+  with the items carried and that no item is missing a name or version.
+- The CI composite Action's authenticated release-lookup branch was dead code:
+  the step never wired a token, and Actions does not expose one as an env var,
+  so every consumer took the unauthenticated path to a per-IP rate-limited
+  endpoint on shared runner IPs.
+- The recall cache tests could not tell a cache hit from a fresh read, and the
+  inode half of the cache stamp was unpinned. A test now rewrites the file
+  byte-identically at the same length and mtime and requires the cached value
+  back, and a second replaces the file with one of identical length and mtime
+  but a different inode and requires the replacement to be served. Both fail
+  when the cache is bypassed or the inode is dropped.
+- The concurrent fresh-store test was two sequential opens, so it pinned
+  nothing: reverting the migration-error swallow left the whole suite green. It
+  is now a real race — eight threads released by a barrier onto a directory
+  that has never existed, over six rounds — and it fails if either the WAL
+  retry or the swallow is reverted.
+- The metadata-cap test in `extract.rs` built and gzipped a gigabyte across four
+  header kinds to check a 64 KiB cap, costing about 21 seconds of the suite's
+  wall time. 4 MiB is still four orders of magnitude past the cap and costs
+  0.24s.
+
 - The recall sync lock did not cover the sequence check it was added for. The
   comparison ran before the lock was taken, so two syncs could both read the
   stored sequence, both pass, and then land out of order, leaving the older
@@ -17,9 +46,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   one would be invisible. The comparison now happens inside the critical
   section. The comment and the changelog entry for that fix both claimed the
   lock spanned the read-compare-write; it did not.
-- A sync lock left behind by a killed process is now reaped. `Drop` does not run
-  on SIGKILL or an abort, so one crash would have made every later sync wait out
-  the full timeout and then fail forever. A fresh lock is never stolen from.
 - The recall snapshot cache key carries the file's inode as well as its length
   and mtime, so a replacement that preserves both — `cp -p`, `rsync --times`, a
   tar or git extraction — is no longer served from cache for the life of the
@@ -30,15 +56,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the migrations could return `SQLITE_BUSY` immediately instead of waiting —
   exactly during the creation race the migration handling exists for.
 
-- The MCP stdio server's request-size cap bounded nothing. The loop used
-  `BufReader::split`, which is an unbounded `read_until`, so a client that never
-  sent a newline could make the server buffer arbitrary memory before the 64 KiB
-  check was ever consulted. The read is now bounded the way the agent hook
-  already bounded its own.
-- A PyPI Simple index that lists a weaker severity entry before a stronger one
-  was reported at the weaker score. The score is now the strongest across every
-  `severity[]` entry, so the newly-scored CVSS v2 path cannot be masked by an
-  earlier entry. This can only raise a reported severity.
 - A `requirements.txt` line carrying an option flag after the spec was folded
   into the version string and surfaced as a PEP 440 error rather than the
   intended refusal. Every token is inspected now, so a trailing `--index-url` is
@@ -124,34 +141,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   score-neutral and would render as a clean auto-approve, hiding the dependency
   behind a passing verdict.
 
-### Removed
-- `BaselineResolution::display_summary`, which had no caller outside its own
-  test.
-- The extraction section of `ARCHITECTURE.md` claimed a Landlock sandbox,
-  capability drop, seccomp filter and open-FD cap. No such code exists and
-  `Cargo.lock` carries none of those crates. The claim is now marked as planned
-  and the document says plainly that the parser-level budget is what bounds a
-  hostile archive today.
-- `Policy::calculate_band`, which had no caller outside its own test and
-  disagreed with the live band ladder: it was a pure function of score, while
-  the production ladder is monotonic and never lowers an already-raised band. A
-  package with one High finding and 25 points is High in production and Medium
-  through `calculate_band`. Wiring it in as written would have silently weakened
-  severity. The two identical inline copies of the ladder are now one shared
-  helper, so they cannot drift.
-- Dead code that made the codebase look safer than it was: `Delta::is_empty`
-  (zero callers, and its semantics were wrong for an "unchanged" check anyway),
-  `DiskFileMeta.size` (written, never read, already re-derived by
-  `classify_bytes`), an unused wheel test helper, and an unreferenced
-  `ci::render_text_summary` print wrapper.
-- Three `#[allow(dead_code)]` suppressions that were hiding live checks from
-  the compiler: `Packument.name` (guards `validate_package_name`),
-  `AurRpcResponse.version` (guards the RPC protocol version), and
-  `Delta.binding_gyp_added` (drives a Block-severity native-build trigger), plus
-  a blanket suppression on `PackageJson`. If any of those checks were deleted,
-  the build would have stayed silent.
-
-### Fixed
 - `[blocklist] maintainers` now blocks — **on the AUR lane**, which is the only
   lane that supplies a publishing identity. The key parsed, validated, and was
   then never read: `is_maintainer_blocked` had no caller outside its own test,
@@ -163,8 +152,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   coverage unqualified; npm, crates.io and PyPI take the default `None` from
   `Registry::release_author` and produce no `P04` at all, and
   `ARCHITECTURE.md`'s policy table did too. Both now name the lane, and say
-  that an ecosystem whose registry does not publish an author is a disclosed
-  no-signal rather than a pass.
+  plainly that on those lanes the key is inert: with no author there is no
+  `P04`, no card line and no warning, so a review of an npm, crates.io or PyPI
+  release looks the same whether or not the policy sets the key. Nothing in the
+  tool discloses the absence, so "a registry that publishes no author" is a
+  silent no-signal, not a pass, and the complaint that motivated the key — a
+  policy asserting a protection and getting none with no warning anywhere — still
+  holds on those lanes.
 - The npm lane is deliberately left unwired, and the reason is a data-shape
   decision rather than an oversight. The adapter requests the *abbreviated*
   packument (`application/vnd.npm.install-v1+json`), whose top-level members
@@ -205,11 +199,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   directory turned a sync into an overwrite of any file the user could
   write. The write now goes to an `O_EXCL` tempfile, is flushed, and is
   renamed into place.
-- Concurrent `recall sync` runs are serialised by a lock spanning the
+- Concurrent `recall sync` runs are serialised by a lock around the
   read-compare-write. Two syncs could both pass the sequence check and
   then land out of order, leaving a stale snapshot in place. A sync that
-  cannot take the lock within five seconds now fails loudly instead of
-  racing.
+  cannot take the lock within 30 s now fails loudly instead of racing, and
+  a lock left behind by a killed process is reaped once it is older than
+  the five-minute staleness window, so one crash cannot brick the sync
+  path — `Drop` does not run on SIGKILL or an abort, so without reaping
+  every later sync would wait out the full timeout and then fail forever.
+  A fresh lock is never stolen from.
 - The recall snapshot cache is keyed by path as well as timestamp, and
   carries the file length. A `OnceLock` froze at the first snapshot it
   saw, so the cache stopped hitting exactly when the file changed, and
@@ -354,7 +352,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   step runs with `continue-on-error` because this repo legitimately BLOCKs on
   itself, but the health script only checked which packages were evaluated,
   never the bands, so a HIGH or BLOCK finding in an otherwise healthy delta
-  reported success. The report is now gated on its own findings.
+  reported success. The bands are read now: the health check requires every
+  reported band to parse and requires the summary's `max_band` and
+  `total_evaluated` to agree with the items it actually carries, so a scanner
+  that silently under-reports still fails. The hard gate is scanner health, not
+  risk level — our own first-party binary packages legitimately produce HIGH
+  findings, and the scan step is `continue-on-error` precisely so a
+  dependency-bump PR is not red for one — so HIGH and BLOCK go to the step
+  summary instead. The first version of this entry claimed the report was gated
+  on its own findings, which is not what ships.
 - The mutation-testing aggregate fails instead of reporting `skipped`. Without
   `always()` plus an explicit result check, GitHub skips the job when a shard
   fails, and a skipped required check counts as satisfied.
@@ -414,11 +420,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   registry the command was explicitly redirecting away from and writing
   evidence rows for an install that never ran. The denial is unchanged and
   still exit 2; only the wasted and misleading work is gone.
-- Registry requests no longer stall for 90 seconds against a peer that accepts
-  the connection and then goes quiet. All four adapters share one agent with a
-  10s connect ceiling and a 30s per-read/write ceiling. No whole-request
-  timeout is set, because `ureq` lets it override the per-operation values, and
-  response size stays bounded by `RegistryLimits` as before.
+- Registry requests no longer stall against a peer that accepts the connection
+  and then goes quiet. All four adapters share one agent with a 10s connect
+  ceiling and a 30s per-read/write ceiling, with no whole-request timeout set
+  because `ureq` lets it override the per-operation values, and response size
+  stays bounded by `RegistryLimits` as before. Both of those figures were later
+  reversed, so what ships is the other way round: no per-read ceiling, and a 90s
+  whole-request deadline alongside the 10s connect ceiling. The per-read ceiling
+  was dropped because a peer dribbling one byte per interval keeps every read
+  inside it and so runs unbounded, and `ureq` 2.x cannot express a short stall
+  guard and a long total budget at once.
 - Concurrent first runs against one data directory no longer fail. `record_verified`
   inserts-then-verifies rather than checking-then-inserting, which removed a
   primary-key collision between two reviewers recording the same package; the
@@ -434,6 +445,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   before that rule still carry capitals; otherwise a single legacy spelling
   would refuse the whole index and silently stop every revocation in it from
   blocking.
+- The extraction section of `ARCHITECTURE.md` claimed a Landlock sandbox,
+  capability drop, seccomp filter and open-FD cap. No such code exists and
+  `Cargo.lock` carries none of those crates. The claim is now marked as planned
+  and the document says plainly that the parser-level budget is what bounds a
+  hostile archive today.
+- The docs stopped describing code that does not exist and stopped
+  contradicting themselves. In this section: the MCP request cap was attributed
+  to `BufReader::split` when the base loop read with `lines()` and had no cap at
+  all, and to a "64 KiB check" that is `MAX_HOOK_STDIN_BYTES` in `src/agent.rs`,
+  a different component; the strongest-`severity[]`-entry fix was attributed to a
+  PyPI Simple index when `severity[]` is an OSV advisory field and PEP 691
+  carries no severity at all; the sync lock's ceiling was five seconds when the
+  loop was 250 × 20 ms and `LOCK_WAIT` is now 30 s; the dogfood gate was said to
+  be "gated on its own findings" when it gates on scanner health, which the entry
+  now records as its own over-claim; and the registry agent was described as a
+  30 s per-read ceiling with no whole-request timeout, which is the reverse of
+  `src/registry/http_util.rs` (a 90 s whole-request deadline, no per-read
+  ceiling). Both false entries were duplicates of correct ones already in this
+  section and are gone. In `ARCHITECTURE.md`: the "full" heuristic inventory
+  stopped at R28 and omitted every `P01`–`P04` rule; the `ci` policy table
+  omitted `allow_requirements_options`; an open risk still said `ci` was "Phase
+  3, not Phase 1" with every phase shipped; and two sections were both numbered
+  5. Its "disclosed no-signal" wording is also gone — on npm, crates.io and PyPI
+  the `[blocklist] maintainers` key is inert and nothing discloses that, which
+  is the very complaint the key was wired to answer.
+
+### Removed
+
+- `BaselineResolution::display_summary`, which had no caller outside its own
+  test.
+- `Policy::calculate_band`, which had no caller outside its own test and
+  disagreed with the live band ladder: it was a pure function of score, while
+  the production ladder is monotonic and never lowers an already-raised band. A
+  package with one High finding and 25 points is High in production and Medium
+  through `calculate_band`. Wiring it in as written would have silently weakened
+  severity. The two identical inline copies of the ladder are now one shared
+  helper, so they cannot drift.
+- Dead code that made the codebase look safer than it was: `Delta::is_empty`
+  (zero callers, and its semantics were wrong for an "unchanged" check anyway),
+  `DiskFileMeta.size` (written, never read, already re-derived by
+  `classify_bytes`), an unused wheel test helper, and an unreferenced
+  `ci::render_text_summary` print wrapper.
+- Three `#[allow(dead_code)]` suppressions that were hiding live checks from
+  the compiler: `Packument.name` (guards `validate_package_name`),
+  `AurRpcResponse.version` (guards the RPC protocol version), and
+  `Delta.binding_gyp_added` (drives a Block-severity native-build trigger), plus
+  a blanket suppression on `PackageJson`. If any of those checks were deleted,
+  the build would have stayed silent.
 
 ### Changed
 
@@ -445,9 +504,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - Docs refresh: `ROADMAP.md` marks the local-first recall index shipped
   (hosted API stays under Someday); `ARCHITECTURE.md` drops the stale
-  Phase-0/1 notes, lists the full R00–R28 heuristic inventory, and records
+  Phase-0/1 notes, lists the heuristic inventory, and records
   the recursion (D12), local-first recall (D13), and agent-enforcement
-  (D14) decisions.
+  (D14) decisions. The inventory was first written as "the full R00–R28"; it
+  now carries `R29_PKGBUILD_DEPENDS_NOT_IN_SRCINFO` and the `P01`–`P04` policy
+  rules as well, so the list is actually complete.
 - Mutation testing now covers the verdict path: `heuristic.rs`, `diff.rs`,
   `advisory.rs`, `provenance.rs`, `verdict.rs`, and the crates.io / AUR /
   `http_util` / registry-mod files join the `--file` scope in both mutants

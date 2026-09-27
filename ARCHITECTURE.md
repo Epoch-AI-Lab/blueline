@@ -124,9 +124,9 @@ Every tarball and registry response is fully untrusted. The `extract` stage enfo
 | D9 | Build-provenance-attested release binaries         | We audit supply chains — we must eat our own dog food. The CI composite Action verifies each downloaded binary against the attestation `release.yml` publishes, not just a checksum from the same release. |
 | D10| Policy-as-code (`blueline.toml`)                    | Per-project + global thresholds, allow/blocklists, required-provenance flags. |
 | D11| Approve = `npm install --ignore-scripts`           | Honors "never execute": install proceeds without running lifecycle scripts; `postinstall` is surfaced for a separate human decision, not auto-run. |
-| D12| Recursive second-order review in the engine           | Install references found in reviewed payloads are re-reviewed with depth/budget caps, cycle detection, and child-to-parent roll-up (§5). Non-registry refs are disclosed, never resolved. |
-| D13| Local-first recall index, no hosted dependency        | Curated revocations sync as a validated JSON snapshot (never the SQLite store); hits BLOCK through the advisory engine, staleness is disclosed (§5). |
-| D14| Explicit agent tool primary, shim as backstop         | `review_install` is what well-behaved agents call; PATH shims and hook bindings enforce at the terminal/agent boundary with honest bypass docs (§5). |
+| D12| Recursive second-order review in the engine           | Install references found in reviewed payloads are re-reviewed with depth/budget caps, cycle detection, and child-to-parent roll-up (§3). Non-registry refs are disclosed, never resolved. |
+| D13| Local-first recall index, no hosted dependency        | Curated revocations sync as a validated JSON snapshot (never the SQLite store); hits BLOCK through the advisory engine, staleness is disclosed (§3). |
+| D14| Explicit agent tool primary, shim as backstop         | `review_install` is what well-behaved agents call; PATH shims and hook bindings enforce at the terminal/agent boundary with honest bypass docs (§3). |
 
 ### Verdict bands
 - `LOW` — auto-approve path
@@ -136,25 +136,53 @@ Every tarball and registry response is fully untrusted. The `extract` stage enfo
   revocation, or unpinned dangerous delta
 
 ### Heuristic rule set (local, v1 — full inventory; bands tunable via policy)
-- R00 — unparseable/unreadable baseline or PKGBUILD (fail closed), PKGBUILD scope disclosure
-- R01 — lifecycle script added/modified, `binding.gyp` added/modified (native build trigger)
-- R02 — executable/binary blob added/modified, opaque large file, new install script, entry-points script
-- R03 — `child_process`, `eval`, VM execution, network primitives, high entropy in diff
-- R04 — dependency added/modified, sdist build code
-- R05 — large patch diff, non-standard version
-- R06 — first sighting (no baseline), native platform wheel
-- R07 — unreviewed predecessor baseline
-- R08 — yanked predecessor (MEDIUM)
-- R09 — advisory CVE / critical CVE / malware hit (BLOCK), yanked target
-- R10 — maintainer transition (`R10_MAINTAINER_TRANSITION`, AUR lane only — the
-  author-transition comparison needs a per-release identity, which only the AUR
-  adapter supplies), lockfile hash mismatch
-- R11–R23 — PKGBUILD static rules (checksum SKIP, source drift, pipe-to-shell,
-  eval family, indirection, cmd-subst in metadata, build-time network,
-  homoglyph, validpgpkeys change, install/hook change, unpinned VCS,
-  conditional execution, npm delivery); see §5 and `src/pkgbuild.rs`
-- R24–R27 — recursive review (install-ref disclosure, depth cap, cycle, second-order roll-up); see §5
-- R28 — recall-index staleness; see §5
+Every `rule_id` the engine emits, `R00`–`R29` and `P01`–`P04`; the `P` rules
+are policy decisions, not heuristics, and are listed last.
+
+- R00 — fail-closed on a PKGBUILD that cannot be reviewed:
+  `R00_PKGBUILD_UNREADABLE`, `R00_PKGBUILD_UNPARSEABLE`,
+  `R00_BASELINE_UNPARSEABLE`, `R00_BASELINE_UNREADABLE` (all HIGH), plus
+  `R00_PKGBUILD_SCOPE` (LOW), the disclosure that only repo scripts are reviewed
+- R01 — `R01_LIFECYCLE_SCRIPT_ADDED` / `R01_LIFECYCLE_SCRIPT_MODIFIED`,
+  `R01_BINDING_GYP_ADDED` / `R01_BINDING_GYP_MODIFIED` (native build trigger)
+- R02 — `R02_EXECUTABLE_ADDED`, `R02_BINARY_BLOB_ADDED` /
+  `R02_BINARY_BLOB_MODIFIED`, `R02_OPAQUE_LARGE_FILE_ADDED`,
+  `R02_ENTRY_POINTS_SCRIPT` (PyPI: `entry_points.txt` / `.data/scripts`)
+- R03 — `R03_EVAL_USAGE`, `R03_CHILD_PROCESS`, `R03_VM_EXECUTION`,
+  `R03_NETWORK_PRIMITIVE`, `R03_BASE64_DECODE`, `R03_HIGH_ENTROPY` in the text diff
+- R04 — `R04_DEPENDENCY_ADDED` / `R04_DEPENDENCY_MODIFIED`,
+  `R04_SDIST_BUILD_CODE` (PyPI)
+- R05 — `R05_LARGE_PATCH_DIFF`, `R05_NON_STANDARD_VERSION`
+- R06 — `R06_FIRST_SIGHTING` (no baseline), `R06_NATIVE_PLATFORM_WHEEL` (PyPI)
+- R07 — `R07_UNREVIEWED_PREDECESSOR_BASELINE`
+- R08 — `R08_YANKED_PREDECESSOR` (MEDIUM)
+- R09 — `R09_ADVISORY_MALWARE` / `R09_ADVISORY_CRITICAL_CVE` (BLOCK),
+  `R09_ADVISORY_CVE`, `R09_ADVISORY_UNVERIFIED` (HIGH, under
+  `fail_closed_network`), `R09_YANKED_TARGET`
+- R10 — `R10_MAINTAINER_TRANSITION` (AUR lane only — the author-transition
+  comparison needs a per-release identity, which only the AUR adapter
+  supplies), `R10_LOCKFILE_HASH_MISMATCH` (BLOCK, `blueline ci` only)
+- R11–R23, R29 — PKGBUILD static rules: `R11_CHECKSUM_SKIP`,
+  `R12_SOURCE_URL_DRIFT`, `R13_PIPE_TO_SHELL`, `R14_EVAL_FAMILY`,
+  `R15_DYNAMIC_INDIRECTION`, `R16_CMD_SUBST_IN_META`,
+  `R17_BUILD_TIME_NETWORK`, `R18_HOMOGLYPH`, `R19_VALIDPGPKEYS_CHANGE`,
+  `R20_INSTALL_HOOK_CHANGE`, `R21_UNPINNED_VCS_SOURCE`,
+  `R22_CONDITIONAL_EXECUTION`, `R23_NPM_DELIVERY`,
+  `R29_PKGBUILD_DEPENDS_NOT_IN_SRCINFO`; see §3 and `src/pkgbuild.rs`
+- R24–R27 — recursive review: `R24_LIFECYCLE_INSTALL_REF`,
+  `R25_RECURSION_DEPTH`, `R26_RECURSION_CYCLE`, `R27_SECOND_ORDER`; see §3
+- R28 — `R28_RECALL_STALE`, recall-index staleness; see §3
+- P01 — `P01_PACKAGE_BLOCKED` (BLOCK), the `blocklist.packages` hit
+- P02 — `P02_LIFECYCLE_SCRIPT_ALLOWED`, `P02_BINDING_GYP_ALLOWED` (LOW): the
+  allowlist's own disclosure that it allowed what R01 would otherwise fire on
+- P03 — `P03_PROVENANCE_DIGEST_MISMATCH`, `P03_PROVENANCE_REQUIRED_MISSING`,
+  `P03_SIGNATURE_REQUIRED_MISSING`, `P03_UNAUTHORIZED_BUILD_REPO`,
+  `P03_UNAUTHORIZED_BUILD_BUILDER` (BLOCK), and
+  `P03_PROVENANCE_NOT_CRYPTO_VERIFIED` (LOW), which is an attestation no
+  policy requires
+- P04 — `P04_MAINTAINER_BLOCKED` (BLOCK), `[blocklist] maintainers`; AUR lane
+  only, since the other three take the `Registry::release_author` `None`
+  default (see §3)
 
 ### MCP design
 Explicit `review_install` tool (agent calls before install) is primary; optional
@@ -163,7 +191,7 @@ Recommend the explicit tool to avoid breaking agent toolchains.
 
 ---
 
-## 5. Second-order lanes (agent / recall / shim)
+## 3. Second-order lanes (agent / recall / shim)
 
 Install-time references (npm lifecycle scripts, wheel `.data/scripts`,
 PKGBUILD npm/bun delivery) are first-class findings, reviewed recursively:
@@ -224,7 +252,7 @@ Known bypasses stay documented in the README.
 | `provenance` | `require_provenance`, `require_signatures`, `allowed_builders`, `allowed_repositories` (the last two enforced at Block) |
 | `allowlist.packages` | exact `name` (+optional `ecosystem`), `allowed_scripts`, `allow_unreviewed_baseline` |
 | `blocklist` | glob `packages` (+optional `ecosystem`) — every lane; `maintainers` — **AUR only** (see below) |
-| `ci` | `fail_on`, `max_evaluations`, `include_dev` |
+| `ci` | `fail_on`, `max_evaluations`, `include_dev`, `allow_requirements_options` |
 | `recursion` | `max_depth` (3, cap 16), `max_child_reviews` (8, cap 256), `child_block_band` (HIGH) |
 | `recall` | `max_age_hours` (48), `block_on_stale` |
 
@@ -233,10 +261,13 @@ Known bypasses stay documented in the README.
 `[blocklist] maintainers` is enforced through `Registry::release_author`, and
 only the AUR adapter overrides it. **The key is therefore live on the AUR lane
 alone**: npm, crates.io and PyPI supply no publishing identity, take the trait's
-`None` default, and produce no `P04_MAINTAINER_BLOCKED`. An ecosystem whose
-registry publishes no author is a **disclosed no-signal, not a pass** — the
-same reading as a registry whose author is absent from the list — so a policy
-that sets the key is protecting the AUR install line and nothing else.
+`None` default, and produce no `P04_MAINTAINER_BLOCKED`. On those lanes the key
+is **inert** — P04 fires only when `release_author` returns `Some`, and `None`
+yields no finding, no card line and no warning, so a review there is
+indistinguishable from one on a policy that never set the key. That is the shape
+this tool exists to refuse, and on those three lanes it is still live: a registry
+that publishes no author is a **silent no-signal, not a pass**, and a policy that
+sets the key is protecting the AUR install line and nothing else.
 
 The AUR lane reads two identity channels: the pinned commit's self-declared
 author email (`commit_author`), falling back to the `Maintainer` field the RPC
@@ -269,7 +300,7 @@ add the blocklist signal and leave `R10` structurally dead there, not firing.
 
 ---
 
-## 3. Tech Stack (Rust core)
+## 4. Tech Stack (Rust core)
 
 | Concern            | Crate / Tool                          |
 |--------------------|---------------------------------------|
@@ -285,16 +316,18 @@ add the blocklist signal and leave `R10` structurally dead there, not firing.
 
 ---
 
-## 4. Open Risks
+## 5. Open Risks
 
 - **First-sighting bootstrap:** no baseline on initial install → default to a
   *neutral* verdict and flag "no known-clean baseline" rather than BLOCK.
 - **`scripts` false positives:** legit packages (esbuild, core-js) use
   postinstall. Need an allowlist-by-maintainer or "review once, remember" flow.
 - **Lockfile vs manifest:** `review` diffs a single package; `ci` must diff the
-  whole lockfile. Two code paths — `ci` is Phase 3, not Phase 1.
+  whole lockfile. Two code paths. (This note used to read "`ci` is Phase 3, not
+  Phase 1", which was stale: Phases 0–4 are all shipped, per the status note
+  above and `ROADMAP.md`.)
 
-## 5. Defect policy
+## 6. Defect policy
 
 A defect is a defect regardless of when it arrived. "Pre-existing", "out of
 scope", and "unrelated to this diff" describe the diff, not the bug, and none
