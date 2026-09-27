@@ -28,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   disclosed. An option-led line carrying an *unpinned* requirement is refused for
   the same reason — dropping it let the gate pass a requirements.txt holding an
   unpinned dependency, and the package read as removed rather than never-pinned.
+  The splitting that entry describes was itself replaced, twice over; the rule
+  that ships is the total one below, which refuses any line mixing an option
+  with a requirement.
 
 - A decompressed-stream budget breach is now classified as a limit everywhere it
   can surface. It was recognised by matching an error message, which fails on
