@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A mutant in the CVSS v2 exploitability term survived the whole suite, found
+  by `cargo mutants` in CI. Every NVD reference vector used `AV:N`, whose weight
+  is 1.0, so turning `20.0 * av` into `20.0 / av` changed nothing. Two tests now
+  vary the access vector with impact held constant, one on exact values and one
+  on the ordering network > adjacent > local, which kills the mutant without
+  depending on the arithmetic.
+
 - CI runs again. A comment added to `ci.yml` in `e8e8fb2` contained the text
   `${{ }}` literally, and GitHub expands expressions inside a `run:` block even
   when they sit in a shell comment, so the workflow failed to compile. Every run

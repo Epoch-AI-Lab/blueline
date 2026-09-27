@@ -38,6 +38,12 @@ premise you hand them.
   cycles in this repo silently changed nothing: a string replace that did not
   match, a stale `/tmp` backup restored over newer work, a `--lib` run against
   a `blueline` binary cargo had not rebuilt. Each one read as "verified".
+- Treat a hand-picked revert as a floor, not evidence. It tests the one change
+  you thought of. CI's `cargo mutants` enumerates the rest, and it found a
+  survivor in the CVSS v2 scoring that six review passes and every manual check
+  had cleared, because all six reference vectors used `AV:N` and its weight is
+  1.0, so multiplying and dividing by it agree. Vary a fixture's constant
+  before trusting it to pin the expression around it.
 - Skip the fan-out for one-line changes. Deleting dead code does not need four
   agents. The bar is an open answer space and an expensive miss.
 

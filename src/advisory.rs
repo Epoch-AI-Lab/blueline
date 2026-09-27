@@ -805,6 +805,48 @@ mod tests {
         }
     }
 
+    /// The access vector, which the NVD vectors above never vary.
+    ///
+    /// Every reference vector in `cvss_v2_base_scores_match_the_nvd_reference_vectors`
+    /// uses `AV:N`, and for network the weight is 1.0, so `20.0 * 1.0` and
+    /// `20.0 / 1.0` are the same number. A mutant that turned the exploitability
+    /// product into a quotient therefore survived the whole suite, which is how
+    /// `cargo mutants` found it in CI. These three vary only the access vector,
+    /// with impact held at Complete, and they kill it.
+    ///
+    /// The values follow the v2.0 base equation; the ordering is the part worth
+    /// trusting independently, since it is a property rather than arithmetic.
+    #[test]
+    fn cvss_v2_exploitability_scales_with_the_access_vector() {
+        for (av, expected) in [("N", 10.0), ("A", 8.3), ("L", 7.2)] {
+            let vector = format!("AV:{av}/AC:L/Au:N/C:C/I:C/A:C");
+            assert_eq!(parse_cvss_v2_vector(&vector), Some(expected), "{vector}");
+        }
+    }
+
+    /// Network is more exploitable than adjacent, which is more exploitable than
+    /// local. Asserted as an ordering rather than as three literals, so it holds
+    /// whatever the exact weights are: a mutant that inverts the access-vector
+    /// scale, by dividing instead of multiplying, inverts this too.
+    #[test]
+    fn cvss_v2_access_vector_ordering_is_preserved() {
+        let score = |av: &str| {
+            parse_cvss_v2_vector(&format!("AV:{av}/AC:L/Au:N/C:P/I:P/A:P")).expect("a v2 vector")
+        };
+        assert!(
+            score("N") > score("A"),
+            "network must outscore adjacent: {} vs {}",
+            score("N"),
+            score("A")
+        );
+        assert!(
+            score("A") > score("L"),
+            "adjacent must outscore local: {} vs {}",
+            score("A"),
+            score("L")
+        );
+    }
+
     /// A v2 vector that is not a v2 vector scores as nothing rather than as a
     /// guess. Each of these is unscored today too, so this pins that the new
     /// path never invents a number.
