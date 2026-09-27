@@ -379,8 +379,36 @@ impl BaselineStore {
             }
         }
 
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|e| BluelineError::Store(format!("enabling WAL: {e}")))?;
+        // SQLite does not consult the busy handler for a journal-mode change while
+        // other connections are attached, so this one statement can return
+        // SQLITE_BUSY immediately instead of waiting out `busy_timeout` -- and it
+        // does exactly that when two processes open a never-before-used data
+        // directory at the same time, which is the creation race the migration
+        // handling below is built for. A concurrent opener sets the same mode, so
+        // retrying is safe, and the alternative is refusing a review over a
+        // journal setting another process is in the middle of applying.
+        let mut wal_error = None;
+        for attempt in 0..40 {
+            match conn.pragma_update(None, "journal_mode", "WAL") {
+                Ok(_) => {
+                    wal_error = None;
+                    break;
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    let retryable = msg.contains("database is locked")
+                        || msg.contains("database table is locked");
+                    if !retryable || attempt == 39 {
+                        wal_error = Some(e);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        }
+        if let Some(e) = wal_error {
+            return Err(BluelineError::Store(format!("enabling WAL: {e}")));
+        }
 
         let migrations = Migrations::new(MIGRATIONS.iter().map(|sql| M::up(sql)).collect());
         // A lost creation race is the expected cause of a migration failure:

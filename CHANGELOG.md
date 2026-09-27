@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The recall sync lock did not cover the sequence check it was added for. The
+  comparison ran before the lock was taken, so two syncs could both read the
+  stored sequence, both pass, and then land out of order, leaving the older
+  snapshot on disk. `sequence` is read nowhere else, so every later review would
+  have trusted a rolled-back index and the revocations published in the newer
+  one would be invisible. The comparison now happens inside the critical
+  section. The comment and the changelog entry for that fix both claimed the
+  lock spanned the read-compare-write; it did not.
+- A sync lock left behind by a killed process is now reaped. `Drop` does not run
+  on SIGKILL or an abort, so one crash would have made every later sync wait out
+  the full timeout and then fail forever. A fresh lock is never stolen from.
+- The recall snapshot cache key carries the file's inode as well as its length
+  and mtime, so a replacement that preserves both — `cp -p`, `rsync --times`, a
+  tar or git extraction — is no longer served from cache for the life of the
+  process.
+- Opening a fresh SQLite store concurrently no longer fails on the journal-mode
+  pragma. SQLite does not consult the busy handler for a journal-mode change
+  while other connections are attached, so the one statement that runs before
+  the migrations could return `SQLITE_BUSY` immediately instead of waiting —
+  exactly during the creation race the migration handling exists for.
+
 - The MCP stdio server's request-size cap bounded nothing. The loop used
   `BufReader::split`, which is an unbounded `read_until`, so a client that never
   sent a newline could make the server buffer arbitrary memory before the 64 KiB

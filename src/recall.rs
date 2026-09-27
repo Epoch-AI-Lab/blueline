@@ -87,20 +87,31 @@ pub struct SyncedSnapshot {
 /// the only case it exists for. It was also keyed on mtime alone, so two
 /// snapshot paths sharing a timestamp served each other's index.
 ///
-/// Keyed on the full path plus `(mtime, len)`. The length is free and closes
-/// the same-second collision a coarse filesystem clock would otherwise allow,
-/// and an `Arc` makes a hit a refcount bump rather than a deep clone of up to
-/// 10 000 entries.
-type CacheKey = (std::path::PathBuf, (std::time::SystemTime, u64));
+/// Keyed on the full path plus `(mtime, len, ino)`. The length closes the
+/// same-second collision a coarse filesystem clock would otherwise allow, and
+/// the inode catches a replacement that preserves both, which `cp -p`,
+/// `rsync --times` and a tar or git extraction all do. The value is an `Arc`
+/// so populating the cache does not need a second deep copy; a *hit* still
+/// clones the snapshot out of it, because the callers want an owned value.
+type CacheKey = (std::path::PathBuf, Stamp);
 static SNAPSHOT_CACHE: std::sync::Mutex<
     Option<(CacheKey, std::sync::Arc<Option<SyncedSnapshot>>)>,
 > = std::sync::Mutex::new(None);
 
-fn stamp(path: &Path) -> (std::time::SystemTime, u64) {
-    match std::fs::metadata(path) {
-        Ok(m) => (m.modified().unwrap_or(std::time::UNIX_EPOCH), m.len()),
-        Err(_) => (std::time::UNIX_EPOCH, 0),
-    }
+type Stamp = (std::time::SystemTime, u64, u64);
+
+fn stamp(path: &Path) -> Stamp {
+    let Ok(m) = std::fs::metadata(path) else {
+        return (std::time::UNIX_EPOCH, 0, 0);
+    };
+    #[cfg(unix)]
+    let ino = {
+        use std::os::unix::fs::MetadataExt;
+        m.ino()
+    };
+    #[cfg(not(unix))]
+    let ino = 0;
+    (m.modified().unwrap_or(std::time::UNIX_EPOCH), m.len(), ino)
 }
 
 fn cached_load(path: &Path) -> Result<Option<SyncedSnapshot>, BluelineError> {
@@ -385,6 +396,20 @@ pub fn sync(url: &str) -> anyhow::Result<SyncedSnapshot> {
         url: url.clone(),
         snapshot,
     };
+    let path = snapshot_path()?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| anyhow::anyhow!("creating {}: {e}", parent.display()))?;
+
+    // The lock spans the read-compare-write, which means the comparison has to
+    // happen *inside* it. Comparing first and locking after looks equivalent and
+    // is not: two syncs that both read sequence 4, both pass a `5 < 4` check,
+    // and then land out of order, leaving 5 on disk after 6 was already there.
+    // Nothing else reads `sequence`, so every later review would then trust the
+    // rolled-back index and the revocations published at 6 would be invisible.
+    let _lock = SyncLock::acquire(parent)?;
     if let Some(existing) = SyncedSnapshot::load()?
         && synced.snapshot.sequence < existing.snapshot.sequence
     {
@@ -394,19 +419,6 @@ pub fn sync(url: &str) -> anyhow::Result<SyncedSnapshot> {
             existing.snapshot.sequence
         );
     }
-    let path = snapshot_path()?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", path.display()))?;
-    std::fs::create_dir_all(parent)
-        .map_err(|e| anyhow::anyhow!("creating {}: {e}", parent.display()))?;
-
-    // Held across the read-compare-write above, so two concurrent syncs
-    // cannot both pass the sequence check and then write out of order. The
-    // wait is bounded and then fails loudly, which is the right direction for
-    // a tool that fails closed; a crashed holder is cleared by the guard on
-    // drop. Cooperative: only blueline takes it.
-    let _lock = SyncLock::acquire(parent)?;
 
     // A tempfile rather than a name derived from the pid. The old name was
     // fully predictable and `fs::write` follows a symlink, so a planted link
@@ -430,29 +442,65 @@ pub fn sync(url: &str) -> anyhow::Result<SyncedSnapshot> {
 /// needs no new dependency. Removed on drop, including on an error path.
 struct SyncLock(PathBuf);
 
+/// How long a sync waits for a peer before refusing. Generous enough for the
+/// 8 MiB worst case plus its `fsync` on a loaded disk, short enough that a
+/// wedged peer does not hang a review indefinitely.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A lock file older than this was left by a process that died: `Drop` does
+/// not run on SIGKILL or an abort, so without reaping one crash would make
+/// every later sync wait out the full timeout and then fail forever.
+const LOCK_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(300);
+
 impl SyncLock {
     fn acquire(parent: &Path) -> anyhow::Result<Self> {
         let path = parent.join("recall_snapshot.lock");
-        for attempt in 0..250 {
+        let deadline = std::time::Instant::now() + LOCK_WAIT;
+        loop {
             match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&path)
             {
                 Ok(_) => return Ok(SyncLock(path)),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if attempt == 249 {
-                        anyhow::bail!(
-                            "another blueline recall sync holds {}; refusing to race it",
-                            path.display()
-                        );
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(e) => return Err(anyhow::anyhow!("creating {}: {e}", path.display())),
             }
+            if Self::reap_if_stale(&path) {
+                continue;
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "another blueline recall sync holds {}; refusing to race it",
+                    path.display()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        unreachable!("the loop either returns or bails")
+    }
+
+    /// Remove a lock left behind by a dead holder. `Drop` cannot cover a
+    /// SIGKILL, an abort, or a power loss, and a lock that is never released
+    /// bricks the sync path permanently. Only a lock older than
+    /// `LOCK_STALE_AFTER` is reaped, so a slow-but-alive holder is never
+    /// stolen from. Removing a lock is itself racy — two waiters may both reap
+    /// and both proceed — so the create above stays `create_new` and the worst
+    /// case is two writers racing, which the sequence check under the lock
+    /// still catches.
+    fn reap_if_stale(path: &Path) -> bool {
+        let Ok(meta) = std::fs::metadata(path) else {
+            return false;
+        };
+        let Ok(modified) = meta.modified() else {
+            return false;
+        };
+        let age = std::time::SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or_default();
+        if age < LOCK_STALE_AFTER {
+            return false;
+        }
+        std::fs::remove_file(path).is_ok()
     }
 }
 
@@ -1358,6 +1406,21 @@ mod tests {
         );
     }
 
+    /// Child half of the rollback race, re-executed as its own process so the
+    /// lock contention is between two real syncs. Exits 0 when the sync landed
+    /// and 1 when it refused, so the parent's assertion is on the decision the
+    /// sync made rather than on a panic.
+    #[test]
+    #[ignore = "re-executed by the_sequence_check_runs_inside_the_lock_not_before_it"]
+    fn sync_child_for_rollback_race() {
+        let Ok(url) = std::env::var("BLUELINE_TEST_URL") else {
+            return;
+        };
+        if sync(&url).is_err() {
+            std::process::exit(1);
+        }
+    }
+
     /// Child half of the symlink test above, re-executed as its own process so
     /// the planted name matches the pid that actually syncs.
     #[test]
@@ -1424,6 +1487,126 @@ mod tests {
         assert!(
             err.to_string().contains("refusing to race"),
             "a contended lock must fail loudly, got {err}"
+        );
+    }
+    /// The rollback this branch claimed to fix. Two syncs that both read the
+    /// stored sequence before either writes: comparing first and locking
+    /// afterwards lets the older snapshot land last, and `sequence` is read
+    /// nowhere else, so every later review then trusts a rolled-back index.
+    ///
+    /// The ordering is forced with the lock itself. The parent holds the lock,
+    /// so a child that compares *before* locking has already read the stored
+    /// value and is now stuck in its retry loop holding a stale answer; a child
+    /// that locks first has not compared at all. The parent then writes a newer
+    /// sequence as a finished peer would, and releases. Only the second
+    /// implementation can still see the newer sequence.
+    #[test]
+    fn the_sequence_check_runs_inside_the_lock_not_before_it() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let snapshot_path = data_dir.path().join("recall_snapshot.json");
+        let (seed_url, seed_handle) =
+            serve_recall_once(serde_json::to_vec(&recall_snapshot(4, 1_700_000_000)).unwrap());
+        let out = blueline_cmd(data_dir.path())
+            .args(["recall", "sync", "--url", &seed_url])
+            .output()
+            .unwrap();
+        seed_handle.join().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let held = SyncLock::acquire(data_dir.path()).unwrap();
+
+        // This child fetches sequence 5 while the parent holds the lock.
+        let (older_url, older_handle) =
+            serve_recall_once(serde_json::to_vec(&recall_snapshot(5, 1_700_000_000)).unwrap());
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "sync_child_for_rollback_race", "--nocapture"])
+            .env("BLUELINE_DATA_DIR", data_dir.path())
+            .env("BLUELINE_TEST_URL", &older_url)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        older_handle.join().unwrap();
+
+        // Long enough for the child to fetch, compare, and settle into its lock
+        // retry loop. Generous on purpose: a short wait would let the child
+        // reach the lock late enough to read the new sequence regardless of
+        // which implementation it is, and the test would pass either way.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+
+        // A finished peer lands sequence 9 while the lock is still held.
+        std::fs::write(
+            &snapshot_path,
+            serde_json::to_vec(&synced_tagged(9, "peer")).unwrap(),
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        drop(held);
+
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "a sync to sequence 5 must refuse once a peer stored sequence 9, \
+             got: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&snapshot_path).unwrap()).unwrap();
+        assert_eq!(
+            stored["snapshot"]["sequence"], 9,
+            "the stored sequence must not roll back to 5"
+        );
+    }
+
+    /// A lock file left by a process that died is reaped. `Drop` does not run
+    /// on SIGKILL or an abort, so without reaping one crash would make every
+    /// later sync wait out the full timeout and then fail forever.
+    #[test]
+    fn a_stale_lock_from_a_dead_holder_is_reaped() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let lock = data_dir.path().join("recall_snapshot.lock");
+        std::fs::write(&lock, b"").unwrap();
+        assert!(
+            !SyncLock::reap_if_stale(&lock),
+            "a fresh lock file must not be stolen from a live holder"
+        );
+        let old =
+            std::time::SystemTime::now() - (LOCK_STALE_AFTER + std::time::Duration::from_secs(60));
+        std::fs::File::options()
+            .write(true)
+            .open(&lock)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert!(
+            SyncLock::reap_if_stale(&lock),
+            "a dead holder's lock must be reaped"
+        );
+
+        // The property that matters is on the acquire path, not the helper: a
+        // stale lock left by a dead sync must not make every later sync wait
+        // out the full timeout and then fail. Asserted through `acquire` with no
+        // manual reaping first, so removing the call inside it fails here --
+        // which takes the full lock deadline to do, but only in the mutated
+        // build.
+        let lock2 = data_dir.path().join("recall_snapshot.lock");
+        std::fs::write(&lock2, b"").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&lock2)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let acquired = SyncLock::acquire(data_dir.path());
+        assert!(
+            acquired.is_ok(),
+            "a stale lock must not block acquisition: {:?}",
+            acquired.err()
         );
     }
 }
