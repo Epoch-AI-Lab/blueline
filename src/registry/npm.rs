@@ -60,15 +60,7 @@ impl NpmRegistry {
         }
         let fetched = self.fetch_packument(name)?;
         if let Ok(mut cache) = self.packuments.lock() {
-            let size = packument_size_estimate(&fetched);
-            if size <= MAX_MEMOISED_PACKUMENT_BYTES {
-                if cache.bytes + size > MAX_MEMOISED_PACKUMENT_TOTAL_BYTES {
-                    cache.by_name.clear();
-                    cache.bytes = 0;
-                }
-                cache.bytes += size;
-                cache.by_name.insert(name.to_string(), fetched.clone());
-            }
+            cache.insert(name.to_string(), &fetched);
         }
         Ok(fetched)
     }
@@ -313,6 +305,25 @@ fn packument_size_estimate(p: &Packument) -> u64 {
 struct PackumentMemo {
     by_name: std::collections::HashMap<String, Packument>,
     bytes: u64,
+}
+
+impl PackumentMemo {
+    /// The whole ceiling policy, in one place so a test can exercise the
+    /// production logic rather than a copy of it. A document over the per-entry
+    /// ceiling is not stored; a store that would pass the total restarts rather
+    /// than grows.
+    fn insert(&mut self, name: String, p: &Packument) {
+        let size = packument_size_estimate(p);
+        if size > MAX_MEMOISED_PACKUMENT_BYTES {
+            return;
+        }
+        if self.bytes + size > MAX_MEMOISED_PACKUMENT_TOTAL_BYTES {
+            self.by_name.clear();
+            self.bytes = 0;
+        }
+        self.bytes += size;
+        self.by_name.insert(name, p.clone());
+    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -1215,6 +1226,8 @@ mod tests {
         );
 
         // Under the per-document ceiling but over the total: cleared, not grown.
+        // Calls the production `insert`, not a copy of the policy, so deleting
+        // the ceiling in the real code fails here.
         let mut memo = PackumentMemo::default();
         let small = Packument {
             name: "memo".into(),
@@ -1234,21 +1247,30 @@ mod tests {
         };
         let small_size = packument_size_estimate(&small);
         assert!(small_size <= MAX_MEMOISED_PACKUMENT_BYTES);
+
+        memo.insert("stale".into(), &small);
+        assert!(memo.by_name.contains_key("stale"));
+        // Fill the accounting right up to the ceiling without inserting a
+        // document, which is what a long walk of small ones does.
         memo.bytes = MAX_MEMOISED_PACKUMENT_TOTAL_BYTES;
-        memo.by_name.insert("stale".into(), small.clone());
-        if memo.bytes + small_size > MAX_MEMOISED_PACKUMENT_TOTAL_BYTES {
-            memo.by_name.clear();
-            memo.bytes = 0;
-        }
-        memo.bytes += small_size;
-        memo.by_name.insert("memo".into(), small);
-        assert_eq!(
-            memo.bytes, small_size,
-            "the total must restart, not accumulate"
-        );
+        memo.insert("memo".into(), &small);
         assert!(
             !memo.by_name.contains_key("stale"),
             "a memo past its total ceiling must drop what it held"
         );
+        assert_eq!(
+            memo.bytes, small_size,
+            "the total must restart at the new entry, not accumulate"
+        );
+        assert!(memo.by_name.contains_key("memo"));
+
+        // An over-ceiling document is refused outright, even when there is room.
+        let mut roomy = PackumentMemo::default();
+        roomy.insert("toobig".into(), &p);
+        assert!(
+            !roomy.by_name.contains_key("toobig"),
+            "a document over the per-entry ceiling must not be stored"
+        );
+        assert_eq!(roomy.bytes, 0);
     }
 }

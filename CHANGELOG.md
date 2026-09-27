@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A requirements line that puts the option *before* the pin is now refused
+  rather than dropped. The opt-in truncates at the first non-hash option, which
+  for `--index-url https://evil requests==2.31.0` left nothing and skipped the
+  line, so an upgrade from `requests==2.28.0` never entered the head graph and
+  was never evaluated. An option alone on its line is the ordinary pip layout and
+  stays allowed.
+
 - The `[ci] allow_requirements_options` opt-in no longer drops the pin it was
   asked to tolerate. The escape skipped the whole line, so
   `requests==2.31.0 --index-url https://evil.example` left the reviewed graph with
