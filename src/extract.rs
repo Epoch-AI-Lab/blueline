@@ -1266,41 +1266,49 @@ mod tests {
         );
     }
 
-    /// A breach that happens while unpacking a file, rather than while reading
-    /// the next header, arrives through `entry.unpack_in` -- and tar-rs's
-    /// `TarError` there prints only its own description, so the budget's message
-    /// is gone and only the type-based walk can classify it. That path had no
-    /// test: deleting the walk left the whole suite green.
+    /// A breach raised while unpacking a file, rather than between entries, is
+    /// classified as a limit too.
+    ///
+    /// Driven through the real types and not through `safe_extract`: a
+    /// `Budgeted` reader whose budget covers the 512-byte header block but not
+    /// the file's payload, so exhaustion happens while tar-rs is copying the
+    /// entry. An earlier version went through `safe_extract` with production
+    /// limits small enough that the pre-flight total check fired first, so
+    /// `unpack_in` was never reached and the test passed with the
+    /// classification disabled.
+    ///
+    /// What this pins: that a breach from `unpack_in` is an `ExtractionLimit`
+    /// rather than a plain extraction failure. tar-rs wraps it in a `TarError`
+    /// whose `Display` is only "failed to unpack `<path>`", so the budget's
+    /// wording is gone and the walk through `source` is what recovers the
+    /// marker. `budget_breach_is_classified_by_type_not_by_message` pins the
+    /// same walk synthetically, at a nesting level this path does not reach.
     #[test]
     fn a_breach_during_unpack_is_reported_as_a_limit() {
-        use std::io::Write;
-        // One file whose data is far larger than the stream budget, so the
-        // budget is exhausted partway through unpacking it rather than between
-        // entries. 32 MiB of data against a budget near 17 MiB.
-        let mut out = Vec::new();
-        out.extend_from_slice(&raw_header(
-            "package/big",
-            0x30,
-            32 * 1024 * 1024,
-            "",
-            0o644,
-        ));
-        out.extend(std::iter::repeat_n(b'A', 32 * 1024 * 1024));
-        out.extend_from_slice(&[0u8; 1024]);
-        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-        enc.write_all(&out).unwrap();
-        let tgz = enc.finish().unwrap();
+        let mut tar_bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_bytes);
+            let data = vec![b'A'; 8 * 1024];
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "package/big", &data[..])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let mut archive = tar::Archive::new(Budgeted::new(std::io::Cursor::new(tar_bytes), 1024));
         let dir = tempfile::tempdir().unwrap();
-        let err = safe_extract(
-            &tgz,
-            dir.path(),
-            &ExtractionLimits {
-                max_unpacked_bytes: 64 * 1024,
-                max_entries: 4,
-                max_entry_bytes: 64 * 1024 * 1024,
-            },
-        )
-        .unwrap_err();
+        let mut breach = None;
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if let Err(e) = entry.unpack_in(dir.path()) {
+                breach = Some(map_stream_error("unpacking", e));
+                break;
+            }
+        }
+        let err = breach.expect("the budget must be exhausted inside unpack_in");
         assert!(
             matches!(err, BluelineError::ExtractionLimit(_)),
             "a breach while unpacking a file must be a limit, got {err:?}"

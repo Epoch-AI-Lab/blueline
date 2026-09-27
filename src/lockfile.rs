@@ -318,6 +318,18 @@ fn is_hash_option(token: &str) -> bool {
     token == "--hash" || token.starts_with("--hash=")
 }
 
+/// Whether a line carries a requirement spec at all. An unpinned one
+/// (`requests>=2.0`, or a direct URL) counts: dropping such a line under the
+/// options opt-in would let the gate pass a requirements.txt holding an
+/// unpinned dependency, and the package would read as *removed* rather than
+/// never-pinned. The operators are the set the range check uses, plus `@` for a
+/// direct reference.
+fn carries_requirement(code_part: &str) -> bool {
+    [">=", "<=", "===", "==", "~=", "!=", ">", "<", "@"]
+        .into_iter()
+        .any(|op| code_part.contains(op))
+}
+
 /// Parse a pinned requirements.txt file (PEP 508 / pip requirements format).
 /// Fail-closed rules:
 /// - Size cap 10 MiB.
@@ -416,7 +428,7 @@ pub fn parse_requirements_txt_packages(
                 .split_whitespace()
                 .position(|tok| tok.starts_with('-') && !is_hash_option(tok))
             {
-                Some(0) if code_part.contains("==") => {
+                Some(0) if carries_requirement(&code_part) => {
                     // The option comes first AND the line also pins something,
                     // so truncation would leave nothing and the line would be
                     // dropped -- losing the pin silently, which is the
@@ -427,16 +439,28 @@ pub fn parse_requirements_txt_packages(
                     // tolerates an option alongside a requirement, not a
                     // requirement the parser cannot reach.
                     return Err(LockfileError::InvalidData(format!(
-                        "line {line_num}: a requirements option precedes the pinned requirement on \
-                         the same line, so the pin cannot be reviewed alongside it: `{code_part}`"
+                        "line {line_num}: a requirements option precedes the requirement on the \
+                         same line, so it cannot be reviewed alongside it: `{code_part}`"
                     )));
                 }
                 // An option alone on its line is the ordinary pip layout, and
                 // the requirement it belongs to is on another line.
                 Some(0) => continue,
                 Some(cut) => {
-                    let kept: Vec<&str> = code_part.split_whitespace().take(cut).collect();
-                    code_part = kept.join(" ");
+                    let tokens: Vec<&str> = code_part.split_whitespace().collect();
+                    // A `--hash` past the first redirecting option is exactly
+                    // what truncation discards, and dropping it is not safe: the
+                    // line then carries no integrity at all, `R10_` never
+                    // compares it, and the declared hash is neither verified
+                    // nor disclosed. Refuse rather than review a line whose own
+                    // hash is gone.
+                    if tokens[cut..].iter().any(|t| is_hash_option(t)) {
+                        return Err(LockfileError::InvalidData(format!(
+                            "line {line_num}: a requirements option precedes `--hash`, so the \
+                             declared hash would be discarded unreviewed: `{code_part}`"
+                        )));
+                    }
+                    code_part = tokens[..cut].join(" ");
                 }
                 None => {}
             }
@@ -1307,10 +1331,45 @@ urllib3==2.1.0 # trailing comment
                 .unwrap_err()
                 .to_string();
             assert!(
-                err.contains("precedes the pinned requirement"),
+                err.contains("precedes the requirement"),
                 "an option-led line carrying a pin must be refused, got: {err}"
             );
         }
+
+        // An *unpinned* requirement on an option-led line counts too. Dropping
+        // it let the gate pass a requirements.txt holding an unpinned dependency,
+        // and the package read as removed rather than never-pinned.
+        for file in [
+            "--index-url https://evil.example/simple requests>=2.0\n",
+            "--index-url https://evil.example/simple foo @ https://evil/x.whl\n",
+        ] {
+            let err = parse_requirements_txt_packages(file, true)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("precedes the requirement"),
+                "an option-led line with an unpinned requirement must be refused: {err}"
+            );
+        }
+
+        // A `--hash` past the first redirecting option is what truncation
+        // discards. Dropping it left the line with no integrity, so `R10_` never
+        // compared the declared hash and it was neither verified nor disclosed.
+        // With the hash *before* the option it survives and the line is reviewed
+        // normally, so the refusal is about the order rather than the opt-in.
+        let lost = "requests==2.31.0 --index-url https://e/s --hash sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+        assert!(
+            parse_requirements_txt_packages(lost, true)
+                .unwrap_err()
+                .to_string()
+                .contains("precedes `--hash`"),
+            "a hash after the redirecting option must be refused"
+        );
+        let kept = "requests==2.31.0 --hash sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --index-url https://e/s\n";
+        assert!(
+            parse_requirements_txt_packages(kept, true).is_ok(),
+            "a hash before the redirecting option must still be reviewed"
+        );
 
         // The ordinary layout still works: the option is on its own line.
         let ok = parse_requirements_txt_packages(
