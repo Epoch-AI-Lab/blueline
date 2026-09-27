@@ -9,6 +9,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The MCP stdio server's request-size cap bounded nothing. The loop used
+  `BufReader::split`, which is an unbounded `read_until`, so a client that never
+  sent a newline could make the server buffer arbitrary memory before the 64 KiB
+  check was ever consulted. The read is now bounded the way the agent hook
+  already bounded its own.
+- A PyPI Simple index that lists a weaker severity entry before a stronger one
+  was reported at the weaker score. The score is now the strongest across every
+  `severity[]` entry, so the newly-scored CVSS v2 path cannot be masked by an
+  earlier entry. This can only raise a reported severity.
+- A `requirements.txt` line carrying an option flag after the spec was folded
+  into the version string and surfaced as a PEP 440 error rather than the
+  intended refusal. Every token is inspected now, so a trailing `--index-url` is
+  refused as an option.
+- A mixed npm+cargo install command recorded the cargo `--registry` denial
+  twice, because the same check ran on both sides of an early return.
+- A registry base URL carrying a path prefix (`http://127.0.0.1:8080/registry`)
+  lost the SSRF resolver's base exemption and had every request refused as a
+  private target. Fails closed, but it broke the supported local-mirror setup.
+- The dogfood CI job asserted that our own distribution produced no HIGH or
+  BLOCK findings, which contradicted the design note directly above it and made
+  the job red on every dependency bump of a first-party binary package — the
+  binary packages ship an executable at the package root, so a bump is a first
+  sighting of one. The gate is now scanner health, including a check that the
+  reported `max_band` and `total_evaluated` agree with the items actually
+  carried, so a scanner that silently under-reports still fails. Risk findings
+  go to the step summary.
+- The CI composite Action authenticated its own download with a `SHA256SUMS`
+  file published by the same release, which proves only that the download was
+  not corrupted. It now verifies the GitHub build-provenance attestation that
+  `release.yml` already publishes before running the binary.
+
+- An OSV advisory is now scored by the **strongest** `severity[]` entry rather
+  than the first one it can parse. The order those entries happen to appear in
+  is attacker-shaped remote data, and it decided the reported severity: an
+  advisory listing a 5.0 ahead of a 10.0 CVSS v2 vector was reported MEDIUM, and
+  one listing a 7.8 v2 vector ahead of a 9.8 v3 one reported HIGH instead of
+  blocking. The v2 path this branch added was only reached when nothing earlier
+  parsed, so the under-report outlived it. Every entry is now read and the
+  maximum is reported. The change can only raise a reported severity, never
+  lower it: the fold takes a maximum over a superset of the entries the old
+  path considered, which is asserted over every ordered pair of a corpus
+  mixing numeric scores, v2 vectors, v3 vectors and an unscoreable entry.
+- `"NaN"` in an advisory's `severity[].score` is no longer read as a score. It
+  parses as an `f64` and compares false against every band threshold, so it
+  banded as LOW — the weakest verdict a score can produce, reachable by sending
+  the four characters `NaN` where a number belongs. An advisory carrying no
+  score is unscored, which is the Medium default every unparseable entry
+  already got. Scores above 10 are deliberately left as parsed: they already
+  read as the strongest band, so refusing one could only lower a reported
+  severity.
+
 - A yanked PyPI release now shows the registry's stated reason on the card
   instead of only that a withdrawal happened. The reason was fetched and dropped
   at the `Release` conversion, so R08/R09 could report "yanked" with no cause.
@@ -22,19 +73,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   reaches the provenance report. Presence is still all that is checked — nothing
   verifies the signature, and the card still says "not verified".
 
-### Removed
-- `BaselineResolution::display_summary`, which had no caller outside its own
-  test.
-- The extraction section of `ARCHITECTURE.md` claimed a Landlock sandbox,
-  capability drop, seccomp filter and open-FD cap. No such code exists and
-  `Cargo.lock` carries none of those crates. The claim is now marked as planned
-  and the document says plainly that the parser-level budget is what bounds a
-  hostile archive today.
-
-- The MCP stdio server validates the JSON-RPC `jsonrpc` member. `"jsonrpc":"1.0"`,
-  or a request with the member absent, was accepted; 2.0 is now required and a
-  bad request gets the existing parse-error response without killing the
-  server.
+- The MCP stdio server validates the JSON-RPC `jsonrpc` member.
+  `"jsonrpc":"1.0"`, or a request with the member absent, was accepted; 2.0 is
+  now required and a bad request gets the existing parse-error response without
+  killing the server.
 - An OSV advisory's declared `severity[].type` is now read. A CVSS v2 vector is
   the one score string with no self-identifying prefix, so the declared type
   was the only thing that said how to read it; v2 vectors were silently
@@ -49,9 +91,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   withdrawn file. Pages are now walked, with a single byte budget across the
   walk, a 16-page cap, loop detection, and a same-scheme-and-host check on
   every `next` link. A chain that outlives the cap is an error, never a prefix.
-- A yanked PyPI release now carries the registry's stated reason instead of
-  dropping it, so R08/R09 can explain a withdrawal rather than only reporting
-  that one happened.
 - `[provenance] allowed_builders` is enforced. It parsed, validated, and was
   then never read, so a policy pinning trusted Sigstore builders asserted a
   restriction and applied none. A release naming a builder outside the list is
@@ -65,6 +104,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   behind a passing verdict.
 
 ### Removed
+- `BaselineResolution::display_summary`, which had no caller outside its own
+  test.
+- The extraction section of `ARCHITECTURE.md` claimed a Landlock sandbox,
+  capability drop, seccomp filter and open-FD cap. No such code exists and
+  `Cargo.lock` carries none of those crates. The claim is now marked as planned
+  and the document says plainly that the parser-level budget is what bounds a
+  hostile archive today.
 - `Policy::calculate_band`, which had no caller outside its own test and
   disagreed with the live band ladder: it was a pure function of score, while
   the production ladder is monotonic and never lowers an already-raised band. A
@@ -84,13 +130,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   a blanket suppression on `PackageJson`. If any of those checks were deleted,
   the build would have stayed silent.
 
-- `[blocklist] maintainers` now blocks. The key parsed, validated, and was then
-  never read: `is_maintainer_blocked` had no caller outside its own test, so a
-  policy could assert a protection and silently get none. A release published by
-  a blocklisted identity is now a `P04_MAINTAINER_BLOCKED` block. The AUR
-  adapter also reads the maintainer the RPC declares as a second identity
-  channel, so a package whose clone cannot be pinned is no longer invisible to
-  the blocklist.
+### Fixed
+- `[blocklist] maintainers` now blocks — **on the AUR lane**, which is the only
+  lane that supplies a publishing identity. The key parsed, validated, and was
+  then never read: `is_maintainer_blocked` had no caller outside its own test,
+  so a policy could assert a protection and silently get none. A release
+  published by a blocklisted identity is now a `P04_MAINTAINER_BLOCKED` block.
+  The AUR adapter also reads the maintainer the RPC declares as a second
+  identity channel, so a package whose clone cannot be pinned is no longer
+  invisible to the blocklist. The first version of this entry claimed the
+  coverage unqualified; npm, crates.io and PyPI take the default `None` from
+  `Registry::release_author` and produce no `P04` at all, and
+  `ARCHITECTURE.md`'s policy table did too. Both now name the lane, and say
+  that an ecosystem whose registry does not publish an author is a disclosed
+  no-signal rather than a pass.
+- The npm lane is deliberately left unwired, and the reason is a data-shape
+  decision rather than an oversight. The adapter requests the *abbreviated*
+  packument (`application/vnd.npm.install-v1+json`), whose top-level members
+  are `name`, `dist-tags`, `modified` and `versions`; the `maintainers` array
+  exists only in the full packument. Deserializing it and returning it would
+  compile, pass a mock server and be `None` against every real registry — a
+  check wired to nothing, which is the failure `require_signatures` just had on
+  this same lane. Making it real means either switching the media type (the
+  body grows 2.4x-10.5x — `express` 341 KB -> 809 KB, `react` 2.9 MB ->
+  7.0 MB, `npm` 2.5 MB -> 25.7 MB — against a 64 MiB fail-closed packument
+  cap, so every review would pay for a blocklist signal) or a second full fetch
+  per review. And npm publishes a *list*: `express` declares 5 identities,
+  `typescript` 7, `react` 2, `lodash` 1, and some entries are bots
+  (`react-bot`, `typescript-bot`) rather than people. The seam carries one
+  `Option<String>` and P04 compares that one string, so any selection rule
+  checks one of N, leaves the rest unchecked, and still says an identity was
+  checked. `Registry` (the seam), `Policy::is_maintainer_blocked` and the P04
+  call site have to grow a list before this lane can carry the key honestly.
+  Until then the behaviour is pinned by a test rather than by prose.
+- npm's author is also per package, not per release, which is why wiring it
+  would not have restored `R10` either: the target and baseline reads both hit
+  the same live packument, so the author-transition comparison can never differ
+  on that lane.
 
 - npm and cargo reviews now bind the name the archive declares to the name the
   registry resolved. Only the AUR lane checked, and the check is the one that

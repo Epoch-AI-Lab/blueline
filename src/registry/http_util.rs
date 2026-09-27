@@ -28,10 +28,14 @@ pub fn registry_agent(user_agent: &str, base: &str) -> Agent {
         .timeout(REQUEST_TIMEOUT)
         .user_agent(user_agent)
         .redirects(0)
-        .resolver(ValidatingResolver {
-            base_host: authority_of(base),
-        })
+        .resolver(validating_resolver_for(base))
         .build()
+}
+
+fn validating_resolver_for(base: &str) -> ValidatingResolver {
+    ValidatingResolver {
+        base_host: authority_of(base),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -307,15 +311,25 @@ pub fn is_private_or_local_host(host: &str) -> bool {
 }
 
 /// The `host:port` authority of a registry base URL, which is the form
-/// `ureq` hands its resolver. A base with no port is compared on the host
-/// alone, since that is all the two strings can share.
+/// `ureq` hands its resolver: `stream.rs` passes `format!("{host}:{port}")`
+/// from the parsed URL, with the default port filled in and any userinfo
+/// already stripped. Everything from the first `/`, `?` or `#` on is path,
+/// query and fragment, and keeping it made a base like
+/// `http://127.0.0.1:8080/registry` unmatchable, so a mirror mounted under a
+/// subpath was refused every request as a private target. A base with no port
+/// is compared on the host alone, since that is all the two strings can
+/// share.
 fn authority_of(base: &str) -> String {
     let lower = base.trim().to_ascii_lowercase();
     let without_scheme = lower
         .strip_prefix("http://")
         .or_else(|| lower.strip_prefix("https://"))
         .unwrap_or(&lower);
-    without_scheme.trim_end_matches('/').to_string()
+    let netloc = without_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    match netloc.rsplit_once('@') {
+        Some((_, host_port)) => host_port.to_string(),
+        None => netloc.to_string(),
+    }
 }
 
 /// Resolver that is the SSRF guard rather than a duplicate of it.
@@ -405,6 +419,53 @@ mod tests {
         );
         assert_eq!(authority_of("http://127.0.0.1:8080"), "127.0.0.1:8080");
         assert_eq!(authority_of("HTTP://Example.COM:80/"), "example.com:80");
+    }
+
+    /// A registry base with a path prefix is a supported shape (a mirror
+    /// mounted under a subpath). `authority_of` kept the path, so the stored
+    /// base could never equal the bare `host:port` netloc `ureq` hands the
+    /// resolver, and every request to that base was refused as a private
+    /// target.
+    #[test]
+    fn a_base_with_a_path_prefix_still_exempts_its_own_netloc() {
+        for base in [
+            "http://127.0.0.1:8080/registry",
+            "http://127.0.0.1:8080/registry/",
+            "http://user:pass@127.0.0.1:8080/registry",
+            "http://127.0.0.1:8080/registry?x=1",
+            "http://127.0.0.1:8080/registry#f",
+        ] {
+            assert_eq!(authority_of(base), "127.0.0.1:8080", "{base}");
+            assert!(
+                validating_resolver_for(base)
+                    .resolve("127.0.0.1:8080")
+                    .is_ok(),
+                "{base}"
+            );
+        }
+    }
+
+    /// The exemption is that one netloc and nothing else: a path-prefixed
+    /// local base must not hand the whole private range an exemption.
+    #[test]
+    fn a_path_prefixed_base_exempts_only_its_own_netloc() {
+        let r = validating_resolver_for("http://127.0.0.1:8080/registry");
+        for target in [
+            "127.0.0.1:9090",
+            "127.0.0.2:8080",
+            "10.0.0.1:8080",
+            "169.254.169.254:80",
+            "localhost:8080",
+        ] {
+            assert!(r.resolve(target).is_err(), "`{target}` must stay refused");
+        }
+        // A path-prefixed public base exempts its own netloc and still
+        // refuses a private one. A literal address keeps this test off DNS:
+        // the resolver resolves before it compares, so a name would fail here
+        // for a reason that has nothing to do with the path prefix.
+        let r = validating_resolver_for("https://203.0.113.1:8443/npm/");
+        assert!(r.resolve("203.0.113.1:8443").is_ok());
+        assert!(r.resolve("127.0.0.1:8080").is_err());
     }
 
     #[test]

@@ -77,7 +77,7 @@ pub fn run_stdio(
     policy_path: Option<&Path>,
 ) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
-    let reader = BufReader::new(stdin.lock());
+    let mut reader = BufReader::new(stdin.lock());
     let mut stdout = std::io::stdout();
 
     let policy = Policy::load_or_default(policy_path)?;
@@ -85,8 +85,8 @@ pub fn run_stdio(
 
     eprintln!("blueline-mcp: starting stdio server loop (ready for JSON-RPC 2.0)");
 
-    for line in reader.split(b'\n') {
-        let line = match next_request_line(line) {
+    loop {
+        let line = match next_request_line(&mut reader) {
             Ok(Some(l)) => l,
             // A clean end of stream is a normal shutdown.
             Ok(None) => break,
@@ -201,8 +201,10 @@ fn check_protocol_version(req: &JsonRpcRequest) -> Result<(), JsonRpcError> {
     }
 }
 
-/// One framed line off the MCP stdin stream, already length-checked and
-/// decoded.
+/// One framed line off the MCP stdin stream, decoded. `Oversize` means the
+/// cap was passed before a newline arrived, not that a longer line was read
+/// and then measured.
+#[derive(Debug)]
 enum RequestLine {
     Skip,
     Text(String),
@@ -210,17 +212,90 @@ enum RequestLine {
     InvalidUtf8,
 }
 
-fn next_request_line(raw: std::io::Result<Vec<u8>>) -> std::io::Result<Option<RequestLine>> {
-    let raw = raw?;
-    Ok(Some(if raw.len() > MAX_REQUEST_LINE_BYTES {
-        RequestLine::Oversize
-    } else {
-        match String::from_utf8(raw) {
-            Ok(text) if text.trim().is_empty() => RequestLine::Skip,
-            Ok(text) => RequestLine::Text(text),
-            Err(_) => RequestLine::InvalidUtf8,
+enum FrameStep {
+    Eof,
+    /// Bytes to hand back to the reader, and whether they ended the line.
+    Take {
+        len: usize,
+        newline: bool,
+    },
+}
+
+fn next_request_line<R: BufRead>(reader: &mut R) -> std::io::Result<Option<RequestLine>> {
+    let mut raw: Vec<u8> = Vec::new();
+    let mut any = false;
+    loop {
+        let step = {
+            let available = match reader.fill_buf() {
+                Ok(available) => available,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            if available.is_empty() {
+                FrameStep::Eof
+            } else {
+                match available.iter().position(|&b| b == b'\n') {
+                    Some(nl) => {
+                        push_bounded(&mut raw, &available[..nl]);
+                        FrameStep::Take {
+                            len: nl + 1,
+                            newline: true,
+                        }
+                    }
+                    None => {
+                        push_bounded(&mut raw, available);
+                        FrameStep::Take {
+                            len: available.len(),
+                            newline: false,
+                        }
+                    }
+                }
+            }
+        };
+        match step {
+            FrameStep::Eof => {
+                return Ok(if any || !raw.is_empty() {
+                    Some(classify(raw))
+                } else {
+                    None
+                });
+            }
+            FrameStep::Take { len, newline } => {
+                reader.consume(len);
+                any = true;
+                // Refuse the moment the cap is passed rather than at the
+                // newline: the line is already unreviewable, and the caller
+                // treats `Oversize` as fatal, so there is nothing to resync.
+                if raw.len() > MAX_REQUEST_LINE_BYTES {
+                    return Ok(Some(RequestLine::Oversize));
+                }
+                if newline {
+                    return Ok(Some(classify(raw)));
+                }
+            }
         }
-    }))
+    }
+}
+
+/// Copy at most what is still needed to prove the cap is passed, so the
+/// resident bytes never exceed `MAX_REQUEST_LINE_BYTES + 1` no matter how much
+/// the peer sends. `BufRead::read_until` (and therefore `split`) copies the
+/// whole line first and bounds nothing; `agent.rs` has the same shape bounded
+/// with `Read::take`.
+fn push_bounded(buf: &mut Vec<u8>, chunk: &[u8]) {
+    let room = MAX_REQUEST_LINE_BYTES + 1 - buf.len();
+    buf.extend_from_slice(&chunk[..chunk.len().min(room)]);
+}
+
+fn classify(raw: Vec<u8>) -> RequestLine {
+    if raw.len() > MAX_REQUEST_LINE_BYTES {
+        return RequestLine::Oversize;
+    }
+    match String::from_utf8(raw) {
+        Ok(text) if text.trim().is_empty() => RequestLine::Skip,
+        Ok(text) => RequestLine::Text(text),
+        Err(_) => RequestLine::InvalidUtf8,
+    }
 }
 
 fn write_error<W: Write>(out: &mut W, message: &str) -> anyhow::Result<()> {
@@ -846,33 +921,113 @@ mod tests {
     }
 
     #[test]
-    fn oversized_request_line_is_refused_rather_than_buffered() {
-        let big = vec![b'a'; MAX_REQUEST_LINE_BYTES + 1];
+    fn a_line_at_the_cap_is_read_and_one_byte_over_is_refused() {
+        let mut at_cap = vec![b'a'; MAX_REQUEST_LINE_BYTES];
+        at_cap.push(b'\n');
+        let mut reader = BufReader::new(&at_cap[..]);
         assert!(matches!(
-            next_request_line(Ok(big)),
-            Ok(Some(RequestLine::Oversize))
+            next_request_line(&mut reader).unwrap(),
+            Some(RequestLine::Text(_))
         ));
-        let at_cap = vec![b'a'; MAX_REQUEST_LINE_BYTES];
+        // A consumed line leaves the reader at a clean end of stream.
+        assert!(next_request_line(&mut reader).unwrap().is_none());
+
+        let mut over = vec![b'a'; MAX_REQUEST_LINE_BYTES + 1];
+        over.push(b'\n');
+        let mut reader = BufReader::new(&over[..]);
         assert!(matches!(
-            next_request_line(Ok(at_cap)),
-            Ok(Some(RequestLine::Text(_)))
+            next_request_line(&mut reader).unwrap(),
+            Some(RequestLine::Oversize)
         ));
+    }
+
+    /// The cap has to bound the read, not just the check. The old loop used
+    /// `split(b'\n')`, whose `read_until` pulls the whole line into a `Vec`
+    /// before anything looks at its length, so a peer that never sends a
+    /// newline made the server buffer as much as it cared to send. The
+    /// strongest observable proxy for "the buffer never grew to the size of
+    /// what was sent" is the byte count the source was drained by: a bounded
+    /// read stops within a few buffer-fills of the cap, an unbounded one
+    /// drains the stream to EOF.
+    #[test]
+    fn newline_free_stream_is_refused_at_the_cap_without_reading_the_stream() {
+        // Sized down so the accounting is tight rather than dominated by the
+        // reader's own buffer.
+        const CHUNK: usize = 64;
+        const STREAM: usize = 8 * 1024 * 1024;
+
+        struct Counting {
+            remaining: usize,
+            served: usize,
+        }
+        impl std::io::Read for Counting {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = buf.len().min(CHUNK).min(self.remaining);
+                for b in &mut buf[..n] {
+                    *b = b'a';
+                }
+                self.remaining -= n;
+                self.served += n;
+                Ok(n)
+            }
+        }
+
+        let mut src = Counting {
+            remaining: STREAM,
+            served: 0,
+        };
+        let mut reader = BufReader::with_capacity(CHUNK, &mut src);
+
+        assert!(matches!(
+            next_request_line(&mut reader).unwrap(),
+            Some(RequestLine::Oversize)
+        ));
+        assert!(
+            src.served <= MAX_REQUEST_LINE_BYTES + 64 * CHUNK,
+            "the refusal must land within a few reads of the cap, not after the stream: \
+             served {} bytes of {STREAM}",
+            src.served
+        );
+        assert!(
+            src.remaining > STREAM / 2,
+            "most of the stream must never be read: served {} of {STREAM}",
+            src.served
+        );
+    }
+
+    #[test]
+    fn consecutive_requests_keep_their_framing() {
+        let stream = concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}"
+        );
+        let mut reader = BufReader::new(stream.as_bytes());
+        for id in ["1", "2"] {
+            match next_request_line(&mut reader).unwrap() {
+                Some(RequestLine::Text(text)) => {
+                    assert!(text.contains(&format!("\"id\":{id}")), "{text}")
+                }
+                other => panic!("request {id} did not frame: {other:?}"),
+            }
+        }
+        assert!(next_request_line(&mut reader).unwrap().is_none());
     }
 
     #[test]
     fn non_utf8_line_is_flagged_and_a_blank_one_skipped() {
+        let mut reader = BufReader::new(&b"{ \xff\xfe\n"[..]);
         assert!(matches!(
-            next_request_line(Ok(vec![b'{', 0xff, 0xfe])),
-            Ok(Some(RequestLine::InvalidUtf8))
+            next_request_line(&mut reader).unwrap(),
+            Some(RequestLine::InvalidUtf8)
         ));
+        let mut reader = BufReader::new(&b"   \n"[..]);
         assert!(matches!(
-            next_request_line(Ok(b"   \n".to_vec())),
-            Ok(Some(RequestLine::Skip))
+            next_request_line(&mut reader).unwrap(),
+            Some(RequestLine::Skip)
         ));
-        assert!(matches!(
-            next_request_line(Ok(Vec::new())),
-            Ok(Some(RequestLine::Skip))
-        ));
+        // An empty stream is a clean shutdown, not an empty request.
+        let mut reader = BufReader::new(&b""[..]);
+        assert!(next_request_line(&mut reader).unwrap().is_none());
     }
 
     #[test]

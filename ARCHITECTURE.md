@@ -121,7 +121,7 @@ Every tarball and registry response is fully untrusted. The `extract` stage enfo
 | D6 | Revocation = OSV + GitHub Advisory cache            | Reuse the open vulnerability corpus; paid tier adds human-verified recall (hosted index). |
 | D7 | Stable `Verdict` JSON schema                        | Same struct feeds CLI card, CI comment, and MCP tool. One source of truth.|
 | D8 | No default telemetry in OSS                         | Privacy-by-default; hosted tier reports only with explicit token.         |
-| D9 | Signed, SLSA-built release binaries                 | We audit supply chains — we must eat our own dog food.                    |
+| D9 | Build-provenance-attested release binaries         | We audit supply chains — we must eat our own dog food. The CI composite Action verifies each downloaded binary against the attestation `release.yml` publishes, not just a checksum from the same release. |
 | D10| Policy-as-code (`blueline.toml`)                    | Per-project + global thresholds, allow/blocklists, required-provenance flags. |
 | D11| Approve = `npm install --ignore-scripts`           | Honors "never execute": install proceeds without running lifecycle scripts; `postinstall` is surfaced for a separate human decision, not auto-run. |
 | D12| Recursive second-order review in the engine           | Install references found in reviewed payloads are re-reviewed with depth/budget caps, cycle detection, and child-to-parent roll-up (§5). Non-registry refs are disclosed, never resolved. |
@@ -146,7 +146,9 @@ Every tarball and registry response is fully untrusted. The `extract` stage enfo
 - R07 — unreviewed predecessor baseline
 - R08 — yanked predecessor (MEDIUM)
 - R09 — advisory CVE / critical CVE / malware hit (BLOCK), yanked target
-- R10 — maintainer transition, lockfile hash mismatch
+- R10 — maintainer transition (`R10_MAINTAINER_TRANSITION`, AUR lane only — the
+  author-transition comparison needs a per-release identity, which only the AUR
+  adapter supplies), lockfile hash mismatch
 - R11–R23 — PKGBUILD static rules (checksum SKIP, source drift, pipe-to-shell,
   eval family, indirection, cmd-subst in metadata, build-time network,
   homoglyph, validpgpkeys change, install/hook change, unpinned VCS,
@@ -221,10 +223,49 @@ Known bypasses stay documented in the README.
 | `advisories` | `block_on_malware`, `block_on_critical_cve`, cache TTLs |
 | `provenance` | `require_provenance`, `require_signatures`, `allowed_builders`, `allowed_repositories` (the last two enforced at Block) |
 | `allowlist.packages` | exact `name` (+optional `ecosystem`), `allowed_scripts`, `allow_unreviewed_baseline` |
-| `blocklist` | glob `packages` (+optional `ecosystem`), `maintainers` |
+| `blocklist` | glob `packages` (+optional `ecosystem`) — every lane; `maintainers` — **AUR only** (see below) |
 | `ci` | `fail_on`, `max_evaluations`, `include_dev` |
 | `recursion` | `max_depth` (3, cap 16), `max_child_reviews` (8, cap 256), `child_block_band` (HIGH) |
 | `recall` | `max_age_hours` (48), `block_on_stale` |
+
+### `blocklist.maintainers` coverage (AUR only)
+
+`[blocklist] maintainers` is enforced through `Registry::release_author`, and
+only the AUR adapter overrides it. **The key is therefore live on the AUR lane
+alone**: npm, crates.io and PyPI supply no publishing identity, take the trait's
+`None` default, and produce no `P04_MAINTAINER_BLOCKED`. An ecosystem whose
+registry publishes no author is a **disclosed no-signal, not a pass** — the
+same reading as a registry whose author is absent from the list — so a policy
+that sets the key is protecting the AUR install line and nothing else.
+
+The AUR lane reads two identity channels: the pinned commit's self-declared
+author email (`commit_author`), falling back to the `Maintainer` field the RPC
+declares, so a package whose clone cannot be pinned is still checked.
+
+npm is not wired, deliberately, and not for want of a field. Two things would
+have to be decided first:
+
+- The npm adapter asks for the **abbreviated** packument
+  (`application/vnd.npm.install-v1+json`), whose top-level members are `name`,
+  `dist-tags`, `modified` and `versions`. A `maintainers` array exists only in
+  the full packument (`Accept: application/json`), so reading it means either
+  switching the adapter's media type — the body grows 2.4x-10.5x (measured:
+  `express` 341 KB -> 809 KB, `react` 2.9 MB -> 7.0 MB, `npm` 2.5 MB ->
+  25.7 MB) against a 64 MiB fail-closed packument cap, i.e. every review pays
+  for a blocklist signal and the largest packages get closest to a cap breach,
+  which reads as "refuse to review" — or a second full fetch per review.
+- npm publishes a **list**, not one identity (`express` 5, `typescript` 7,
+  `react` 2, `lodash` 1), and some entries are bots (`react-bot`,
+  `typescript-bot`). The seam carries a single `Option<String>` and P04 compares
+  that one string, so any selection rule checks one of N and leaves the rest
+  unchecked while the card claims an identity was checked. Carrying the list
+  needs a second identity channel on `Registry` and on
+  `Policy::is_maintainer_blocked`.
+
+Note also that npm's author is **per package, not per release**: both the
+target and baseline reads hit the same live packument, so `R10`'s
+author-transition comparison can never differ on that lane. Wiring npm would
+add the blocklist signal and leave `R10` structurally dead there, not firing.
 
 ---
 

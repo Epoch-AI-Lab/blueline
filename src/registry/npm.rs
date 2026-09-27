@@ -919,6 +919,75 @@ mod tests {
         let _ = handle.join();
     }
 
+    /// The `[blocklist] maintainers` key is enforced through
+    /// `Registry::release_author`, and on the npm lane that seam supplies
+    /// nothing — so the key is a no-signal here, not a pass. This pins that,
+    /// including the case that makes the naive wiring wrong: the adapter asks
+    /// for the *abbreviated* packument (`application/vnd.npm.install-v1+json`),
+    /// which does not publish a `maintainers` member at all. Its top-level keys
+    /// are `name`, `dist-tags`, `modified` and `versions`; a
+    /// `maintainers` array only appears in the full packument. Deserializing
+    /// one and returning it would therefore compile, pass a mock, and be
+    /// `None` against every real registry — a check wired to nothing.
+    ///
+    /// Even with the member in hand, npm's value is a *list*: `express`
+    /// declares 5 identities, `typescript` 7, `react` 2, and some are bots
+    /// (`react-bot`, `typescript-bot`) rather than people. The seam carries one
+    /// `Option<String>` and P04 compares that one string, so a selection rule
+    /// would silently check one of N and leave the rest unchecked while the
+    /// card claimed the identity was checked. Wiring this needs a seam that
+    /// carries the whole list (`Registry` + `Policy::is_maintainer_blocked`),
+    /// and a decision about the 2.4x-10.5x larger full-packument body that
+    /// carries it; see `CHANGELOG.md` and `ARCHITECTURE.md`.
+    #[test]
+    fn the_npm_lane_contributes_no_blocklist_identity() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let _ = listener.set_nonblocking(true);
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_millis(600) {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 1024];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    if req.contains("GET /orgpkg ") {
+                        // As generous as the wire gets: the member the
+                        // abbreviated format never publishes, carrying several
+                        // identities including a bot.
+                        let body = format!(
+                            r#"{{"name":"orgpkg","maintainers":[{{"name":"alice","email":"alice@example.com"}},{{"name":"mallory","email":"mallory@example.com"}},{{"name":"orgpkg-bot","email":"bot@example.com"}}],"dist-tags":{{"latest":"1.0.0"}},"versions":{{"1.0.0":{{"name":"orgpkg","version":"1.0.0","dist":{{"tarball":"http://127.0.0.1:{port}/o.tgz","integrity":null}}}}}}}}"#
+                        );
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    }
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        });
+
+        let reg = NpmRegistry::new(&base);
+        let pkg = reg.resolve("orgpkg", "1.0.0").unwrap();
+        assert_eq!(
+            reg.release_author(&pkg),
+            None,
+            "the npm lane supplies no publishing identity, so `[blocklist] maintainers` \
+             is a disclosed no-signal here rather than a pass"
+        );
+
+        let _ = handle.join();
+    }
+
     #[test]
     fn packument_404_reports_not_found() {
         use std::io::{Read, Write};

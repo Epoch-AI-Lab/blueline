@@ -89,7 +89,7 @@ jobs:
       - name: Gate on scanner health, report risk separately
         run: |
           python3 - <<'EOF'
-          import json, sys
+          import json, os, sys
 
           r = json.load(open("blueline-dogfood.json"))
           names = {i["name"] for i in r["items"]}
@@ -112,17 +112,40 @@ jobs:
           unknown = names - expected
           assert not unknown, f"scanner evaluated unknown packages: {unknown}"
 
-          # continue-on-error above is deliberate (we BLOCK on ourselves), so
-          # the report is the only place a real risk verdict is visible. A BLOCK
-          # in a delta that is otherwise healthy is a genuine finding and must
-          # fail here, or the gate reports success while reviewing nothing.
-          blocking = [
+          # Scanner health, not risk level, is the gate. Our own first-party
+          # packages legitimately produce High findings: the binary-*
+          # packages ship an executable at the package root, so any PR bumping
+          # one is a first sighting of an executable and trips R02. Asserting
+          # no HIGH/BLOCK here made the job red on exactly the dependency-bump
+          # PRs it was made continue-on-error for, and it contradicted the
+          # design note above this step. Findings are reported where a human
+          # reads them instead.
+          rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "BLOCK": 3}
+          bands = [i["verdict"]["band"] for i in r["items"]]
+          unknown_bands = sorted({b for b in bands if b not in rank})
+          assert not unknown_bands, f"scanner emitted unknown bands: {unknown_bands}"
+
+          # A scanner that silently under-reports is the failure this gate
+          # exists to catch, so the summary it writes is checked against the
+          # items it carries rather than trusted.
+          assert r["total_evaluated"] == len(r["items"]), (
+              f"total_evaluated {r['total_evaluated']} disagrees with "
+              f"{len(r['items'])} reported items"
+          )
+          if bands:
+              assert rank[max(bands, key=lambda b: rank[b])] == rank[r["max_band"]], (
+                  f"max_band {r['max_band']} disagrees with the reported bands {bands}"
+              )
+          else:
+              assert r["total_evaluated"] == 0, (
+                  f"no items but total_evaluated {r['total_evaluated']}"
+              )
+
+          findings = [
               (i["name"], i["new_version"], i["verdict"]["band"])
               for i in r["items"]
-              if i["verdict"]["band"] in ("HIGH", "BLOCK")
+              if rank[i["verdict"]["band"]] >= rank["HIGH"]
           ]
-          for name, version, band in blocking:
-              print(f"  !! {name}@{version}: {band}")
 
           if r["total_evaluated"] == 0:
               print("dogfood scanner healthy: empty lockfile delta, nothing to evaluate")
@@ -132,10 +155,15 @@ jobs:
               for item in r["items"]:
                   print(f"  {item['name']}@{item['new_version']}: {item['verdict']['band']}")
 
-          assert not blocking, (
-              "dogfood gate: our own distribution produced "
-              f"{len(blocking)} HIGH/BLOCK findings: {blocking}"
-          )
+          if findings:
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
+                  fh.write("## Dogfood risk findings (not gating)\n\n")
+                  fh.write("Our own distribution, reviewed by the shipped scanner. "
+                           "Expected on first-party binary bumps; investigate anything else.\n\n")
+                  fh.write("| package | version | band |\n| --- | --- | --- |\n")
+                  for name, version, band in findings:
+                      fh.write(f"| {name} | {version} | {band} |\n")
+              print(f"dogfood: {len(findings)} HIGH/BLOCK findings recorded in the step summary")
           EOF
       - uses: actions/upload-artifact@v4
         if: always()

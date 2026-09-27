@@ -34,6 +34,10 @@ inputs:
     description: 'Build blueline from the checked-out source with cargo instead of downloading the prebuilt release binary. Required when scanning with unreleased code (e.g. this repo''s own dogfood job).'
     required: false
     default: 'false'
+  verify-attestation:
+    description: 'Verify the downloaded release binary''s GitHub build-provenance attestation before running it. Turn this off only for a release published before attestations existed; the SHA256SUMS check alone cannot distinguish a good release from a tampered one, because both come from the same release.'
+    required: false
+    default: 'true'
 
 runs:
   using: 'composite'
@@ -88,6 +92,23 @@ runs:
         EXPECTED="$(grep -F " $ASSET" SHA256SUMS || true)"
         [ -n "$EXPECTED" ] || { echo "::error::release SHA256SUMS has no entry for $ASSET" && exit 1; }
         printf '%s\n' "$EXPECTED" | sha256sum -c -
+
+        # SHA256SUMS and the binary are published by the same release, so
+        # `sha256sum -c` proves the download was not corrupted in transit and
+        # nothing more: a compromised release job signs its own checksums.
+        # release.yml already publishes a Sigstore build-provenance attestation
+        # for every binary (actions/attest-build-provenance), so verify that
+        # before executing. This is the same trust boundary the tool itself
+        # refuses to cross as P03_SIGNATURE_REQUIRED_MISSING.
+        if [ "${{ inputs.verify-attestation }}" = "true" ]; then
+          if ! gh attestation verify "$ASSET" --repo "$REPO"; then
+            echo "::error::no valid build provenance for $ASSET from $TAG; refusing to run it"
+            exit 1
+          fi
+        else
+          echo "::warning::attestation verification disabled by input; $ASSET is authenticated only by a checksum published beside it"
+        fi
+
         chmod +x "$ASSET"
         printf '%s' "$OUT_DIR/$ASSET" > "$OUT_DIR/path"
 

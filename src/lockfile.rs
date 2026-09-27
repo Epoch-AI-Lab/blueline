@@ -312,6 +312,12 @@ pub fn parse_cargo_lock_packages(
 
 const MAX_REQUIREMENTS_TXT_BYTES: usize = 10 * 1024 * 1024;
 
+/// The two spellings the token loop below consumes as a hash rather than as a
+/// requirement spec. Every other token starting with `-` is an option.
+fn is_hash_option(token: &str) -> bool {
+    token == "--hash" || token.starts_with("--hash=")
+}
+
 /// Parse a pinned requirements.txt file (PEP 508 / pip requirements format).
 /// Fail-closed rules:
 /// - Size cap 10 MiB.
@@ -319,7 +325,10 @@ const MAX_REQUIREMENTS_TXT_BYTES: usize = 10 * 1024 * 1024;
 ///   with line-numbered errors listing every unpinned line.
 /// - Valid lines must have exact pinned version `name == version` (or `name==version`).
 /// - Optional `--hash=sha256:<hex>` is parsed and validated (64 hex characters).
-/// - Comments (`#...`), blank lines, and options like `--index-url`, `--extra-index-url`, `-r` are skipped.
+/// - Comments (`#...`) and blank lines are skipped. Any other option
+///   (`--index-url`, `--extra-index-url`, `-r`, ...) fails the file closed
+///   unless `allow_options` opts in, on any token of the line, not only a
+///   leading one.
 pub fn parse_requirements_txt_packages(
     content: &str,
     allow_options: bool,
@@ -373,11 +382,17 @@ pub fn parse_requirements_txt_packages(
         // An option that redirects pip changes which packages get installed,
         // so reviewing the pinned lines alone certifies a graph nobody will
         // install. Refused rather than skipped, unless policy opts in, and
-        // checked per token so a flag trailing a spec is caught too.
-        if code_part.starts_with('-') && !code_part.starts_with("--hash") {
+        // checked on every token so a flag trailing a spec is caught too: a
+        // line-leading check folded `--index-url https://evil` into the
+        // version string and refused it as a PEP 440 error quoting the flag,
+        // which is not the refusal it is.
+        if let Some(option) = code_part
+            .split_whitespace()
+            .find(|tok| tok.starts_with('-') && !is_hash_option(tok))
+        {
             if !allow_options {
                 return Err(LockfileError::InvalidData(format!(
-                    "line {line_num}: unsupported requirements option `{code_part}`; blueline \
+                    "line {line_num}: unsupported requirements option `{option}`; blueline \
                      models only pinned `name==version [--hash sha256:...]` lines and cannot \
                      follow an alternative index, an extra requirements file, or a constraints \
                      file. Set [ci] allow_requirements_options = true to review the pins anyway."
@@ -1190,6 +1205,53 @@ urllib3==2.1.0 # trailing comment
         let json = r#"{"lockfileVersion":3,"packages":{
             "node_modules/foo":{"name":"bar","version":"1.0.0"}}}"#;
         assert!(parse_lockfile_packages(json).is_err());
+    }
+
+    /// A redirect flag trailing a spec has to be refused as the option it is.
+    /// The check was line-leading only, so the flag was folded into the
+    /// version string and surfaced as a PEP 440 error quoting the flag — a
+    /// message about a version, for a line whose problem is that pip would
+    /// install from somewhere else entirely.
+    #[test]
+    fn refuses_a_requirements_option_trailing_a_spec() {
+        for opt in [
+            "--index-url https://evil.example/simple",
+            "--extra-index-url=https://evil.example/simple",
+            "-r other-requirements.txt",
+            "--constraint constraints.txt",
+            "--trusted-host evil.example",
+            "--pre",
+        ] {
+            let file = format!("requests==2.31.0 {opt}\nurllib3==2.1.0\n");
+            let err = parse_requirements_txt_packages(&file, false)
+                .unwrap_err()
+                .to_string();
+            let flag = opt.split_whitespace().next().unwrap();
+            assert!(
+                err.contains("unsupported requirements option"),
+                "option `{opt}` must be refused as an option, not as a version: {err}"
+            );
+            assert!(err.contains(flag), "the refusal must name `{flag}`: {err}");
+            // The opt-in stays an opt-in.
+            assert!(
+                parse_requirements_txt_packages(&file, true).is_ok(),
+                "the policy escape must let a trailing option through"
+            );
+        }
+    }
+
+    /// The option scan looks at every token, so a flag that follows a spec
+    /// through a line continuation is caught on the joined line too.
+    #[test]
+    fn refuses_a_requirements_option_trailing_a_continued_spec() {
+        let file = "requests==2.31.0 \\\n  --index-url https://evil.example/simple\n";
+        let err = parse_requirements_txt_packages(file, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unsupported requirements option"),
+            "a continued line must still be scanned per token: {err}"
+        );
     }
 
     #[test]
