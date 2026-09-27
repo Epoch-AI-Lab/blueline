@@ -17,6 +17,19 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # GitHub compiles a workflow before it runs a single step, and a compile
+  # error produces a run with zero jobs that cannot be retried, so a bad
+  # expression takes out every check at once with a message that does not name
+  # the line. actionlint implements GitHub's expression grammar, which a YAML
+  # parser does not: `on: push:` filters, expression syntax and context typing
+  # are all invisible to `yaml.safe_load`.
+  lint-workflows:
+    name: Lint workflows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker://rhysd/actionlint:1.7.7
+
   fmt:
     name: Formatting
     runs-on: ubuntu-latest
@@ -215,8 +228,12 @@ jobs:
           BASE_BRANCH: ${{ github.base_ref }}
         run: |
           # The base ref reaches the shell through the environment, never
-          # through `${{ }}` interpolation: a branch may legally be named
+          # through expression interpolation: a branch may legally be named
           # something like `main$(id)`, and an interpolated one would run.
+          # Note for future edits: GitHub expands expressions inside a run
+          # block even when they sit in a shell comment, so writing one out
+          # literally in a comment here is a parse error that takes the whole
+          # workflow down. That is not hypothetical; it did.
           BASE="origin/$BASE_BRANCH"
           # Read the whole list before matching. `git diff | grep -q` can take
           # SIGPIPE under `pipefail` once grep has its answer, which turns a

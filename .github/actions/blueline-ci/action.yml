@@ -52,8 +52,10 @@ runs:
         # consumer took the unauthenticated path -- api.github.com rate-limits
         # by IP, and runner IPs are shared.
         GITHUB_TOKEN: ${{ github.token }}
-        # Inputs reach the shell through env, never through ${{ }} in a run
-        # body: a value interpolated into a script is a value the shell parses.
+        # Inputs reach the shell through env, never through expression
+        # interpolation in a run body: a value interpolated into a script is a
+        # value the shell parses. Written without the delimiters deliberately,
+        # since GitHub expands them here even inside a comment.
         INPUT_VERIFY_ATTESTATION: ${{ inputs.verify-attestation }}
       run: |
         set -euo pipefail

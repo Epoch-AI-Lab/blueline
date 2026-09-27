@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- CI runs again. A comment added to `ci.yml` in `e8e8fb2` contained the text
+  `${{ }}` literally, and GitHub expands expressions inside a `run:` block even
+  when they sit in a shell comment, so the workflow failed to compile. Every run
+  since then produced zero jobs in 0s with a message that does not name the line,
+  and could not be retried, so every check in the repo was down for two days
+  while a YAML parser reported the file as valid. The same text sat in the
+  `blueline-ci` composite Action, where it would have broken the dogfood jobs at
+  runtime rather than at compile time.
+- CI now lints its own workflows with `actionlint`, which implements GitHub's
+  expression grammar. A YAML parser sees none of what breaks a workflow: trigger
+  filters, expression syntax and context typing.
+
 - A requirements line that puts the option *before* the pin is now refused
   rather than dropped. The opt-in truncates at the first non-hash option, which
   for `--index-url https://evil requests==2.31.0` left nothing and skipped the

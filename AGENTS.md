@@ -15,10 +15,43 @@ These three are exactly the CI gate (`.github/workflows/ci.yml`). If a change
 passes locally it passes CI. The toolchain is pinned in `rust-toolchain.toml`
 — do not run a different one.
 
+## Delegating
+Review agents grade an answer. They do not derive one, and they inherit the
+premise you hand them.
+
+- Never hand a reviewer your own conclusion and ask it to check. A finding
+  that says "there is a hole here" gets investigated by someone who has not
+  seen your fixture, your reading of the dependency, or your test output.
+  Verification that starts from your answer cannot escape your answer.
+- When a finding contradicts you, treat your own reproduction as the suspect.
+  A hand-built fixture proves only that the code does what the fixture
+  exercises. Check that the fixture reaches the path its comment claims before
+  you use it to close a finding: an extract.rs fixture that omitted the ustar
+  version field let tar-rs yield the header instead of consuming it, and the
+  resulting "false positive" shipped a 256 MiB allocation hole for a day.
+- For a problem with an open answer and an expensive failure, draft several
+  solutions in parallel and have a second group review the candidates. One
+  candidate graded by one reviewer is a single point of failure wearing two
+  hats. Comparing candidates also surfaces the combination nobody would have
+  proposed alone.
+- Confirm a mutation actually applied. Roughly one in three revert-and-test
+  cycles in this repo silently changed nothing: a string replace that did not
+  match, a stale `/tmp` backup restored over newer work, a `--lib` run against
+  a `blueline` binary cargo had not rebuilt. Each one read as "verified".
+- Skip the fan-out for one-line changes. Deleting dead code does not need four
+  agents. The bar is an open answer space and an expensive miss.
+
 ## Guardrails
 
 **Always**
 - Run the three commands above before finishing any work.
+- Lint workflows with `actionlint` after touching `.github/`. GitHub compiles a
+  workflow before running any step, so one bad expression yields a run with zero
+  jobs that cannot be retried, and a message that does not name the line. It
+  also expands expressions inside a `run:` block even when they sit in a shell
+  comment, so writing `${{ }}` out literally in a comment takes the whole
+  workflow down. That happened, and it failed every check in the repo for a day
+  while a YAML parser reported the file as valid.
 - Fail closed: on any doubt in extraction, parsing, or verification, error
   out loud rather than guess.
 - Use `anyhow` at the boundary (`run()` → `main`), `thiserror` inside modules.
