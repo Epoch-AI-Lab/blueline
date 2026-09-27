@@ -52,6 +52,9 @@ runs:
         # consumer took the unauthenticated path -- api.github.com rate-limits
         # by IP, and runner IPs are shared.
         GITHUB_TOKEN: ${{ github.token }}
+        # Inputs reach the shell through env, never through ${{ }} in a run
+        # body: a value interpolated into a script is a value the shell parses.
+        INPUT_VERIFY_ATTESTATION: ${{ inputs.verify-attestation }}
       run: |
         set -euo pipefail
         OUT_DIR="${RUNNER_TEMP}/blueline-bin"
@@ -105,7 +108,7 @@ runs:
         # for every binary (actions/attest-build-provenance), so verify that
         # before executing. This is the same trust boundary the tool itself
         # refuses to cross as P03_SIGNATURE_REQUIRED_MISSING.
-        if [ "${{ inputs.verify-attestation }}" = "true" ]; then
+        if [ "$INPUT_VERIFY_ATTESTATION" = "true" ]; then
           if ! gh attestation verify "$ASSET" --repo "$REPO"; then
             echo "::error::no valid build provenance for $ASSET from $TAG; refusing to run it"
             exit 1

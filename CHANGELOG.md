@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The CI composite Action no longer interpolates `${{ inputs.verify-attestation }}`
+  into a shell body. Every other input already went through `env:`, for the
+  reason this repository records in its own workflow: a value interpolated into
+  a script is a value the shell parses.
+
+- A tar metadata bomb is refused on the path that actually reaches it. tar-rs
+  recognises a header as ustar only when both the `ustar\0` magic and the `"00"`
+  version are present, and then consumes pax and GNU long-name entries inside
+  its own iterator, `read_all`ing the declared size with no cap. Those bytes
+  never reach the extraction loop, so the 64 KiB per-entry cap and the
+  total-unpacked accounting both never saw them, and the declared size field is
+  12 octal digits. Measured: a 1.2 MB gzip declaring 256 MiB of pax metadata
+  was accepted with `unpacked_bytes: 1` while tar-rs held the whole 256 MiB, and
+  the field allows 8 GiB. A decompressed-stream budget now sits between the
+  gunzip and the archive reader, so the bytes have to pass a bound that exists.
+
+  An earlier commit on this branch recorded the opposite conclusion — that the
+  cap was not dead code and no budget was needed. That conclusion came from a
+  fixture which set the magic but not the version, so tar-rs yielded the
+  metadata entry to the extraction loop and the per-entry cap fired. The
+  fixture now sets both, which is what a real archive looks like.
+
 - The dogfood CI health gate passed on an empty report. Every assertion held for
   zero items, so a PR that changed `package-lock.json` and had the scan evaluate
   nothing was reported healthy — the exact silent under-reporting the gate
@@ -421,15 +443,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   evidence rows for an install that never ran. The denial is unchanged and
   still exit 2; only the wasted and misleading work is gone.
 - Registry requests no longer stall against a peer that accepts the connection
-  and then goes quiet. All four adapters share one agent with a 10s connect
-  ceiling and a 30s per-read/write ceiling, with no whole-request timeout set
-  because `ureq` lets it override the per-operation values, and response size
-  stays bounded by `RegistryLimits` as before. Both of those figures were later
-  reversed, so what ships is the other way round: no per-read ceiling, and a 90s
-  whole-request deadline alongside the 10s connect ceiling. The per-read ceiling
-  was dropped because a peer dribbling one byte per interval keeps every read
+  and then goes quiet. All four adapters share one agent, with a 10s connect
+  ceiling and a 90s whole-request deadline, and response size stays bounded by
+  `RegistryLimits` as before. An earlier version of this entry described the
+  opposite arrangement -- a 30s per-read/write ceiling and no whole-request
+  timeout -- which is what the first attempt shipped. The per-read ceiling was
+  dropped because a peer dribbling one byte per interval keeps every read
   inside it and so runs unbounded, and `ureq` 2.x cannot express a short stall
-  guard and a long total budget at once.
+  guard and a long total budget at once. What ships is the 90s total budget
+  with no per-read ceiling.
 - Concurrent first runs against one data directory no longer fail. `record_verified`
   inserts-then-verifies rather than checking-then-inserting, which removed a
   primary-key collision between two reviewers recording the same package; the

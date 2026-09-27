@@ -18,6 +18,13 @@ pub struct NpmRegistry {
     agent: Agent,
     base: String,
     limits: RegistryLimits,
+    /// Packuments already fetched in this process, keyed by package name. A
+    /// review resolves the target and then asks for its signature block, and
+    /// the packument can be tens of megabytes against a fail-closed 64 MiB cap,
+    /// so the second call is a second full download of a document already in
+    /// hand. The lifetime is one review, which is also the window in which a
+    /// stale packument could matter.
+    packuments: std::sync::Mutex<std::collections::HashMap<String, Packument>>,
 }
 
 impl NpmRegistry {
@@ -31,10 +38,28 @@ impl NpmRegistry {
             agent,
             base: base.trim_end_matches('/').to_string(),
             limits,
+            packuments: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
+    /// Fetch the packument once per process. A poisoned lock means some other
+    /// thread panicked holding it, and this adapter has no other state to
+    /// corrupt, so the document is simply fetched again rather than erroring.
     fn packument(&self, name: &str) -> Result<Packument, BluelineError> {
+        validate_package_name(name)?;
+        if let Ok(cache) = self.packuments.lock()
+            && let Some(hit) = cache.get(name)
+        {
+            return Ok(hit.clone());
+        }
+        let fetched = self.fetch_packument(name)?;
+        if let Ok(mut cache) = self.packuments.lock() {
+            cache.insert(name.to_string(), fetched.clone());
+        }
+        Ok(fetched)
+    }
+
+    fn fetch_packument(&self, name: &str) -> Result<Packument, BluelineError> {
         validate_package_name(name)?;
         // Scoped packages must have the slash percent-encoded in the path.
         let encoded = name.replace('/', "%2f");
@@ -309,7 +334,7 @@ fn summarize_versions(packument: &Packument) -> String {
         .join(", ")
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct Packument {
     name: String,
     #[serde(rename = "dist-tags")]
@@ -317,14 +342,14 @@ struct Packument {
     versions: BTreeMap<String, VersionMeta>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct VersionMeta {
     name: String,
     version: String,
     dist: Dist,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct Dist {
     tarball: String,
     integrity: Option<String>,
@@ -435,9 +460,11 @@ mod tests {
         let base = format!("http://127.0.0.1:{port}");
 
         let handle = std::thread::spawn(move || {
-            // Exactly 5 requests: testpkg default_version, testpkg releases,
-            // testpkg resolve, mismatchname, mismatchver
-            for _ in 0..5 {
+            // Exactly 3 requests: testpkg once, mismatchname, mismatchver. The
+            // packument is memoised per registry, so default_version, releases
+            // and resolve share one fetch rather than making three -- which is
+            // the point, and a fourth request would block this loop forever.
+            for _ in 0..3 {
                 if let Ok((mut stream, _)) = listener.accept() {
                     let mut buf = [0u8; 1024];
                     let n = stream.read(&mut buf).unwrap_or(0);
@@ -495,6 +522,79 @@ mod tests {
         assert!(err_ver.to_string().contains("registry metadata mismatch"));
 
         let _ = handle.join();
+    }
+
+    /// The three npm calls a review makes for one package -- default version,
+    /// release list, resolve -- share a single packument fetch, and so does the
+    /// signature lookup that follows them. The mock above serves exactly three
+    /// responses, so a fourth request would hang the test rather than fail it.
+    #[test]
+    fn a_packument_is_fetched_once_per_package() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base = format!("http://127.0.0.1:{port}");
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let handle = std::thread::spawn(move || {
+            // Poll rather than block on accept: with the packument memoised
+            // there is no second request to serve, so a blocking accept() would
+            // wait forever instead of letting the thread finish and the count
+            // be asserted. Exit after a stretch with no connection.
+            listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut idle = 0u32;
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        idle = 0;
+                        let mut buf = [0u8; 1024];
+                        let n = stream.read(&mut buf).unwrap_or(0);
+                        let req = String::from_utf8_lossy(&buf[..n]);
+                        if !req.contains("GET /counted ") {
+                            break;
+                        }
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        let body = r#"{"name":"counted","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"counted","version":"1.0.0","dist":{"tarball":"http://127.0.0.1:1/pkg.tgz","integrity":null,"signatures":[{"keyid":"k","sig":"s"}]}}}}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        idle += 1;
+                        if idle > 200 {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let reg = NpmRegistry::new(&base);
+        assert_eq!(
+            reg.default_version("counted").unwrap(),
+            Some("1.0.0".into())
+        );
+        assert_eq!(reg.list_releases("counted").unwrap().len(), 1);
+        let pkg = reg.resolve("counted", "1.0.0").unwrap();
+        assert!(
+            reg.release_signatures(&pkg).is_some(),
+            "the signature block must be readable"
+        );
+        let _ = handle.join();
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "four npm calls for one package must share one packument fetch"
+        );
     }
 
     #[test]

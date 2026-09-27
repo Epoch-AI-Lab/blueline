@@ -84,8 +84,12 @@ Every tarball and registry response is fully untrusted. The `extract` stage enfo
   size — entry count (100 000, checked before any write), per-entry unpacked
   size (128 MiB, checked against the header and again against the bytes actually
   written), and cumulative unpacked bytes (512 MiB). Tar metadata entries (GNU
-  long name/link, pax extensions) carry their own 64 KiB cap and count against
-  that total, so a long-name bomb cannot slip under it. A directory entry that
+  long name/link, pax extensions) carry their own 64 KiB cap when tar-rs hands
+  them to us. A header tar-rs recognises as ustar — magic *and* version — is
+  consumed inside its own iterator with an uncapped `read_all` of the declared
+  size, which the 12-digit size field can put at 8 GiB, so those bytes pass a
+  separate decompressed-stream budget instead and never reach the per-entry
+  accounting at all. A directory entry that
   declares payload is refused. There is no decompress-ratio monitor and no
   open-FD cap: the guard is the byte and entry budget, enforced on the declared
   size *and* on the inflated stream. The temp dir is an RAII guard removed on
