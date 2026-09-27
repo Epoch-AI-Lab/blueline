@@ -44,7 +44,7 @@ pub struct ExtractStats {
 /// with no cap. Those bytes never reach `safe_extract`'s loop, so the
 /// per-entry metadata cap and the total-unpacked accounting both never see
 /// them. The declared size field is 12 octal digits, so one small gzip can
-/// name 8 GiB and have tar-rs try to hold it.
+/// name 64 GiB minus one and have tar-rs try to hold it.
 ///
 /// The per-entry cap is kept as well: it still covers a header tar-rs does not
 /// recognise, which it then hands to us.
@@ -78,9 +78,7 @@ impl<R: std::io::Read> Budgeted<R> {
 impl<R: std::io::Read> std::io::Read for Budgeted<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.remaining == 0 {
-            return Err(std::io::Error::other(
-                "decompressed tar stream exceeds its budget",
-            ));
+            return Err(std::io::Error::other(BudgetExceeded));
         }
         let want = usize::try_from(self.remaining)
             .unwrap_or(usize::MAX)
@@ -91,14 +89,47 @@ impl<R: std::io::Read> std::io::Read for Budgeted<R> {
     }
 }
 
-/// Budget exhaustion arrives as an opaque `io::Error` from inside tar-rs, which
-/// would otherwise be reported as a malformed archive. It is a limit, so say
-/// so.
-fn map_stream_error(context: &str, e: std::io::Error) -> BluelineError {
-    if e.to_string().contains("exceeds its budget") {
-        return BluelineError::ExtractionLimit(format!(
-            "{context}: the decompressed archive exceeds its budget"
-        ));
+/// The error `Budgeted` raises. A zero-sized type, so identifying it costs
+/// nothing and — unlike matching on a message — cannot be spoofed by an
+/// archive that happens to contain the same words.
+#[derive(Debug)]
+struct BudgetExceeded;
+
+impl std::fmt::Display for BudgetExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("decompressed tar stream exceeds its budget")
+    }
+}
+
+impl std::error::Error for BudgetExceeded {}
+
+/// Budget exhaustion has to be recognised by type rather than by message:
+/// tar-rs wraps I/O errors in its own `TarError`, whose `Display` prints only
+/// tar-rs's description and drops the inner error, so on the `unpack_in` path
+/// the message is all that survives and it never mentions the budget. Walking
+/// the `source` chain recovers the original. Going the other way, tar-rs
+/// echoes raw header bytes into its messages, so a header containing the
+/// budget's wording would otherwise be filed as a limit breach.
+fn budget_breached(err: &(dyn std::error::Error + 'static)) -> bool {
+    if err.downcast_ref::<BudgetExceeded>().is_some() {
+        return true;
+    }
+    // `io::Error` boxes a custom payload instead of exposing it as its own
+    // `source`, so the wrapped marker has to be reached through `get_ref`.
+    err.downcast_ref::<std::io::Error>()
+        .and_then(std::io::Error::get_ref)
+        .is_some_and(|inner| inner.downcast_ref::<BudgetExceeded>().is_some())
+}
+
+fn map_stream_error<E: std::error::Error + 'static>(context: &str, e: E) -> BluelineError {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&e);
+    while let Some(err) = cause {
+        if budget_breached(err) {
+            return BluelineError::ExtractionLimit(format!(
+                "{context}: the decompressed archive exceeds its budget"
+            ));
+        }
+        cause = err.source();
     }
     BluelineError::Extraction(format!("{context}: {e}"))
 }
@@ -983,10 +1014,7 @@ mod tests {
         // The budget is a headroom allowance, so the risk is that it is set too
         // tight and refuses an archive that is merely legal. 1000 entries of one
         // byte each is the shape that stresses it: half the stream is 512-byte
-        // headers and padding, which no payload accounting sees. Limits are
-        // scaled down so the budget is close to the stream rather than 600 MiB
-        // above it -- with the defaults this archive would fit in any budget at
-        // all and the test would assert nothing.
+        // headers and padding, which no payload accounting sees.
         use std::io::Write;
         let mut out = Vec::new();
         for i in 0..1000 {
@@ -1149,6 +1177,57 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("total unpacked size would exceed cap")
+        );
+    }
+
+    /// The budget marker must be recognised through tar-rs's own `TarError`,
+    /// whose Display prints only tar-rs's description and drops the inner I/O
+    /// error, and through the `io::Error` that boxes it. A breach during
+    /// `unpack_in` was therefore being filed as a plain extraction failure --
+    /// the exact misclassification `map_stream_error` exists to prevent. The
+    /// other direction matters too: tar-rs echoes raw header bytes into its
+    /// messages, so matching on that text would file a malformed archive as a
+    /// limit breach.
+    #[test]
+    fn budget_breach_is_classified_by_type_not_by_message() {
+        let marker: std::io::Error = std::io::Error::other(BudgetExceeded);
+        assert!(
+            budget_breached(&marker),
+            "our marker must be recognised through the io::Error payload"
+        );
+
+        let spoofed: std::io::Error = std::io::Error::other(
+            "numeric field was not a number: decompressed tar stream exceeds its budget",
+        );
+        assert!(
+            !budget_breached(&spoofed),
+            "an unrelated error must not be mistaken for a breach"
+        );
+
+        assert!(
+            matches!(
+                map_stream_error("ctx", BudgetExceeded),
+                BluelineError::ExtractionLimit(_)
+            ),
+            "a direct marker is a limit"
+        );
+        let unrelated = std::io::Error::other("some other failure");
+        assert!(
+            matches!(
+                map_stream_error("ctx", unrelated),
+                BluelineError::Extraction(_)
+            ),
+            "an unrelated error is a plain extraction failure"
+        );
+
+        // Wrapped the way tar-rs wraps it: TarError::source() yields the
+        // io::Error, which boxes the marker. Both depths must classify.
+        let tar_err = tar::Archive::new(std::io::Cursor::new(b"not a tar".to_vec()))
+            .unpack("nowhere")
+            .unwrap_err();
+        assert!(
+            !budget_breached(&tar_err),
+            "a real tar-rs error is not a breach"
         );
     }
 }

@@ -87,7 +87,8 @@ Every tarball and registry response is fully untrusted. The `extract` stage enfo
   long name/link, pax extensions) carry their own 64 KiB cap when tar-rs hands
   them to us. A header tar-rs recognises as ustar — magic *and* version — is
   consumed inside its own iterator with an uncapped `read_all` of the declared
-  size, which the 12-digit size field can put at 8 GiB, so those bytes pass a
+  size, which the 12-octal-digit size field can put at 64 GiB minus one, so those
+  bytes pass a
   separate decompressed-stream budget instead and never reach the per-entry
   accounting at all. A directory entry that
   declares payload is refused. There is no decompress-ratio monitor and no

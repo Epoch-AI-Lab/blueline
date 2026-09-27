@@ -24,7 +24,13 @@ pub struct NpmRegistry {
     /// so the second call is a second full download of a document already in
     /// hand. The lifetime is one review, which is also the window in which a
     /// stale packument could matter.
-    packuments: std::sync::Mutex<std::collections::HashMap<String, Packument>>,
+    ///
+    /// Byte-bounded for the same reason the tarball memo in `ReviewContext` is:
+    /// a recursive review walks a dependency graph, and without a ceiling the
+    /// memo is the one place the walk's own memory grows without bound. A
+    /// packument over the ceiling is simply not cached, which costs a refetch
+    /// and nothing else.
+    packuments: std::sync::Mutex<PackumentMemo>,
 }
 
 impl NpmRegistry {
@@ -38,7 +44,7 @@ impl NpmRegistry {
             agent,
             base: base.trim_end_matches('/').to_string(),
             limits,
-            packuments: std::sync::Mutex::new(std::collections::HashMap::new()),
+            packuments: std::sync::Mutex::new(PackumentMemo::default()),
         }
     }
 
@@ -48,13 +54,21 @@ impl NpmRegistry {
     fn packument(&self, name: &str) -> Result<Packument, BluelineError> {
         validate_package_name(name)?;
         if let Ok(cache) = self.packuments.lock()
-            && let Some(hit) = cache.get(name)
+            && let Some(hit) = cache.by_name.get(name)
         {
             return Ok(hit.clone());
         }
         let fetched = self.fetch_packument(name)?;
         if let Ok(mut cache) = self.packuments.lock() {
-            cache.insert(name.to_string(), fetched.clone());
+            let size = packument_size_estimate(&fetched);
+            if size <= MAX_MEMOISED_PACKUMENT_BYTES {
+                if cache.bytes + size > MAX_MEMOISED_PACKUMENT_TOTAL_BYTES {
+                    cache.by_name.clear();
+                    cache.bytes = 0;
+                }
+                cache.bytes += size;
+                cache.by_name.insert(name.to_string(), fetched.clone());
+            }
         }
         Ok(fetched)
     }
@@ -264,6 +278,30 @@ impl Registry for NpmRegistry {
     }
 }
 
+/// Ceiling on one memoised packument, and on the memo as a whole. Mirrors the
+/// tarball memo in `ReviewContext`: a single document is capped, and the total
+/// is capped, and a walk that would exceed the total starts over rather than
+/// growing.
+const MAX_MEMOISED_PACKUMENT_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_MEMOISED_PACKUMENT_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Rough serialised size of a packument, for the memo ceiling only. Not a
+/// security bound -- the fetch itself is already byte-capped separately.
+fn packument_size_estimate(p: &Packument) -> u64 {
+    let versions: u64 = p
+        .versions
+        .values()
+        .map(|v| 512 + v.dist.tarball.len() as u64)
+        .sum();
+    p.name.len() as u64 + 512 + versions
+}
+
+#[derive(Default)]
+struct PackumentMemo {
+    by_name: std::collections::HashMap<String, Packument>,
+    bytes: u64,
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -460,10 +498,11 @@ mod tests {
         let base = format!("http://127.0.0.1:{port}");
 
         let handle = std::thread::spawn(move || {
-            // Exactly 3 requests: testpkg once, mismatchname, mismatchver. The
-            // packument is memoised per registry, so default_version, releases
-            // and resolve share one fetch rather than making three -- which is
-            // the point, and a fourth request would block this loop forever.
+            // Exactly 3 requests: testpkg once, then mismatchname and
+            // mismatchver. The packument is memoised per registry, so
+            // default_version, list_releases and resolve share one fetch rather
+            // than making three. A fourth request would not be served, and the
+            // loop below would then block on accept().
             for _ in 0..3 {
                 if let Ok((mut stream, _)) = listener.accept() {
                     let mut buf = [0u8; 1024];
@@ -526,8 +565,7 @@ mod tests {
 
     /// The three npm calls a review makes for one package -- default version,
     /// release list, resolve -- share a single packument fetch, and so does the
-    /// signature lookup that follows them. The mock above serves exactly three
-    /// responses, so a fourth request would hang the test rather than fail it.
+    /// signature lookup that follows them.
     #[test]
     fn a_packument_is_fetched_once_per_package() {
         use std::io::{Read, Write};

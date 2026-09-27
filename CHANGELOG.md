@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A decompressed-stream budget breach is now classified as a limit everywhere it
+  can surface. It was recognised by matching an error message, which fails on
+  the `unpack_in` path because tar-rs wraps I/O errors in a `TarError` whose
+  `Display` prints only tar-rs's own description and drops the inner error — so
+  a real limit was filed as a plain extraction failure. The marker is now a
+  type, found by walking the `source` chain and the `io::Error` payload, which
+  also closes the other direction: tar-rs echoes raw header bytes into its
+  messages, so an archive containing the budget's wording was filed as a breach.
+- The memoised npm packument is byte-bounded, on both a single document and the
+  memo as a whole, mirroring the tarball memo in `ReviewContext`. A recursive
+  review walks a dependency graph, and an unbounded memo is the one place that
+  walk's memory grows without limit. An over-ceiling packument is not cached,
+  which costs a refetch and nothing else.
+
 - The CI composite Action no longer interpolates `${{ inputs.verify-attestation }}`
   into a shell body. Every other input already went through `env:`, for the
   reason this repository records in its own workflow: a value interpolated into
@@ -20,9 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   its own iterator, `read_all`ing the declared size with no cap. Those bytes
   never reach the extraction loop, so the 64 KiB per-entry cap and the
   total-unpacked accounting both never saw them, and the declared size field is
-  12 octal digits. Measured: a 1.2 MB gzip declaring 256 MiB of pax metadata
-  was accepted with `unpacked_bytes: 1` while tar-rs held the whole 256 MiB, and
-  the field allows 8 GiB. A decompressed-stream budget now sits between the
+  12 octal digits. Measured: a 1,221,702-byte gzip declaring 256 MiB of pax
+  metadata was accepted with `unpacked_bytes: 1` while tar-rs held the whole
+  256 MiB, and the field allows 64 GiB minus one. A decompressed-stream budget now sits between the
   gunzip and the archive reader, so the bytes have to pass a bound that exists.
 
   An earlier commit on this branch recorded the opposite conclusion — that the
@@ -57,8 +71,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   retry or the swallow is reverted.
 - The metadata-cap test in `extract.rs` built and gzipped a gigabyte across four
   header kinds to check a 64 KiB cap, costing about 21 seconds of the suite's
-  wall time. 4 MiB is still four orders of magnitude past the cap and costs
-  0.24s.
+  wall time. The fixture is now sized against the budget the test actually
+  exercises, which reaches the same code path for a fraction of the cost.
 
 - The recall sync lock did not cover the sequence check it was added for. The
   comparison ran before the lock was taken, so two syncs could both read the
