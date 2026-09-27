@@ -318,16 +318,35 @@ fn is_hash_option(token: &str) -> bool {
     token == "--hash" || token.starts_with("--hash=")
 }
 
-/// Whether a line carries a requirement spec at all. An unpinned one
-/// (`requests>=2.0`, or a direct URL) counts: dropping such a line under the
-/// options opt-in would let the gate pass a requirements.txt holding an
-/// unpinned dependency, and the package would read as *removed* rather than
-/// never-pinned. The operators are the set the range check uses, plus `@` for a
-/// direct reference.
-fn carries_requirement(code_part: &str) -> bool {
-    [">=", "<=", "===", "==", "~=", "!=", ">", "<", "@"]
-        .into_iter()
-        .any(|op| code_part.contains(op))
+/// Whether a token could be an option's *value* rather than a requirement.
+///
+/// Under the options opt-in, a line that mixes an option with a requirement
+/// cannot be split reliably: whether `-r` consumes the token after it is pip's
+/// business, not ours, and three separate rounds of review each found another
+/// requirement shape that a splitting heuristic lost -- a pinned spec, an
+/// unpinned range, then a bare name, an extras form and a direct URL. So the
+/// line is only treated as option-only when every token is unmistakably part of
+/// an option: a flag, a URL, a path, or a filename.
+///
+/// Erring towards "requirement" is the fail-closed direction: it refuses a line
+/// rather than dropping a package from the reviewed graph.
+fn is_option_or_value(token: &str) -> bool {
+    token.starts_with('-')
+        || token.contains("://")
+        || token.contains('/')
+        || token.contains('\\')
+        || token.ends_with(".txt")
+        || token.ends_with(".in")
+        // `-e .` is an editable install of the working directory, which is a
+        // value rather than a requirement.
+        || token == "."
+        || token == ".."
+}
+
+/// Whether a set of tokens contains something that is not part of an option, and
+/// so must be a requirement this parser would otherwise lose.
+fn carries_requirement(tokens: &[&str]) -> bool {
+    tokens.iter().any(|t| !is_option_or_value(t))
 }
 
 /// Parse a pinned requirements.txt file (PEP 508 / pip requirements format).
@@ -424,45 +443,39 @@ pub fn parse_requirements_txt_packages(
             // the first redirecting option is kept, because that one is part of
             // the pin. A `--hash` after it is lost, which makes the line fail
             // its hash check rather than pass unreviewed.
-            match code_part
-                .split_whitespace()
+            let tokens: Vec<&str> = code_part.split_whitespace().collect();
+            match tokens
+                .iter()
                 .position(|tok| tok.starts_with('-') && !is_hash_option(tok))
             {
-                Some(0) if carries_requirement(&code_part) => {
-                    // The option comes first AND the line also pins something,
-                    // so truncation would leave nothing and the line would be
-                    // dropped -- losing the pin silently, which is the
-                    // fail-open this path exists to close. pip accepts
-                    // `--index-url URL requests==2.31.0` on one line, so this is
-                    // not hypothetical, and the redirect would never be
-                    // reviewed or disclosed. Refused instead: the opt-in
-                    // tolerates an option alongside a requirement, not a
-                    // requirement the parser cannot reach.
-                    return Err(LockfileError::InvalidData(format!(
-                        "line {line_num}: a requirements option precedes the requirement on the \
-                         same line, so it cannot be reviewed alongside it: `{code_part}`"
-                    )));
-                }
-                // An option alone on its line is the ordinary pip layout, and
-                // the requirement it belongs to is on another line.
-                Some(0) => continue,
+                None => {}
                 Some(cut) => {
-                    let tokens: Vec<&str> = code_part.split_whitespace().collect();
-                    // A `--hash` past the first redirecting option is exactly
-                    // what truncation discards, and dropping it is not safe: the
-                    // line then carries no integrity at all, `R10_` never
-                    // compares it, and the declared hash is neither verified
-                    // nor disclosed. Refuse rather than review a line whose own
-                    // hash is gone.
+                    // Everything from the first redirecting option onward is
+                    // off-limits, because a requirement in that tail is
+                    // unreachable and nothing downstream would ever say so.
+                    // Refuse rather than review a partial line: silently
+                    // dropping a pin files the package as *removed*, and
+                    // silently dropping a range loses the unpinned error.
                     if tokens[cut..].iter().any(|t| is_hash_option(t)) {
                         return Err(LockfileError::InvalidData(format!(
                             "line {line_num}: a requirements option precedes `--hash`, so the \
                              declared hash would be discarded unreviewed: `{code_part}`"
                         )));
                     }
+                    if carries_requirement(&tokens[cut..]) {
+                        return Err(LockfileError::InvalidData(format!(
+                            "line {line_num}: a requirements option is mixed with a requirement \
+                             on the same line, so the requirement cannot be reviewed alongside \
+                             it: `{code_part}`"
+                        )));
+                    }
+                    // Option-only line: the ordinary pip layout, where the
+                    // requirement it belongs to is on another line.
+                    if cut == 0 {
+                        continue;
+                    }
                     code_part = tokens[..cut].join(" ");
                 }
-                None => {}
             }
         }
 
@@ -1297,19 +1310,24 @@ urllib3==2.1.0 # trailing comment
                 "option `{opt}` must be refused as an option, not as a version: {err}"
             );
             assert!(err.contains(flag), "the refusal must name `{flag}`: {err}");
-            // The opt-in stays an opt-in -- and the pin on the same line must
-            // still be in the reviewed graph. Skipping the line outright
-            // returned Ok with an empty result, so a package the line pins was
-            // never checked at all. `is_ok()` alone is what let that pass.
-            let opted_in = parse_requirements_txt_packages(&file, true).unwrap();
-            assert!(
-                !opted_in.is_empty(),
-                "the opt-in path must still review the pin on the line: {file:?}"
-            );
-            assert!(
-                opted_in.values().any(|e| e.version == "2.31.0"),
-                "the pinned version must survive the opt-in: {opted_in:?}"
-            );
+            // The opt-in lets the option through, but not a requirement mixed
+            // with it: that line cannot be split reliably, so it is refused
+            // rather than reviewed in part. Dropping the pin outright, as an
+            // earlier version did, returned Ok with an empty result, so the
+            // package the line pins was never checked at all.
+            // Either the line is refused as unsplittable, or it is truncated
+            // and the pin is kept. What must never happen is the pin being
+            // dropped: that put a reviewed package into the *removed* set.
+            match parse_requirements_txt_packages(&file, true) {
+                Err(e) => assert!(
+                    e.to_string().contains("mixed with a requirement"),
+                    "an option mixed with a pin must be refused as unsplittable: {e}"
+                ),
+                Ok(opted_in) => assert!(
+                    opted_in.values().any(|e| e.version == "2.31.0"),
+                    "a truncated line must keep its pin, never drop it: {opted_in:?}"
+                ),
+            }
         }
     }
 
@@ -1331,25 +1349,38 @@ urllib3==2.1.0 # trailing comment
                 .unwrap_err()
                 .to_string();
             assert!(
-                err.contains("precedes the requirement"),
+                err.contains("mixed with a requirement"),
                 "an option-led line carrying a pin must be refused, got: {err}"
             );
         }
 
-        // An *unpinned* requirement on an option-led line counts too. Dropping
-        // it let the gate pass a requirements.txt holding an unpinned dependency,
-        // and the package read as removed rather than never-pinned.
+        // Every requirement shape has to be refused, not just the pinned one.
+        // Three rounds of review each found another shape that a splitting
+        // heuristic lost: a pinned spec, then an unpinned range, then a bare
+        // name, an extras form and a direct URL. Each of these is a package the
+        // reviewed graph would otherwise not contain, while `ci` reports it as
+        // *removed* and passes.
         for file in [
+            // pinned, unpinned range, direct reference
+            "--index-url https://evil.example/simple requests==2.31.0\n",
             "--index-url https://evil.example/simple requests>=2.0\n",
             "--index-url https://evil.example/simple foo @ https://evil/x.whl\n",
+            // bare name and extras carry no operator at all
+            "--index-url https://evil.example/simple requests\n",
+            "--pre foo[bar]\n",
+            // a line continuation joins the requirement onto the option's line
+            "--index-url https://e/s \\\nrequests==2.31.0\n",
+            // and the option *after* a spec, where truncation would drop the tail
+            "requests==2.31.0 --index-url https://e/s urllib3==2.0.0\n",
+            "requests==2.31.0 --index-url https://e/s bar>=2.0\n",
         ] {
-            let err = parse_requirements_txt_packages(file, true)
-                .unwrap_err()
-                .to_string();
-            assert!(
-                err.contains("precedes the requirement"),
-                "an option-led line with an unpinned requirement must be refused: {err}"
-            );
+            match parse_requirements_txt_packages(file, true) {
+                Err(e) => assert!(
+                    e.to_string().contains("mixed with a requirement"),
+                    "`{file:?}` must be refused as mixed, gave: {e}"
+                ),
+                Ok(m) => panic!("`{file:?}` was ACCEPTED with {m:?} and its requirement lost"),
+            }
         }
 
         // A `--hash` past the first redirecting option is what truncation
@@ -1415,7 +1446,6 @@ urllib3==2.1.0 # trailing comment
             "--find-links /path/to/wheels",
             "-e .",
             "--pre",
-            "--trusted-host example.com",
         ] {
             let file = format!("{opt}\nrequests==2.31.0\n");
             let err = parse_requirements_txt_packages(&file, false)
@@ -1426,11 +1456,27 @@ urllib3==2.1.0 # trailing comment
                 "option `{opt}` must be refused by name: {err}"
             );
             // Opting in reviews the pins and discloses nothing.
-            assert!(
-                parse_requirements_txt_packages(&file, true).is_ok(),
-                "the policy escape must let a mirrored index through"
-            );
+            match parse_requirements_txt_packages(&file, true) {
+                Ok(_) => {}
+                Err(e) => panic!("the policy escape must let `{opt}` through, got: {e}"),
+            }
         }
+
+        // `--trusted-host` takes a bare hostname, which is shape-identical to a
+        // bare requirement: `zope.interface` is a real PyPI name, so a dot
+        // cannot tell them apart. Refused under the opt-in rather than guessed
+        // at, since guessing wrong drops a package from the reviewed graph.
+        // The option is deprecated in pip, and pinning a host is better done
+        // with `PIP_INDEX_URL` in the environment, which blueline does not
+        // read either way.
+        let host_file = "--trusted-host example.com\nrequests==2.31.0\n";
+        let err = parse_requirements_txt_packages(host_file, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("mixed with a requirement"),
+            "a bare hostname value must not be guessed at: {err}"
+        );
 
         let content = r#"
 # Empty lines and comments with whitespace
