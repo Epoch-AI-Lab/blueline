@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The two provenance attestation fetches no longer follow redirects to any host.
+  The npm attestations call and the PyPI PEP 740 call each built their own
+  `ureq::AgentBuilder` instead of going through `registry_agent`, so they
+  inherited ureq's default of five redirects with no SSRF validation on any hop
+  and no validating resolver. The configured base is operator config and is
+  trusted, but the *response* is not: a registry — or anything able to answer for
+  an `http://` base — could reply `302 Location: http://169.254.169.254/...` and
+  have blueline follow it, or supply an attestation body from any host it liked.
+  `registry_agent`'s documented purpose is that redirects stay off so each hop is
+  validated by `follow_redirects` instead of followed blindly, and these were the
+  only registry-facing fetches in `src/` bypassing it. Both now use a
+  timeout-parameterised variant of the same agent, keeping their original 3s
+  budget, and go through `download_bounded`, so every hop is checked.
+
+  The size cap's direction was wrong there too: `take(1 MiB)` silently truncated
+  a larger body, and the truncated text then failed to parse, so an over-cap
+  response reported *missing* provenance for a release that has some — the
+  parser mistaking "too much" for "nothing". Over the cap is now an error.
+
+  Verified with a two-listener fixture that makes the two outcomes
+  distinguishable: one server serves a genuinely attesting body, the other (the
+  configured base) redirects to it. Following the redirect yields `Attested`;
+  refusing it yields `Missing`. Confirmed failing 6 of 6 runs against the old
+  code and passing 6 of 6 against the new. The first version of that fixture was
+  itself flaky — it replied without reading the request, so closing the socket
+  with unread bytes queued made the kernel send RST and truncate the response —
+  which is why the control assertion is in the test: it proves the fixture can
+  produce the vulnerable outcome at all.
+
 - An advisory lookup that never happened is no longer reported as a clean
   advisory pass. `fetch_advisories` returns `Ok` both for a real answer and for
   an `unverified` report, and the review only inspected the `Err` arm — so a

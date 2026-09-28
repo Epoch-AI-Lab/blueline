@@ -1,11 +1,21 @@
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use std::io::Read;
 
 use crate::error::BluelineError;
 use crate::policy::Policy;
 use crate::registry::{Checksum, Ecosystem};
 use crate::store::BaselineStore;
+
+/// Sent on every registry request, so the shared validating agent sets it in
+/// one place rather than each call site remembering to.
+const USER_AGENT: &str = "blueline-security/0.1.0";
+
+/// Ceiling on one attestation body. A DSSE envelope for a large multi-platform
+/// release runs to a few hundred kilobytes; a megabyte is generous, and going
+/// over it is an error rather than a truncation. Truncating produced text that
+/// then failed to parse, which reported a *missing* attestation for a release
+/// that has one -- the parser mistaking "too much" for "nothing".
+const MAX_ATTESTATION_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -255,53 +265,66 @@ pub fn inspect_provenance(
     }
 
     // 3. Attempt to fetch npm attestations endpoint
-    let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_millis(3000))
-        .build();
-
+    //
+    // The base is operator config and so is trusted; the *response* is not. A
+    // registry that answers with a 302 can point this at the loopback
+    // interface or a link-local metadata address, and a bare `AgentBuilder`
+    // follows up to five such hops to any host. Every other registry fetch in
+    // the tree goes through `registry_agent`, whose documented purpose is that
+    // each hop is SSRF-validated rather than followed blindly; these two sites
+    // built their own agent and so opted out of the check the rest of the
+    // codebase relies on.
+    //
+    // `download_bounded` also fixes the size cap's direction: the old
+    // `take(1 MiB)` silently truncated a larger body, and the truncated text
+    // then failed to parse, so an over-cap response reported *missing*
+    // provenance for a release that has some. Over the cap is now an error,
+    // which is the direction this parser wants.
     let encoded_pkg = package.replace('/', "%2f");
     let base = attestations_base.trim_end_matches('/');
     let attestations_url = format!("{base}/-/npm/v1/attestations/{encoded_pkg}@{version}");
-    let resp_res = agent
-        .get(&attestations_url)
-        .set("Accept", "application/json")
-        .set("User-Agent", "blueline-security/0.1.0")
-        .call();
+    let agent = crate::registry::http_util::registry_agent_with_timeout(
+        USER_AGENT,
+        base,
+        std::time::Duration::from_millis(3000),
+    );
 
-    if let Ok(resp) = resp_res {
-        let mut reader = resp.into_reader().take(1024 * 1024);
-        let mut body = String::new();
-        if reader.read_to_string(&mut body).is_ok()
-            && let Ok(envelope) = serde_json::from_str::<NpmAttestationEnvelope>(&body)
-        {
-            for item in envelope.attestations {
-                if let Some(payload_b64) = item
-                    .bundle
-                    .and_then(|b| b.dsse_envelope)
-                    .and_then(|d| d.payload)
-                    && let Ok(mut report) =
-                        parse_attestation_payload(&payload_b64, expected_integrity)
-                {
-                    report.registry_signature_present = has_sig;
-                    report.registry_signature_key_id = sig_key_id.clone();
+    if let Ok(bytes) = crate::registry::http_util::download_bounded_with_headers(
+        &agent,
+        base,
+        &attestations_url,
+        MAX_ATTESTATION_BYTES,
+        5,
+        &[("Accept", "application/json")],
+    ) && let Ok(body) = String::from_utf8(bytes)
+        && let Ok(envelope) = serde_json::from_str::<NpmAttestationEnvelope>(&body)
+    {
+        for item in envelope.attestations {
+            if let Some(payload_b64) = item
+                .bundle
+                .and_then(|b| b.dsse_envelope)
+                .and_then(|d| d.payload)
+                && let Ok(mut report) = parse_attestation_payload(&payload_b64, expected_integrity)
+            {
+                report.registry_signature_present = has_sig;
+                report.registry_signature_key_id = sig_key_id.clone();
 
-                    // Cache in SQLite store
-                    if let Some(store) = store {
-                        let _ = store.record_provenance(
-                            Ecosystem::Npm,
-                            package,
-                            version,
-                            report.builder_id.as_deref(),
-                            report.source_repo.as_deref(),
-                            report.commit_sha.as_deref(),
-                            report.workflow_path.as_deref(),
-                            report.slsa_level,
-                            has_sig,
-                        );
-                    }
-
-                    return report;
+                // Cache in SQLite store
+                if let Some(store) = store {
+                    let _ = store.record_provenance(
+                        Ecosystem::Npm,
+                        package,
+                        version,
+                        report.builder_id.as_deref(),
+                        report.source_repo.as_deref(),
+                        report.commit_sha.as_deref(),
+                        report.workflow_path.as_deref(),
+                        report.slsa_level,
+                        has_sig,
+                    );
                 }
+
+                return report;
             }
         }
     }
@@ -415,45 +438,48 @@ pub fn inspect_provenance_pypi(
         };
     }
 
-    // 2. Fetch PyPI provenance endpoint
-    let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_millis(3000))
-        .build();
-
+    // 2. Fetch PyPI provenance endpoint. Same reasoning as the npm attestations
+    // fetch above: the configured base is trusted, the response is not, so the
+    // agent validates every resolved address and every redirect hop is checked
+    // rather than followed blindly.
     let base = registry_base.trim_end_matches('/');
     let provenance_url = format!("{base}/integrity/{norm}/{version}/{filename}/provenance");
-    let resp_res = agent
-        .get(&provenance_url)
-        .set("Accept", "application/json")
-        .set("User-Agent", "blueline-security/0.1.0")
-        .call();
+    let agent = crate::registry::http_util::registry_agent_with_timeout(
+        USER_AGENT,
+        base,
+        std::time::Duration::from_millis(3000),
+    );
 
-    if let Ok(resp) = resp_res {
-        let mut reader = resp.into_reader().take(1024 * 1024);
-        let mut body = String::new();
-        if reader.read_to_string(&mut body).is_ok() {
-            match parse_pypi_provenance_json(&body, expected_integrity) {
-                Ok(report) => {
-                    if report.status == ProvenanceStatus::Attested
-                        && let Some(store) = store
-                    {
-                        let _ = store.record_provenance(
-                            Ecosystem::PyPi,
-                            package,
-                            version,
-                            report.builder_id.as_deref(),
-                            report.source_repo.as_deref(),
-                            report.commit_sha.as_deref(),
-                            report.workflow_path.as_deref(),
-                            report.slsa_level,
-                            false,
-                        );
-                    }
-                    return report;
+    if let Ok(bytes) = crate::registry::http_util::download_bounded_with_headers(
+        &agent,
+        base,
+        &provenance_url,
+        MAX_ATTESTATION_BYTES,
+        5,
+        &[("Accept", "application/json")],
+    ) && let Ok(body) = String::from_utf8(bytes)
+    {
+        match parse_pypi_provenance_json(&body, expected_integrity) {
+            Ok(report) => {
+                if report.status == ProvenanceStatus::Attested
+                    && let Some(store) = store
+                {
+                    let _ = store.record_provenance(
+                        Ecosystem::PyPi,
+                        package,
+                        version,
+                        report.builder_id.as_deref(),
+                        report.source_repo.as_deref(),
+                        report.commit_sha.as_deref(),
+                        report.workflow_path.as_deref(),
+                        report.slsa_level,
+                        false,
+                    );
                 }
-                Err(e) => {
-                    return ProvenanceReport::unverified(&e.to_string());
-                }
+                return report;
+            }
+            Err(e) => {
+                return ProvenanceReport::unverified(&e.to_string());
             }
         }
     }
@@ -700,5 +726,118 @@ mod tests {
                 "{signatures:?} must not satisfy require_signatures"
             );
         }
+    }
+
+    /// The SSRF shape, end to end through the real entry point.
+    ///
+    /// Two listeners. The second serves a *valid* PEP 740 attestation whose
+    /// subject digest matches. The first is the configured registry base and
+    /// answers `302 Location: <second>`. The second is a different authority on
+    /// a private address, which `validate_download_url` refuses because it does
+    /// not match the base host.
+    ///
+    /// Built so the two outcomes are distinguishable, which a redirect to an
+    /// unroutable address would not be: following the redirect yields
+    /// `Attested`, refusing it yields `Missing`. Before the fix both fetch sites
+    /// built a bare `ureq::AgentBuilder`, whose redirect default is 5, so the
+    /// registry could hand blueline an attestation body from whatever host it
+    /// named -- including a link-local metadata service.
+    ///
+    /// The handlers read the request before replying. Writing first and closing
+    /// with unread request bytes still in the receive queue makes the kernel
+    /// send RST rather than FIN, which truncates the response and made this test
+    /// fail roughly a third of the time for reasons that had nothing to do with
+    /// the code under test.
+    #[test]
+    fn a_provenance_redirect_to_another_host_is_not_followed() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        fn reply(stream: std::net::TcpStream, head: &str, body: &[u8]) {
+            let mut stream = stream;
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(body);
+            let _ = stream.flush();
+        }
+
+        fn serve(listener: TcpListener, head: String, body: Vec<u8>) {
+            std::thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    let (h, b) = (head.clone(), body.clone());
+                    std::thread::spawn(move || reply(stream, &h, &b));
+                }
+            });
+        }
+
+        let expected = ck("tarball");
+        let statement = format!(
+            r#"{{"_type":"https://in-toto.io/Statement/v0.1",
+                 "subject":[{{"name":"pkg:pypi/requests@2.31.0",
+                             "digest":{{"sha512":"{}"}}}}],
+                 "predicateType":"https://slsa.dev/provenance/v0.2",
+                 "predicate":{{"builder":{{"id":"https://github.com/actions/runner"}}}}}}"#,
+            expected.value_hex
+        );
+        let b64 = base64::engine::general_purpose::STANDARD.encode(statement.as_bytes());
+        let body = format!(
+            r#"{{"attestations":[{{"bundle":{{"dsseEnvelope":{{"payload":"{b64}"}}}}}}]}}"#
+        );
+
+        // Control: the payload is genuinely attesting, so a `Missing` below can
+        // only mean the redirect was refused -- not that the fixture is inert.
+        assert_eq!(
+            parse_pypi_provenance_json(&body, &expected)
+                .expect("the fixture payload must parse")
+                .status,
+            ProvenanceStatus::Attested,
+            "control: this body attests, so refusing the redirect is observable"
+        );
+
+        // The redirect target: a valid attestation, on a private address.
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_base = format!("http://{}", target.local_addr().unwrap());
+        serve(
+            target,
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                body.len()
+            ),
+            body.into_bytes(),
+        );
+
+        // The configured base, which redirects there.
+        let base = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", base.local_addr().unwrap());
+        let location = format!(
+            "{target_base}/integrity/requests/2.31.0/requests-2.31.0-py3-none-any.whl/provenance"
+        );
+        serve(
+            base,
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\
+                 Connection: close\r\n\r\n"
+            ),
+            Vec::new(),
+        );
+
+        let report = inspect_provenance_pypi(
+            "requests",
+            "2.31.0",
+            "requests-2.31.0-py3-none-any.whl",
+            &expected,
+            &base_url,
+            None,
+            &Policy::default(),
+        );
+
+        assert_ne!(
+            report.status,
+            ProvenanceStatus::Attested,
+            "an attestation reached only by following a redirect to a different \
+             private host must not be trusted: {report:?}"
+        );
     }
 }

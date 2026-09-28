@@ -23,9 +23,18 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 /// Shared agent for every registry adapter. Redirects stay off so each hop can
 /// be SSRF-validated by `follow_redirects` instead of followed blindly.
 pub fn registry_agent(user_agent: &str, base: &str) -> Agent {
+    registry_agent_with_timeout(user_agent, base, REQUEST_TIMEOUT)
+}
+
+/// As `registry_agent`, with a caller-chosen end-to-end budget. The SSRF
+/// properties are identical and are the point of this function: a validating
+/// resolver and `redirects(0)`. A caller that wants a short budget must not have
+/// to give that up to get one -- building a bare `ureq::AgentBuilder` is how the
+/// two provenance fetches ended up following redirects to any host.
+pub fn registry_agent_with_timeout(user_agent: &str, base: &str, total: Duration) -> Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
+        .timeout(total)
         .user_agent(user_agent)
         .redirects(0)
         .resolver(validating_resolver_for(base))
@@ -105,12 +114,33 @@ pub fn download_bounded(
     max_bytes: u64,
     max_redirects: usize,
 ) -> Result<Vec<u8>, BluelineError> {
+    download_bounded_with_headers(agent, base, url, max_bytes, max_redirects, &[])
+}
+
+/// As `download_bounded`, additionally sending request headers on every hop.
+///
+/// The headers are re-sent on each redirect rather than only the first, because
+/// a redirect is a fresh request to a host that has not been vetted for
+/// credentials: only call this with headers that are safe to send to whatever
+/// host the chain lands on.
+pub fn download_bounded_with_headers(
+    agent: &Agent,
+    base: &str,
+    url: &str,
+    max_bytes: u64,
+    max_redirects: usize,
+    headers: &[(&str, &str)],
+) -> Result<Vec<u8>, BluelineError> {
     let mut current_url = url.to_string();
     let mut redirects_followed = 0;
 
     let resp = loop {
         validate_download_url(base, &current_url)?;
-        let res = agent.get(&current_url).call();
+        let mut req = agent.get(&current_url);
+        for (name, value) in headers {
+            req = req.set(name, value);
+        }
+        let res = req.call();
         match res {
             Ok(response) if (301..=308).contains(&response.status()) => {
                 redirects_followed += 1;
@@ -649,5 +679,59 @@ mod tests {
             resolve_redirect_url(base, "https://cdn.npmjs.org/pkg.tgz").unwrap(),
             "https://cdn.npmjs.org/pkg.tgz"
         );
+    }
+
+    /// A redirect chain that leaves the registry is the SSRF shape, and the hop
+    /// that matters is the one the *registry* chose. This is the property the two
+    /// provenance attestation fetches were missing: both built a bare
+    /// `ureq::AgentBuilder`, which follows up to five redirects to any host, so
+    /// a registry answering `302 Location: http://169.254.169.254/...` reached
+    /// the cloud metadata service. `registry_agent` disables ureq's own
+    /// redirect handling precisely so that each hop comes through
+    /// `validate_download_url` instead.
+    ///
+    /// The listener binds loopback, which is why the base host is exempted by
+    /// `ValidatingResolver`: the fixture has to be reachable to be able to
+    /// prove anything. The redirect *target* is a link-local address, which is
+    /// never exempt, so the chain must stop at hop one.
+    #[test]
+    fn a_redirect_off_the_registry_host_is_refused() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let body = "{\"attestations\":[]}";
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 302 Found\r\n\
+                     Location: http://169.254.169.254/latest/meta-data/\r\n\
+                     Content-Length: 0\r\n\
+                     Connection: close\r\n\r\n"
+                );
+                let _ = stream.flush();
+                let _ = body;
+            }
+        });
+
+        let agent = registry_agent_with_timeout(
+            "blueline-security/test",
+            &base,
+            std::time::Duration::from_secs(5),
+        );
+        let url = format!("{base}/-/npm/v1/attestations/pkg@1.0.0");
+        let err = download_bounded_with_headers(&agent, &base, &url, 1024, 5, &[])
+            .expect_err("a redirect to a link-local address must be refused");
+
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("private/local host") || rendered.contains("169.254.169.254"),
+            "the refusal must name the private target it stopped at: {rendered}"
+        );
+
+        drop(handle);
     }
 }
