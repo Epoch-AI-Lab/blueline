@@ -840,4 +840,153 @@ mod tests {
              private host must not be trusted: {report:?}"
         );
     }
+
+    /// The bare DSSE form, `{"payload": "..."}`, on its own.
+    ///
+    /// `parse_pypi_provenance_json` accepts two shapes: an `attestations` array
+    /// and a bare DSSE envelope. Only the array form had a test, so the second
+    /// shape's "is this attested?" comparison was never exercised — and a
+    /// comparison inverted there does not change the band, only whether the
+    /// report is returned early, so nothing else would notice either.
+    #[test]
+    fn the_bare_dsse_form_is_parsed_and_reported_as_attested() {
+        let expected = ck("tarball");
+        let statement = format!(
+            r#"{{"_type":"https://in-toto.io/Statement/v0.1",
+                 "subject":[{{"name":"pkg:pypi/requests@2.31.0",
+                             "digest":{{"sha512":"{}"}}}}],
+                 "predicateType":"https://slsa.dev/provenance/v0.2",
+                 "predicate":{{"builder":{{"id":"https://github.com/actions/runner"}}}}}}"#,
+            expected.value_hex
+        );
+        let b64 = base64::engine::general_purpose::STANDARD.encode(statement.as_bytes());
+        let body = format!(r#"{{"payload":"{b64}"}}"#);
+
+        let report =
+            parse_pypi_provenance_json(&body, &expected).expect("the bare DSSE form must parse");
+        assert_eq!(
+            report.status,
+            ProvenanceStatus::Attested,
+            "a matching subject digest is attested: {report:?}"
+        );
+        assert_eq!(
+            report.slsa_level, 0,
+            "no signature was checked, so no level"
+        );
+        assert_eq!(
+            report.builder_id.as_deref(),
+            Some("https://github.com/actions/runner")
+        );
+
+        // The same body with a digest that does not match is a mismatch, not an
+        // attestation, and not a clean pass either.
+        let other = ck("a-different-tarball");
+        let mismatched = parse_pypi_provenance_json(&body, &other).expect("must parse");
+        assert_eq!(
+            mismatched.status,
+            ProvenanceStatus::FailedMismatch,
+            "a digest that does not match the bytes under review is a mismatch"
+        );
+    }
+
+    /// An attested PyPI release is written to the provenance cache.
+    ///
+    /// The write is gated on the status being `Attested`, and that gate is the
+    /// only thing between a verified subject digest and a row in the store. With
+    /// it inverted the review still reports `Attested` on the card and caches
+    /// nothing, so the next review re-fetches and a policy reading the cache sees
+    /// no provenance at all.
+    #[test]
+    fn an_attested_pypi_release_is_written_to_the_provenance_cache() {
+        let expected = ck("tarball");
+        // Built with `json!` rather than a raw string: a hand-written statement
+        // with this much nesting is easy to malform, and a malformed one fails as
+        // "unverified", which is a different finding and would make this test
+        // pass for the wrong reason.
+        let statement = serde_json::json!({
+            "_type": "https://in-toto.io/Statement/v0.1",
+            "subject": [{
+                "name": "pkg:pypi/requests@2.31.0",
+                "digest": {"sha512": expected.value_hex}
+            }],
+            "predicateType": "https://slsa.dev/provenance/v0.2",
+            "predicate": {
+                "builder": {"id": "https://github.com/actions/runner"},
+                "invocation": {
+                    "configSource": {
+                        "uri": "git+https://github.com/psf/requests",
+                        "digest": {"sha1": "deadbeef"},
+                        "entryPoint": ".github/workflows/w.yml"
+                    }
+                }
+            }
+        });
+        let b64 = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&statement).unwrap());
+        let body = format!(
+            r#"{{"attestations":[{{"bundle":{{"dsseEnvelope":{{"payload":"{b64}"}}}}}}]}}"#
+        );
+
+        // Control: the body really does attest, so a cache miss below can only
+        // mean the write was skipped.
+        assert_eq!(
+            parse_pypi_provenance_json(&body, &expected)
+                .expect("the fixture body must parse")
+                .status,
+            ProvenanceStatus::Attested,
+            "control: this body attests"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&dir.path().join("blueline.db")).unwrap();
+        let server = provenance_fixture_server(body);
+
+        let report = inspect_provenance_pypi(
+            "requests",
+            "2.31.0",
+            "requests-2.31.0-py3-none-any.whl",
+            &expected,
+            &server,
+            Some(&store),
+            &Policy::default(),
+        );
+        assert_eq!(report.status, ProvenanceStatus::Attested, "{report:?}");
+
+        let cached = store
+            .get_cached_provenance(Ecosystem::PyPi, "requests", "2.31.0")
+            .expect("the cache read must not error")
+            .expect("an attested release must leave a provenance row behind");
+        assert_eq!(
+            cached.source_repo.as_deref(),
+            Some("git+https://github.com/psf/requests"),
+            "the cached row must carry what the statement said"
+        );
+    }
+
+    /// A single-purpose listener that answers every request with `body`.
+    /// Reads the request before replying: closing with unread bytes queued makes
+    /// the kernel send RST, which truncates the response.
+    fn provenance_fixture_server(body: String) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let body = body.into_bytes();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+        base
+    }
 }

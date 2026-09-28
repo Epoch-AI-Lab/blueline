@@ -1658,4 +1658,67 @@ requests==2.31.0 \
         let parsed_trailing = parse_requirements_txt_packages(trailing_cont, false).unwrap();
         assert_eq!(parsed_trailing["pkg"].version, "1.0.0");
     }
+
+    /// An entry whose `name` is the empty string takes its name from the key.
+    ///
+    /// A lockfile is attacker-shaped in the sense that matters here: a registry
+    /// chooses the keys, and one that emitted `"name": ""` would otherwise put a
+    /// nameless entry in the graph. The guard substitutes the key name in that
+    /// case, and nothing tested it — with the guard disabled the entry falls to
+    /// the `Some(n) => n` arm, arrives with an empty name, and is refused a few
+    /// lines later as a nameless package. Loud rather than silently wrong, which
+    /// is part of why it survived: no existing fixture has an empty `name`.
+    ///
+    /// The key is a real `node_modules/...` path, not `""` — that one is the
+    /// root entry and is skipped before this code is reached, so a fixture using
+    /// it would exercise nothing and pass for the wrong reason.
+    #[test]
+    fn an_entry_with_an_empty_name_falls_back_to_its_key() {
+        let content = r#"{
+          "name": "root",
+          "version": "1.0.0",
+          "lockfileVersion": 3,
+          "requires": true,
+          "packages": {
+            "": {
+              "name": "root",
+              "version": "1.0.0"
+            },
+            "node_modules/left-pad": {
+              "name": "",
+              "version": "9.9.9",
+              "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+              "integrity": "sha256-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            }
+          }
+        }"#;
+        let parsed =
+            parse_lockfile_packages(content).expect("an empty name must not fail the parse");
+        // The map is keyed by install path; the *name* is the field under test.
+        let entry = parsed
+            .get("node_modules/left-pad")
+            .unwrap_or_else(|| panic!("the entry must be present, got {:?}", parsed.keys()));
+        assert_eq!(
+            entry.name, "left-pad",
+            "an empty `name` must be replaced by the name in the key"
+        );
+        assert_eq!(entry.version, "9.9.9", "the entry's own version is kept");
+
+        // A populated name still wins over the key. npm's alias shape is the
+        // honest fixture for this: the key is what the importer asked for, the
+        // declared name and the resolved URL are what the registry served, and
+        // they legitimately differ. If the guard were reading the key instead,
+        // this entry would be reviewed under the alias.
+        let aliased = content
+            .replace("\"node_modules/left-pad\"", "\"node_modules/pad-alias\"")
+            .replace("\"name\": \"\",", "\"name\": \"left-pad\",");
+        let parsed = parse_lockfile_packages(&aliased).expect("an aliased entry parses");
+        assert_eq!(
+            parsed
+                .get("node_modules/pad-alias")
+                .map(|e| e.name.as_str()),
+            Some("left-pad"),
+            "a populated name must be used as-is, not replaced by the key's"
+        );
+    }
 }

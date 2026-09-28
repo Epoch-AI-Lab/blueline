@@ -992,4 +992,69 @@ mod tests {
         assert!(reg.resolve("invalid!name", "1.0.0").is_err());
         assert!(reg.resolve("demo", "invalid-ver!").is_err());
     }
+
+    /// The page-URL check itself, on the URLs that separate its three decisions.
+    ///
+    /// Testing it through `list_releases` cannot work, and that is why both of
+    /// its mutants survived. A `next` link to a second *local* listener is
+    /// refused by the SSRF resolver before `validate_page_url` is ever reached,
+    /// so "validated" and "tried and refused" look identical; and a link to a
+    /// genuinely public host cannot be served from a test. The check is
+    /// therefore called directly, where each of its three outcomes is distinct:
+    ///
+    /// * the same authority under a *different scheme* — this is the only input
+    ///   that separates the `||` from the `&&`, because the scheme differs while
+    ///   the host does not, so the `&&` form sees one true operand and allows
+    ///   it;
+    /// * the base itself, which must be allowed, or the function is not a check.
+    #[test]
+    fn the_page_url_check_allows_only_the_base_authority_and_scheme() {
+        let server = MockPyPIServer::spawn(|_path, _base| ("text/plain".into(), b"x".to_vec()));
+        let reg = PyPIRegistry::new(&server.base);
+        let (scheme, authority) = server
+            .base
+            .split_once("://")
+            .expect("the fixture base is an http URL");
+
+        // The base, and a path under it: allowed.
+        assert!(
+            reg.validate_page_url(&format!("{}/simple/paged/", server.base))
+                .is_ok()
+        );
+        assert!(
+            reg.validate_page_url(&format!("{scheme}://{authority}/simple/a/page=2"))
+                .is_ok(),
+            "the base authority under the base scheme must be allowed"
+        );
+
+        // Same authority, different scheme: refused, and refused *because* of
+        // the scheme check rather than the host check.
+        let https_same_authority = format!("https://{authority}/simple/paged/?page=2");
+        let err = reg
+            .validate_page_url(&https_same_authority)
+            .expect_err("a scheme change alone must be refused");
+        assert!(
+            format!("{err:#}").contains("leaves registry base"),
+            "the refusal must name the boundary: {err:#}"
+        );
+
+        // A different *port* on the same host is deliberately not this check's
+        // business: `authority_of` compares hostnames, so it is allowed here and
+        // refused later by the SSRF resolver, which exempts only the exact base
+        // authority including its port. Pinned so that exemption is not later
+        // mistaken for an oversight and "fixed" in the wrong layer.
+        assert!(
+            reg.validate_page_url("http://127.0.0.1:1/simple/paged/?page=2")
+                .is_ok(),
+            "a port change is the resolver's check, not this one's"
+        );
+
+        // And a wholly different host, for the shape the existing pagination
+        // test uses.
+        assert!(
+            reg.validate_page_url("https://pypi.org/simple/paged/?page=2")
+                .is_err(),
+            "another registry must be refused"
+        );
+    }
 }

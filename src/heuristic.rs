@@ -4257,4 +4257,73 @@ allowed_builders = [
         assert_eq!(finding.severity, VerdictBand::Medium);
         assert!(!finding.description.contains("allow_git_dependencies"));
     }
+
+    /// The required-provenance finding must say *which* shortfall it found.
+    ///
+    /// Both statuses raise the same rule at the same band, so the only thing
+    /// distinguishing "a build statement was published and its digest matched,
+    /// but nothing verified who published it" from "none was present" is the
+    /// `why` clause. A test asserting the band passes either way, which is why
+    /// inverting the comparison survived: the finding is still Block, still
+    /// P03, and only the sentence a human reads is wrong.
+    ///
+    /// The two are opposite sentences about the world — one asserts an
+    /// attestation exists, the other asserts none does — so a swapped `why` is a
+    /// false statement about the artifact under review, not a cosmetic slip.
+    #[test]
+    fn the_required_provenance_finding_distinguishes_attested_from_absent() {
+        let policy_with_requirement = || {
+            let mut p = Policy::default();
+            p.policy.require_provenance = true;
+            p
+        };
+        let policy = policy_with_requirement();
+
+        let find = |status: ProvenanceStatus| {
+            provenance_findings(
+                &ProvenanceReport {
+                    status,
+                    slsa_level: 0,
+                    builder_id: Some("https://github.com/actions/runner".into()),
+                    source_repo: None,
+                    commit_sha: None,
+                    workflow_path: None,
+                    registry_signature_present: false,
+                    registry_signature_key_id: None,
+                    message: None,
+                },
+                &policy,
+            )
+            .into_iter()
+            .find(|f| f.rule_id == "P03_PROVENANCE_REQUIRED_MISSING")
+            .unwrap_or_else(|| panic!("{status:?} must raise the required-provenance rule"))
+        };
+
+        let attested = find(ProvenanceStatus::Attested);
+        let missing = find(ProvenanceStatus::Missing);
+
+        assert!(
+            attested.description.contains("digest matched"),
+            "an attested release must be described as attested: {}",
+            attested.description
+        );
+        assert!(
+            !attested.description.contains("none was present"),
+            "an attested release must not be described as absent: {}",
+            attested.description
+        );
+        assert!(
+            missing.description.contains("none was present"),
+            "an absent release must be described as absent: {}",
+            missing.description
+        );
+        assert!(
+            !missing.description.contains("digest matched"),
+            "an absent release must not claim a digest matched: {}",
+            missing.description
+        );
+        // Same rule, same band: only the sentence differs.
+        assert_eq!(attested.rule_id, missing.rule_id);
+        assert_eq!(attested.severity, missing.severity);
+    }
 }

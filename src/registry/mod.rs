@@ -524,4 +524,27 @@ mod tests {
         assert!(boolean_form.yanked);
         assert_eq!(reasons.get("3.0.0"), None);
     }
+
+    /// The trait's default `release_signatures` is absence, not an empty block.
+    ///
+    /// npm overrides this; every other adapter inherits it, and the default is
+    /// what a policy requiring registry signatures meets on those ecosystems.
+    /// Returning "a signature block that happens to be empty" instead of "there
+    /// is no signature block" would let a registry that publishes none look like
+    /// one that published an unverifiable one, and the default exists precisely
+    /// so that a registry which cannot answer refuses rather than guesses.
+    ///
+    /// `NoReasonRegistry` is used because it implements the trait without
+    /// overriding this method, so the assertion is on the default and not on
+    /// some adapter's behaviour.
+    #[test]
+    fn the_default_release_signatures_reports_absence() {
+        let reg = NoReasonRegistry;
+        let pkg = reg.resolve("anything", "1.0.0").expect("resolve");
+        assert_eq!(
+            reg.release_signatures(&pkg),
+            None,
+            "a registry that publishes no signature block must report absence"
+        );
+    }
 }

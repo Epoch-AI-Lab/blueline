@@ -137,10 +137,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (6), CVSS v2 parsing and declared-severity banding (4), `rule_title` (3).
   Every "confirmed it kills its mutant" claim made while these shards were
   timing out was checked by hand against one mutation at a time; the automated
-  sweep is wider and is finding gaps the hand checks did not reach. None of the
-  54 is a known behavioural defect — a surviving mutant means no test
-  distinguishes the mutation, which is a coverage gap rather than proof the code
-  is wrong. They remain open, listed per shard in the run's logs.
+  sweep is wider and found gaps the hand checks did not reach. **All 54 are now
+  closed**, each with a test that fails without it, plus one equivalent mutant
+  deleted rather than pinned. None of the 54 was a known behavioural defect: a
+  surviving mutant means no test distinguishes the mutation, which is a coverage
+  gap rather than proof the code is wrong. What the sweep did surface is a
+  pattern worth recording, because it recurred in every cluster:
+
+  * **A test that derives both sides of a comparison from the same call.** The
+    recall staleness boundary test took its expected cap from
+    `recall_max_age_secs(&policy)`, so a conversion returning 0 moved the cap and
+    the ages together and the test still passed.
+  * **An inequality where an equality is needed.** Every memo test compared an
+    estimate with `>` against a ceiling, so `64 * 1024` and `64 + 1024` were both
+    "large" and a ceiling that no longer meant 64 MiB passed. A ceiling that is
+    wrong in the permissive direction is the dangerous one: it reads as a bound
+    and is not.
+  * **A property asserted only through its verdict.** `push_bounded` exists to
+    bound resident bytes; the framing tests asserted the refusal, which is
+    identical whether the cap held or the peer stream was swallowed whole.
+  * **A boundary a test cannot reach.** A file's mtime cannot be set to the exact
+    instant a comparison tests against, and neither can a private-host check be
+    reached past the SSRF resolver. Both are now computed by functions that take
+    the age, the scheme or the size as a parameter — the shape
+    `stale_band_for` and `reap_if_aged` already used on the recall side.
+  * **A test that only ever reached one of two copies of the code.** The
+    executable/binary classification exists twice in `compute_delta`, and the
+    existing test passed `baseline_root: None`, so the merge arm was untested.
 
   A trap worth recording, because it cost this investigation its first two
   measurements: the repository sets `diff.mnemonicprefix`, so a bare `git diff`
