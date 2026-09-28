@@ -989,4 +989,16 @@ mod tests {
         });
         base
     }
+
+    /// The attestation body cap, asserted as a value.
+    ///
+    /// Every provenance fixture is a few hundred bytes, so the cap was only ever
+    /// exercised as "much larger than the fixture" — which a wrong constant
+    /// satisfies just as well. The fetch already has a byte cap of its own; this
+    /// one has to be a number someone chose, and 1 MiB is the choice.
+    #[test]
+    fn the_attestation_body_cap_is_one_mebibyte() {
+        assert_eq!(MAX_ATTESTATION_BYTES, 1024 * 1024);
+        assert_eq!(MAX_ATTESTATION_BYTES, 1_048_576);
+    }
 }

@@ -1463,4 +1463,102 @@ mod tests {
         );
         assert_eq!(bytes, 0, "a refused document must not be accounted for");
     }
+
+    /// The whole-memo ceiling, on its exact boundary.
+    ///
+    /// `the_per_document_ceiling_is_strict` passes `u64::MAX` as the total, so
+    /// the running sum and its comparison were never exercised: a `>` that could
+    /// not be reached, and an arithmetic operator on a value too large to
+    /// overflow.
+    ///
+    /// Two boundaries, because the two mutants are separable in different ways:
+    ///
+    /// * a total of exactly `bytes + size` must **not** restart. A `>` relaxed to
+    ///   `>=` discards a memo that is exactly full, which turns a full cache
+    ///   into a permanently empty one as the walk proceeds.
+    /// * at that same total the sum is 2 × `size`, and a sum replaced by a
+    ///   product is astronomically larger, so the product form restarts where the
+    ///   sum does not. `size` is at least 1025 for any real packument, which is
+    ///   what makes `2 * size` and `size * size` land on opposite sides.
+    #[test]
+    fn the_whole_memo_ceiling_is_strict_and_adds_rather_than_multiplies() {
+        let doc = Packument {
+            name: "memo".into(),
+            dist_tags: BTreeMap::new(),
+            versions: BTreeMap::from([(
+                "1.0.0".to_string(),
+                VersionMeta {
+                    name: "memo".into(),
+                    version: "1.0.0".into(),
+                    dist: Dist {
+                        tarball: "https://example.invalid/p.tgz".into(),
+                        integrity: None,
+                        signatures: None,
+                    },
+                },
+            )]),
+        };
+        let size = packument_size_estimate(&doc);
+
+        // Fill the memo to exactly `size`, then offer one more document with a
+        // total of exactly `size + size`.
+        let mut by_name = std::collections::HashMap::new();
+        let mut bytes = 0u64;
+        PackumentMemo::insert_within(
+            &mut by_name,
+            &mut bytes,
+            "first".into(),
+            &doc,
+            u64::MAX,
+            u64::MAX,
+        );
+        assert_eq!(bytes, size);
+        assert_eq!(by_name.len(), 1);
+
+        PackumentMemo::insert_within(
+            &mut by_name,
+            &mut bytes,
+            "second".into(),
+            &doc,
+            u64::MAX,
+            size * 2,
+        );
+        assert!(
+            by_name.contains_key("first") && by_name.contains_key("second"),
+            "a memo exactly at the total must be kept, not restarted: {:?}",
+            by_name.keys()
+        );
+        assert_eq!(bytes, size * 2);
+
+        // One byte below the total, the next document does not fit, and the
+        // memo restarts rather than growing.
+        let mut by_name = std::collections::HashMap::new();
+        let mut bytes = 0u64;
+        PackumentMemo::insert_within(
+            &mut by_name,
+            &mut bytes,
+            "first".into(),
+            &doc,
+            u64::MAX,
+            u64::MAX,
+        );
+        PackumentMemo::insert_within(
+            &mut by_name,
+            &mut bytes,
+            "second".into(),
+            &doc,
+            u64::MAX,
+            size * 2 - 1,
+        );
+        assert_eq!(
+            by_name.len(),
+            1,
+            "an over-total document restarts the memo rather than growing it"
+        );
+        assert!(
+            by_name.contains_key("second"),
+            "the document that triggered the restart is still kept"
+        );
+        assert_eq!(bytes, size, "the accounting restarts from the new document");
+    }
 }

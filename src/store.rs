@@ -298,6 +298,29 @@ pub struct BaselineStore {
     conn: rusqlite::Connection,
 }
 
+/// How many times the journal-mode change is retried before giving up.
+const WAL_RETRY_ATTEMPTS: u32 = 40;
+
+/// Whether the journal-mode retry loop should stop on this error.
+///
+/// Split out so the decision can be tested without provoking a real
+/// `SQLITE_BUSY`: the loop is bounded and sleeps 50ms between tries, so the only
+/// way to observe a wrong bound through `open_at` is to measure how long a
+/// failure takes, which is exactly the kind of assertion that stops being one
+/// on a loaded machine.
+///
+/// Two shapes are retryable and the rest are not. The `||` matters because
+/// SQLite words the same condition two ways depending on which object is locked,
+/// so a store contended on a *table* and not on the database would otherwise
+/// give up immediately — turning a creation race that resolves in milliseconds
+/// into a refused review. The attempt bound matters because a message that is
+/// retryable on attempt 0 is still retryable on attempt 39, and a loop that
+/// stopped early would convert contention into a hard failure.
+fn should_give_up_enabling_wal(msg: &str, attempt: u32) -> bool {
+    let retryable = msg.contains("database is locked") || msg.contains("database table is locked");
+    !retryable || attempt + 1 >= WAL_RETRY_ATTEMPTS
+}
+
 impl BaselineStore {
     pub fn open() -> Result<Self, BluelineError> {
         Self::open_at(&default_db_path()?)
@@ -388,17 +411,14 @@ impl BaselineStore {
         // retrying is safe, and the alternative is refusing a review over a
         // journal setting another process is in the middle of applying.
         let mut wal_error = None;
-        for attempt in 0..40 {
+        for attempt in 0..WAL_RETRY_ATTEMPTS {
             match conn.pragma_update(None, "journal_mode", "WAL") {
                 Ok(_) => {
                     wal_error = None;
                     break;
                 }
                 Err(e) => {
-                    let msg = e.to_string();
-                    let retryable = msg.contains("database is locked")
-                        || msg.contains("database table is locked");
-                    if !retryable || attempt == 39 {
+                    if should_give_up_enabling_wal(&e.to_string(), attempt) {
                         wal_error = Some(e);
                         break;
                     }
@@ -1750,5 +1770,130 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The journal-mode retry decision, on every shape that matters.
+    ///
+    /// The loop this governs sleeps 50ms between attempts and runs up to 40
+    /// times, so the only way to observe a wrong decision through `open_at` is
+    /// to time a failure — which stops being a test on a loaded machine. The two
+    /// conditions are therefore pinned directly:
+    ///
+    /// * SQLite words the same contention two ways, and both are retryable. A
+    ///   store locked on a *table* must not give up immediately; that is the
+    ///   creation race the whole retry exists for, and giving up turns one that
+    ///   resolves in milliseconds into a refused review.
+    /// * A retryable message stays retryable on the last attempt, so the bound
+    ///   stops the loop rather than the classification stopping it early.
+    #[test]
+    fn the_journal_mode_retry_decision_is_per_shape() {
+        for locked in ["database is locked", "database table is locked: some_table"] {
+            assert!(
+                !should_give_up_enabling_wal(locked, 0),
+                "`{locked}` is contention and must be retried, not given up on"
+            );
+            // Retried right up to the last try in the budget: the bound stops
+            // the loop, it does not reclassify the error as permanent early.
+            assert!(
+                !should_give_up_enabling_wal(locked, WAL_RETRY_ATTEMPTS - 2),
+                "`{locked}` is still contention two tries before the end"
+            );
+            // And the last try reports rather than sleeping on into a loop that
+            // has nowhere left to go.
+            assert!(
+                should_give_up_enabling_wal(locked, WAL_RETRY_ATTEMPTS - 1),
+                "the final attempt must give up and report"
+            );
+        }
+
+        for fatal in [
+            "no such table: main.migrations",
+            "attempt to write a readonly database",
+            "disk I/O error",
+            "malformed database schema",
+            "",
+        ] {
+            assert!(
+                should_give_up_enabling_wal(fatal, 0),
+                "`{fatal}` is permanent and must be reported at once"
+            );
+            assert!(
+                should_give_up_enabling_wal(fatal, WAL_RETRY_ATTEMPTS - 1),
+                "`{fatal}` is permanent at every attempt"
+            );
+        }
+
+        assert_eq!(WAL_RETRY_ATTEMPTS, 40, "the attempt budget is pinned");
+    }
+
+    /// A trust-bearing column that is wrong in exactly one way.
+    ///
+    /// `verify_schema` checks three things about `known_clean.clean` — the type,
+    /// `NOT NULL`, and that the default is `0` — and combines them with `||`,
+    /// because any one of them is independently disqualifying. The existing
+    /// fixture breaks all three at once by declaring a table with the wrong
+    /// columns entirely, which cannot tell an `||` from an `&&`: a store wrong
+    /// in one respect only has to be refused too.
+    ///
+    /// This is the case that matters. `record_verified` never supplies `clean`,
+    /// so a `DEFAULT 1` there writes a package nobody approved straight into the
+    /// set `list_clean_versions` treats as approved baselines — and the store
+    /// still opens, still migrates, still answers every query, with nothing to
+    /// distinguish it from a clean one except this comparison.
+    #[test]
+    fn a_trust_bearing_column_wrong_in_one_respect_alone_is_still_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("defaulted.db");
+        {
+            let _store = BaselineStore::open_at(&db_path).expect("a fresh store opens");
+        }
+        // Rebuild `known_clean` with the right columns, the right types, and
+        // `NOT NULL` intact -- and only the default changed.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let ddl: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='known_clean'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                ddl.contains("clean       INTEGER NOT NULL DEFAULT 0"),
+                "the fixture's starting shape changed: {ddl}"
+            );
+            conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+            conn.execute_batch("ALTER TABLE known_clean RENAME TO known_clean_orig")
+                .unwrap();
+            let poisoned = ddl.replacen("DEFAULT 0", "DEFAULT 1", 1);
+            assert_ne!(poisoned, ddl, "the default must have been replaced");
+            conn.execute_batch(&poisoned).unwrap();
+            conn.execute_batch("DROP TABLE known_clean_orig").unwrap();
+        }
+
+        let err = BaselineStore::open_at(&db_path)
+            .map(|_| ())
+            .expect_err("a trust-bearing column with the wrong default must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("known_clean.clean") && msg.contains("default"),
+            "the refusal must name the column and the reason: {msg}"
+        );
+
+        // The one-respect-only claim, made explicit: the other two properties
+        // really are intact in that fixture, so the refusal cannot be attributed
+        // to a missing column or a wrong type.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let (ty, notnull, default): (String, i64, String) = conn
+            .query_row(
+                "SELECT type, \"notnull\", dflt_value FROM pragma_table_info('known_clean') \
+                 WHERE name = 'clean'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(ty, "INTEGER", "the type is intact");
+        assert_eq!(notnull, 1, "NOT NULL is intact");
+        assert_eq!(default, "1", "only the default was changed");
     }
 }

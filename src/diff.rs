@@ -740,6 +740,18 @@ mod tests {
         // of the check, so an added file only reaches one of them by name.
         fs::write(new_dir.path().join("zzz-opaque"), &big).unwrap();
 
+        // Added, executable, and named so it sorts after every baseline entry,
+        // for the executable check in the same `(None, Some(_))` arm.
+        fs::write(new_dir.path().join("zzz-exec"), "hi\n").unwrap();
+        set_mode(new_dir.path(), "zzz-exec", 0o755);
+
+        // Added and genuinely *binary* -- a NUL byte, which is what makes
+        // `classify_bytes` call it Binary rather than OpaqueTooLarge. The
+        // opaque file above covers the other arm of the `||`; only a real
+        // binary tells a `==` from a `!=` here, because an opaque file satisfies
+        // "kind is not Binary" as readily as "kind is Binary".
+        fs::write(new_dir.path().join("zzz-binary"), [1u8, 0, 2, 3]).unwrap();
+
         // Removed.
         fs::write(old_dir.path().join("gone"), "bye\n").unwrap();
 
@@ -755,7 +767,7 @@ mod tests {
         )
         .unwrap();
 
-        for want in ["gains-exec", "added-exec-mode", "hook.sh"] {
+        for want in ["gains-exec", "added-exec-mode", "hook.sh", "zzz-exec"] {
             assert!(
                 delta.new_executables.iter().any(|p| p == want),
                 "`{want}` must be reported as a new executable, got {:?}",
@@ -778,10 +790,10 @@ mod tests {
             "a file that becomes opaque is a new binary, got {:?}",
             delta.new_binaries
         );
-        for want in ["added-opaque", "zzz-opaque"] {
+        for want in ["added-opaque", "zzz-opaque", "zzz-binary"] {
             assert!(
                 delta.new_binaries.iter().any(|p| p == want),
-                "an added opaque file is a new binary: `{want}`, got {:?}",
+                "an added non-text file is a new binary: `{want}`, got {:?}",
                 delta.new_binaries
             );
         }

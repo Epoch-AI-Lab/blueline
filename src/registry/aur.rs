@@ -817,12 +817,24 @@ impl AurRegistry {
             MAX_GIT_SMALL_OUTPUT_BYTES,
         )
         .ok()?;
-        let email = text.trim();
-        if email.is_empty() || email.chars().any(char::is_control) {
-            None
-        } else {
-            Some(email.to_string())
-        }
+        usable_author_email(&text)
+    }
+}
+
+/// The email an author field yields, or `None` when it is not usable.
+///
+/// The commit author and the RPC-declared maintainer are different strings from
+/// different sources — `git log --format=%ae` and a JSON field the AUR serves —
+/// and either can be empty or carry a control character, so the check lives
+/// here rather than being written twice. A maintainer string is written into an
+/// audit row, so a control character in it is a report-injection vector rather
+/// than a cosmetic problem.
+fn usable_author_email(text: &str) -> Option<String> {
+    let email = text.trim();
+    if email.is_empty() || email.chars().any(char::is_control) {
+        None
+    } else {
+        Some(email.to_string())
     }
 }
 
@@ -881,12 +893,7 @@ impl Registry for AurRegistry {
             return Some(email);
         }
         let declared = self.rpc.info(&pkg.name).ok()?.maintainer?;
-        let trimmed = declared.trim();
-        if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
+        usable_author_email(&declared)
     }
 }
 
@@ -1885,5 +1892,50 @@ mod tests {
         let url = format!("git+{base}/nosuchpkg.git#{hash}");
         let err = reg.fetch_verified(&pkg(url)).unwrap_err().to_string();
         assert!(err.contains("git clone failed"), "unexpected error: {err}");
+    }
+
+    /// An author email must be present *and* free of control characters.
+    ///
+    /// Both conditions are needed and they are checked with `||`, which means
+    /// the two failure shapes are independent: an empty string, and a non-empty
+    /// string carrying a control character. The empty case is the one a test has
+    /// to include, because it is the only input where the two operands disagree
+    /// — a well-formed email satisfies neither, so asserting the happy path
+    /// leaves an `&&` in place of the `||` completely undetected.
+    ///
+    /// A control character matters because this string is written into an audit
+    /// row. The AUR's RPC `Maintainer` field is registry-asserted, so whatever
+    /// the AUR serves reaches the log.
+    #[test]
+    fn an_author_email_must_be_present_and_free_of_control_characters() {
+        // The ordinary case, with the surrounding whitespace git and the RPC
+        // both add.
+        assert_eq!(
+            usable_author_email(" maintainer@example.org \n").as_deref(),
+            Some("maintainer@example.org")
+        );
+
+        // Present but empty: the discriminating case.
+        assert_eq!(usable_author_email(""), None, "an empty author is unknown");
+        assert_eq!(
+            usable_author_email("   \n\t  "),
+            None,
+            "whitespace is empty"
+        );
+
+        // Non-empty but carrying a control character: a report-injection vector
+        // in a value that lands in the audit log.
+        for bad in [
+            "bad\u{0}name@example.org",
+            "bad\nname@example.org",
+            "bad\tname@example.org",
+            "na\rme@example.org",
+        ] {
+            assert_eq!(
+                usable_author_email(bad),
+                None,
+                "a control character must disqualify `{bad:?}`"
+            );
+        }
     }
 }

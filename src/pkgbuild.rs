@@ -3405,4 +3405,52 @@ mod tests {
         assert_eq!(rule_title("R99_NOT_A_RULE"), "PKGBUILD finding");
         assert_eq!(rule_title(""), "PKGBUILD finding");
     }
+
+    /// `${...}` is one unit, and a `#` inside one is not a comment.
+    ///
+    /// `strip_comment` had no test at all, so the whole parameter-depth tracker
+    /// was unpinned. The function returns a *slice* of the original line, so a
+    /// state difference only shows up when it changes whether some `#` is
+    /// recognised as a comment — which is what each case below isolates:
+    ///
+    /// * `x=${a}# c` — the closing brace of a parameter must leave the next `#`
+    ///   eligible to be a comment. A depth that never rose, never fell, or fell
+    ///   on the wrong character all swallow the `#` instead, so this one case
+    ///   separates three of the mutants.
+    /// * `x=${a}${b} }# c` — after two parameters the depth is back to zero, so
+    ///   the standalone `}` is *not* a parameter close and must not arm the `#`
+    ///   that follows it. A depth that increments instead of decrementing, or
+    ///   divides by one, is still positive here and arms it.
+    /// * `pkg() {#c` — a `{` preceded by ordinary text is not a parameter
+    ///   opener. Reading "next character is `{`" as sufficient consumes the
+    ///   brace and leaves the comment marker unrecognised.
+    #[test]
+    fn a_hash_inside_a_parameter_expansion_is_not_a_comment() {
+        assert_eq!(
+            strip_comment("x=${a}# c"),
+            "x=${a}",
+            "the `#` after a closed parameter is a comment"
+        );
+        assert_eq!(
+            strip_comment("x=${a}${b} }# c"),
+            "x=${a}${b} }# c",
+            "a standalone brace does not arm a comment, because no parameter is open"
+        );
+        assert_eq!(
+            strip_comment("pkg() {#c"),
+            "pkg() {",
+            "a brace in ordinary position is not a parameter opener"
+        );
+
+        // The cases the tracker exists for, so a rewrite cannot pass by
+        // stripping every `#`.
+        assert_eq!(strip_comment("echo hi # c"), "echo hi");
+        assert_eq!(strip_comment("x=${a}${b}# c"), "x=${a}${b}");
+        assert_eq!(
+            strip_comment("echo ${#var} and a # comment"),
+            "echo ${#var} and a",
+            "the length operator inside a parameter expansion is not a comment"
+        );
+        assert_eq!(strip_comment("no comment here"), "no comment here");
+    }
 }
