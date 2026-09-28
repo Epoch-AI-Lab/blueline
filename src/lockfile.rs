@@ -326,7 +326,23 @@ fn is_hash_option(token: &str) -> bool {
 /// requirement shape that a splitting heuristic lost -- a pinned spec, an
 /// unpinned range, then a bare name, an extras form and a direct URL. So the
 /// line is only treated as option-only when every token is unmistakably part of
-/// an option: a flag, a URL, a path, or a filename.
+/// an option: a flag, a URL, a path, or the working directory.
+///
+/// A filename used to be on that list, on the reasoning that `base.txt` is what
+/// `-r` consumes. It cannot come off by narrowing the rule, because a PyPI
+/// project name may legally contain dots and end in a letter: `payload.txt` and
+/// `payload.in` are valid names, and `payload.txt==1.0.0` is a valid pin. So the
+/// shape does not distinguish the two cases, it only decides which one gets
+/// silently dropped. `requests==2.31.0 --pre payload.txt` parsed as a truncated
+/// line, the pin survived and `payload.txt` vanished -- and a package that pip
+/// still installs then lands in the *removed* set, which CI never evaluates and
+/// reports as if it had been uninstalled.
+///
+/// Whether `-r` consumes the next token is pip's business and this parser
+/// deliberately does not model it, so the ambiguous class is refused. That does
+/// mean the opt-in no longer tolerates `-r other.txt` or `-c constraints.txt`,
+/// which is the correct direction: both name a second file whose contents this
+/// parser never sees.
 ///
 /// Erring towards "requirement" is the fail-closed direction: it refuses a line
 /// rather than dropping a package from the reviewed graph.
@@ -335,10 +351,9 @@ fn is_option_or_value(token: &str) -> bool {
         || token.contains("://")
         || token.contains('/')
         || token.contains('\\')
-        || token.ends_with(".txt")
-        || token.ends_with(".in")
         // `-e .` is an editable install of the working directory, which is a
-        // value rather than a requirement.
+        // value rather than a requirement. `.` and `..` are not valid project
+        // names, so unlike `payload.txt` they are unambiguously a path.
         || token == "."
         || token == ".."
 }
@@ -1331,6 +1346,59 @@ urllib3==2.1.0 # trailing comment
         }
     }
 
+    /// A requirement whose *name* looks like a filename. `payload.txt` is a legal
+    /// PyPI project name -- dots are permitted and a name may end in a letter --
+    /// and the parser used to classify any token ending in `.txt` or `.in` as an
+    /// option value, on the reasoning that `base.txt` is what `-r` consumes.
+    ///
+    /// The two cases are the same string, so that classification did not
+    /// distinguish them; it only picked which one got dropped. Measured against
+    /// the real parser and the real delta computation, a base of
+    /// `payload.txt==1.0.0` and `requests==2.28.0` with a head of
+    /// `requests==2.31.0 --pre payload.txt` produced `Ok(requests==2.31.0)`: the
+    /// pin survived, `payload.txt` vanished, and the delta then reported
+    /// `removed: [payload.txt@1.0.0]`. CI evaluates only `added` and `upgraded`,
+    /// so a package pip still installs was never reviewed, and the report listed
+    /// it under "Removed" as though it had been uninstalled.
+    ///
+    /// The refusal is the whole point: a package that is still installed cannot
+    /// be reported as removed, and the line cannot be split without knowing
+    /// whether the option consumes the next token, which is pip's business.
+    #[test]
+    fn a_requirement_named_like_a_filename_is_not_an_option_value() {
+        for name in ["payload.txt", "payload.in", "zope.interface"] {
+            // The name is a legal requirement and the parser must accept it as
+            // one when it stands alone -- otherwise this test would pass for the
+            // wrong reason, on a parser that refuses every dotted name.
+            let alone = format!("{name}==1.0.0\n");
+            let parsed = parse_requirements_txt_packages(&alone, false)
+                .unwrap_or_else(|e| panic!("`{name}==1.0.0` is a valid pin: {e}"));
+            assert_eq!(parsed.len(), 1, "`{name}` must parse as one requirement");
+
+            // Mixed with an option on one line, it must be refused rather than
+            // silently truncated.
+            let mixed = format!("requests==2.31.0 --pre {name}\n");
+            let err = parse_requirements_txt_packages(&mixed, true)
+                .expect_err("a requirement riding along with an option must be refused")
+                .to_string();
+            assert!(
+                err.contains("mixed with a requirement"),
+                "`{name}` is a requirement, not an option value: {err}"
+            );
+
+            // And the consequence that made this worth fixing: the dropped name
+            // must not be reportable as removed while pip still installs it.
+            let base = format!("{name}==1.0.0\nrequests==2.28.0\n");
+            let head = format!("requests==2.31.0 --pre {name}\n");
+            let base_map = parse_requirements_txt_packages(&base, false).unwrap();
+            assert!(
+                parse_requirements_txt_packages(&head, true).is_err(),
+                "the head must be refused, so no delta can be computed from it"
+            );
+            assert_eq!(base_map.len(), 2, "the base holds both packages");
+        }
+    }
+
     /// An option *before* the pin on the same line. Truncating at the option
     /// leaves nothing, and skipping the line loses the pin -- so
     /// `--index-url https://evil requests==2.31.0` against a base of
@@ -1434,14 +1502,14 @@ urllib3==2.1.0 # trailing comment
         // Skipping them meant the gate certified pins that were never the ones
         // installed, so they are refused instead. This assertion used to pin
         // the permissive behaviour.
+        //
+        // Only options whose value is unambiguously a URL, a path or a bare flag
+        // survive the opt-in. An option whose value could equally be a project
+        // name is in the second list below, not this one.
         for opt in [
             "-i https://pypi.org/simple",
             "--index-url https://example.com/pypi",
             "--extra-index-url https://example.com/pypi",
-            "-r base.txt",
-            "--requirement other.txt",
-            "-c constraints.txt",
-            "--constraint constraints.txt",
             "-f /path/to/wheels",
             "--find-links /path/to/wheels",
             "-e .",
@@ -1469,14 +1537,33 @@ urllib3==2.1.0 # trailing comment
         // The option is deprecated in pip, and pinning a host is better done
         // with `PIP_INDEX_URL` in the environment, which blueline does not
         // read either way.
-        let host_file = "--trusted-host example.com\nrequests==2.31.0\n";
-        let err = parse_requirements_txt_packages(host_file, true)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("mixed with a requirement"),
-            "a bare hostname value must not be guessed at: {err}"
-        );
+        //
+        // `-r`/`-c`/`--requirement`/`--constraint` belong here for the same
+        // reason, and this is the change: their value is a *filename*, which was
+        // previously on the "unmistakably an option" list. A project name may
+        // contain dots and end in a letter, so `base.txt` is indistinguishable
+        // from a package called `base.txt` -- and choosing wrong drops a package
+        // pip still installs into the *removed* set, which CI reports as an
+        // uninstall and never evaluates. All four also name a second file whose
+        // contents this parser never reads, so the opt-in cannot honestly claim
+        // to have reviewed the graph.
+        for opt in [
+            "--trusted-host example.com",
+            "-r base.txt",
+            "--requirement other.txt",
+            "-c constraints.txt",
+            "--constraint constraints.txt",
+        ] {
+            let file = format!("{opt}\nrequests==2.31.0\n");
+            let err = parse_requirements_txt_packages(&file, true)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("mixed with a requirement"),
+                "a value shape-identical to a project name must not be guessed \
+                 at: `{opt}`: {err}"
+            );
+        }
 
         let content = r#"
 # Empty lines and comments with whitespace

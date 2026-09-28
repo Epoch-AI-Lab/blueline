@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A requirement whose *name* looks like a filename is no longer silently dropped
+  from the reviewed graph. The parser classified any token ending in `.txt` or
+  `.in` as an option value, on the reasoning that `base.txt` is what `-r`
+  consumes — but a PyPI project name may contain dots and end in a letter, so
+  `payload.txt` and `payload.in` are valid names and `payload.txt==1.0.0` is a
+  valid pin. The two cases are the same string, so the classification did not
+  distinguish them; it only decided which one got dropped.
+  `requests==2.31.0 --pre payload.txt` parsed as a truncated line: the pin
+  survived and `payload.txt` vanished. A base of `payload.txt==1.0.0` plus
+  `requests==2.28.0` therefore produced a delta reporting
+  `removed: [payload.txt@1.0.0]` — and CI evaluates only `added` and `upgraded`,
+  so a package pip still installs was never reviewed, while the report listed it
+  under "Removed" as though it had been uninstalled. That is the exact hole the
+  previous three entries describe this rule as closing, and it was still open.
+
+  The fix refuses the ambiguous class rather than guessing, because whether `-r`
+  consumes the next token is pip's business and this parser deliberately does not
+  model it. Behaviour change worth stating plainly: under
+  `[ci] allow_requirements_options = true`, `-r other.txt`, `--requirement
+  other.txt`, `-c constraints.txt` and `--constraint constraints.txt` are now
+  refused instead of tolerated. All four name a second file whose contents the
+  parser never reads, so the opt-in cannot honestly claim to have reviewed the
+  graph. Options whose value is unambiguously a URL, a path or a bare flag
+  (`-i`, `--index-url`, `--extra-index-url`, `-f`, `--find-links`, `-e .`,
+  `--pre`) are unaffected, as is a legal dotted requirement on its own line.
+
 - The mutation gate could not pass, and its failures did not mean what they
   said. Three separate numbers were wrong, and each one cost the check its
   meaning rather than its speed.
