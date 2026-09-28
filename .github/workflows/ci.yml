@@ -268,18 +268,46 @@ jobs:
   # catch a regression like the poisoned-baseline bug, so audits don't have to.
   # Warnings must NOT be denied here — a mutation IS the divergence, and
   # `-D warnings` would mask the signal (surviving mutants would look caught).
-  # Sharded across 16 parallel runners: a PR diff can generate hundreds of
-  # mutants and 16 shards keep each runner around ~3-4 min with --baseline=skip.
+  #
+  # These three numbers were all wrong, and each one cost the gate its meaning
+  # rather than its speed. Measured, not guessed:
+  #
+  #   * The scope was a hand-maintained --file list of 30 modules. It omitted
+  #     src/cli.rs, src/lib.rs, src/main.rs and src/error.rs, and cargo-mutants
+  #     exits 0 with "No mutants to filter" when a diff touches only an omitted
+  #     file — so the aggregate reported success having mutated nothing. A glob
+  #     cannot drift when a module is added.
+  #   * --timeout 30 sat BELOW the cost of the suite that has to run. The warm
+  #     full suite is 64s (`cargo test --all-targets --locked`), so any mutant
+  #     whose killer is not in the first 30 seconds was recorded as a TIMEOUT —
+  #     an unknown fate, not a caught mutant. A shard of this diff reported
+  #     "2 caught, 1 unviable, 29 timeouts" and exited 3.
+  #   * timeout-minutes 15 was below one shard's cost, so shards were CANCELLED
+  #     mid-run. cargo-mutants reports a timed-out job as `cancelled`, which
+  #     looks exactly like a fail-fast cancellation and reads as "the other
+  #     shards found survivors". They found nothing; they were killed at 15
+  #     minutes. 15 of 16 shards ended that way and the gate could not go green
+  #     for any reason other than a diff too small to mutate.
+  #
+  # Now: 503 mutants for this diff (measured via --list), 32 shards, so ~16
+  # mutants per shard, at up to 180s each — 48 min worst case against a 60 min
+  # ceiling. --timeout is per-mutant, so it must clear the whole suite plus
+  # margin for a loaded runner; 180s is ~2.8x the measured 64s.
+  #
+  # A docs-only or Cargo.lock-only diff legitimately mutates nothing and exits 0.
+  # That is correct, not the scope bug above: the glob now makes "nothing to
+  # mutate" mean the diff really had no Rust in it.
   mutants-pr:
-    name: Mutation testing (PR diff, shard ${{ matrix.shard }}/16)
+    name: Mutation testing (PR diff, shard ${{ matrix.shard }}/32)
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     needs: [test]
-    timeout-minutes: 15
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+            21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
     env:
       CARGO_TERM_COLOR: always
       RUSTFLAGS: ""
@@ -297,19 +325,9 @@ jobs:
         run: git diff "origin/${BASE_REF}"...HEAD -- > pr.diff
       - name: Mutate the changed lines
         run: |
-          cargo mutants --in-diff pr.diff --shard ${{ matrix.shard }}/16 \
-            --file src/extract.rs --file src/manifest.rs --file src/registry/npm.rs \
-            --file src/registry/pypi.rs --file src/wheel_extract.rs --file src/baseline.rs \
-            --file src/version.rs --file src/review.rs --file src/store.rs \
-            --file src/executor.rs --file src/lockfile.rs --file src/ci.rs \
-            --file src/mcp.rs --file src/install_ref.rs --file src/recursive.rs \
-            --file src/agent.rs --file src/recall.rs --file src/shim.rs \
-            --file src/pkgbuild.rs --file src/render.rs --file src/policy.rs \
-            --file src/heuristic.rs --file src/diff.rs --file src/advisory.rs \
-            --file src/provenance.rs --file src/verdict.rs \
-            --file src/registry/cratesio.rs --file src/registry/aur.rs \
-            --file src/registry/http_util.rs --file src/registry/mod.rs \
-            --in-place --baseline=skip --timeout 30
+          cargo mutants --in-diff pr.diff --shard ${{ matrix.shard }}/32 \
+            --file 'src/**/*.rs' \
+            --in-place --baseline=skip --timeout 180
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -325,6 +343,10 @@ jobs:
       # Without always(), GitHub SKIPS this job when any shard fails, and a
       # skipped required check counts as satisfied. The result is then read
       # explicitly so a failed, cancelled, or timed-out shard fails the gate.
+      #
+      # A timed-out shard reports as `cancelled`, which is why this reads the
+      # job result rather than trusting a green run: `cancelled` and `failure`
+      # are the same verdict here, and neither is "no survivors".
       - name: Every shard must have succeeded
         env:
           RESULT: ${{ needs.mutants-pr.result }}
@@ -333,19 +355,21 @@ jobs:
             echo "::error::mutation testing shards reported '$RESULT'"
             exit 1
           fi
-          echo "All 16 mutation testing shards completed successfully."
+          echo "All 32 mutation testing shards completed successfully."
 
-  # Sharded across 16 parallel runners for push to main.
+  # Sharded across 32 parallel runners for push to main, with the same scope and
+  # timeout arithmetic as mutants-pr above.
   mutants:
-    name: Mutation testing (push diff, shard ${{ matrix.shard }}/16)
+    name: Mutation testing (push diff, shard ${{ matrix.shard }}/32)
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [test]
-    timeout-minutes: 15
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+            21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
     env:
       CARGO_TERM_COLOR: always
       RUSTFLAGS: ""
@@ -361,19 +385,9 @@ jobs:
         run: git diff HEAD~1..HEAD -- > push.diff
       - name: Mutate the changed lines
         run: |
-          cargo mutants --in-diff push.diff --shard ${{ matrix.shard }}/16 \
-            --file src/extract.rs --file src/manifest.rs --file src/registry/npm.rs \
-            --file src/registry/pypi.rs --file src/wheel_extract.rs --file src/baseline.rs \
-            --file src/version.rs --file src/review.rs --file src/store.rs \
-            --file src/executor.rs --file src/lockfile.rs --file src/ci.rs \
-            --file src/mcp.rs --file src/install_ref.rs --file src/recursive.rs \
-            --file src/agent.rs --file src/recall.rs --file src/shim.rs \
-            --file src/pkgbuild.rs --file src/render.rs --file src/policy.rs \
-            --file src/heuristic.rs --file src/diff.rs --file src/advisory.rs \
-            --file src/provenance.rs --file src/verdict.rs \
-            --file src/registry/cratesio.rs --file src/registry/aur.rs \
-            --file src/registry/http_util.rs --file src/registry/mod.rs \
-            --in-place --baseline=skip --timeout 30
+          cargo mutants --in-diff push.diff --shard ${{ matrix.shard }}/32 \
+            --file 'src/**/*.rs' \
+            --in-place --baseline=skip --timeout 180
       - uses: actions/upload-artifact@v4
         if: always()
         with:

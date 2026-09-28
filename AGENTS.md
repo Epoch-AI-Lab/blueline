@@ -10,10 +10,19 @@ fail closed on any doubt.
 - Format: `cargo fmt --all`
 - Lint:   `cargo clippy --all-targets -- -D warnings`
 - Test:   `cargo test --all-targets --locked`
+- Workflows: `actionlint -shellcheck= -pyflakes=` (run it after touching
+  `.github/`; see the Guardrails section)
 
-These three are exactly the CI gate (`.github/workflows/ci.yml`). If a change
-passes locally it passes CI. The toolchain is pinned in `rust-toolchain.toml`
-— do not run a different one.
+The first three are the Rust gate (`.github/workflows/ci.yml`), and if a change
+passes them it passes CI's Rust jobs. They are no longer *exactly* the gate: the
+same workflow also runs `actionlint` over the workflows, a supply-chain audit,
+and two dogfood jobs that run the built binary against this repository's own
+`Cargo.lock` and `package-lock.json`. Mutant scope is `src/**/*.rs`, so a change
+to a module outside `src/` is not mutation-tested at all. The toolchain is
+pinned in `rust-toolchain.toml` — do not run a different one.
+
+Two of those cannot be reproduced by the three commands above. A green local
+run is necessary, not sufficient.
 
 ## Delegating
 Review agents grade an answer. They do not derive one, and they inherit the

@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The mutation gate could not pass, and its failures did not mean what they
+  said. Three separate numbers were wrong, and each one cost the check its
+  meaning rather than its speed.
+  `--timeout 30` sat below the cost of the suite that has to run — the warm full
+  suite is 64s — so any mutant whose killer is not in the first 30 seconds was
+  recorded as a TIMEOUT, an unknown fate rather than a caught mutant. A shard of
+  this diff reported `2 caught, 1 unviable, 29 timeouts` and exited 3.
+  `timeout-minutes: 15` was below one shard's cost, so shards were CANCELLED
+  mid-run; cargo-mutants reports a timed-out job as `cancelled`, which is
+  indistinguishable from a fail-fast cancellation and reads as "the other shards
+  found survivors". 15 of 16 shards ended that way, so the gate could not go
+  green for any reason other than a diff too small to mutate. And the mutant
+  scope was a hand-maintained list of 30 modules that omitted `src/cli.rs`,
+  `src/lib.rs`, `src/main.rs` and `src/error.rs`; cargo-mutants exits 0 with
+  "No mutants to filter" when a diff touches only an omitted file, and the
+  aggregate reported success having mutated nothing. Verified by re-introducing
+  the condition: a `src/cli.rs`-only diff produced zero mutants under the old
+  list and three under the new one. The scope is now a `src/**/*.rs` glob, which
+  cannot drift when a module is added; the timeout is 180s and the ceiling 60
+  minutes across 32 shards, sized from 503 mutants measured for this diff.
+
+  The comment claiming 16 shards "keep each runner around ~3-4 min" was false by
+  roughly 4x, and it is the number a future maintainer would have sized the next
+  change against.
+
+  A trap worth recording, because it cost this investigation its first two
+  measurements: the repository sets `diff.mnemonicprefix`, so a bare `git diff`
+  emits `i/`/`w/` prefixes and cargo-mutants' diff parser silently discards
+  every hunk — "No mutants to filter", exit 0, a green run that mutated nothing.
+  CI is unaffected because it diffs two explicit revisions (`a/`/`b/`), but any
+  local reproduction must do the same or it will "confirm" a false green.
+
 - A mutant in the CVSS v2 exploitability term survived the whole suite, found
   by `cargo mutants` in CI. Every NVD reference vector used `AV:N`, whose weight
   is 1.0, so turning `20.0 * av` into `20.0 / av` changed nothing. Two tests now
