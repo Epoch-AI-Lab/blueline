@@ -29,7 +29,6 @@ comfy-table = "7"
 tempfile = "3"
 dirs = "6"
 toml = "0.8"
-nothing = "0.1.12"
 
 [dev-dependencies]
 assert_cmd = "2"

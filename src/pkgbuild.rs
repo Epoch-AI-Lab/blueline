@@ -3346,4 +3346,63 @@ mod tests {
         let plain = findings_for("build() {\n make install\n}\n");
         assert!(!has_rule(&plain, "R22_CONDITIONAL_EXECUTION"));
     }
+
+    /// Every rule id gets its own title, and none of them falls through.
+    ///
+    /// `rule_title` is a display-only lookup, which is exactly why it drifted
+    /// unnoticed: a rule with the wrong title still fires, still blocks, and
+    /// still lands in the report under a name that tells the reader nothing
+    /// about what was found. The `R29` arm had no test at all, so deleting it
+    /// shipped a real finding labelled "PKGBUILD finding".
+    ///
+    /// Asserted three ways, because they catch different mistakes: each title is
+    /// non-empty (a function that returned a constant), each is distinct (a
+    /// function that returned one constant for everything), and none equals the
+    /// fallback (a rule id that fell out of the match).
+    #[test]
+    fn every_pkbuild_rule_id_has_its_own_title() {
+        const IDS: [&str; 14] = [
+            "R11_CHECKSUM_SKIP",
+            "R12_SOURCE_URL_DRIFT",
+            "R13_PIPE_TO_SHELL",
+            "R14_EVAL_FAMILY",
+            "R15_DYNAMIC_INDIRECTION",
+            "R16_CMD_SUBST_IN_META",
+            "R17_BUILD_TIME_NETWORK",
+            "R18_HOMOGLYPH",
+            "R19_VALIDPGPKEYS_CHANGE",
+            "R20_INSTALL_HOOK_CHANGE",
+            "R21_UNPINNED_VCS_SOURCE",
+            "R22_CONDITIONAL_EXECUTION",
+            "R23_NPM_DELIVERY",
+            "R29_PKGBUILD_DEPENDS_NOT_IN_SRCINFO",
+        ];
+
+        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for id in IDS {
+            let title = rule_title(id);
+            assert!(!title.is_empty(), "`{id}` has an empty title");
+            assert_ne!(
+                title, "PKGBUILD finding",
+                "`{id}` fell through to the default title"
+            );
+            assert!(
+                seen.insert(title),
+                "`{id}` shares its title `{title}` with another rule"
+            );
+        }
+        assert_eq!(seen.len(), IDS.len(), "every rule needs a distinct title");
+
+        // R29 named exactly, since its arm is the one that was missing.
+        assert_eq!(
+            rule_title("R29_PKGBUILD_DEPENDS_NOT_IN_SRCINFO"),
+            "PKGBUILD dependency not in .SRCINFO"
+        );
+
+        // An id this build does not know still gets the generic label rather
+        // than an empty string, so a new rule is visibly unlabelled instead of
+        // silently blank.
+        assert_eq!(rule_title("R99_NOT_A_RULE"), "PKGBUILD finding");
+        assert_eq!(rule_title(""), "PKGBUILD finding");
+    }
 }
