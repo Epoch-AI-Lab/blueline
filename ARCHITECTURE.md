@@ -163,8 +163,9 @@ are policy decisions, not heuristics, and are listed last.
 - R07 — `R07_UNREVIEWED_PREDECESSOR_BASELINE`
 - R08 — `R08_YANKED_PREDECESSOR` (MEDIUM)
 - R09 — `R09_ADVISORY_MALWARE` / `R09_ADVISORY_CRITICAL_CVE` (BLOCK),
-  `R09_ADVISORY_CVE`, `R09_ADVISORY_UNVERIFIED` (HIGH, under
-  `fail_closed_network`), `R09_YANKED_TARGET`
+  `R09_ADVISORY_CVE`, `R09_ADVISORY_UNVERIFIED` (HIGH under
+  `fail_closed_network`, MEDIUM when policy accepts continuing without advisory
+  coverage), `R09_YANKED_TARGET`
 - R10 — `R10_MAINTAINER_TRANSITION` (AUR lane only — the author-transition
   comparison needs a per-release identity, which only the AUR adapter
   supplies), `R10_LOCKFILE_HASH_MISMATCH` (BLOCK, `blueline ci` only)

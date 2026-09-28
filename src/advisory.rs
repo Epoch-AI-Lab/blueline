@@ -116,6 +116,39 @@ fn osv_ecosystem(ecosystem: Ecosystem) -> &'static str {
     }
 }
 
+/// Whether an advisory report that arrived as `Ok` means *no answer was
+/// obtained* rather than *the answer was clean*.
+///
+/// `fetch_advisories` returns `Ok` for both, so a caller that only inspects the
+/// `Err` arm cannot tell a completed lookup from an abandoned one. That
+/// distinction is the whole disclosure: an `unverified` report has no hits, so
+/// nothing downstream raises a finding on its own, and a verdict built from it
+/// is identical to a clean advisory pass.
+///
+/// Two `unverified` reports are deliberately not treated the same:
+///
+/// * Advisories switched off in policy is the operator's own choice, made
+///   knowingly before the review ran. It is not a hole discovered at review
+///   time, so it stays out of the verdict.
+/// * Everything else -- a refused connection, a timeout, a body that would not
+///   parse, or an ecosystem with no advisory coverage at all -- means this
+///   release's revocation coverage is *unknown* rather than clear, and the
+///   caller must say so.
+///
+/// Told apart by policy rather than by matching on the message text, so
+/// rewording a disclosure cannot silently change which of the two it is.
+pub(crate) fn coverage_unknown(report: &AdvisoryReport, policy: &Policy) -> Option<String> {
+    if !policy.policy.check_advisories || report.status != AdvisoryStatus::Unverified {
+        return None;
+    }
+    Some(
+        report
+            .message
+            .clone()
+            .unwrap_or_else(|| "the advisory source gave no reason".to_string()),
+    )
+}
+
 pub fn fetch_advisories(
     package: &str,
     version: &str,
@@ -146,6 +179,23 @@ pub fn fetch_advisories(
     if !policy.policy.check_advisories {
         return Ok(AdvisoryReport::unverified(
             "advisory checking disabled by policy",
+        ));
+    }
+
+    // The AUR has no OSV coverage. `osv_ecosystem` maps it to a placeholder
+    // string that OSV does not recognise, and OSV answers an unrecognised
+    // ecosystem the way it answers a clean one -- a 200 with no vulns -- so
+    // querying it produced `AdvisoryReport::clean("osv.dev")` for every AUR
+    // review. The card then claimed clean advisory coverage from a source that
+    // has none, which is the one claim an unverified report is supposed to
+    // prevent. Refusing to ask is the honest answer; the caller discloses it.
+    //
+    // The recall index above still applies, so a curated revocation blocks an
+    // AUR package exactly as it blocks any other.
+    if ecosystem == Ecosystem::Aur {
+        return Ok(AdvisoryReport::unverified(
+            "the AUR has no OSV advisory coverage; revocation coverage for this release comes \
+             from the recall index only",
         ));
     }
 
@@ -766,6 +816,125 @@ mod tests {
         assert_eq!(osv_ecosystem(crate::registry::Ecosystem::Npm), "npm");
         assert_eq!(osv_ecosystem(crate::registry::Ecosystem::Cargo), "CratesIO");
         assert_eq!(osv_ecosystem(crate::registry::Ecosystem::PyPi), "PyPI");
+    }
+
+    /// OSV has no AUR ecosystem, and it answers an ecosystem it does not
+    /// recognise the way it answers a clean one: a 200 with no `vulns`. Asking
+    /// it about an AUR package therefore produced `AdvisoryReport::clean`, and
+    /// the card claimed clean advisory coverage from a source that has none --
+    /// strictly worse than an honest `unverified`, because a clean report
+    /// produces no hits and no disclosure at all.
+    ///
+    /// `fetch_advisories` is reached for every ecosystem, so this was live on
+    /// every AUR review rather than on some unreachable path. Asserted on the
+    /// status rather than on the message, so rewording the disclosure cannot
+    /// quietly turn this test back into a tautology.
+    #[test]
+    fn the_aur_never_claims_clean_advisory_coverage() {
+        let report = fetch_advisories(
+            "webtorrent-desktop",
+            "1.9.0-1",
+            crate::registry::Ecosystem::Aur,
+            None,
+            &Policy::default(),
+        )
+        .expect("AUR advisory lookup must not error");
+
+        assert_eq!(
+            report.status,
+            AdvisoryStatus::Unverified,
+            "OSV has no AUR coverage, so the only honest answer is `unverified`: {report:?}"
+        );
+        assert!(
+            report.message.as_deref().is_some_and(|m| m.contains("AUR")),
+            "the disclosure must name the reason: {report:?}"
+        );
+    }
+
+    /// Advisory checking switched off in policy is the operator's deliberate
+    /// choice, not a coverage hole discovered at review time, so it must not be
+    /// laundered into the "coverage unknown" disclosure the AUR and the
+    /// network-failure paths raise. The two are told apart by policy, not by
+    /// matching on the message text.
+    #[test]
+    fn policy_disabled_advisories_stay_distinguishable_from_a_failed_lookup() {
+        let mut policy = Policy::default();
+        policy.policy.check_advisories = false;
+        let report = fetch_advisories(
+            "webtorrent-desktop",
+            "1.9.0-1",
+            crate::registry::Ecosystem::Aur,
+            None,
+            &policy,
+        )
+        .expect("disabling advisories must not error");
+
+        assert_eq!(report.status, AdvisoryStatus::Unverified);
+        assert!(
+            report
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("disabled by policy")),
+            "the operator's own choice must be reported as such: {report:?}"
+        );
+    }
+
+    /// The classification itself, on hand-built reports so it needs no network.
+    /// A report that was never asked for is not a coverage hole; a report that
+    /// came back `unverified` with advisories enabled is. This is the decision
+    /// that was missing, and it is the reason a failed lookup used to be
+    /// indistinguishable from a clean pass at every surface that does not render
+    /// the status.
+    #[test]
+    fn only_an_unverified_report_with_advisories_enabled_is_unknown_coverage() {
+        let enabled = Policy::default();
+        let mut disabled = Policy::default();
+        disabled.policy.check_advisories = false;
+
+        // An answer was obtained: nothing to disclose, whatever it says.
+        assert_eq!(
+            coverage_unknown(&AdvisoryReport::clean("osv.dev"), &enabled),
+            None
+        );
+        let vulnerable = AdvisoryReport {
+            status: AdvisoryStatus::Vulnerable,
+            hits: Vec::new(),
+            source: "osv.dev".to_string(),
+            message: None,
+        };
+        assert_eq!(coverage_unknown(&vulnerable, &enabled), None);
+
+        // No answer, and the operator wants advisories: this is the hole.
+        assert_eq!(
+            coverage_unknown(
+                &AdvisoryReport::unverified("OSV advisory request failed: status code 502"),
+                &enabled
+            )
+            .as_deref(),
+            Some("OSV advisory request failed: status code 502")
+        );
+
+        // No answer, but the operator turned advisories off on purpose.
+        assert_eq!(
+            coverage_unknown(
+                &AdvisoryReport::unverified("advisory checking disabled by policy"),
+                &disabled
+            ),
+            None,
+            "a choice the operator made knowingly is not a coverage hole"
+        );
+
+        // A report with no reason must still be disclosed rather than dropped.
+        let reasonless = AdvisoryReport {
+            status: AdvisoryStatus::Unverified,
+            hits: Vec::new(),
+            source: "osv.dev".to_string(),
+            message: None,
+        };
+        assert!(
+            coverage_unknown(&reasonless, &enabled).is_some(),
+            "an unverified report with no message is still unknown coverage"
+        );
     }
 
     #[test]

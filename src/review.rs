@@ -249,19 +249,42 @@ fn evaluate_with_registry<V: VersionInfo>(
     // set `fail_closed_network` asked for exactly this to stop the review, and
     // as an `unverified` report it produced no finding at all, so the verdict
     // came out the same as a clean advisory pass. It becomes a finding below.
-    let (advisories, advisory_error) = match crate::advisory::fetch_advisories(
-        &target_pkg.name,
-        &target_pkg.version,
-        ecosystem,
-        Some(store),
-        policy,
-    ) {
-        Ok(report) => (report, None),
-        Err(e) => (
-            crate::advisory::AdvisoryReport::unverified(&e.to_string()),
-            Some(e.to_string()),
-        ),
-    };
+    //
+    // The `Ok` arm needed the same treatment for the case where policy does NOT
+    // fail closed. `fetch_advisories` returns `Ok(unverified(..))` when the
+    // lookup could not complete but the operator asked for the review to carry
+    // on -- and that arm set no error at all, so a network failure and a clean
+    // advisory pass reached the verdict identically. Nothing downstream could
+    // tell them apart: the only reader of the status was a colour label on the
+    // interactive card, and the CI text and markdown summaries, the JSON verdict
+    // and every MCP response reported the same thing for both. A lockfile diff
+    // adding one already-baselined package therefore printed `Status: PASSED`
+    // and exited 0 with the advisory host down.
+    //
+    // The two cases are not the same severity. An `Err` is a real failure and
+    // stays HIGH. An `unverified` report the operator has already accepted is a
+    // coverage hole worth saying out loud, not worth blocking on -- so it is a
+    // MEDIUM disclosure that escalates for anyone running a stricter
+    // `fail_on`. Advisory checking switched off in policy is the operator's
+    // deliberate choice and is not a coverage hole, so it stays silent.
+    let (advisories, advisory_error, advisory_coverage_unknown) =
+        match crate::advisory::fetch_advisories(
+            &target_pkg.name,
+            &target_pkg.version,
+            ecosystem,
+            Some(store),
+            policy,
+        ) {
+            Ok(report) => {
+                let unknown = crate::advisory::coverage_unknown(&report, policy);
+                (report, None, unknown)
+            }
+            Err(e) => (
+                crate::advisory::AdvisoryReport::unverified(&e.to_string()),
+                Some(e.to_string()),
+                None,
+            ),
+        };
 
     let provenance = match ecosystem {
         Ecosystem::Npm => Some(crate::provenance::inspect_provenance(
@@ -375,6 +398,20 @@ fn evaluate_with_registry<V: VersionInfo>(
             description: format!(
                 "the advisory lookup failed and policy is configured to fail closed, so \
                  revocation coverage for this release is unknown: {detail}"
+            ),
+        };
+        crate::heuristic::apply_extra_findings(&mut verdict, vec![finding], policy);
+    }
+
+    if let Some(detail) = advisory_coverage_unknown {
+        let finding = crate::verdict::Finding {
+            rule_id: "R09_ADVISORY_UNVERIFIED".to_string(),
+            severity: crate::verdict::VerdictBand::Medium,
+            title: "Advisory coverage unknown".to_string(),
+            description: format!(
+                "the advisory lookup did not complete and policy is configured to continue \
+                 anyway, so this release's revocation coverage is unknown rather than clear: \
+                 {detail}"
             ),
         };
         crate::heuristic::apply_extra_findings(&mut verdict, vec![finding], policy);

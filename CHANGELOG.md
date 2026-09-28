@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- An advisory lookup that never happened is no longer reported as a clean
+  advisory pass. `fetch_advisories` returns `Ok` both for a real answer and for
+  an `unverified` report, and the review only inspected the `Err` arm — so a
+  refused connection, a timeout, an unparseable body or an ecosystem with no
+  coverage all produced `advisory_error = None` and no finding. An
+  `unverified` report has no hits, so nothing downstream raised anything on its
+  own, and the sole reader of the status anywhere was a colour label on the
+  interactive card. CI's text and markdown summaries, the JSON verdict, the MCP
+  response and `blueline agent`'s exit code were byte-identical for "the
+  advisory host is down" and "OSV says this release is clean". A lockfile diff
+  adding one already-baselined package printed `Status: PASSED` and exited 0
+  with the network down.
+
+  An unverified report with advisory checking *enabled* now raises
+  `R09_ADVISORY_UNVERIFIED` at MEDIUM: a coverage hole worth saying out loud,
+  not worth blocking on, and it escalates for anyone running a stricter
+  `fail_on`. An actual `Err` stays HIGH. Advisories switched off in policy stays
+  silent, because that is the operator's own choice made before the review ran
+  rather than a hole discovered during it — the two are told apart by policy,
+  not by matching on the message text.
+
+- The AUR no longer claims clean advisory coverage from a source that has none.
+  OSV has no AUR ecosystem, and it answers an unrecognised ecosystem with a
+  `400`, so every AUR review fell into the same silent hole above — surfacing as
+  an HTTP error string rather than a disclosure anyone wrote. `fetch_advisories`
+  now refuses to ask and returns a named `unverified` report, which the review
+  discloses at MEDIUM. Every AUR review now carries that disclosure until the
+  adapter wires advisory handling properly. The recall index is unaffected: a
+  curated revocation still blocks an AUR package exactly as it blocks any other.
+
 - A requirement whose *name* looks like a filename is no longer silently dropped
   from the reviewed graph. The parser classified any token ending in `.txt` or
   `.in` as an option value, on the reasoning that `base.txt` is what `-r`
