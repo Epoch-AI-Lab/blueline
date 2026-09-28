@@ -59,6 +59,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   rather than a hole discovered during it — the two are told apart by policy,
   not by matching on the message text.
 
+  Consequence worth stating plainly, because it is visible: MEDIUM is above the
+  band `blueline shim` and `blueline agent` gate on, so **a review that cannot
+  reach the advisory host now refuses the install** rather than passing quietly.
+  That is the fail-closed direction and it is what the disclosure is for, but it
+  is a behaviour change for anyone behind a proxy, offline, or during an OSV
+  outage. The ladder is now: `check_advisories = false` stays silent;
+  advisories enabled and reachable answer as asked; enabled and unreachable
+  disclose at MEDIUM under the default policy, or stop the review at HIGH under
+  `fail_closed_network`.
+
 - The AUR no longer claims clean advisory coverage from a source that has none.
   OSV has no AUR ecosystem, and it answers an unrecognised ecosystem with a
   `400`, so every AUR review fell into the same silent hole above — surfacing as

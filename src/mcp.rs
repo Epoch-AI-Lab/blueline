@@ -254,11 +254,14 @@ fn next_request_line<R: BufRead>(reader: &mut R) -> std::io::Result<Option<Reque
         };
         match step {
             FrameStep::Eof => {
-                return Ok(if any || !raw.is_empty() {
-                    Some(classify(raw))
-                } else {
-                    None
-                });
+                // `any` alone decides this. `raw` only ever grows inside the
+                // `Take` arm, and reaching that arm sets `any` before it can
+                // return, so `any` is false exactly when `raw` is empty -- the
+                // `|| !raw.is_empty()` this replaces could never be the true one
+                // on its own. It read as a second safety net and was in fact a
+                // second opinion that could not disagree, which is how it
+                // survived every attempt to pin it with a test.
+                return Ok(if any { Some(classify(raw)) } else { None });
             }
             FrameStep::Take { len, newline } => {
                 reader.consume(len);
@@ -1087,5 +1090,136 @@ mod tests {
         assert_eq!(resp["id"], 1);
         assert_eq!(resp["result"], json!({}));
         assert!(resp.get("error").is_none(), "{resp}");
+    }
+
+    /// The cap's own value. Every framing test builds its fixture *from* this
+    /// constant, so a constant that stopped meaning 64 KiB would resize every
+    /// case and none of them would notice.
+    #[test]
+    fn the_request_line_cap_is_sixty_four_kibibytes() {
+        assert_eq!(MAX_REQUEST_LINE_BYTES, 64 * 1024);
+        assert_eq!(MAX_REQUEST_LINE_BYTES, 65_536);
+    }
+
+    /// The cap has to bound the *resident bytes*, not just the verdict.
+    ///
+    /// The framing tests all check the outcome, and the outcome is identical
+    /// either way: an over-cap line is refused whether the buffer stopped
+    /// growing at `MAX + 1` or swallowed the whole peer stream. What the cap is
+    /// for is the second one — a peer that never sends a newline must not be able
+    /// to make blueline hold its payload — so the invariant is asserted directly
+    /// against the helper, over far more input than the cap.
+    #[test]
+    fn the_resident_bytes_never_exceed_the_cap_plus_one() {
+        let mut buf: Vec<u8> = Vec::new();
+        let chunk = vec![b'x'; 4096];
+        let rounds = MAX_REQUEST_LINE_BYTES / chunk.len() + 16;
+        for _ in 0..rounds {
+            push_bounded(&mut buf, &chunk);
+        }
+        assert_eq!(
+            buf.len(),
+            MAX_REQUEST_LINE_BYTES + 1,
+            "a peer sending {rounds} chunks with no newline must not be able to \
+             grow the buffer past the cap plus the one byte that proves it"
+        );
+
+        // A partial final chunk lands exactly on the same bound.
+        let mut buf: Vec<u8> = Vec::new();
+        push_bounded(&mut buf, &chunk);
+        assert_eq!(buf.len(), chunk.len());
+        let headroom = MAX_REQUEST_LINE_BYTES + 1 - buf.len();
+        push_bounded(&mut buf, &vec![b'y'; headroom + 5_000]);
+        assert_eq!(buf.len(), MAX_REQUEST_LINE_BYTES + 1);
+    }
+
+    /// A reader that fails with `Interrupted` first, then works.
+    ///
+    /// `Interrupted` is the one I/O error that means "try again" rather than
+    /// "this stream is broken", and a signal arriving mid-read is the ordinary
+    /// way to get it. Treating it as fatal would drop a request for no reason;
+    /// treating every error as retryable would spin on a stream that is never
+    /// going to recover. Both directions need a test, and they need different
+    /// fixtures, because each is invisible to the other.
+    struct FlakyReader {
+        remaining_faults: Vec<std::io::ErrorKind>,
+        inner: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl std::io::Read for FlakyReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.remaining_faults.is_empty() {
+                let kind = self.remaining_faults.remove(0);
+                return Err(std::io::Error::from(kind));
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    fn framed(faults: Vec<std::io::ErrorKind>, body: &str) -> std::io::Result<Option<RequestLine>> {
+        let mut reader = std::io::BufReader::new(FlakyReader {
+            remaining_faults: faults,
+            inner: std::io::Cursor::new(body.as_bytes().to_vec()),
+        });
+        next_request_line(&mut reader)
+    }
+
+    #[test]
+    fn an_interrupted_read_is_retried_rather_than_fatal() {
+        let line = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+        for faults in [
+            vec![std::io::ErrorKind::Interrupted],
+            vec![
+                std::io::ErrorKind::Interrupted,
+                std::io::ErrorKind::Interrupted,
+            ],
+            vec![
+                std::io::ErrorKind::Interrupted,
+                std::io::ErrorKind::Interrupted,
+                std::io::ErrorKind::Interrupted,
+            ],
+        ] {
+            let got = framed(faults, &format!("{line}\n"))
+                .expect("an interrupted read must be retried, not fatal");
+            match got {
+                Some(RequestLine::Text(text)) => assert_eq!(text, line),
+                other => panic!("the request was lost across the retry: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_error_that_is_not_interrupted_is_propagated() {
+        // The fault fires once and the stream would recover, so retrying
+        // everything would return a request instead of the error -- which is
+        // what makes this a test rather than a hang.
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::InvalidData,
+        ] {
+            let err = framed(vec![kind], "{\"a\":1}\n").expect_err(
+                "an error that is not `Interrupted` must reach the caller, or the \
+                 read spins on a stream that will never recover",
+            );
+            assert_eq!(err.kind(), kind, "the original error kind must survive");
+        }
+    }
+
+    /// A bare newline carries no request, but it *is* input: the peer spoke and
+    /// then closed. Reporting a clean shutdown would tell the caller the stream
+    /// ended having said nothing, which is a different statement from "said
+    /// something empty". The two are separated here because `raw` is empty and
+    /// only the "did we see anything" flag distinguishes them.
+    #[test]
+    fn a_bare_newline_is_an_empty_request_not_a_clean_shutdown() {
+        let mut reader = BufReader::new(&b"\n"[..]);
+        assert!(
+            matches!(
+                next_request_line(&mut reader).unwrap(),
+                Some(RequestLine::Skip)
+            ),
+            "a blank line must be skipped, not reported as end of stream"
+        );
     }
 }

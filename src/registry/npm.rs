@@ -1317,7 +1317,10 @@ mod tests {
         assert_eq!(MAX_MEMOISED_PACKUMENT_TOTAL_BYTES, 256 * 1024 * 1024);
         assert_eq!(MAX_MEMOISED_PACKUMENT_TOTAL_BYTES, 268_435_456);
         // The memo as a whole is allowed to be larger than any one document.
-        assert!(MAX_MEMOISED_PACKUMENT_TOTAL_BYTES > MAX_MEMOISED_PACKUMENT_BYTES);
+        assert_eq!(
+            MAX_MEMOISED_PACKUMENT_TOTAL_BYTES - MAX_MEMOISED_PACKUMENT_BYTES,
+            192 * 1024 * 1024
+        );
     }
 
     /// The estimate, exactly, on a packument small enough to reason about.
