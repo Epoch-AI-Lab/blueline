@@ -535,6 +535,17 @@ impl SyncLock {
         let age = std::time::SystemTime::now()
             .duration_since(modified)
             .unwrap_or_default();
+        Self::reap_if_aged(path, age)
+    }
+
+    /// The comparison, with the age handed in. A lock is stolen once its age
+    /// *reaches* the threshold: the bound is inclusive, so a lock exactly
+    /// `LOCK_STALE_AFTER` old is reaped and only a younger one is left alone.
+    /// The comparison is what decides that, and it is not reachable through the
+    /// filesystem — reading a file's mtime and comparing it to `now` always
+    /// straddles the instant the test set — so the arithmetic lives here where a
+    /// test can sit exactly on it.
+    fn reap_if_aged(path: &Path, age: std::time::Duration) -> bool {
         if age < LOCK_STALE_AFTER {
             return false;
         }
@@ -1807,6 +1818,157 @@ mod tests {
             acquired.is_ok(),
             "a stale lock must not block acquisition: {:?}",
             acquired.err()
+        );
+    }
+
+    /// The hours-to-seconds conversion, pinned against the constant rather than
+    /// against itself.
+    ///
+    /// `stale_band_pins_max_age_boundary` derived *both* sides of its boundary
+    /// from `recall_max_age_secs(&policy)`, so it would have passed with the
+    /// conversion returning 0, 1, or anything at all: both the cap and the
+    /// ages under test moved together. That is the one way an assertion about a
+    /// conversion can be vacuous, and it is why the constant is written out
+    /// here. A window that silently became zero would make every snapshot over
+    /// zero seconds old stale, and one that became 48x too large would disable
+    /// staleness disclosure entirely.
+    #[test]
+    fn the_recall_window_converts_hours_to_seconds() {
+        let cases: [(u64, i64); 4] = [(1, 3_600), (2, 7_200), (24, 86_400), (48, 172_800)];
+        for (hours, secs) in cases {
+            let mut policy = crate::policy::Policy::default();
+            policy.recall.max_age_hours = hours;
+            assert_eq!(
+                recall_max_age_secs(&policy),
+                secs,
+                "max_age_hours = {hours} must be {secs} seconds"
+            );
+        }
+    }
+
+    /// `age_secs` is the public accessor and the only place the real clock is
+    /// read, and every other test hands `stale_band_for` a clock it chose. A
+    /// constant here would have gone unnoticed, including a negative one.
+    ///
+    /// The window is a few seconds wide rather than exact: this genuinely reads
+    /// `SystemTime::now()`, and pinning it to the second would make it a
+    /// coin flip on where the test's own execution lands.
+    #[test]
+    fn age_secs_measures_against_the_wall_clock() {
+        let hour_ago = now_secs() - 3_600;
+        let synced = SyncedSnapshot {
+            fetched_at: hour_ago,
+            url: "http://127.0.0.1:1".into(),
+            snapshot: valid_snapshot(),
+        };
+        let age = synced.age_secs();
+        assert!(
+            (3_600..=3_610).contains(&age),
+            "a snapshot fetched an hour ago must read about an hour old, got {age}"
+        );
+
+        // A clock that has gone backwards reads as fresh rather than negative:
+        // a future stamp is a fault to disclose, not an age to subtract.
+        let ahead = SyncedSnapshot {
+            fetched_at: now_secs() + 600,
+            url: "http://127.0.0.1:1".into(),
+            snapshot: valid_snapshot(),
+        };
+        assert_eq!(ahead.age_secs(), 0);
+    }
+
+    /// A lock that is released while the caller is still inside its wait window
+    /// must be acquired, not refused.
+    ///
+    /// This is the pair of mutants that a contended-lock test cannot see. Both
+    /// the deadline expression and the comparison that consults it can be
+    /// broken in a direction that makes the *refusal* fire immediately, and the
+    /// existing timeout test still passes — a lock that is held forever and a
+    /// lock that is held for 60ms both produce "refusing to race". Only a
+    /// holder that lets go distinguishes them: a deadline computed in the past,
+    /// or a comparison that bails while the deadline is still ahead, turns a
+    /// successful acquisition into an error.
+    #[test]
+    fn a_lock_released_inside_the_wait_window_is_acquired() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let parent = data_dir.path().to_path_buf();
+        let held = SyncLock::acquire(&parent).unwrap();
+
+        let releaser = {
+            let parent = parent.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                drop(held);
+                // Keep the directory alive until the waiter is done with it.
+                drop(parent);
+            })
+        };
+
+        let got = SyncLock::acquire_within(&parent, std::time::Duration::from_millis(5_000))
+            .map(|_| ())
+            .map_err(|e| format!("{e:#}"));
+        releaser.join().unwrap();
+
+        assert!(
+            got.is_ok(),
+            "a lock freed inside the wait window must be acquired, not refused: {got:?}"
+        );
+    }
+
+    /// An error opening the lock that is *not* "it already exists" must be
+    /// reported as itself.
+    ///
+    /// The `AlreadyExists` arm is what lets the loop retry. Widening it to every
+    /// error turns a permanent, immediately detectable fault — a path whose
+    /// parent is a regular file, so the open fails `ENOTDIR` — into a spin
+    /// until the deadline and then the generic "refusing to race", which names
+    /// a lock contention that never happened and hides the real cause. Asserted
+    /// on the message so a caller can tell the two apart.
+    #[test]
+    fn an_unopenable_lock_path_reports_its_own_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_dir = dir.path().join("a-regular-file");
+        std::fs::write(&not_a_dir, b"not a directory").unwrap();
+
+        let err = SyncLock::acquire_within(&not_a_dir, TEST_LOCK_WAIT)
+            .map(|_| ())
+            .expect_err("opening a lock under a regular file cannot succeed");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("creating"),
+            "the real failure must be reported, not retried into a timeout: {msg}"
+        );
+        assert!(
+            !msg.contains("refusing to race"),
+            "this is not lock contention and must not be reported as such: {msg}"
+        );
+    }
+
+    /// The reap threshold, sitting exactly on it.
+    ///
+    /// Through the filesystem this boundary is unreachable: setting a file's
+    /// mtime and then reading it always lands on the far side of the instant the
+    /// test chose, so a filesystem test can only ever check "clearly fresh" or
+    /// "clearly stale". That is why `reap_if_aged` takes the age.
+    #[test]
+    fn a_lock_exactly_at_the_stale_threshold_is_not_reaped() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("recall_snapshot.lock");
+
+        // A real file, because the removal has to succeed for the reap to report
+        // itself; a lock that is never created is reaped vacuously.
+        std::fs::write(&lock, b"").unwrap();
+        assert!(
+            SyncLock::reap_if_aged(&lock, LOCK_STALE_AFTER),
+            "the threshold is inclusive: a lock that has reached it is reaped"
+        );
+        assert!(
+            !SyncLock::reap_if_aged(&lock, LOCK_STALE_AFTER - std::time::Duration::from_nanos(1)),
+            "one nanosecond short of the threshold must be left alone"
+        );
+        assert!(
+            !SyncLock::reap_if_aged(&lock, std::time::Duration::ZERO),
+            "a brand new lock is not stale"
         );
     }
 }

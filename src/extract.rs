@@ -928,6 +928,66 @@ mod tests {
         enc.finish().unwrap()
     }
 
+    /// The cap's exact arithmetic, and the reason the terms are separate.
+    ///
+    /// Every one of these mutants is a `*` that could become a `+` or a `/`, and
+    /// each changes the total for the limits used here:
+    ///
+    /// ```text
+    /// 1000 + (10*1024)   + 16*1024*1024        = 16_788_456
+    /// 1000 + (10+1024)   + 16*1024*1024        = 16_779_250   (entries `*` -> `+`)
+    /// 1000 + (10/1024)   + 16*1024*1024        = 16_778_216   (entries `*` -> `/`)
+    /// 1000 + (10*1024)   + (16+1024*1024)      =  1_059_832   (slack first `*` -> `+`)
+    /// 1000 + (10*1024)   + (16/1024*1024)      =     11_240   (slack first `*` -> `/`)
+    /// 1000 + (10*1024)   + (16*1024+1024)      =     28_648   (slack second `*` -> `+`)
+    /// ```
+    ///
+    /// The slack term matters more than its size suggests: it is what leaves room
+    /// for the headers of `max_entries` entries at 512 bytes plus padding, and
+    /// for the metadata entries the per-entry cap still admits. Dividing it away
+    /// instead of multiplying would leave a cap that a header-heavy archive
+    /// could cross while every entry was individually legal.
+    ///
+    /// Asserting the total rather than "the cap is some large number" is the
+    /// point. The behavioural tests above all pass with any cap comfortably
+    /// above their fixtures, which is exactly why every arithmetic mutant here
+    /// survived: they all still let those fixtures through.
+    #[test]
+    fn the_stream_cap_is_the_sum_of_its_three_terms() {
+        let limits = ExtractionLimits {
+            max_unpacked_bytes: 1_000,
+            max_entries: 10,
+            max_entry_bytes: 0,
+        };
+        assert_eq!(decompressed_stream_cap(0, &limits), 16_788_456);
+
+        // The `.max(tarball_len)` arm: a tarball bigger than the computed budget
+        // raises the cap to itself rather than being capped below its own size,
+        // which would make every extraction of such a package fail.
+        assert_eq!(decompressed_stream_cap(20_000_000, &limits), 20_000_000);
+        // ...and it must not *lower* a budget that is already larger.
+        assert_eq!(decompressed_stream_cap(5, &limits), 16_788_456);
+
+        // The shipped defaults, so a change to any of the three constants is
+        // visible here rather than only as a mysterious budget shift.
+        assert_eq!(
+            decompressed_stream_cap(0, &ExtractionLimits::default()),
+            536_870_912 + 102_400_000 + 16_777_216
+        );
+    }
+
+    /// The budget error is identified by type, but a zero-sized type whose
+    /// `Display` returned nothing would still be *found* by the type walk while
+    /// telling an operator nothing. Pin the wording, since that wording is the
+    /// only thing a human reads when a real archive trips the ceiling.
+    #[test]
+    fn the_budget_exceeded_error_says_what_was_exceeded() {
+        assert_eq!(
+            BudgetExceeded.to_string(),
+            "decompressed tar stream exceeds its budget"
+        );
+    }
+
     #[test]
     fn ustar_metadata_headers_are_capped() {
         use std::io::Write;
