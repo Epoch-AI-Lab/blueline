@@ -290,9 +290,16 @@ jobs:
   #     for any reason other than a diff too small to mutate.
   #
   # Now: 503 mutants for this diff (measured via --list), 32 shards, so ~16
-  # mutants per shard, at up to 180s each — 48 min worst case against a 60 min
-  # ceiling. --timeout is per-mutant, so it must clear the whole suite plus
-  # margin for a loaded runner; 180s is ~2.8x the measured 64s.
+  # mutants per shard, at up to 300s each — 80 min worst case against a 60 min
+  # ceiling, which is only reached if every mutant in a shard hangs.
+  #
+  # --timeout is per-mutant, so it must clear the whole suite plus margin for a
+  # runner carrying 32 concurrent jobs. It was 180s, which is 2.8x the 64s the
+  # suite takes on an idle machine, and two shards still timed out: a timeout is
+  # an unknown fate rather than a caught mutant, and cargo-mutants exits 3, so
+  # the gate went red for a mutant that may well have been caught. 300s is ~4.7x
+  # the idle figure, and the measured shard cost is ~55s per mutant, so the
+  # 60 minute job ceiling is not the binding constraint.
   #
   # A docs-only or Cargo.lock-only diff legitimately mutates nothing and exits 0.
   # That is correct, not the scope bug above: the glob now makes "nothing to
@@ -327,7 +334,7 @@ jobs:
         run: |
           cargo mutants --in-diff pr.diff --shard ${{ matrix.shard }}/32 \
             --file 'src/**/*.rs' \
-            --in-place --baseline=skip --timeout 180
+            --in-place --baseline=skip --timeout 300
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -387,7 +394,7 @@ jobs:
         run: |
           cargo mutants --in-diff push.diff --shard ${{ matrix.shard }}/32 \
             --file 'src/**/*.rs' \
-            --in-place --baseline=skip --timeout 180
+            --in-place --baseline=skip --timeout 300
       - uses: actions/upload-artifact@v4
         if: always()
         with:

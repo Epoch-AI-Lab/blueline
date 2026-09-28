@@ -165,6 +165,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     executable/binary classification exists twice in `compute_delta`, and the
     existing test passed `baseline_root: None`, so the merge arm was untested.
 
+  Two further corrections to the numbers above, both from measuring rather than
+  reasoning. The per-mutant `--timeout` went from 30 to 180 to **300**: at 180,
+  which is 2.8x the 64s an idle suite takes, two shards still timed out, and a
+  timeout is an unknown fate rather than a caught mutant — cargo-mutants exits 3,
+  so the gate went red over a mutant that may well have been caught. The
+  measured shard cost is ~55s per mutant against a 60 minute job ceiling, so the
+  ceiling is not the binding constraint. And one shard reported a single
+  surviving mutant on `verify_schema` that an isolated `cargo mutants` run
+  against the same line caught 6 times out of 6; a survivor that does not
+  reproduce under the tool that produced it is a flake in that run rather than a
+  coverage gap, and the longer timeout is also what should reduce those.
+
   A trap worth recording, because it cost this investigation its first two
   measurements: the repository sets `diff.mnemonicprefix`, so a bare `git diff`
   emits `i/`/`w/` prefixes and cargo-mutants' diff parser silently discards
