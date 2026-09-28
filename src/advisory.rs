@@ -1226,4 +1226,109 @@ mod tests {
             }
         }
     }
+
+    /// Every CVSS v2 access-complexity weight, and the one the parser used to
+    /// lack.
+    ///
+    /// `AC:M` fell through to `_ => return None`, so a perfectly ordinary v2
+    /// vector scored nothing at all -- and "no score" is not neutral here: the
+    /// severity then falls back to the advisory's own declared label, or to the
+    /// Medium default, so a real vulnerability could be reported below its true
+    /// band because a two-character metric was unrecognised.
+    ///
+    /// The three weights are asserted exactly, because the interesting property
+    /// is their *order*: `AC:L` is the most exploitable, `AC:M` sits between,
+    /// and `AC:H` the least. Any one of them being wrong, or the arm being
+    /// deleted outright, moves a score.
+    #[test]
+    fn every_cvss_v2_access_complexity_is_scored() {
+        let score = |ac: &str| {
+            parse_cvss_v2_vector(&format!("AV:N/AC:{ac}/Au:N/C:C/I:C/A:C"))
+                .unwrap_or_else(|| panic!("AC:{ac} must be a recognised v2 metric"))
+        };
+        let low = score("L");
+        let medium = score("M");
+        let high = score("H");
+
+        // Impact and every other weight are identical across the three, so the
+        // only thing that moves the score is the access-complexity term.
+        assert!(low > medium, "AC:L ({low}) must outrank AC:M ({medium})");
+        assert!(medium > high, "AC:M ({medium}) must outrank AC:H ({high})");
+
+        // The exact value, so a wrong weight cannot hide behind the ordering.
+        //   impact         = 10.41 * (1 - 0.34^3)        = 10.0008
+        //   exploitability = 20 * 1.0 * AC * 0.704
+        //   base           = ((0.6*impact) + (0.4*exploitability) - 1.5) * 1.176
+        // rounded to one decimal
+        assert_eq!(low, 10.0, "AC:L -> exploitability 9.9968");
+        assert_eq!(medium, 9.3, "AC:M -> exploitability 8.5888");
+        assert_eq!(high, 7.6, "AC:H -> exploitability 4.9280");
+
+        // A metric value that is not in the v2 vocabulary is refused outright,
+        // which is the direction the shared `(_, "P")` arm would have broken.
+        assert!(parse_cvss_v2_vector("AV:N/AC:P/Au:N/C:C/I:C/A:C").is_none());
+        assert!(parse_cvss_v2_vector("AV:N/Au:N/C:C/I:C/A:C").is_none());
+    }
+
+    /// Every declared-severity label, mapped to its band.
+    ///
+    /// One label was covered. `CRITICAL` is the one that matters most to a
+    /// policy, so it is the one the suite reached -- through a CRITICAL advisory
+    /// whose CVSS score was deliberately low, so the declared label had to win.
+    /// `HIGH`, `MODERATE`/`MEDIUM` and `LOW` had no test at all, and deleting any
+    /// of those arms sends the label down the score fallback, which is a
+    /// different band by construction. Asserted per label, including the alias,
+    /// the case folding, and the refusal.
+    #[test]
+    fn every_declared_severity_label_maps_to_its_band() {
+        let p = Policy::default();
+        for (label, band) in [
+            ("HIGH", VerdictBand::High),
+            ("MODERATE", VerdictBand::Medium),
+            ("MEDIUM", VerdictBand::Medium),
+            ("LOW", VerdictBand::Low),
+        ] {
+            assert_eq!(
+                band_from_declared_severity(label, &p),
+                Some(band),
+                "`{label}` must map to {band:?}"
+            );
+        }
+
+        // Case folding is by upper-casing the whole label.
+        for (label, band) in [
+            ("high", VerdictBand::High),
+            ("Medium", VerdictBand::Medium),
+            ("mOdErAtE", VerdictBand::Medium),
+            ("low", VerdictBand::Low),
+        ] {
+            assert_eq!(
+                band_from_declared_severity(label, &p),
+                Some(band),
+                "`{label}`"
+            );
+        }
+
+        // CRITICAL is policy-bound; the other three are not.
+        assert_eq!(
+            band_from_declared_severity("CRITICAL", &p),
+            Some(VerdictBand::Block),
+            "block_on_critical_cve defaults on"
+        );
+        let mut lenient = Policy::default();
+        lenient.advisories.block_on_critical_cve = false;
+        assert_eq!(
+            band_from_declared_severity("CRITICAL", &lenient),
+            Some(VerdictBand::High)
+        );
+
+        // An unrecognised label is refused, not guessed at.
+        for label in ["", "SEVERE", "IMPORTANT", "NONE"] {
+            assert_eq!(
+                band_from_declared_severity(label, &p),
+                None,
+                "`{label}` is not a declared severity"
+            );
+        }
+    }
 }
