@@ -313,16 +313,43 @@ impl PackumentMemo {
     /// ceiling is not stored; a store that would pass the total restarts rather
     /// than grows.
     fn insert(&mut self, name: String, p: &Packument) {
+        Self::insert_within(
+            &mut self.by_name,
+            &mut self.bytes,
+            name,
+            p,
+            MAX_MEMOISED_PACKUMENT_BYTES,
+            MAX_MEMOISED_PACKUMENT_TOTAL_BYTES,
+        );
+    }
+
+    /// The policy with the two ceilings supplied, so the *comparison* can be
+    /// pinned.
+    ///
+    /// The per-document test is `size > ceiling`, and the only input that
+    /// separates `>` from `>=` is a packument estimating to exactly the ceiling
+    /// — 64 MiB of fixture to assert one byte of comparison. Handing the
+    /// ceilings in makes that a rounding argument instead, and the same shape
+    /// `stale_band_for` and `reap_if_aged` use on the recall side.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_within(
+        by_name: &mut std::collections::HashMap<String, Packument>,
+        bytes: &mut u64,
+        name: String,
+        p: &Packument,
+        per_document: u64,
+        total: u64,
+    ) {
         let size = packument_size_estimate(p);
-        if size > MAX_MEMOISED_PACKUMENT_BYTES {
+        if size > per_document {
             return;
         }
-        if self.bytes + size > MAX_MEMOISED_PACKUMENT_TOTAL_BYTES {
-            self.by_name.clear();
-            self.bytes = 0;
+        if *bytes + size > total {
+            by_name.clear();
+            *bytes = 0;
         }
-        self.bytes += size;
-        self.by_name.insert(name, p.clone());
+        *bytes += size;
+        by_name.insert(name, p.clone());
     }
 }
 
@@ -1272,5 +1299,165 @@ mod tests {
             "a document over the per-entry ceiling must not be stored"
         );
         assert_eq!(roomy.bytes, 0);
+    }
+
+    /// The two ceilings, asserted as values.
+    ///
+    /// Every test of the memo so far has compared an estimate against these
+    /// constants with `>`, which is why six arithmetic mutants across the two
+    /// lines survived: `64 * 1024` and `64 + 1024` are both "large", so a
+    /// ceiling that no longer means 64 MiB still refused the 256 MiB fixture and
+    /// still passed. A ceiling that is wrong in the *permissive* direction is
+    /// the dangerous one -- it looks like a bound and is not -- so the number
+    /// itself is the thing worth pinning.
+    #[test]
+    fn the_packument_memo_ceilings_are_the_documented_sizes() {
+        assert_eq!(MAX_MEMOISED_PACKUMENT_BYTES, 64 * 1024 * 1024);
+        assert_eq!(MAX_MEMOISED_PACKUMENT_BYTES, 67_108_864);
+        assert_eq!(MAX_MEMOISED_PACKUMENT_TOTAL_BYTES, 256 * 1024 * 1024);
+        assert_eq!(MAX_MEMOISED_PACKUMENT_TOTAL_BYTES, 268_435_456);
+        // The memo as a whole is allowed to be larger than any one document.
+        assert!(MAX_MEMOISED_PACKUMENT_TOTAL_BYTES > MAX_MEMOISED_PACKUMENT_BYTES);
+    }
+
+    /// The estimate, exactly, on a packument small enough to reason about.
+    ///
+    /// ```text
+    /// name("memo", 4) + 512
+    ///   + per version: 512 + tarball.len() + signatures
+    /// ```
+    ///
+    /// One version with no signatures and a 29-byte tarball URL is
+    /// `4 + 512 + 512 + 29 = 1057`. Each of the five `+` operators in the
+    /// expression can be mutated to `*` or `-`, and every one of those changes
+    /// this number, so asserting the total rather than a range is what kills
+    /// them. A second version pins that the per-version terms are *summed* over
+    /// versions rather than taken from one.
+    #[test]
+    fn the_packument_estimate_is_exact() {
+        let one = Packument {
+            name: "memo".into(),
+            dist_tags: BTreeMap::new(),
+            versions: BTreeMap::from([(
+                "1.0.0".to_string(),
+                VersionMeta {
+                    name: "memo".into(),
+                    version: "1.0.0".into(),
+                    dist: Dist {
+                        tarball: "https://example.invalid/p.tgz".into(),
+                        integrity: None,
+                        signatures: None,
+                    },
+                },
+            )]),
+        };
+        assert_eq!(
+            packument_size_estimate(&one),
+            4 + 512 + (512 + "https://example.invalid/p.tgz".len() as u64),
+            "one unsigned version"
+        );
+        assert_eq!(packument_size_estimate(&one), 1057);
+
+        // Two versions: the per-version term is summed, not overwritten.
+        let mut two = one.clone();
+        two.versions.insert(
+            "1.0.1".to_string(),
+            VersionMeta {
+                name: "memo".into(),
+                version: "1.0.1".into(),
+                dist: Dist {
+                    tarball: "https://example.invalid/q.tgz".into(),
+                    integrity: None,
+                    signatures: None,
+                },
+            },
+        );
+        assert_eq!(
+            packument_size_estimate(&two),
+            1057 + 512 + "https://example.invalid/q.tgz".len() as u64,
+            "a second version adds its own 512 plus its tarball length"
+        );
+
+        // The signature block is counted, because it is retained as raw JSON.
+        // Dropping this term is what let a 32 MiB block measure 1050 bytes.
+        let mut signed = one.clone();
+        signed.versions.get_mut("1.0.0").unwrap().dist.signatures =
+            Some(serde_json::json!({"keyid": "k", "sig": "s"}));
+        let sig_len = serde_json::to_string(&serde_json::json!({"keyid": "k", "sig": "s"}))
+            .unwrap()
+            .len() as u64;
+        assert_eq!(
+            packument_size_estimate(&signed),
+            1057 + sig_len,
+            "a retained signature block must count toward the ceiling"
+        );
+
+        // An absent packument still costs its name and the two fixed terms, so
+        // the estimate is never zero for a real document.
+        let empty = Packument {
+            name: String::new(),
+            dist_tags: BTreeMap::new(),
+            versions: BTreeMap::new(),
+        };
+        assert_eq!(packument_size_estimate(&empty), 512);
+    }
+
+    /// The per-document comparison is strict, pinned with the ceilings handed
+    /// in. A document estimating to exactly the ceiling is stored; one byte more
+    /// is refused. The `insert` path with the real 64 MiB ceiling cannot express
+    /// this without a 64 MiB fixture, and the mutation it catches -- `>` becoming
+    /// `>=` -- would let an over-ceiling document sit in the memo whenever the
+    /// estimate landed exactly on the bound.
+    #[test]
+    fn the_per_document_ceiling_is_strict() {
+        let doc = Packument {
+            name: "memo".into(),
+            dist_tags: BTreeMap::new(),
+            versions: BTreeMap::from([(
+                "1.0.0".to_string(),
+                VersionMeta {
+                    name: "memo".into(),
+                    version: "1.0.0".into(),
+                    dist: Dist {
+                        tarball: "https://example.invalid/p.tgz".into(),
+                        integrity: None,
+                        signatures: None,
+                    },
+                },
+            )]),
+        };
+        let size = packument_size_estimate(&doc);
+
+        let mut by_name = std::collections::HashMap::new();
+        let mut bytes = 0u64;
+        PackumentMemo::insert_within(
+            &mut by_name,
+            &mut bytes,
+            "memo".into(),
+            &doc,
+            size,
+            u64::MAX,
+        );
+        assert!(
+            by_name.contains_key("memo"),
+            "a document exactly at the ceiling must be stored: {size}"
+        );
+        assert_eq!(bytes, size);
+
+        let mut by_name = std::collections::HashMap::new();
+        let mut bytes = 0u64;
+        PackumentMemo::insert_within(
+            &mut by_name,
+            &mut bytes,
+            "memo".into(),
+            &doc,
+            size - 1,
+            u64::MAX,
+        );
+        assert!(
+            !by_name.contains_key("memo"),
+            "one byte over the ceiling must not be stored"
+        );
+        assert_eq!(bytes, 0, "a refused document must not be accounted for");
     }
 }
