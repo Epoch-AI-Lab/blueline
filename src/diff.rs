@@ -650,4 +650,178 @@ mod tests {
         fs::write(dir.path().join("extra.txt"), "hello").unwrap();
         assert_eq!(find_package_prefix(dir.path()), dir.path());
     }
+
+    /// The executable and binary classification, on the *merge* path.
+    ///
+    /// `compute_delta` has two independent implementations of this
+    /// classification: a sorted merge when a baseline tree is supplied, and a
+    /// one-sided walk when it is not. `detects_binary_files` passes
+    /// `baseline_root: None`, so it only ever reached the second — which is why
+    /// every mutant in the merge arm survived while its twin in the one-sided
+    /// arm was already covered.
+    ///
+    /// Each assertion below is the one input that separates a mutation from the
+    /// code as written:
+    ///
+    /// * `added-exec-mode` is executable by mode with an unremarkable name, so
+    ///   it is in `new_executables` only while the test is an `||`. Under `&&`
+    ///   it needs both signals and drops out.
+    /// * `hook.sh` is the other half: an exec extension with no exec bit.
+    /// * `both-exec` is executable in the baseline *and* the target, so it is a
+    ///   modified file that gained nothing and must not be reported as a new
+    ///   executable. Deleting the `!` on the baseline's `is_executable` turns
+    ///   the guard into "executable in both" and reports it.
+    /// * `text-to-big` crosses into `OpaqueTooLarge` by growing past 2 MiB, so
+    ///   it is neither binary before nor binary after, and only the
+    ///   "became opaque" arm can put it in `new_binaries`.
+    /// * `bin-to-bin` is binary on both sides, which is the only way into
+    ///   `modified_binaries`.
+    #[test]
+    fn the_merge_path_classifies_executables_and_binaries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn manifest(version: &str) -> PackageJson {
+            PackageJson {
+                name: "test".into(),
+                version: version.into(),
+                gypfile: None,
+                scripts: BTreeMap::new(),
+                dependencies: BTreeMap::new(),
+                optional_dependencies: BTreeMap::new(),
+                peer_dependencies: BTreeMap::new(),
+            }
+        }
+
+        fn set_mode(dir: &std::path::Path, name: &str, mode: u32) {
+            fs::set_permissions(dir.join(name), fs::Permissions::from_mode(mode)).unwrap();
+        }
+
+        let old_dir = tempfile::tempdir().unwrap();
+        let new_dir = tempfile::tempdir().unwrap();
+
+        // Modified files.
+        fs::write(old_dir.path().join("both-exec"), "old\n").unwrap();
+        set_mode(old_dir.path(), "both-exec", 0o755);
+        fs::write(new_dir.path().join("both-exec"), "new\n").unwrap();
+        set_mode(new_dir.path(), "both-exec", 0o755);
+
+        fs::write(old_dir.path().join("gains-exec"), "old\n").unwrap();
+        set_mode(old_dir.path(), "gains-exec", 0o644);
+        fs::write(new_dir.path().join("gains-exec"), "new\n").unwrap();
+        set_mode(new_dir.path(), "gains-exec", 0o755);
+
+        // Binary on both sides: the only route into `modified_binaries`.
+        fs::write(old_dir.path().join("bin-to-bin"), [1u8, 0, 2, 3]).unwrap();
+        fs::write(new_dir.path().join("bin-to-bin"), [9u8, 0, 8, 7]).unwrap();
+
+        // Grows past MAX_DIFF_FILE_BYTES, so it is opaque rather than binary.
+        let big = "a".repeat((MAX_DIFF_FILE_BYTES + 1024) as usize);
+        fs::write(old_dir.path().join("text-to-big"), "small\n").unwrap();
+        fs::write(new_dir.path().join("text-to-big"), &big).unwrap();
+
+        // Added files, one signal each.
+        fs::write(new_dir.path().join("added-exec-mode"), "hi\n").unwrap();
+        set_mode(new_dir.path(), "added-exec-mode", 0o755);
+        fs::write(new_dir.path().join("hook.sh"), "hi\n").unwrap();
+        set_mode(new_dir.path(), "hook.sh", 0o644);
+
+        // Added, and opaque rather than binary. This is the only shape that
+        // separates the two arms of the `new_binaries` test in the `(None,
+        // Some(_))` merge arm, and that arm is reachable only with a baseline --
+        // the one-sided walk has its own copy of the check further down.
+        fs::write(new_dir.path().join("added-opaque"), &big).unwrap();
+
+        // Added, opaque, and named so it sorts *after* every baseline entry.
+        // That is what routes it through the `(None, Some(_))` arm rather than
+        // the `Greater` one: the merge compares the two sorted streams, so a
+        // file that sorts before the next baseline entry is classified as
+        // `Greater` and one that sorts after all of them is classified only once
+        // the baseline iterator is exhausted. The two arms carry their own copy
+        // of the check, so an added file only reaches one of them by name.
+        fs::write(new_dir.path().join("zzz-opaque"), &big).unwrap();
+
+        // Removed.
+        fs::write(old_dir.path().join("gone"), "bye\n").unwrap();
+
+        let base_m = manifest("1.0.0");
+        let target_m = manifest("1.1.0");
+        let delta = compute_delta(
+            Some(old_dir.path()),
+            Some(&base_m),
+            Some("1.0.0"),
+            new_dir.path(),
+            &target_m,
+            "1.1.0",
+        )
+        .unwrap();
+
+        for want in ["gains-exec", "added-exec-mode", "hook.sh"] {
+            assert!(
+                delta.new_executables.iter().any(|p| p == want),
+                "`{want}` must be reported as a new executable, got {:?}",
+                delta.new_executables
+            );
+        }
+        assert!(
+            !delta.new_executables.iter().any(|p| p == "both-exec"),
+            "a file executable in both trees gained nothing: {:?}",
+            delta.new_executables
+        );
+
+        assert!(
+            delta.modified_binaries.iter().any(|p| p == "bin-to-bin"),
+            "binary before and after is a modified binary, got {:?}",
+            delta.modified_binaries
+        );
+        assert!(
+            delta.new_binaries.iter().any(|p| p == "text-to-big"),
+            "a file that becomes opaque is a new binary, got {:?}",
+            delta.new_binaries
+        );
+        for want in ["added-opaque", "zzz-opaque"] {
+            assert!(
+                delta.new_binaries.iter().any(|p| p == want),
+                "an added opaque file is a new binary: `{want}`, got {:?}",
+                delta.new_binaries
+            );
+        }
+        assert!(
+            delta
+                .files_removed
+                .iter()
+                .any(|c| c.relative_path == "gone"),
+            "the removed file must still be reported"
+        );
+    }
+
+    /// An added file that is opaque rather than binary. `classify_bytes` tests
+    /// the size cap *before* the NUL scan, so a file over 2 MiB is
+    /// `OpaqueTooLarge` and never `Binary` — which is the only way to tell the
+    /// two arms of the `new_binaries` test apart. `detects_binary_files` adds a
+    /// 4-byte `.node` file, where both sides of the `||` are false, so it passes
+    /// whether the operator is `||` or `&&`.
+    #[test]
+    fn an_added_opaque_file_counts_as_a_new_binary() {
+        let new_dir = tempfile::tempdir().unwrap();
+        let big = "a".repeat((MAX_DIFF_FILE_BYTES + 1024) as usize);
+        fs::write(new_dir.path().join("huge.txt"), &big).unwrap();
+
+        let m = PackageJson {
+            name: "test".into(),
+            version: "1.0.0".into(),
+            gypfile: None,
+            scripts: BTreeMap::new(),
+            dependencies: BTreeMap::new(),
+            optional_dependencies: BTreeMap::new(),
+            peer_dependencies: BTreeMap::new(),
+        };
+        let delta = compute_delta(None, None, None, new_dir.path(), &m, "1.0.0").unwrap();
+
+        assert_eq!(delta.files_added[0].kind, FileKind::OpaqueTooLarge);
+        assert!(
+            delta.new_binaries.contains(&"huge.txt".to_string()),
+            "an opaque file is not scannable, so it counts as a new binary: {:?}",
+            delta.new_binaries
+        );
+    }
 }
