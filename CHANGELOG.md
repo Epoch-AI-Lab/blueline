@@ -119,6 +119,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   roughly 4x, and it is the number a future maintainer would have sized the next
   change against.
 
+  With the gate actually running it immediately reported **54 surviving mutants
+  across 12 files** (288 mutants tested, 54 missed). The clusters are the code
+  this branch touched most recently: `packument_size_estimate` and
+  `PackumentMemo::insert` (12), the recall `SyncLock` and its age helpers (9),
+  `decompressed_stream_cap` (7), `compute_delta` (6), the MCP framing helpers
+  (6), CVSS v2 parsing and declared-severity banding (4), `rule_title` (3).
+  Every "confirmed it kills its mutant" claim made while these shards were
+  timing out was checked by hand against one mutation at a time; the automated
+  sweep is wider and is finding gaps the hand checks did not reach. None of the
+  54 is a known behavioural defect — a surviving mutant means no test
+  distinguishes the mutation, which is a coverage gap rather than proof the code
+  is wrong. They remain open, listed per shard in the run's logs.
+
   A trap worth recording, because it cost this investigation its first two
   measurements: the repository sets `diff.mnemonicprefix`, so a bare `git diff`
   emits `i/`/`w/` prefixes and cargo-mutants' diff parser silently discards
