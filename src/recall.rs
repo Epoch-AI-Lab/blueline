@@ -404,9 +404,19 @@ pub fn sync(url: &str) -> anyhow::Result<SyncedSnapshot> {
 /// in milliseconds. Production always passes `LOCK_WAIT`.
 fn sync_within(url: &str, lock_wait: std::time::Duration) -> anyhow::Result<SyncedSnapshot> {
     let url = format!("{}/revocations.json", url.trim_end_matches('/'));
-    let agent = ureq::AgentBuilder::new()
-        .timeout_read(std::time::Duration::from_secs(HTTP_READ_TIMEOUT_SECS))
-        .build();
+    // The shared registry agent, not a bare `AgentBuilder`. The SSRF properties
+    // are the point: `redirects(0)` and a resolver that validates every address
+    // against the host the operator configured. A bare builder defaults to
+    // following 5 redirects to any host, which is how the two provenance fetches
+    // ended up reachable from a recall URL pointing anywhere. The total budget
+    // also replaces the per-read one that was here: a peer that dribbles a byte
+    // every few seconds stays inside a per-read ceiling forever, because each
+    // individual read is small.
+    let agent = crate::registry::http_util::registry_agent_with_timeout(
+        "blueline-security/recall",
+        &url,
+        std::time::Duration::from_secs(HTTP_READ_TIMEOUT_SECS),
+    );
     let resp = agent
         .get(&url)
         .call()
@@ -505,6 +515,18 @@ impl SyncLock {
                 Err(e) => return Err(anyhow::anyhow!("creating {}: {e}", path.display())),
             }
             if Self::reap_if_stale(&path) {
+                // Reaped, so try to take it immediately -- but a reap that keeps
+                // succeeding must not buy unbounded retries. `continue` here skips
+                // the deadline test below, so a peer that recreates the lock the
+                // instant it is removed would spin forever and turn a bounded wait
+                // into a hang. Re-checked before looping, so the wait stays bounded
+                // however the reap goes.
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "another blueline recall sync holds {}; refusing to race it",
+                        path.display()
+                    );
+                }
                 continue;
             }
             if std::time::Instant::now() >= deadline {
@@ -1942,6 +1964,70 @@ mod tests {
             !msg.contains("refusing to race"),
             "this is not lock contention and must not be reported as such: {msg}"
         );
+    }
+
+    /// The reap branch must respect the deadline, or a reap that always succeeds
+    /// spins forever.
+    ///
+    /// The reap arm used to `continue` past the deadline test, so a peer whose
+    /// lock is reapable never reached a bound: every iteration removed the lock,
+    /// looped, and hit the next one. No sleep, no deadline, no exit — a 30 second
+    /// bounded wait becomes a hang on the sync path, with no error to show.
+    /// Mutation shard 22 hit this and ran to the 300s per-mutant timeout.
+    ///
+    /// A wait of zero makes the assertion deterministic instead of racy, which a
+    /// competing-recreator test could not be. The deadline has already passed on
+    /// entry, so the reap must bail immediately:
+    ///
+    /// * with the check, the reap succeeds and the now-expired deadline refuses.
+    /// * without it, the reap succeeds and the loop's next `create_new` finds a
+    ///   free path, so the call returns `Ok` having waited no time at all.
+    ///
+    /// So `Ok` here is not "won the lock", it is the bug.
+    #[test]
+    fn a_reap_that_always_succeeds_still_honours_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().to_path_buf();
+        let lock_path = parent.join("recall_snapshot.lock");
+        let held = SyncLock::acquire(&parent).unwrap();
+        drop(held);
+
+        // Old enough that every reap succeeds, which is the condition that turns
+        // the missing check into an unbounded loop.
+        let old =
+            std::time::SystemTime::now() - LOCK_STALE_AFTER - std::time::Duration::from_secs(1);
+        filetime_reset(&lock_path, old);
+
+        let got = SyncLock::acquire_within(&parent, std::time::Duration::ZERO)
+            .map(|_| ())
+            .map_err(|e| format!("{e:#}"));
+        let _ = std::fs::remove_file(&lock_path);
+
+        assert!(
+            got.is_err(),
+            "an expired deadline must refuse even when the reap succeeds; returning \
+             Ok means the reap branch skipped the deadline check and would spin \
+             against a peer that keeps re-creating its lock: {got:?}"
+        );
+        assert!(
+            got.as_ref().unwrap_err().contains("refusing to race"),
+            "the bound must be reported as the contention it is: {got:?}"
+        );
+    }
+
+    /// Set a file's mtime, so a lock can be made old enough to reap. Shells out
+    /// to `touch` because the stdlib has no portable setter, and the one caller
+    /// is a file-age test on a platform that has one.
+    fn filetime_reset(path: &Path, when: std::time::SystemTime) {
+        let secs = when
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let _ = std::process::Command::new("touch")
+            .arg("-d")
+            .arg(format!("@{secs}"))
+            .arg(path)
+            .status();
     }
 
     /// The reap threshold, sitting exactly on it.

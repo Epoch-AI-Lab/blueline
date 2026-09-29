@@ -251,7 +251,9 @@ fn verify_schema(conn: &rusqlite::Connection, path: &Path) -> Result<(), Bluelin
             .and_then(|d| d.trim().parse::<i64>().ok());
         if !shape.ty.eq_ignore_ascii_case(want_type) || !shape.notnull || default != Some(0) {
             return Err(BluelineError::Store(format!(
-                "{} is not a usable blueline store: {table}.{column} is {}                  {} default {:?}, expected {want_type} NOT NULL DEFAULT 0; a store that                  blesses by default would approve releases nobody reviewed; move the file                  aside to start a new one",
+                "{} is not a usable blueline store: {table}.{column} is {} {} default {:?}, \
+                 expected {want_type} NOT NULL DEFAULT 0; a store that blesses by default \
+                 would approve releases nobody reviewed; move the file aside to start a new one",
                 path.display(),
                 shape.ty,
                 if shape.notnull { "NOT NULL" } else { "NULL" },
@@ -1895,5 +1897,156 @@ mod tests {
         assert_eq!(ty, "INTEGER", "the type is intact");
         assert_eq!(notnull, 1, "NOT NULL is intact");
         assert_eq!(default, "1", "only the default was changed");
+    }
+
+    /// The other two arms of the same `||`, one fixture each.
+    ///
+    /// `a_trust_bearing_column_wrong_in_one_respect_alone_is_still_refused`
+    /// poisons the default and leaves the type and `NOT NULL` intact, so it pins
+    /// the third arm alone. Mutating the comparison at `store.rs:252` to `&&`
+    /// instead of `||` survives that test: with the default wrong and the other
+    /// two right, both `||` and `&&` refuse. These two close that gap by breaking
+    /// one of the other arms and leaving the rest intact, which is the only shape
+    /// that tells the operators apart.
+    ///
+    /// Both matter for the same reason as the default: `clean` is what
+    /// `list_clean_versions` reads to decide a release is an approved baseline.
+    /// A NULL there and a `TEXT` there are both ways for that read to stop
+    /// meaning what the code assumes.
+    fn refuse_trust_bearing_column_whose_ddl_is(from: &str, to: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("poisoned.db");
+        {
+            let _store = BaselineStore::open_at(&db_path).expect("a fresh store opens");
+        }
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let ddl: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='known_clean'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let poisoned = ddl.replacen(from, to, 1);
+            assert_ne!(
+                poisoned, ddl,
+                "`{from}` must occur in the fixture DDL: {ddl}"
+            );
+            conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+            conn.execute_batch("ALTER TABLE known_clean RENAME TO known_clean_orig")
+                .unwrap();
+            conn.execute_batch(&poisoned).unwrap();
+            conn.execute_batch("DROP TABLE known_clean_orig").unwrap();
+        }
+
+        let err = BaselineStore::open_at(&db_path)
+            .map(|_| ())
+            .expect_err("a trust-bearing column wrong in one respect alone must be refused");
+        err.to_string()
+    }
+
+    /// A NULLABLE `clean` is refused even though its type and default are right.
+    ///
+    /// The fixture is `clean INTEGER DEFAULT 0`: correct type, correct default,
+    /// and no `NOT NULL`. Every check except nullability passes, so only the
+    /// `!shape.notnull` arm can refuse it.
+    #[test]
+    fn a_nullable_trust_bearing_column_is_refused_even_with_a_correct_default() {
+        let msg = refuse_trust_bearing_column_whose_ddl_is(
+            "clean       INTEGER NOT NULL DEFAULT 0",
+            "clean       INTEGER DEFAULT 0",
+        );
+        assert!(
+            msg.contains("known_clean.clean") && msg.contains("NULL"),
+            "the refusal must name the column and that it is NULL: {msg}"
+        );
+        // The type and default really are right in that fixture, so the refusal
+        // cannot be attributed to either of them. The message names the found
+        // shape on every path, so this asserts what it reports, not that the
+        // default went unmentioned.
+        assert!(
+            msg.contains("is INTEGER NULL default Some(\"0\")"),
+            "the type and default must be reported as correct, with NULL the \
+             only thing wrong: {msg}"
+        );
+    }
+
+    /// A wrongly-typed `clean` is refused even though it is `NOT NULL DEFAULT 0`.
+    ///
+    /// The fixture is `clean TEXT NOT NULL DEFAULT 0`: nullability and default
+    /// are right, only the declared type is wrong. Without this test, replacing
+    /// the type comparison at `store.rs:252` with a constant true would survive.
+    #[test]
+    fn a_mistyped_trust_bearing_column_is_refused_even_when_not_null_with_the_right_default() {
+        let msg = refuse_trust_bearing_column_whose_ddl_is(
+            "clean       INTEGER NOT NULL DEFAULT 0",
+            "clean       TEXT NOT NULL DEFAULT 0",
+        );
+        assert!(
+            msg.contains("known_clean.clean") && msg.contains("TEXT"),
+            "the refusal must name the column and the type it found: {msg}"
+        );
+        assert!(
+            msg.contains("expected INTEGER NOT NULL DEFAULT 0"),
+            "the refusal must say what was required: {msg}"
+        );
+        assert!(
+            !msg.contains("is NULL NOT NULL"),
+            "nullability was intact, so it is not what was refused: {msg}"
+        );
+    }
+
+    /// `EXPECTED_SCHEMA` and `MIGRATIONS` are two hand-written lists of the same
+    /// schema, so they can drift apart silently: a column added to a migration and
+    /// forgotten in `EXPECTED_SCHEMA` is never checked at open, and a column listed
+    /// in `EXPECTED_SCHEMA` that no migration creates makes a fresh store
+    /// unopenable. Neither shows up as a test failure on its own.
+    ///
+    /// So this compares the two directly: every column the migrations actually
+    /// produce is in `EXPECTED_SCHEMA`, and nothing is listed that is absent.
+    #[test]
+    fn expected_schema_agrees_with_the_migrations() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("fresh.db");
+        {
+            let _store = BaselineStore::open_at(&db_path).expect("a fresh store opens");
+        }
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT m.name, p.name FROM sqlite_master m, pragma_table_info(m.name) p \
+                 WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%'",
+            )
+            .unwrap();
+        let migrated: HashSet<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        // A fresh store is opened by `verify_schema` on the way in, so reaching
+        // this line at all proves `EXPECTED_SCHEMA` is not over-claiming: a listed
+        // column the migrations never create would have refused the open above.
+        // What is left to catch is the other direction.
+        let listed: HashSet<(String, String)> = EXPECTED_SCHEMA
+            .iter()
+            .map(|(t, c)| ((*t).to_string(), (*c).to_string()))
+            .collect();
+        let unlisted: Vec<String> = migrated
+            .difference(&listed)
+            .map(|(t, c)| format!("{t}.{c}"))
+            .collect();
+        assert!(
+            unlisted.is_empty(),
+            "the migrations create columns EXPECTED_SCHEMA does not check, so an \
+             open would never notice them missing: {}",
+            unlisted.join(", ")
+        );
+        assert_eq!(
+            listed.len(),
+            EXPECTED_SCHEMA.len(),
+            "EXPECTED_SCHEMA lists a duplicate, which makes the count misleading"
+        );
     }
 }

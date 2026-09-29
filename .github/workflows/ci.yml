@@ -290,8 +290,17 @@ jobs:
   #     for any reason other than a diff too small to mutate.
   #
   # Now: 503 mutants for this diff (measured via --list), 32 shards, so ~16
-  # mutants per shard, at up to 300s each — 80 min worst case against a 60 min
-  # ceiling, which is only reached if every mutant in a shard hangs.
+  # mutants per shard, at up to 300s each.
+  #
+  # The job ceiling is 60 min against that 80 min worst case, and the two cannot
+  # both be right. A shard that reaches 60 min is CANCELLED, which the aggregate
+  # reads as failure and a human reads as a fail-fast cancellation — but the real
+  # cause is the ceiling, not a survivor. So the ceiling is raised to 100, above
+  # the 80 min arithmetic, with headroom for a cold runner: a job is now killed
+  # only when it would have overrun the per-mutant budget across the whole shard.
+  # Lowering --timeout instead would put the ceiling back in reach, and a timeout
+  # is an unknown fate rather than a caught mutant (it exits 3), so the gate would
+  # go red for a mutant that may well have been caught.
   #
   # --timeout is per-mutant, so it must clear the whole suite plus margin for a
   # runner carrying 32 concurrent jobs. It was 180s, which is 2.8x the 64s the
@@ -299,7 +308,7 @@ jobs:
   # an unknown fate rather than a caught mutant, and cargo-mutants exits 3, so
   # the gate went red for a mutant that may well have been caught. 300s is ~4.7x
   # the idle figure, and the measured shard cost is ~55s per mutant, so the
-  # 60 minute job ceiling is not the binding constraint.
+  # job ceiling set above is not the binding constraint.
   #
   # A docs-only or Cargo.lock-only diff legitimately mutates nothing and exits 0.
   # That is correct, not the scope bug above: the glob now makes "nothing to
@@ -309,7 +318,10 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     needs: [test]
-    timeout-minutes: 60
+    # Above the 80 min worst case in the comment above, not at it. See there for
+    # why a shard killed at 60 read as a fail-fast cancellation rather than a
+    # timeout.
+    timeout-minutes: 100
     strategy:
       fail-fast: false
       matrix:
@@ -371,7 +383,8 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [test]
-    timeout-minutes: 60
+    # Same arithmetic as mutants-pr above: 100, above the 80 min worst case.
+    timeout-minutes: 100
     strategy:
       fail-fast: false
       matrix:

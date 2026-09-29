@@ -13,6 +13,12 @@ const MAX_OSV_RESPONSE_BYTES: u64 = 1024 * 1024;
 /// Default timeout in milliseconds for advisory network calls.
 const DEFAULT_TIMEOUT_MS: u64 = 3000;
 
+/// The one host this module talks to. Named rather than inlined at the call site
+/// so the validating resolver below is anchored to the same authority the request
+/// is actually made against — the two drifting apart is how a guard that looks
+/// present stops checking anything.
+const OSV_BASE_URL: &str = "https://api.osv.dev";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdvisoryStatus {
@@ -217,9 +223,18 @@ pub fn fetch_advisories(
     }
 
     // 2. Query OSV.dev REST API
-    let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_millis(DEFAULT_TIMEOUT_MS))
-        .build();
+    //
+    // The shared registry agent, so this request carries the same SSRF guards the
+    // registry fetches do: `redirects(0)` and a resolver that validates every
+    // resolved address against the configured host. A bare `AgentBuilder` defaults
+    // to following 5 redirects anywhere, and OSV answers with a redirect for an
+    // unknown package shape, so a hostile or merely wrong response could walk this
+    // request off api.osv.dev and onto a link-local address.
+    let agent = crate::registry::http_util::registry_agent_with_timeout(
+        "blueline-security/0.1.0",
+        OSV_BASE_URL,
+        std::time::Duration::from_millis(DEFAULT_TIMEOUT_MS),
+    );
 
     let query_payload = serde_json::json!({
         "version": version,
@@ -231,7 +246,7 @@ pub fn fetch_advisories(
 
     let payload_str = query_payload.to_string();
     let resp_result = agent
-        .post("https://api.osv.dev/v1/query")
+        .post(&format!("{OSV_BASE_URL}/v1/query"))
         .set("Content-Type", "application/json")
         .set("User-Agent", "blueline-security/0.1.0")
         .send_string(&payload_str);
