@@ -24,6 +24,11 @@ const MAX_TEXT_BYTES: usize = 512;
 /// Clock skew allowance when validating generated_at.
 const TIMESTAMP_SKEW_SECS: i64 = 300;
 const HTTP_READ_TIMEOUT_SECS: u64 = 30;
+/// Redirect hops a snapshot fetch will follow. A recall service is an operator-
+/// configured origin that serves one document, so two hops is generous for the
+/// legitimate shapes (a trailing-slash correction plus a versioned-path move)
+/// while keeping the chain short enough to reason about.
+const MAX_REDIRECTS: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Revocation {
@@ -400,6 +405,90 @@ pub fn sync(url: &str) -> anyhow::Result<SyncedSnapshot> {
     sync_within(url, LOCK_WAIT)
 }
 
+/// Follow the snapshot fetch's redirect chain, one hop at a time.
+///
+/// The agent has `redirects(0)`, so every hop is a request this function makes
+/// explicitly and every hop goes back through the same validating resolver
+/// rather than being followed blindly. Two rules bound what a hop may do:
+///
+/// * At most `MAX_REDIRECTS` hops, so the chain stays short and terminates.
+/// * A hop may change path, or upgrade `http` to `https`, but it may not change
+///   *host* — and it may not downgrade `https` to `http` even on the same host,
+///   because that hands the operator's configured origin a request they did not
+///   intend to make in cleartext.
+///
+/// A cross-host hop is refused rather than followed. The commonest real cause is
+/// a base URL pointing at a web front end instead of the file host, so the
+/// error names that case rather than leaving the operator to guess.
+fn follow_redirects(agent: &ureq::Agent, url: &str) -> Result<ureq::Response, anyhow::Error> {
+    let mut current = url.to_string();
+    for hop in 0..=MAX_REDIRECTS {
+        let resp = agent
+            .get(&current)
+            .call()
+            .map_err(|e| anyhow::anyhow!("GET {current}: {e}"))?;
+        let status = resp.status();
+        if !(301..=308).contains(&status) {
+            return Ok(resp);
+        }
+        if hop == MAX_REDIRECTS {
+            anyhow::bail!(
+                "recall snapshot fetch exceeded {MAX_REDIRECTS} redirects starting at {url}; \
+                 point the recall URL at the file host that serves {}/revocations.json directly",
+                base_of(url)
+            );
+        }
+        let location = resp.header("location").ok_or_else(|| {
+            anyhow::anyhow!(
+                "recall snapshot fetch got {status} from {current} with no Location header"
+            )
+        })?;
+        let next = crate::registry::http_util::resolve_redirect_url(&current, location)
+            .map_err(|e| anyhow::anyhow!("resolving redirect from {current}: {e}"))?;
+        check_hop(&current, &next, url)?;
+        current = next;
+    }
+    unreachable!("the loop returns or bails on its final iteration")
+}
+
+/// The scheme and host of a URL, for comparing two hops.
+fn scheme_host(raw: &str) -> Result<(String, String), anyhow::Error> {
+    crate::registry::http_util::parse_url_scheme_and_host(raw)
+        .map_err(|e| anyhow::anyhow!("parsing {raw}: {e}"))
+}
+
+/// The origin of the configured URL, minus the snapshot path, for error text.
+fn base_of(url: &str) -> String {
+    url.split_once("/revocations.json")
+        .map(|(base, _)| base)
+        .unwrap_or(url)
+        .to_string()
+}
+
+/// Refuse a hop that leaves the origin, or that downgrades to cleartext.
+fn check_hop(from: &str, to: &str, configured: &str) -> Result<(), anyhow::Error> {
+    let (from_scheme, from_host) = scheme_host(from)?;
+    let (to_scheme, to_host) = scheme_host(to)?;
+
+    if to_host != from_host {
+        anyhow::bail!(
+            "recall snapshot redirect from {from} to {to} changes host, which is refused. \
+             If the recall URL is a web front end, point it at the file host that serves the \
+             snapshot directly, e.g. a GitHub repo's \
+             `https://raw.githubusercontent.com/OWNER/REPO/BRANCH` page rather than \
+             `https://github.com/OWNER/REPO`."
+        );
+    }
+    if from_scheme == "https" && to_scheme != "https" {
+        anyhow::bail!(
+            "recall snapshot redirect from {from} to {to} downgrades HTTPS to cleartext, \
+             which is refused. Fix the redirect at {}, or configure the https URL directly.",
+            base_of(configured)
+        );
+    }
+    Ok(())
+}
+
 /// `lock_wait` is a parameter only so the tests can exercise the contended path
 /// in milliseconds. Production always passes `LOCK_WAIT`.
 fn sync_within(url: &str, lock_wait: std::time::Duration) -> anyhow::Result<SyncedSnapshot> {
@@ -417,10 +506,7 @@ fn sync_within(url: &str, lock_wait: std::time::Duration) -> anyhow::Result<Sync
         &url,
         std::time::Duration::from_secs(HTTP_READ_TIMEOUT_SECS),
     );
-    let resp = agent
-        .get(&url)
-        .call()
-        .map_err(|e| anyhow::anyhow!("GET {url}: {e}"))?;
+    let resp = follow_redirects(&agent, &url)?;
     let mut body = Vec::new();
     resp.into_reader()
         .take(MAX_SNAPSHOT_BYTES as u64 + 1)
@@ -641,6 +727,142 @@ pub fn serve(port: u16, index: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A redirect chain the fetch is allowed to follow: same host, path only.
+    ///
+    /// Control for the refusal tests below. Without it, a `check_hop` that
+    /// refused *everything* would make them pass for the wrong reason, which is
+    /// the same trap the provenance redirect fixture had to guard against.
+    #[test]
+    fn a_same_host_path_redirect_is_followed() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            // One hop: /start redirects to /moved, which serves the body.
+            for stream in listener.incoming().take(2).flatten() {
+                let mut stream = stream;
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                let req = String::from_utf8_lossy(&buf);
+                let (head, body): (&str, &[u8]) = if req.contains("/moved") {
+                    (
+                        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n",
+                        b"hello",
+                    )
+                } else {
+                    (
+                        "HTTP/1.1 302 Found\r\nLocation: /moved\r\nContent-Length: 0\r\n\
+                         Connection: close\r\n\r\n",
+                        b"",
+                    )
+                };
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(body);
+                let _ = stream.flush();
+            }
+        });
+
+        let agent = crate::registry::http_util::registry_agent_with_timeout(
+            "blueline-security/recall-test",
+            &format!("http://127.0.0.1:{port}"),
+            std::time::Duration::from_secs(10),
+        );
+        let resp = follow_redirects(&agent, &format!("http://127.0.0.1:{port}/start"))
+            .expect("a same-host path redirect must be followed");
+        assert_eq!(resp.status(), 200);
+    }
+
+    /// A hop to a different host is refused, and the error names the mistake.
+    ///
+    /// The likeliest real cause is a recall URL pointing at a web front end that
+    /// redirects to a file host, so the message has to name that shape — an
+    /// operator who only sees "changes host" cannot tell what to fix.
+    #[test]
+    fn a_cross_host_redirect_is_refused_with_the_likely_cause_named() {
+        let from = "https://recall.example/revocations.json";
+        let to = "https://raw.githubusercontent.com/owner/repo/main/revocations.json";
+        let err = check_hop(from, to, from)
+            .map_err(|e| format!("{e:#}"))
+            .unwrap_err();
+        assert!(err.contains("changes host"), "must say why: {err}");
+        assert!(
+            err.contains("raw.githubusercontent.com"),
+            "must name the file-host form the operator probably wants: {err}"
+        );
+        assert!(
+            err.contains("github.com/OWNER/REPO"),
+            "must contrast it with the front-end form that causes this: {err}"
+        );
+    }
+
+    /// A same-host hop is fine; the two things that are not are a changed host
+    /// and an https-to-http downgrade. The downgrade matters independently: a
+    /// chain that stays on one host can still move the request into cleartext.
+    #[test]
+    fn only_a_downgrade_is_refused_among_same_host_hops() {
+        let from = "https://recall.example/revocations.json";
+        assert!(
+            check_hop(from, "https://recall.example/v2/revocations.json", from).is_ok(),
+            "a same-host path change on https must be allowed"
+        );
+        assert!(
+            check_hop(from, "http://recall.example/revocations.json", from).is_err(),
+            "an https to http downgrade must be refused even on the same host"
+        );
+        assert!(
+            check_hop(
+                "http://recall.example/revocations.json",
+                "https://recall.example/revocations.json",
+                from
+            )
+            .is_ok(),
+            "an http to https upgrade must be allowed"
+        );
+    }
+
+    /// The hop cap has to be enforced, not merely configured.
+    ///
+    /// An unbounded chain against an operator-configured origin is a hang, and
+    /// the cap is the only thing that bounds it, so this pins the count rather
+    /// than the constant.
+    #[test]
+    fn a_chain_longer_than_the_hop_cap_is_refused() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Redirect forever; only the cap can stop this.
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(8).flatten() {
+                let mut stream = stream;
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: /again\r\nContent-Length: 0\r\n\
+                      Connection: close\r\n\r\n",
+                );
+                let _ = stream.flush();
+            }
+        });
+
+        let agent = crate::registry::http_util::registry_agent_with_timeout(
+            "blueline-security/recall-test",
+            &format!("http://127.0.0.1:{port}"),
+            std::time::Duration::from_secs(10),
+        );
+        let err = follow_redirects(&agent, &format!("http://127.0.0.1:{port}/start"))
+            .map(|_| ())
+            .map_err(|e| format!("{e:#}"))
+            .expect_err("an endless redirect chain must be refused");
+        assert!(
+            err.contains(&format!("{MAX_REDIRECTS} redirects")),
+            "the refusal must name the cap it hit: {err}"
+        );
+    }
 
     /// The lock wait the tests use for the contended path. The production
     /// default is `LOCK_WAIT` and is pinned to 30 s in

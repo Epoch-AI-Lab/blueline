@@ -226,10 +226,20 @@ pub fn fetch_advisories(
     //
     // The shared registry agent, so this request carries the same SSRF guards the
     // registry fetches do: `redirects(0)` and a resolver that validates every
-    // resolved address against the configured host. A bare `AgentBuilder` defaults
-    // to following 5 redirects anywhere, and OSV answers with a redirect for an
-    // unknown package shape, so a hostile or merely wrong response could walk this
-    // request off api.osv.dev and onto a link-local address.
+    // resolved address against the configured host.
+    //
+    // This is defence in depth, and the reason is worth stating precisely so the
+    // comment does not go stale in either direction. Probing found no case in
+    // which OSV redirects — 108+ requests across unknown shapes, malformed
+    // bodies and unusual names all answered directly — so the redirect guard is
+    // not holding up a currently-observed behaviour. It stays because "the origin
+    // we do not control does not currently do this" is not a property worth
+    // relying on: OSV is a third party, its edge configuration can change without
+    // notice, and a bare `AgentBuilder` follows up to 5 redirects to any host with
+    // no validation on any hop, so a single changed response header would walk
+    // this request off api.osv.dev and onto a link-local address. The guard costs
+    // one agent and no behaviour, and the alternative is depending on the origin's
+    // current configuration for our SSRF posture.
     let agent = crate::registry::http_util::registry_agent_with_timeout(
         "blueline-security/0.1.0",
         OSV_BASE_URL,

@@ -1886,27 +1886,74 @@ fn provenance_findings(
         });
     }
 
-    // Policy asked for verified provenance. This build cannot verify one:
-    // it compares a subject digest and never checks a DSSE signature or a
-    // Sigstore chain, so anything short of `CryptographicallyVerified`
-    // refuses rather than quietly downgrading the requirement to a digest
-    // comparison. The description says so, because "missing" is not why.
-    if (policy.policy.require_provenance || policy.provenance.require_provenance)
-        && prov_rep.status != ProvenanceStatus::CryptographicallyVerified
-    {
-        let why = if prov_rep.status == ProvenanceStatus::Attested {
-            "a build statement was published and its subject digest matched, but this build \
-                 verifies no DSSE signature or Sigstore certificate chain, so it cannot confirm \
-                 who published it"
-        } else {
-            "none was present"
-        };
-        findings.push(Finding {
-            rule_id: "P03_PROVENANCE_REQUIRED_MISSING".into(),
-            severity: VerdictBand::Block,
-            title: "Required build provenance not verified".into(),
-            description: format!("Policy requires verified SLSA build provenance, but {why}."),
-        });
+    // Policy asked for verified provenance. What that costs depends on what was
+    // actually found, because the answer ranges from "nothing was published" to
+    // "something was published and it does not hold up". The first is absence and
+    // the second is a claim that failed, and refusing a release for the first
+    // blocked every user who set this key before blueline could verify a
+    // signature at all. So absence is disclosed and the verdict is held, and only
+    // a claim that cannot be confirmed is refused.
+    //
+    // The stricter verification work is unchanged: an `Attested` report is still
+    // reported as attested-and-not-cryptographically-verified, and the digest
+    // comparison below is untouched. Only the enforcement is softer.
+    if policy.policy.require_provenance || policy.provenance.require_provenance {
+        match prov_rep.status {
+            // Satisfied. Nothing to disclose, so nothing is emitted.
+            ProvenanceStatus::CryptographicallyVerified => {}
+            // Present, digest matched, no signature checked. Advisory: the policy
+            // asked for more than this build can deliver, and the verdict says so.
+            ProvenanceStatus::Attested => {
+                findings.push(Finding {
+                    rule_id: "P03_PROVENANCE_NOT_CRYPTO_VERIFIED".into(),
+                    severity: VerdictBand::Low,
+                    title: "Build provenance attested, not cryptographically verified".into(),
+                    description:
+                        "A build statement was published and its subject digest matched these \
+                             bytes, but no signature or certificate chain was checked, so this \
+                             does not confirm who published it. Policy requires verified SLSA \
+                             build provenance."
+                            .into(),
+                });
+            }
+            // Absence. Held, not refused: a release nobody published provenance
+            // for is not evidence of a tampered one, and the finding is what
+            // makes that visible.
+            ProvenanceStatus::Missing => {
+                findings.push(Finding {
+                    rule_id: "P03_PROVENANCE_REQUIRED_MISSING".into(),
+                    severity: VerdictBand::Medium,
+                    title: "Required build provenance not published".into(),
+                    description:
+                        "Policy requires verified SLSA build provenance, but none was present. \
+                         This is reported and the verdict is held rather than refused, because \
+                         a release with no published provenance is not the same as one whose \
+                         provenance does not hold up."
+                            .into(),
+                });
+            }
+            // Present and unreadable: an attestation was published and could not
+            // be confirmed. A claim that cannot be checked is the case the key
+            // exists for, so this one is refused.
+            ProvenanceStatus::Unverified => {
+                findings.push(Finding {
+                    rule_id: "P03_PROVENANCE_REQUIRED_UNVERIFIABLE".into(),
+                    severity: VerdictBand::Block,
+                    title: "Published build provenance could not be verified".into(),
+                    description: format!(
+                        "Policy requires verified SLSA build provenance, and an attestation was \
+                         published for this release but could not be verified. {}",
+                        prov_rep
+                            .message
+                            .clone()
+                            .unwrap_or_else(|| "No further detail was reported.".into())
+                    ),
+                });
+            }
+            // Handled above, and independently of this key: a digest mismatch is
+            // a real integrity problem, not a policy preference.
+            ProvenanceStatus::FailedMismatch => {}
+        }
     } else if prov_rep.status == ProvenanceStatus::Attested {
         // Score-neutral, so this discloses without gating anything.
         findings.push(Finding {
@@ -2175,10 +2222,12 @@ mod tests {
     }
 
     #[test]
-    fn require_provenance_refuses_an_attestation_we_cannot_verify() {
+    fn require_provenance_holds_an_attestation_it_cannot_verify_without_refusing_it() {
         // Policy asked for verified provenance. An attestation is not that, and
-        // silently accepting it would downgrade a block-grade policy to a
-        // digest comparison without saying so.
+        // the finding has to say so — but the release is attested and its digest
+        // matched, so refusing it would be refusing a release that published
+        // what the key asks for and was only short on the one check this build
+        // cannot perform. Held, disclosed, not blocked.
         let mut policy = Policy::default();
         policy.policy.require_provenance = true;
         let report = crate::provenance::ProvenanceReport {
@@ -2194,11 +2243,116 @@ mod tests {
         };
         let findings = provenance_findings(&report, &policy);
         assert!(
-            findings
+            findings.iter().all(|f| f.severity < VerdictBand::Block),
+            "an attestation must not be refused by require_provenance: {findings:?}"
+        );
+        let disclosure: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "P03_PROVENANCE_NOT_CRYPTO_VERIFIED")
+            .collect();
+        assert_eq!(
+            disclosure.len(),
+            1,
+            "the status is still reported: {findings:?}"
+        );
+        assert_eq!(
+            disclosure[0].severity,
+            VerdictBand::Low,
+            "the disclosure is score-neutral, so it cannot move a verdict on its own"
+        );
+        assert!(
+            disclosure[0]
+                .description
+                .contains("does not confirm who published it"),
+            "the disclosure must not read as if the key were satisfied: {}",
+            disclosure[0].description
+        );
+    }
+
+    /// The three shapes a `require_provenance` policy can meet, and what each
+    /// costs. Absence and an unverifiable claim are the two ends of this, and
+    /// conflating them is the whole bug: the old code refused both, so the key
+    /// blocked every release that had no published provenance at all.
+    #[test]
+    fn require_provenance_is_advisory_on_absence_and_refuses_only_an_unverifiable_claim() {
+        let policy = || {
+            let mut p = Policy::default();
+            p.policy.require_provenance = true;
+            p
+        };
+        let report = |status| crate::provenance::ProvenanceReport {
+            status,
+            slsa_level: 0,
+            builder_id: None,
+            source_repo: None,
+            commit_sha: None,
+            workflow_path: None,
+            registry_signature_present: false,
+            registry_signature_key_id: None,
+            message: match status {
+                ProvenanceStatus::Unverified => {
+                    Some("Provenance unverified: bad DSSE envelope".into())
+                }
+                _ => None,
+            },
+        };
+
+        // Absence: held, and named as absent.
+        let missing = provenance_findings(&report(ProvenanceStatus::Missing), &policy());
+        let held = missing
+            .iter()
+            .find(|f| f.rule_id == "P03_PROVENANCE_REQUIRED_MISSING")
+            .unwrap_or_else(|| panic!("absence must still be reported: {missing:?}"));
+        assert_eq!(held.severity, VerdictBand::Medium);
+        assert!(
+            missing.iter().all(|f| f.severity < VerdictBand::Block),
+            "absence must never refuse a release: {missing:?}"
+        );
+
+        // A claim that cannot be confirmed: refused, under its own rule id so a
+        // client can tell this apart from the advisory case.
+        let unverified = provenance_findings(&report(ProvenanceStatus::Unverified), &policy());
+        let refused = unverified
+            .iter()
+            .find(|f| f.rule_id == "P03_PROVENANCE_REQUIRED_UNVERIFIABLE")
+            .unwrap_or_else(|| panic!("an unverifiable claim must be refused: {unverified:?}"));
+        assert_eq!(refused.severity, VerdictBand::Block);
+        assert!(
+            refused.description.contains("bad DSSE envelope"),
+            "the refusal must carry the reason the report gave: {}",
+            refused.description
+        );
+        assert!(
+            unverified
                 .iter()
-                .any(|f| f.rule_id == "P03_PROVENANCE_REQUIRED_MISSING"
-                    && f.severity == VerdictBand::Block),
-            "an attestation must not satisfy require_provenance: {findings:?}"
+                .all(|f| f.rule_id != "P03_PROVENANCE_REQUIRED_MISSING"),
+            "a present-but-unverifiable attestation is not an absent one, and the two \
+             rule ids are what tells them apart: {unverified:?}"
+        );
+
+        // Satisfied: the key is met, so it says nothing at all.
+        let verified = provenance_findings(
+            &report(ProvenanceStatus::CryptographicallyVerified),
+            &policy(),
+        );
+        assert!(
+            verified.is_empty(),
+            "a satisfied requirement must not raise a finding: {verified:?}"
+        );
+    }
+
+    /// Absence is only disclosed when a policy asked for provenance.
+    ///
+    /// The default policy is off, and every existing user is on it, so a finding
+    /// that appeared regardless would move verdicts for releases nobody asked to
+    /// be checked.
+    #[test]
+    fn absence_reports_nothing_when_no_policy_asked_for_provenance() {
+        let report = crate::provenance::ProvenanceReport::missing(true, Some("SHA256:abc".into()));
+        let findings = provenance_findings(&report, &Policy::default());
+        assert!(
+            findings.is_empty(),
+            "an unrequested check must not gate anything: {findings:?}"
         );
     }
 
@@ -3018,7 +3172,7 @@ mod tests {
     }
 
     #[test]
-    fn blocks_when_required_provenance_missing_or_repo_unauthorized() {
+    fn holds_when_required_provenance_missing_or_blocks_unauthorized_repo() {
         let delta = Delta {
             baseline_version: Some("1.0.0".into()),
             target_version: "1.0.1".into(),
@@ -3040,6 +3194,9 @@ mod tests {
         let mut policy = Policy::default();
         policy.provenance.require_provenance = true;
 
+        // Absent provenance on an otherwise clean release. HELD, not refused:
+        // this is the case that used to block every user who set the key before
+        // blueline could verify a signature at all.
         let prov_missing = ProvenanceReport::missing(false, None);
         let verdict = evaluate_with_trust(
             "pkg",
@@ -3057,7 +3214,11 @@ mod tests {
             None,
             Some(&prov_missing),
         );
-        assert_eq!(verdict.band, VerdictBand::Block);
+        assert_eq!(
+            verdict.band,
+            VerdictBand::Medium,
+            "absence holds the verdict for a human to read; it must not refuse it"
+        );
         assert!(
             verdict
                 .findings
@@ -4258,20 +4419,20 @@ allowed_builders = [
         assert!(!finding.description.contains("allow_git_dependencies"));
     }
 
-    /// The required-provenance finding must say *which* shortfall it found.
+    /// The attestation disclosure must say *what* was actually checked.
     ///
-    /// Both statuses raise the same rule at the same band, so the only thing
-    /// distinguishing "a build statement was published and its digest matched,
-    /// but nothing verified who published it" from "none was present" is the
-    /// `why` clause. A test asserting the band passes either way, which is why
-    /// inverting the comparison survived: the finding is still Block, still
-    /// P03, and only the sentence a human reads is wrong.
+    /// This is the sentence a human reads when policy asked for provenance and a
+    /// statement was published, so it has to name both halves: the digest did
+    /// match, and nothing confirmed who published it. The opposite sentences —
+    /// claiming no attestation exists when one does, or claiming a verified
+    /// release when no signature was checked — are both false statements about
+    /// the artifact under review, not cosmetic slips.
     ///
-    /// The two are opposite sentences about the world — one asserts an
-    /// attestation exists, the other asserts none does — so a swapped `why` is a
-    /// false statement about the artifact under review, not a cosmetic slip.
+    /// The two cases now carry different rule ids, because they cost different
+    /// amounts: an attested release is disclosed and an absent one is held, so a
+    /// client reading rule ids alone must be able to tell them apart.
     #[test]
-    fn the_required_provenance_finding_distinguishes_attested_from_absent() {
+    fn the_attestation_disclosure_never_overstates_what_was_verified() {
         let policy_with_requirement = || {
             let mut p = Policy::default();
             p.policy.require_provenance = true;
@@ -4279,7 +4440,7 @@ allowed_builders = [
         };
         let policy = policy_with_requirement();
 
-        let find = |status: ProvenanceStatus| {
+        let find = |status: ProvenanceStatus, rule_id: &str| {
             provenance_findings(
                 &ProvenanceReport {
                     status,
@@ -4295,21 +4456,33 @@ allowed_builders = [
                 &policy,
             )
             .into_iter()
-            .find(|f| f.rule_id == "P03_PROVENANCE_REQUIRED_MISSING")
-            .unwrap_or_else(|| panic!("{status:?} must raise the required-provenance rule"))
+            .find(|f| f.rule_id == rule_id)
+            .unwrap_or_else(|| panic!("{status:?} must raise {rule_id}"))
         };
 
-        let attested = find(ProvenanceStatus::Attested);
-        let missing = find(ProvenanceStatus::Missing);
+        let attested = find(
+            ProvenanceStatus::Attested,
+            "P03_PROVENANCE_NOT_CRYPTO_VERIFIED",
+        );
+        let missing = find(ProvenanceStatus::Missing, "P03_PROVENANCE_REQUIRED_MISSING");
 
         assert!(
-            attested.description.contains("digest matched"),
+            attested.description.contains("subject digest matched"),
             "an attested release must be described as attested: {}",
             attested.description
         );
         assert!(
             !attested.description.contains("none was present"),
             "an attested release must not be described as absent: {}",
+            attested.description
+        );
+        // The sentence that matters most: the policy is NOT satisfied by this,
+        // and the finding must not read as if it were.
+        assert!(
+            attested
+                .description
+                .contains("does not confirm who published it"),
+            "an attestation is not a verification, and the finding must say so: {}",
             attested.description
         );
         assert!(
@@ -4322,8 +4495,11 @@ allowed_builders = [
             "an absent release must not claim a digest matched: {}",
             missing.description
         );
-        // Same rule, same band: only the sentence differs.
-        assert_eq!(attested.rule_id, missing.rule_id);
-        assert_eq!(attested.severity, missing.severity);
+        // Different rules and different bands, because they cost different
+        // amounts. A client keying on rule id alone has to be able to tell a
+        // disclosed attestation from a held absence.
+        assert_ne!(attested.rule_id, missing.rule_id);
+        assert_eq!(attested.severity, VerdictBand::Low);
+        assert_eq!(missing.severity, VerdictBand::Medium);
     }
 }

@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+Targeted at 0.4.0. This release is a behaviour change for anyone who set
+`require_provenance`: see the entry below before upgrading.
+
+### Changed
+
+- `recall sync` follows a bounded redirect chain instead of refusing every
+  redirect. The snapshot fetch was left at `redirects(0)` and never followed
+  anything, so an operator whose recall service redirects a trailing slash or a
+  moved path got a failure naming only the last URL. It now follows at most
+  **2 hops**, and each hop is a request made explicitly so it goes back through
+  the same validating resolver rather than being followed blindly.
+
+  A hop may change path, or upgrade `http` to `https`. Two things are refused: a
+  hop that changes **host**, and a hop that **downgrades** `https` to `http`
+  even on the same host — the second because a chain that stays on one host can
+  still move the operator's configured origin into cleartext.
+
+  The cross-host refusal names the likeliest cause, since a base URL pointing at
+  a web front end rather than the file host is the case that trips it: it points
+  at GitHub's `raw.githubusercontent.com` form as the thing to configure, and
+  contrasts it with the `github.com/OWNER/REPO` form that causes the failure.
+
+- `require_provenance` no longer refuses every release unconditionally. It
+  gated on a single condition — status was not
+  `CryptographicallyVerified` — and nothing in this codebase ever produces that
+  status, because the real Sigstore verification path needs a dependency the
+  project has not approved. So a policy that set the key blocked *all* traffic,
+  including the `Attested` case where a build statement was published and its
+  subject digest actually matched the bytes under review. That release had
+  published what the key asks for and was short only on the one check blueline
+  cannot perform, and it was refused for it.
+
+  Enforcement is now split by what was found, and the two ends are no longer
+  conflated:
+
+  | Provenance status | Rule | Band | Was |
+  |---|---|---|---|
+  | `CryptographicallyVerified` | — (none raised) | — | Block |
+  | `Attested` (published, digest matched, no signature checked) | `P03_PROVENANCE_NOT_CRYPTO_VERIFIED` | Low | Block, under `P03_PROVENANCE_REQUIRED_MISSING` |
+  | `Missing` (nothing published) | `P03_PROVENANCE_REQUIRED_MISSING` | Medium | Block, under the same rule id |
+  | `Unverified` (published, could not be verified) | `P03_PROVENANCE_REQUIRED_UNVERIFIABLE` | **Block** | Block, under `P03_PROVENANCE_REQUIRED_MISSING` |
+  | `FailedMismatch` (digest does not match) | `P03_PROVENANCE_DIGEST_MISMATCH` | **Block** | Block, unchanged and independent of this key |
+
+  The only case that still refuses is the one the key exists for: a provenance
+  claim that cannot be confirmed. A digest mismatch continues to refuse
+  regardless of the key, because that is an integrity problem rather than a
+  policy preference.
+
+  The verification work is untouched. An `Attested` report is still reported as
+  attested-and-not-cryptographically-verified, the digest comparison is
+  unchanged, and the disclosure explicitly says the finding *"does not confirm
+  who published it"* so it can never be read as a satisfied policy. Nothing
+  short of a signature check is presented as satisfying the key.
+
+  **MCP compatibility is additive.** No field was removed, renamed, or had its
+  meaning changed. `verdict.findings` is a list, so the two new rule ids appear
+  as new entries; `verdict.trust_sources.provenance.status` already carried the
+  full report and is unchanged. A client that keyed on the literal rule id
+  `P03_PROVENANCE_REQUIRED_MISSING` will now see it at MEDIUM for an absent
+  attestation and no longer see it at all for an unverifiable one, which moves
+  to `P03_PROVENANCE_REQUIRED_UNVERIFIABLE`. That is the one client-visible
+  change and it is the intended one.
+
 ### Fixed
 
 - The two provenance attestation fetches no longer follow redirects to any host.

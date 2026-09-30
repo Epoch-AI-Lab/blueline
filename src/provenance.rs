@@ -25,8 +25,11 @@ pub enum ProvenanceStatus {
     /// were checked, so this is not a statement about who built it.
     Attested,
     /// Reserved for a real Sigstore verification path, which needs a
-    /// dependency this project has not approved. Nothing produces it yet, and
-    /// `require_provenance` deliberately refuses everything short of it.
+    /// dependency this project has not approved. Nothing produces it yet, so
+    /// `require_provenance` is never satisfied in practice. It is disclosed
+    /// rather than refused, because refusing would block every release that set
+    /// the key before blueline could check a signature at all; a claim that
+    /// cannot be verified is still refused.
     CryptographicallyVerified,
     Unverified,
     Missing,

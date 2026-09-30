@@ -258,6 +258,12 @@ impl Default for ThresholdsConfig {
 #[serde(default)]
 pub struct GeneralPolicyConfig {
     /// Require valid Sigstore/SLSA build attestations (default false).
+    ///
+    /// Reported, not enforced as a blanket block. A release with no published
+    /// provenance is disclosed and its verdict held; a release whose published
+    /// provenance cannot be verified is refused. Nothing short of a signature
+    /// check is presented as satisfying this key, so the report never overstates
+    /// what was proven.
     pub require_provenance: bool,
     /// Block on newly added lifecycle scripts when no baseline approval exists (default true).
     pub block_unreviewed_scripts: bool,
@@ -318,6 +324,9 @@ impl AdvisoriesPolicyConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProvenancePolicyConfig {
+    /// Same rule as `GeneralPolicyConfig::require_provenance`, and honoured
+    /// identically: either key turns the requirement on. Named here as well so a
+    /// policy can group it with the other provenance keys.
     pub require_provenance: bool,
     pub require_signatures: bool,
     pub allowed_builders: Vec<String>,
