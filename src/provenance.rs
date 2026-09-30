@@ -444,14 +444,30 @@ pub fn parse_pypi_provenance_json(
                 {
                     had_attestations = true;
                     let mut report = parse_attestation_payload(&payload_b64, expected_integrity)?;
-                    if report.status == ProvenanceStatus::Attested {
-                        report.message = Some(
-                            "PEP 740 attestation verified (crypto verification not performed)"
-                                .into(),
-                        );
-                        return Ok(report);
-                    } else if report.status == ProvenanceStatus::FailedMismatch {
-                        mismatch_details = report.message;
+                    // An exhaustive match rather than a two-armed `if`, and the
+                    // reason is the mutation gate. It reported `==` to `!=` on
+                    // the `FailedMismatch` test as a survivor: with only two
+                    // possible statuses, `status != FailedMismatch` is true for
+                    // `Attested`, and that arm returns early above, so no test
+                    // can observe the difference. Here a mutant would have to
+                    // delete or reorder an arm, which is a compile error rather
+                    // than a survivor someone has to explain away.
+                    match report.status {
+                        ProvenanceStatus::Attested => {
+                            report.message = Some(
+                                "PEP 740 attestation verified (crypto verification not performed)"
+                                    .into(),
+                            );
+                            return Ok(report);
+                        }
+                        ProvenanceStatus::FailedMismatch => {
+                            mismatch_details = report.message;
+                        }
+                        other => {
+                            return Err(BluelineError::Provenance(format!(
+                                "an in-toto statement produced an unexpected status {other:?}"
+                            )));
+                        }
                     }
                 }
             }
@@ -468,12 +484,21 @@ pub fn parse_pypi_provenance_json(
     {
         had_attestations = true;
         let mut report = parse_attestation_payload(&payload_b64, expected_integrity)?;
-        if report.status == ProvenanceStatus::Attested {
-            report.message =
-                Some("PEP 740 attestation verified (crypto verification not performed)".into());
-            return Ok(report);
-        } else if report.status == ProvenanceStatus::FailedMismatch {
-            mismatch_details = report.message;
+        // Exhaustive for the same reason as the envelope arm above.
+        match report.status {
+            ProvenanceStatus::Attested => {
+                report.message =
+                    Some("PEP 740 attestation verified (crypto verification not performed)".into());
+                return Ok(report);
+            }
+            ProvenanceStatus::FailedMismatch => {
+                mismatch_details = report.message;
+            }
+            other => {
+                return Err(BluelineError::Provenance(format!(
+                    "a DSSE payload produced an unexpected status {other:?}"
+                )));
+            }
         }
     }
 
