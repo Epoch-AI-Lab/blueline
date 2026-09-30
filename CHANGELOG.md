@@ -85,6 +85,29 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
 
 ### Fixed
 
+- The four tests in `tests/agent_cli.rs` no longer depend on `api.osv.dev`
+  answering. They drive `blueline agent` against a fixture registry on
+  127.0.0.1, so the advisory lookup cannot complete, and a lookup that cannot
+  complete is disclosed as `R09_ADVISORY_UNVERIFIED` at MEDIUM. MEDIUM is above
+  LOW, which `agent` gates on, so a package the test had just marked clean came
+  back BLOCK and `agent_gate_uses_exit_codes_and_native_decision_shapes` failed
+  on `left: 2, right: 0`. Measured here at about 1 run in 4, and the run took
+  8s to 20s against 2s to 5s once the lookup was off, so the cost was a live
+  third-party request on every invocation.
+
+  The shared `agent()` helper now writes `check_advisories = false` into the
+  policy it already builds, which is the mechanism `tests/shim_cli.rs` uses.
+  Nothing in the file asserts on advisory coverage, so no assertion is
+  weakened.
+
+  The failure was observed with the key absent, not reproduced with it present:
+  the rate depends on whether `api.osv.dev` answers inside its 3s read timeout
+  at the moment the suite runs, so it moves with a third party's latency. The
+  evidence that the advisory lookup is the cause is that the same test on the
+  clean tree failed 1 run in 4, and that setting only this key took the
+  `agent_cli` suite from 8s-20s per run to 2s-5s, which is the OSV timeout
+  disappearing.
+
 - A provenance fetch that never completed is no longer reported as "nobody
   published any". Both lanes — the npm attestations endpoint and the PyPI PEP
   740 provenance endpoint — ended every uneventful fetch with
