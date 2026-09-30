@@ -1033,10 +1033,31 @@ mod tests {
     fn stale_band_follows_policy_window_and_escalation() {
         let mut policy = crate::policy::Policy::default();
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("recall_snapshot.json");
+
+        // One path per phase. `stale_band_at` reads through the process-wide
+        // snapshot cache, whose key is `(path, mtime, len, ino)`, and these
+        // fixtures differ only in `fetched_at`, so consecutive ones serialize to
+        // the *same length* on the same inode. Two writes inside one filesystem
+        // timestamp tick therefore landed on one cache key, and the second
+        // phase was served the first phase's snapshot. That is what made this
+        // test fail about 1 run in 12 with `left: None` -- a stale hit, not a
+        // wrong band. Distinct paths remove the collision without depending on
+        // the filesystem's timestamp granularity, which is what varies.
+        //
+        // The band ladder is what this test is about; the cache has its own
+        // tests, and `stale_band_for` takes the clock as a parameter for the
+        // same reason.
+        let phase = |name: &str| dir.path().join(name);
+        let fresh_path = phase("fresh.json");
+        let stale_path = phase("stale.json");
+        let corrupt_path = phase("corrupt.json");
 
         // Absent index: never stale.
-        assert!(stale_band_at(&policy, &path).unwrap().is_none());
+        assert!(
+            stale_band_at(&policy, &phase("absent.json"))
+                .unwrap()
+                .is_none()
+        );
 
         // Fresh snapshot: not stale.
         let synced = SyncedSnapshot {
@@ -1044,8 +1065,8 @@ mod tests {
             url: "http://127.0.0.1:1".into(),
             snapshot: valid_snapshot(),
         };
-        std::fs::write(&path, serde_json::to_string(&synced).unwrap()).unwrap();
-        assert!(stale_band_at(&policy, &path).unwrap().is_none());
+        std::fs::write(&fresh_path, serde_json::to_string(&synced).unwrap()).unwrap();
+        assert!(stale_band_at(&policy, &fresh_path).unwrap().is_none());
 
         // Stale past the window: MEDIUM by default, BLOCK on escalation.
         let synced = SyncedSnapshot {
@@ -1053,20 +1074,20 @@ mod tests {
             url: synced.url,
             snapshot: synced.snapshot,
         };
-        std::fs::write(&path, serde_json::to_string(&synced).unwrap()).unwrap();
+        std::fs::write(&stale_path, serde_json::to_string(&synced).unwrap()).unwrap();
         assert_eq!(
-            stale_band_at(&policy, &path).unwrap(),
+            stale_band_at(&policy, &stale_path).unwrap(),
             Some(crate::verdict::VerdictBand::Medium)
         );
         policy.recall.block_on_stale = true;
         assert_eq!(
-            stale_band_at(&policy, &path).unwrap(),
+            stale_band_at(&policy, &stale_path).unwrap(),
             Some(crate::verdict::VerdictBand::Block)
         );
 
         // Corrupt snapshot: an Err the caller must disclose.
-        std::fs::write(&path, "not json").unwrap();
-        assert!(stale_band_at(&policy, &path).is_err());
+        std::fs::write(&corrupt_path, "not json").unwrap();
+        assert!(stale_band_at(&policy, &corrupt_path).is_err());
     }
 
     #[test]
