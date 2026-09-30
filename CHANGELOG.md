@@ -46,7 +46,7 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
   |---|---|---|---|
   | `CryptographicallyVerified` | — (none raised) | — | Block |
   | `Attested` (published, digest matched, no signature checked) | `P03_PROVENANCE_NOT_CRYPTO_VERIFIED` | Low | Block, under `P03_PROVENANCE_REQUIRED_MISSING` |
-  | `Missing` (nothing published) | `P03_PROVENANCE_REQUIRED_MISSING` | Medium | Block, under the same rule id |
+  | `Missing` (nothing published) | `P03_PROVENANCE_REQUIRED_MISSING` | Low | Block, under the same rule id |
   | `Unverified` (published, could not be verified) | `P03_PROVENANCE_REQUIRED_UNVERIFIABLE` | **Block** | Block, under `P03_PROVENANCE_REQUIRED_MISSING` |
   | `FailedMismatch` (digest does not match) | `P03_PROVENANCE_DIGEST_MISMATCH` | **Block** | Block, unchanged and independent of this key |
 
@@ -65,10 +65,23 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
   meaning changed. `verdict.findings` is a list, so the two new rule ids appear
   as new entries; `verdict.trust_sources.provenance.status` already carried the
   full report and is unchanged. A client that keyed on the literal rule id
-  `P03_PROVENANCE_REQUIRED_MISSING` will now see it at MEDIUM for an absent
+  `P03_PROVENANCE_REQUIRED_MISSING` will now see it at LOW for an absent
   attestation and no longer see it at all for an unverifiable one, which moves
   to `P03_PROVENANCE_REQUIRED_UNVERIFIABLE`. That is the one client-visible
   change and it is the intended one.
+
+  **Why LOW and not MEDIUM**, since this is the difference between the change
+  working and merely reading as though it does. The band is not a label on the
+  report; it is what the exit code is made of. `review --yes`, the
+  non-interactive path at `review.rs`, and `agent` all gate on it, and every
+  band above LOW exits 2. A MEDIUM finding therefore is not "a warning with a
+  stronger tone" — it is a refusal. At MEDIUM, this key still blocked every
+  clean release that had no published provenance: the report said
+  `Recommendation: HOLD` and the process said no, which is the complaint the
+  softening was meant to answer. At LOW the finding is disclosed, adds nothing
+  to `risk_score`, and a clean release exits 0. A digest mismatch is still
+  refused and still exits 2 — that is an integrity failure, not a missing
+  document.
 
 ### Fixed
 

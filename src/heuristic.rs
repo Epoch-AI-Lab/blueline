@@ -1916,13 +1916,18 @@ fn provenance_findings(
                             .into(),
                 });
             }
-            // Absence. Held, not refused: a release nobody published provenance
-            // for is not evidence of a tampered one, and the finding is what
-            // makes that visible.
+            // Absence. Warned, not refused and not even score-bearing: a release
+            // nobody published provenance for is not evidence of a tampered one,
+            // and the finding is what makes that visible. LOW rather than MEDIUM
+            // because the band is not just the report's label — `review --yes`,
+            // the non-interactive path, and `agent` all gate on it, and any band
+            // above LOW still exits 2. At MEDIUM this finding read as a warning
+            // and behaved as a refusal, which is the whole bug Kriday called out:
+            // the key was set, the release was clean, and the tool said no.
             ProvenanceStatus::Missing => {
                 findings.push(Finding {
                     rule_id: "P03_PROVENANCE_REQUIRED_MISSING".into(),
-                    severity: VerdictBand::Medium,
+                    severity: VerdictBand::Low,
                     title: "Required build provenance not published".into(),
                     description:
                         "Policy requires verified SLSA build provenance, but none was present. \
@@ -2297,16 +2302,19 @@ mod tests {
             },
         };
 
-        // Absence: held, and named as absent.
+        // Absence: warned, and named as absent. LOW and not merely
+        // non-Block, because the band is what the exit code is made of: every
+        // band above LOW still exits 2 out of `review` and `agent`, so a MEDIUM
+        // here is a refusal wearing a warning's label.
         let missing = provenance_findings(&report(ProvenanceStatus::Missing), &policy());
         let held = missing
             .iter()
             .find(|f| f.rule_id == "P03_PROVENANCE_REQUIRED_MISSING")
             .unwrap_or_else(|| panic!("absence must still be reported: {missing:?}"));
-        assert_eq!(held.severity, VerdictBand::Medium);
+        assert_eq!(held.severity, VerdictBand::Low);
         assert!(
-            missing.iter().all(|f| f.severity < VerdictBand::Block),
-            "absence must never refuse a release: {missing:?}"
+            missing.iter().all(|f| f.severity <= VerdictBand::Low),
+            "absence must warn and nothing more: {missing:?}"
         );
 
         // A claim that cannot be confirmed: refused, under its own rule id so a
@@ -3214,16 +3222,26 @@ mod tests {
             None,
             Some(&prov_missing),
         );
+        // The end-to-end claim, and the reason for LOW rather than MEDIUM: this
+        // is a clean release on an otherwise clean delta, so the verdict has to
+        // stay LOW, and LOW is the only band that exits 0 out of `review` and
+        // `agent`. A MEDIUM would still exit 2, which is the refusal this key
+        // was never meant to be.
         assert_eq!(
             verdict.band,
-            VerdictBand::Medium,
-            "absence holds the verdict for a human to read; it must not refuse it"
+            VerdictBand::Low,
+            "absence must leave a clean release at LOW so the tool exits 0"
         );
         assert!(
             verdict
                 .findings
                 .iter()
-                .any(|f| f.rule_id == "P03_PROVENANCE_REQUIRED_MISSING")
+                .any(|f| f.rule_id == "P03_PROVENANCE_REQUIRED_MISSING"),
+            "but it is still disclosed, or the policy setting is invisible"
+        );
+        assert_eq!(
+            verdict.risk_score, 0,
+            "a warning must not move the score either"
         );
 
         // Test unauthorized repository
@@ -4495,11 +4513,13 @@ allowed_builders = [
             "an absent release must not claim a digest matched: {}",
             missing.description
         );
-        // Different rules and different bands, because they cost different
-        // amounts. A client keying on rule id alone has to be able to tell a
-        // disclosed attestation from a held absence.
+        // Different rules, because they cost different amounts. A client keying
+        // on rule id alone has to be able to tell a disclosed attestation from
+        // an absent one. Both are LOW, so neither gates anything: the rule id is
+        // now the only way to tell them apart, which is the point of splitting
+        // them in the first place.
         assert_ne!(attested.rule_id, missing.rule_id);
         assert_eq!(attested.severity, VerdictBand::Low);
-        assert_eq!(missing.severity, VerdictBand::Medium);
+        assert_eq!(missing.severity, VerdictBand::Low);
     }
 }

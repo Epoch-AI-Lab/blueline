@@ -185,15 +185,19 @@ are policy decisions, not heuristics, and are listed last.
 - P03 — `P03_PROVENANCE_DIGEST_MISMATCH` (BLOCK),
   `P03_PROVENANCE_REQUIRED_UNVERIFIABLE` (BLOCK), `P03_SIGNATURE_REQUIRED_MISSING`,
   `P03_UNAUTHORIZED_BUILD_REPO`,
-  `P03_UNAUTHORIZED_BUILD_BUILDER` (BLOCK), and, at the softer bands,
-  `P03_PROVENANCE_REQUIRED_MISSING` (MEDIUM) and
-  `P03_PROVENANCE_NOT_CRYPTO_VERIFIED` (LOW, also raised with no policy
+  `P03_UNAUTHORIZED_BUILD_BUILDER` (BLOCK), and, at LOW and score-neutral,
+  `P03_PROVENANCE_REQUIRED_MISSING` and
+  `P03_PROVENANCE_NOT_CRYPTO_VERIFIED` (the latter also raised with no policy
   requirement at all when a release is merely attested). Under
-  `require_provenance` an *absent* attestation is disclosed and the verdict is
-  held, and only a *present-but-unverifiable* claim is refused: a release nobody
-  published provenance for is not the same as one whose provenance does not hold
-  up, and conflating the two blocked every user who set the key before blueline
-  could check a signature.
+  `require_provenance` an *absent* attestation is disclosed at LOW and the
+  verdict is untouched, and only a *present-but-unverifiable* claim is refused:
+  a release nobody published provenance for is not the same as one whose
+  provenance does not hold up, and conflating the two blocked every user who set
+  the key before blueline could check a signature.
+
+  LOW specifically, not MEDIUM, because the band gates the exit code. `review
+  --yes`, the non-interactive path, and `agent` all refuse above LOW, so a
+  MEDIUM absence is a refusal wearing a warning's label — it still exits 2.
 - P04 — `P04_MAINTAINER_BLOCKED` (BLOCK), `[blocklist] maintainers`; AUR lane
   only, since the other three take the `Registry::release_author` `None`
   default (see §3)
@@ -264,7 +268,7 @@ Known bypasses stay documented in the README.
 | `policy` | `require_provenance`, `block_unreviewed_scripts`, `allow_git_dependencies`, `check_advisories`, `fail_closed_network` |
 | `advisories` | `block_on_malware`, `block_on_critical_cve`, cache TTLs |
 | `provenance` | `require_provenance`, `require_signatures`, `allowed_builders`, `allowed_repositories` (the last two enforced at Block) |
-| `provenance.require_provenance` | Either this or `policy.require_provenance` turns the requirement on; they are honoured identically. Absence of an attestation is disclosed (MEDIUM) and the verdict held; a present-but-unverifiable attestation is refused (BLOCK). See P03 above. |
+| `provenance.require_provenance` | Either this or `policy.require_provenance` turns the requirement on; they are honoured identically. Absence of an attestation is disclosed (LOW, score-neutral, exit 0); a present-but-unverifiable attestation is refused (BLOCK, exit 2). See P03 above. |
 | `allowlist.packages` | exact `name` (+optional `ecosystem`), `allowed_scripts`, `allow_unreviewed_baseline` |
 | `blocklist` | glob `packages` (+optional `ecosystem`) — every lane; `maintainers` — **AUR only** (see below) |
 | `ci` | `fail_on`, `max_evaluations`, `include_dev`, `allow_requirements_options` |
