@@ -863,16 +863,24 @@ pub fn parse_pkgbuild(input: &str) -> Result<FoldedPkgbuild, BluelineError> {
             let mut j = idx;
             while j < lines.len() {
                 let text = lines[j];
-                let mut k = 0;
-                let text_chars: Vec<char> = text.chars().collect();
-                while k < text_chars.len() {
-                    let ch = text_chars[k];
+                // The scan advances by consuming an iterator rather than by
+                // incrementing an index. An index-based loop is only correct
+                // while every step moves forward, and that is a property no
+                // test can observe until a step stops moving forward: flipping
+                // `k += 2` to `k -= 2` at the `${` branch rewinds to the same
+                // character, so the loop never ends and `body` grows until the
+                // process is OOM-killed. That is not a failing test, it is a
+                // dead machine, so the mutant never got reported and the
+                // mutation gate read the runner dying as a verdict.
+                // `Chars::next` is the only way through the loop, so forward
+                // progress does not depend on arithmetic that can be inverted.
+                let mut chars = text.chars().peekable();
+                while let Some(ch) = chars.next() {
                     if escaped {
                         escaped = false;
                         if started {
                             body.push(ch);
                         }
-                        k += 1;
                         continue;
                     }
                     if ch == '\\' && !in_single {
@@ -880,7 +888,6 @@ pub fn parse_pkgbuild(input: &str) -> Result<FoldedPkgbuild, BluelineError> {
                         if started {
                             body.push(ch);
                         }
-                        k += 1;
                         continue;
                     }
                     if in_single {
@@ -890,7 +897,6 @@ pub fn parse_pkgbuild(input: &str) -> Result<FoldedPkgbuild, BluelineError> {
                         if ch == '\'' {
                             in_single = false;
                         }
-                        k += 1;
                         continue;
                     }
                     if in_double {
@@ -900,31 +906,31 @@ pub fn parse_pkgbuild(input: &str) -> Result<FoldedPkgbuild, BluelineError> {
                         if ch == '"' {
                             in_double = false;
                         }
-                        k += 1;
                         continue;
                     }
                     if ch == '\'' {
                         in_single = true;
                     } else if ch == '"' {
                         in_double = true;
-                    } else if ch == '$' && text_chars.get(k + 1) == Some(&'{') {
+                    } else if ch == '$' && chars.peek() == Some(&'{') {
                         if started {
                             body.push(ch);
                             body.push('{');
                         }
                         param_depth += 1;
-                        k += 2;
+                        // Consume the `{` so the body keeps it exactly once.
+                        chars.next();
                         continue;
                     } else if ch == '}' && param_depth > 0 {
                         if started {
                             body.push(ch);
                         }
                         param_depth -= 1;
-                        k += 1;
                         continue;
                     } else if ch == '#' && param_depth == 0 {
                         if started {
-                            body.push_str(&text_chars[k..].iter().collect::<String>());
+                            body.push(ch);
+                            body.push_str(&chars.collect::<String>());
                         }
                         break;
                     } else if ch == opener {
@@ -944,7 +950,6 @@ pub fn parse_pkgbuild(input: &str) -> Result<FoldedPkgbuild, BluelineError> {
                     if started && depth == 0 {
                         break;
                     }
-                    k += 1;
                 }
                 if started && depth == 0 {
                     break;
@@ -3229,6 +3234,56 @@ mod tests {
             strip_comment("echo '# not a comment'"),
             "echo '# not a comment'"
         );
+    }
+
+    #[test]
+    fn a_function_body_scan_advances_past_every_expansion_it_reads() {
+        // The function-body scan used to walk a line with an index and step it
+        // by hand, so its termination rested on every step moving forward. The
+        // step over `${` rewinding by two instead of advancing past the brace
+        // sent the scan back to the same character, and `body` grew by a couple
+        // of bytes per pass until the process was killed for memory. Nothing
+        // asserted a result, so the mutation was never reported as caught: the
+        // machine died, and a dead machine is not a verdict.
+        //
+        // Each case below ends the scan. A scan that rewinds cannot finish, and
+        // a body that loses or duplicates a character changes what the rules
+        // read out of it, so these pin forward progress and content together.
+        let cases = [
+            // A bare expansion mid-line: the brace is consumed exactly once.
+            "build() {\n  echo ${pkgname}\n  make\n}\n",
+            // Two expansions on one line.
+            "build() {\n  echo ${pkgname}-${pkgver}\n  make\n}\n",
+            // Expansion immediately before the closer.
+            "build() {\n  echo ${x}}\n",
+            // Expansion at the very first column, where the index was 0.
+            "build() {\n${x}\n  make\n}\n",
+            // A hash after a closed expansion is still a comment.
+            "build() {\n  echo ${x} # trailing\n  make\n}\n",
+            // A hash inside an open expansion is not a comment.
+            "build() {\n  echo ${x#y}\n  make\n}\n",
+        ];
+        for content in cases {
+            let folded = parse_pkgbuild(content)
+                .unwrap_or_else(|e| panic!("{content:?} failed to parse: {e}"));
+            let body = folded
+                .func_bodies
+                .get("build")
+                .unwrap_or_else(|| panic!("{content:?} produced no build() body"));
+            // The brace is never doubled or dropped: `${` appears in the body
+            // exactly as many times as the input wrote it.
+            let want = content.matches("${").count();
+            let got = body.matches("${").count();
+            assert_eq!(got, want, "brace count in body of {content:?}: {body:?}");
+            // A comment outside an expansion is stripped, so no `#` from one
+            // may survive into the body the rules scan.
+            if !content.contains("${x#") {
+                assert!(
+                    !body.contains("trailing"),
+                    "a comment leaked into the body of {content:?}: {body:?}"
+                );
+            }
+        }
     }
 
     #[test]

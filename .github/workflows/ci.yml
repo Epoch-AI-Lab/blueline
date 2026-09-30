@@ -342,43 +342,32 @@ jobs:
         env:
           BASE_REF: ${{ github.base_ref }}
         run: git diff "origin/${BASE_REF}"...HEAD -- > pr.diff
-      # Shard 17 died twice on this PR with exit 143 and "the runner has
-      # received a shutdown signal", after 8m30s and 10m5s — nowhere near the
-      # 100 min ceiling. That is the hosted runner being reclaimed mid-job, not
-      # a mutant, and cargo-mutants reports it as `interrupted`, which the
-      # aggregate reads as failure and a human reads as "the other shards found
-      # survivors". They found nothing. timeout-minutes cannot fix this, because
-      # the job is not overrunning its budget.
+      # This block used to wrap the run in a three-attempt retry for exit 143
+      # and 137, on the reading that a shard dying at 8m30s and again at 10m5s
+      # was the hosted runner being reclaimed. It was not. Shard 17 died that
+      # way on six runs across four days while the other 31 shards passed, and
+      # a random runner fault does not pick the same shard every time.
       #
-      # So the shard is retried, but ONLY for signals that mean the machine went
-      # away: 143 (SIGTERM, the shutdown above) and 137 (SIGKILL, usually the OOM
-      # killer). Exit 2 — a survived mutant — and exit 3 — a timeout, an unknown
-      # fate — are the gate working and are re-raised immediately, because
-      # retrying those would just re-roll the dice until a survivor went green.
+      # The cause was in the diff. `parse_pkgbuild`'s function-body scan walked
+      # a line with a hand-incremented index, and its termination rested on
+      # every step moving forward. The step over `${` rewinding by two instead
+      # of advancing past the brace sent the scan back to the same character;
+      # `body` then grew a few bytes per pass until the process was killed for
+      # memory. So exit 137 was the gate working — it killed the mutant's
+      # process — and 143 was GitHub reclaiming the VM afterwards.
+      #
+      # Two things were wrong with retrying it. The mutant was never reported,
+      # so the shard had no verdict to report and each attempt re-ran the same
+      # OOM; and a retry on 137 hides the one case where the harness is
+      # correctly reporting a runaway, which is the signal worth keeping. The
+      # fix belongs in the scanner, which now advances by consuming an iterator
+      # rather than by arithmetic a mutant can invert. The step below stays a
+      # plain invocation, so a mutant that exhausts memory is loud again.
       - name: Mutate the changed lines
         run: |
-          set +e
-          for attempt in 1 2 3; do
-            cargo mutants --in-diff pr.diff --shard ${{ matrix.shard }}/32 \
-              --file 'src/**/*.rs' \
-              --in-place --baseline=skip --timeout 300
-            status=$?
-            if [ "$status" -eq 0 ]; then
-              exit 0
-            fi
-            # 143 = SIGTERM (runner reclaimed), 137 = SIGKILL (OOM). Both are
-            # the machine dying, not a verdict about the code.
-            if [ "$status" -ne 143 ] && [ "$status" -ne 137 ]; then
-              echo "::error::shard ${{ matrix.shard }} exited $status, which is a verdict rather than a runner failure; not retrying."
-              exit "$status"
-            fi
-            echo "::warning::shard ${{ matrix.shard }} exited $status (runner reclaimed the job). Attempt $attempt of 3."
-            if [ "$attempt" -lt 3 ]; then
-              sleep 30
-            fi
-          done
-          echo "::error::shard ${{ matrix.shard }} was reclaimed by the runner 3 times in a row."
-          exit 1
+          cargo mutants --in-diff pr.diff --shard ${{ matrix.shard }}/32 \
+            --file 'src/**/*.rs' \
+            --in-place --baseline=skip --timeout 300
       - uses: actions/upload-artifact@v4
         if: always()
         with:
