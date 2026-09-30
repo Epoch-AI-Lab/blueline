@@ -108,6 +108,27 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
   `agent_cli` suite from 8s-20s per run to 2s-5s, which is the OSV timeout
   disappearing.
 
+- The four tests in `tests/recursive_review.rs` no longer depend on
+  `api.osv.dev` answering. They drive `review --yes` against fixture registries
+  on 127.0.0.1, so the advisory lookup cannot complete, and a lookup that cannot
+  complete is disclosed as `R09_ADVISORY_UNVERIFIED` at MEDIUM. MEDIUM is above
+  LOW, which `--yes` gates on, so `clean_parent_without_references_reviews_normally`
+  failed on `left: 2, right: 0` carrying `R09_ADVISORY_UNVERIFIED` and "OSV
+  advisory request failed: ... timed out reading response", for a package the
+  test had just marked clean.
+
+  The key goes in the shared `review_json_with_policy` helper, and only on the
+  path where the caller passed no policy of its own: an explicit `--policy`
+  outranks the environment, so a caller that supplies one owns its advisory
+  configuration. Nothing in the file asserts on advisory coverage, so no
+  assertion is weakened. 4 of 4 pass, and the suite drops from about 4s to 2.5s
+  per run.
+
+  Five further test files spawn the binary with no advisory key at all
+  (`aur_adapter`, `aur_cli`, `crates_io_cli`, `pypi_cli`, `recall_cli`). They did
+  not fail in the run that found this, so they are left alone rather than changed
+  on a guess.
+
 - A provenance fetch that never completed is no longer reported as "nobody
   published any". Both lanes — the npm attestations endpoint and the PyPI PEP
   740 provenance endpoint — ended every uneventful fetch with
