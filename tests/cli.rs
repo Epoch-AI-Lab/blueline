@@ -142,8 +142,37 @@ fn packument(base: &str, version: &str, integrity: &str) -> String {
     .to_string()
 }
 
+/// A policy file that switches advisory lookups off, pointed at by
+/// `BLUELINE_POLICY` below.
+///
+/// Advisory checking needs `api.osv.dev`, and a fixture registry on 127.0.0.1
+/// cannot provide it. When the lookup cannot complete the review discloses it
+/// as `R09_ADVISORY_UNVERIFIED` at MEDIUM, which is above LOW, so six of these
+/// tests asserted against a third party's availability rather than against
+/// blueline: `review_yes_auto_approves_low_risk_and_fails_closed_on_high_risk`
+/// failed with `Cannot auto-approve safe-yes-pkg@1.0.0: risk verdict is
+/// MEDIUM` on a 3s timeout reading a response OSV never refused to send. A
+/// runner with egress passes it, so the flakiness was invisible in CI.
+///
+/// Nothing in this file asserts on advisory coverage, so disabling the lookup
+/// removes the network dependency without weakening an assertion. The
+/// disclosure itself is pinned by
+/// `advisory::tests::only_an_unverified_report_with_advisories_enabled_is_unknown_coverage`
+/// and by `the_aur_never_claims_clean_advisory_coverage`, neither of which
+/// needs a network.
+const NO_ADVISORIES_POLICY: &str = "[policy]\ncheck_advisories = false\n";
+
 fn blueline() -> Command {
-    Command::cargo_bin("blueline").unwrap()
+    let policy_dir = tempfile::tempdir().expect("policy tempdir");
+    let policy_path = policy_dir.path().join("blueline.toml");
+    std::fs::write(&policy_path, NO_ADVISORIES_POLICY).expect("write policy");
+    // The file must outlive this function, since the child process runs after
+    // it returns. Leaking the directory is the cost of a hermetic child; the
+    // alternative is the third-party network dependency described above.
+    std::mem::forget(policy_dir);
+    let mut cmd = Command::cargo_bin("blueline").unwrap();
+    cmd.env("BLUELINE_POLICY", &policy_path);
+    cmd
 }
 
 #[test]
@@ -1973,10 +2002,18 @@ fn policy_allow_unreviewed_baseline_enables_scripted_onboarding() {
     let temp_policy = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(
         temp_policy.path(),
+        // `check_advisories = false` for the reason on `NO_ADVISORIES_POLICY`:
+        // this case is about the baseline allowlist, and an unreachable advisory
+        // host would add a MEDIUM disclosure to a verdict this test asserts is
+        // LOW. It cannot inherit the file `blueline()` writes, because an
+        // explicit `--policy` outranks `BLUELINE_POLICY`.
         r#"
 [[allowlist.packages]]
 name = "onboard-pkg"
 allow_unreviewed_baseline = true
+
+[policy]
+check_advisories = false
 "#,
     )
     .unwrap();

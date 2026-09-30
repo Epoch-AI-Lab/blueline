@@ -85,6 +85,30 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
 
 ### Fixed
 
+- Six tests in `tests/cli.rs` no longer depend on `api.osv.dev` being reachable.
+  Their registries are fixture servers on 127.0.0.1, so the advisory lookup
+  cannot complete, and a lookup that cannot complete is disclosed as
+  `R09_ADVISORY_UNVERIFIED` at MEDIUM. MEDIUM is above LOW, which
+  `review --yes` and `agent` gate on, so those tests were asserting that
+  `api.osv.dev` answered within its 3s read timeout rather than asserting
+  anything about blueline. Observed as a real failure:
+  `review_yes_auto_approves_low_risk_and_fails_closed_on_high_risk` printed
+  `Cannot auto-approve safe-yes-pkg@1.0.0: risk verdict is MEDIUM` for a
+  package the test had just marked clean. A runner with egress passes it, so CI
+  stayed green and the dependency was invisible.
+
+  The shared `blueline()` helper now points `BLUELINE_POLICY` at a policy file
+  that sets `check_advisories = false`, which is the mechanism
+  `tests/shim_cli.rs` already used for this. One test passes an explicit
+  `--policy`, which outranks the environment variable, so it carries the key in
+  its own file. No assertion in the file is weakened: nothing there tests
+  advisory coverage, and the disclosure itself stays pinned by
+  `only_an_unverified_report_with_advisories_enabled_is_unknown_coverage` and
+  `the_aur_never_claims_clean_advisory_coverage`, both of which need no network.
+
+  Confirmed by blackholing `api.osv.dev`: 6 failures before, 0 after. Reverting
+  only the environment variable restored 5 of the 6.
+
 - The two provenance attestation fetches no longer follow redirects to any host.
   The npm attestations call and the PyPI PEP 740 call each built their own
   `ureq::AgentBuilder` instead of going through `registry_agent`, so they
