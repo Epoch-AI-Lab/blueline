@@ -775,6 +775,52 @@ mod tests {
         assert_eq!(resp.status(), 200);
     }
 
+    /// The origin the error text points the operator back to.
+    ///
+    /// Pinned on its own because it is load-bearing in two messages and neither
+    /// of them is easy to read: the cap message and the downgrade message both
+    /// tell the operator to fix the redirect "at" this base, so a `base_of` that
+    /// returned an empty or wrong origin would send them to fix nothing. The
+    /// last two cases matter because the helper is what keeps a non-snapshot URL
+    /// whole rather than truncating it at a separator it does not carry.
+    #[test]
+    fn the_reported_base_is_the_origin_without_the_snapshot_path() {
+        assert_eq!(
+            base_of("https://recall.example/revocations.json"),
+            "https://recall.example"
+        );
+        assert_eq!(
+            base_of("https://recall.example/api/v2/revocations.json"),
+            "https://recall.example/api/v2"
+        );
+        assert_eq!(
+            base_of("http://127.0.0.1:8080/revocations.json"),
+            "http://127.0.0.1:8080"
+        );
+        // No snapshot path at all: the whole URL stands, rather than a prefix of
+        // it cut at a separator that is not there.
+        assert_eq!(base_of("https://recall.example"), "https://recall.example");
+    }
+
+    /// The two messages that name the base must actually carry it.
+    ///
+    /// This is the test that failed under mutation: `base_of` was unconstrained,
+    /// because the cross-host message does not use it and the other two only
+    /// asserted the refusal, never the host the operator is told to fix. Both
+    /// messages are useless without the origin in them.
+    #[test]
+    fn the_refusal_messages_name_the_origin_to_fix() {
+        let from = "https://recall.example/revocations.json";
+
+        let downgrade = check_hop(from, "http://recall.example/revocations.json", from)
+            .map_err(|e| format!("{e:#}"))
+            .expect_err("a downgrade must be refused");
+        assert!(
+            downgrade.contains("https://recall.example"),
+            "the downgrade message must name the origin to fix: {downgrade}"
+        );
+    }
+
     /// A hop to a different host is refused, and the error names the mistake.
     ///
     /// The likeliest real cause is a recall URL pointing at a web front end that
@@ -861,6 +907,12 @@ mod tests {
         assert!(
             err.contains(&format!("{MAX_REDIRECTS} redirects")),
             "the refusal must name the cap it hit: {err}"
+        );
+        // The cap message tells the operator to point the URL at the file host
+        // directly, so it has to carry the origin it was talking to.
+        assert!(
+            err.contains(&format!("http://127.0.0.1:{port}")),
+            "the cap message must name the origin it gave up on: {err}"
         );
     }
 
