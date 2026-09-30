@@ -85,6 +85,63 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
 
 ### Fixed
 
+- A provenance fetch that never completed is no longer reported as "nobody
+  published any". Both lanes — the npm attestations endpoint and the PyPI PEP
+  740 provenance endpoint — ended every uneventful fetch with
+  `ProvenanceReport::missing(..)`, so a refused connection, a 5xx, a body over
+  the cap, a refused redirect, and a body that would not parse all arrived as
+  `ProvenanceStatus::Missing`, carrying the text *"No SLSA build attestation
+  published for this release"*. `parse_pypi_provenance_json` laundered the same
+  way: a body matching neither the envelope nor a DSSE payload shape fell
+  through to the same `missing` return.
+
+  That is the one status a `require_provenance` policy reads as verified
+  absence, so a registry outage told the policy that nothing had been
+  published. Since absence became LOW and score-neutral in 799853e, a 500 from
+  npm or a 200 carrying an HTML error page from PyPI produced a verdict
+  byte-identical to a clean pass and exited 0. This is the shape 102d23c fixed
+  for advisories, where a lookup that never happened was indistinguishable from
+  a clean one.
+
+  Only a 404 is now read as absence, because that is the registry stating the
+  resource does not exist, and it is the overwhelmingly common answer for an
+  optional attestation. Everything else reports `Unverified`, which
+  `P03_PROVENANCE_REQUIRED_UNVERIFIABLE` already refuses under the same policy
+  key. A well-formed envelope carrying no attestations still reports `Missing`,
+  so the fix does not pass by declaring every answer unverifiable.
+
+  `unverified` also no longer drops the registry signature evidence the caller
+  already holds. The signature block arrives with the packument, before the
+  attestation fetch is attempted, so forgetting it on the failure path made
+  `require_signatures` report a *missing* signature for a release that
+  published one.
+
+  `ureq` returns a 4xx as `Err(Status(..))` rather than an `Ok` response, so a
+  404 could not be told from a transport failure inside the existing download
+  loop. `download_bounded_optional` reports it as a status instead. It is a
+  separate function rather than a change to `download_bounded`, because a 404 on
+  a *tarball* is a broken release and `BluelineError::NotFound` is read by
+  `recursive.rs` as "referenced install could not be resolved"; widening that
+  would reclassify those silently.
+
+  Verified by reverting each half and watching the test fail: removing the 404
+  arm fails `an_authoritative_404_is_still_absence` (`left: Unverified`), and
+  restoring the parser's fallthrough fails
+  `a_provenance_fetch_that_never_completed_is_not_reported_as_absence`
+  (`left: Missing`).
+
+- `recall::tests::stale_band_follows_policy_window_and_escalation` no longer
+  fails about 1 run in 12. It wrote three successive snapshots to one path, and
+  the fixtures differ only in `fetched_at`, so consecutive ones serialize to the
+  same length on the same inode. Two writes inside one filesystem timestamp
+  tick therefore landed on one `SNAPSHOT_CACHE` key — `(path, mtime, len, ino)` —
+  and the stale phase was served the fresh snapshot, reporting
+  `left: None` instead of `Some(Medium)`. One path per phase removes the
+  collision without depending on timestamp granularity, which is what varies
+  between filesystems. The cache has its own tests, and `stale_band_for` takes
+  the clock as a parameter for the same reason. Measured 0 failures in 20 runs
+  after the change, against 1 in 12 before it.
+
 - Six tests in `tests/cli.rs` no longer depend on `api.osv.dev` being reachable.
   Their registries are fixture servers on 127.0.0.1, so the advisory lookup
   cannot complete, and a lookup that cannot complete is disclosed as
