@@ -79,6 +79,22 @@ impl ProvenanceReport {
     }
 
     pub fn unverified(msg: &str) -> Self {
+        Self::unverified_with_signature(msg, false, None)
+    }
+
+    /// As `unverified`, but keeping the registry signature evidence the caller
+    /// already holds.
+    ///
+    /// The signature block comes from the packument, which arrived before the
+    /// attestation fetch was attempted, so a failed attestation request is no
+    /// reason to forget it. Dropping it here would make `require_signatures`
+    /// report a *missing* signature for a release that published one, which is
+    /// the opposite of what happened.
+    pub fn unverified_with_signature(
+        msg: &str,
+        has_signature: bool,
+        key_id: Option<String>,
+    ) -> Self {
         Self {
             status: ProvenanceStatus::Unverified,
             slsa_level: 0,
@@ -86,8 +102,8 @@ impl ProvenanceReport {
             source_repo: None,
             commit_sha: None,
             workflow_path: None,
-            registry_signature_present: false,
-            registry_signature_key_id: None,
+            registry_signature_present: has_signature,
+            registry_signature_key_id: key_id,
             message: Some(format!("Provenance unverified: {msg}")),
         }
     }
@@ -292,47 +308,98 @@ pub fn inspect_provenance(
         std::time::Duration::from_millis(3000),
     );
 
-    if let Ok(bytes) = crate::registry::http_util::download_bounded_with_headers(
+    // A failed fetch is not evidence that nobody published anything, and the
+    // two used to be the same report. The endpoint answers 404 for a release
+    // with no provenance, which is a real and common answer; everything else
+    // (refused connection, 5xx, body over the cap, a refused redirect, a body
+    // that would not parse) means the question was never answered. Reported as
+    // `Missing` those all said "no SLSA build attestation published for this
+    // release", which is the one status a `require_provenance` policy reads as
+    // verified absence. Since absence became LOW and score-neutral, a registry
+    // outage now produced a verdict identical to a clean pass.
+    let fetched = crate::registry::http_util::download_bounded_optional(
         &agent,
         base,
         &attestations_url,
         MAX_ATTESTATION_BYTES,
         5,
         &[("Accept", "application/json")],
-    ) && let Ok(body) = String::from_utf8(bytes)
-        && let Ok(envelope) = serde_json::from_str::<NpmAttestationEnvelope>(&body)
-    {
-        for item in envelope.attestations {
-            if let Some(payload_b64) = item
-                .bundle
-                .and_then(|b| b.dsse_envelope)
-                .and_then(|d| d.payload)
-                && let Ok(mut report) = parse_attestation_payload(&payload_b64, expected_integrity)
-            {
-                report.registry_signature_present = has_sig;
-                report.registry_signature_key_id = sig_key_id.clone();
+    );
 
-                // Cache in SQLite store
-                if let Some(store) = store {
-                    let _ = store.record_provenance(
-                        Ecosystem::Npm,
-                        package,
-                        version,
-                        report.builder_id.as_deref(),
-                        report.source_repo.as_deref(),
-                        report.commit_sha.as_deref(),
-                        report.workflow_path.as_deref(),
-                        report.slsa_level,
-                        has_sig,
-                    );
+    let Some(bytes) = (match fetched {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return ProvenanceReport::unverified_with_signature(
+                &e.to_string(),
+                has_sig,
+                sig_key_id,
+            );
+        }
+    }) else {
+        // 404: the registry states there is no attestation for this release.
+        return ProvenanceReport::missing(has_sig, sig_key_id);
+    };
+
+    let Some(body) = String::from_utf8(bytes).ok() else {
+        return ProvenanceReport::unverified_with_signature(
+            "the attestations endpoint sent a non-UTF-8 body",
+            has_sig,
+            sig_key_id,
+        );
+    };
+
+    match serde_json::from_str::<NpmAttestationEnvelope>(&body) {
+        Ok(envelope) => {
+            for item in envelope.attestations {
+                if let Some(payload_b64) = item
+                    .bundle
+                    .and_then(|b| b.dsse_envelope)
+                    .and_then(|d| d.payload)
+                {
+                    match parse_attestation_payload(&payload_b64, expected_integrity) {
+                        Ok(mut report) => {
+                            report.registry_signature_present = has_sig;
+                            report.registry_signature_key_id = sig_key_id.clone();
+
+                            // Cache in SQLite store
+                            if let Some(store) = store {
+                                let _ = store.record_provenance(
+                                    Ecosystem::Npm,
+                                    package,
+                                    version,
+                                    report.builder_id.as_deref(),
+                                    report.source_repo.as_deref(),
+                                    report.commit_sha.as_deref(),
+                                    report.workflow_path.as_deref(),
+                                    report.slsa_level,
+                                    has_sig,
+                                );
+                            }
+
+                            return report;
+                        }
+                        Err(e) => {
+                            return ProvenanceReport::unverified_with_signature(
+                                &e.to_string(),
+                                has_sig,
+                                sig_key_id,
+                            );
+                        }
+                    }
                 }
-
-                return report;
             }
+        }
+        Err(e) => {
+            return ProvenanceReport::unverified_with_signature(
+                &format!("parsing the npm attestations response: {e}"),
+                has_sig,
+                sig_key_id,
+            );
         }
     }
 
-    // Default: missing SLSA provenance
+    // A well-formed envelope carrying no attestations. The registry answered,
+    // and the answer is that there are none.
     ProvenanceReport::missing(has_sig, sig_key_id)
 }
 
@@ -351,37 +418,49 @@ struct PyPiAttestationBundle {
 }
 
 /// Parse PEP 740 provenance response JSON and verify in-toto subject hash.
+///
+/// Accepts two shapes: a `attestations` / `attestation_bundles` document and a
+/// bare DSSE envelope. A body matching neither is a parse failure, not absence:
+/// it is what a captive portal or an error page under a 200 looks like, and
+/// returning `missing` for it told a `require_provenance` policy that nobody
+/// published provenance when in fact nobody answered.
 pub fn parse_pypi_provenance_json(
     body: &str,
     expected_integrity: &Checksum,
 ) -> Result<ProvenanceReport, BluelineError> {
     let mut had_attestations = false;
     let mut mismatch_details = None;
-
-    if let Ok(resp) = serde_json::from_str::<PyPiProvenanceResponse>(body) {
-        let mut all_items = resp.attestations;
-        for bundle in resp.attestation_bundles {
-            all_items.extend(bundle.attestations);
-        }
-        for item in all_items {
-            if let Some(payload_b64) = item
-                .bundle
-                .and_then(|b| b.dsse_envelope)
-                .and_then(|d| d.payload)
-            {
-                had_attestations = true;
-                let mut report = parse_attestation_payload(&payload_b64, expected_integrity)?;
-                if report.status == ProvenanceStatus::Attested {
-                    report.message = Some(
-                        "PEP 740 attestation verified (crypto verification not performed)".into(),
-                    );
-                    return Ok(report);
-                } else if report.status == ProvenanceStatus::FailedMismatch {
-                    mismatch_details = report.message;
+    let envelope_error = match serde_json::from_str::<PyPiProvenanceResponse>(body) {
+        Ok(resp) => {
+            let mut all_items = resp.attestations;
+            for bundle in resp.attestation_bundles {
+                all_items.extend(bundle.attestations);
+            }
+            for item in all_items {
+                if let Some(payload_b64) = item
+                    .bundle
+                    .and_then(|b| b.dsse_envelope)
+                    .and_then(|d| d.payload)
+                {
+                    had_attestations = true;
+                    let mut report = parse_attestation_payload(&payload_b64, expected_integrity)?;
+                    if report.status == ProvenanceStatus::Attested {
+                        report.message = Some(
+                            "PEP 740 attestation verified (crypto verification not performed)"
+                                .into(),
+                        );
+                        return Ok(report);
+                    } else if report.status == ProvenanceStatus::FailedMismatch {
+                        mismatch_details = report.message;
+                    }
                 }
             }
+            // A well-formed envelope that carries no attestation. The registry
+            // answered, and the answer is that there are none.
+            None
         }
-    }
+        Err(envelope_err) => Some(envelope_err),
+    };
 
     // Direct DSSE envelope format: {"payload": "..."}
     if let Ok(dsse) = serde_json::from_str::<DsseEnvelope>(body)
@@ -404,6 +483,19 @@ pub fn parse_pypi_provenance_json(
         return Ok(ProvenanceReport::failed_mismatch(&msg));
     }
 
+    // Neither shape parsed, so this body is not a provenance document. Reported
+    // as an error rather than absence: a 200 carrying an HTML error page is a
+    // registry that did not answer, and calling it "no attestation published"
+    // hands a clean bill of health to an outage.
+    if let Some(envelope_err) = envelope_error {
+        return Err(BluelineError::Provenance(format!(
+            "the provenance response matched neither the PEP 740 envelope nor a DSSE \
+             payload: {envelope_err}"
+        )));
+    }
+
+    // The envelope parsed and carried no attestation. The registry answered,
+    // and the answer is that there are none.
     Ok(ProvenanceReport::missing(false, None))
 }
 
@@ -453,41 +545,56 @@ pub fn inspect_provenance_pypi(
         std::time::Duration::from_millis(3000),
     );
 
-    if let Ok(bytes) = crate::registry::http_util::download_bounded_with_headers(
+    // The same split as the npm lane above, for the same reason: only a 404
+    // from this endpoint states that no provenance was published. A 5xx, a
+    // refused connection, a body over the cap, or a body that would not parse
+    // mean the question went unanswered, and reporting those as `Missing` let a
+    // registry outage read as verified absence to any `require_provenance`
+    // policy.
+    let fetched = crate::registry::http_util::download_bounded_optional(
         &agent,
         base,
         &provenance_url,
         MAX_ATTESTATION_BYTES,
         5,
         &[("Accept", "application/json")],
-    ) && let Ok(body) = String::from_utf8(bytes)
-    {
-        match parse_pypi_provenance_json(&body, expected_integrity) {
-            Ok(report) => {
-                if report.status == ProvenanceStatus::Attested
-                    && let Some(store) = store
-                {
-                    let _ = store.record_provenance(
-                        Ecosystem::PyPi,
-                        package,
-                        version,
-                        report.builder_id.as_deref(),
-                        report.source_repo.as_deref(),
-                        report.commit_sha.as_deref(),
-                        report.workflow_path.as_deref(),
-                        report.slsa_level,
-                        false,
-                    );
-                }
-                return report;
-            }
-            Err(e) => {
-                return ProvenanceReport::unverified(&e.to_string());
-            }
-        }
-    }
+    );
 
-    ProvenanceReport::missing(false, None)
+    let fetched = match fetched {
+        Ok(Some(bytes)) => bytes,
+        // 404: PEP 740 says there is no attestation for this file.
+        Ok(None) => return ProvenanceReport::missing(false, None),
+        Err(e) => return ProvenanceReport::unverified(&e.to_string()),
+    };
+
+    let body = match String::from_utf8(fetched) {
+        Ok(body) => body,
+        Err(_) => {
+            return ProvenanceReport::unverified("the provenance endpoint sent a non-UTF-8 body");
+        }
+    };
+
+    match parse_pypi_provenance_json(&body, expected_integrity) {
+        Ok(report) => {
+            if report.status == ProvenanceStatus::Attested
+                && let Some(store) = store
+            {
+                let _ = store.record_provenance(
+                    Ecosystem::PyPi,
+                    package,
+                    version,
+                    report.builder_id.as_deref(),
+                    report.source_repo.as_deref(),
+                    report.commit_sha.as_deref(),
+                    report.workflow_path.as_deref(),
+                    report.slsa_level,
+                    false,
+                );
+            }
+            report
+        }
+        Err(e) => ProvenanceReport::unverified(&e.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -963,6 +1070,190 @@ mod tests {
             cached.source_repo.as_deref(),
             Some("git+https://github.com/psf/requests"),
             "the cached row must carry what the statement said"
+        );
+    }
+
+    /// A single-purpose listener that answers every request with `status` and
+    /// `body`. Reads the request before replying: closing with unread bytes
+    /// queued makes the kernel send RST, which truncates the response.
+    fn provenance_status_server(status: &'static str, body: &str) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let body = body.as_bytes().to_vec();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let head = format!(
+                    "{status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+        base
+    }
+
+    /// A registry answer that is not an authoritative "there is none" is not
+    /// evidence that there is none.
+    ///
+    /// Both provenance lanes ended every uneventful fetch with
+    /// `ProvenanceReport::missing(..)`, so a 500, a refused connection, a body
+    /// over the cap, and a body that would not parse all arrived as
+    /// `ProvenanceStatus::Missing` — the one status a policy that set
+    /// `require_provenance` reads as "nobody published provenance for this
+    /// release". Since absence became LOW and score-neutral, that made every one
+    /// of those failures produce a verdict byte-identical to a clean pass.
+    ///
+    /// This is the shape 102d23c fixed for advisories, where a lookup that never
+    /// happened was indistinguishable from a clean one. The established answer
+    /// in this tree is a status that means "no answer was obtained", and
+    /// `Unverified` is already mapped to a refusal under the policy key.
+    ///
+    /// Asserted on the status rather than the message, so rewording the
+    /// disclosure cannot turn this back into a tautology.
+    #[test]
+    fn a_provenance_fetch_that_never_completed_is_not_reported_as_absence() {
+        let expected = ck("tarball");
+
+        // A 200 carrying something that is not a provenance document at all.
+        // Reachable and answered, so the only thing missing is the answer.
+        let garbage = provenance_status_server("HTTP/1.1 200 OK", "<html>not json</html>");
+        let report = inspect_provenance_pypi(
+            "requests",
+            "2.31.0",
+            "requests-2.31.0-py3-none-any.whl",
+            &expected,
+            &garbage,
+            None,
+            &Policy::default(),
+        );
+        assert_eq!(
+            report.status,
+            ProvenanceStatus::Unverified,
+            "a body that would not parse must not read as absence: {report:?}"
+        );
+
+        // A server error. The registry answered, but not with an answer.
+        let broken = provenance_status_server("HTTP/1.1 500 Internal Server Error", "boom");
+        let report = inspect_provenance_pypi(
+            "requests",
+            "2.31.0",
+            "requests-2.31.0-py3-none-any.whl",
+            &expected,
+            &broken,
+            None,
+            &Policy::default(),
+        );
+        assert_eq!(
+            report.status,
+            ProvenanceStatus::Unverified,
+            "a 500 must not read as absence: {report:?}"
+        );
+
+        // And the npm lane, which had the same fallthrough.
+        let broken = provenance_status_server("HTTP/1.1 502 Bad Gateway", "boom");
+        let report = inspect_provenance(
+            "pkg",
+            "1.0.0",
+            &expected,
+            None,
+            &broken,
+            None,
+            &Policy::default(),
+        );
+        assert_eq!(
+            report.status,
+            ProvenanceStatus::Unverified,
+            "a 502 on the npm lane must not read as absence: {report:?}"
+        );
+    }
+
+    /// The other half of the same decision, and the reason the fix above is not
+    /// a blanket "any error is unverifiable".
+    ///
+    /// npm's attestations endpoint answers 404 for a release nobody published
+    /// provenance for, and that is an authoritative statement of absence. It is
+    /// also the overwhelmingly common case, and treating it as unverifiable
+    /// would put back exactly the behaviour 799853e removed: a clean release
+    /// with no provenance, refused under the very key meant to ask for it.
+    #[test]
+    fn an_authoritative_404_is_still_absence() {
+        let expected = ck("tarball");
+        let absent = provenance_status_server("HTTP/1.1 404 Not Found", "");
+
+        let report = inspect_provenance_pypi(
+            "requests",
+            "2.31.0",
+            "requests-2.31.0-py3-none-any.whl",
+            &expected,
+            &absent,
+            None,
+            &Policy::default(),
+        );
+        assert_eq!(
+            report.status,
+            ProvenanceStatus::Missing,
+            "a 404 from the provenance endpoint means nobody published any: {report:?}"
+        );
+
+        let report = inspect_provenance(
+            "pkg",
+            "1.0.0",
+            &expected,
+            None,
+            &absent,
+            None,
+            &Policy::default(),
+        );
+        assert_eq!(
+            report.status,
+            ProvenanceStatus::Missing,
+            "same on the npm lane: {report:?}"
+        );
+    }
+
+    /// A 200 that is a well-formed envelope carrying no attestations is
+    /// absence too, and must keep saying so. Without this the fix would pass by
+    /// reporting `Unverified` for everything and lose the real answer.
+    #[test]
+    fn a_well_formed_empty_envelope_is_still_absence() {
+        let empty = provenance_status_server("HTTP/1.1 200 OK", r#"{"attestations":[]}"#);
+
+        let report = inspect_provenance(
+            "pkg",
+            "1.0.0",
+            &ck("tarball"),
+            None,
+            &empty,
+            None,
+            &Policy::default(),
+        );
+        assert_eq!(
+            report.status,
+            ProvenanceStatus::Missing,
+            "an empty attestation list is a real answer: {report:?}"
+        );
+
+        let report = inspect_provenance_pypi(
+            "requests",
+            "2.31.0",
+            "requests-2.31.0-py3-none-any.whl",
+            &ck("tarball"),
+            &empty,
+            None,
+            &Policy::default(),
+        );
+        assert_eq!(
+            report.status,
+            ProvenanceStatus::Missing,
+            "an empty attestation list is a real answer: {report:?}"
         );
     }
 

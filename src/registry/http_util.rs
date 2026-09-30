@@ -131,6 +131,50 @@ pub fn download_bounded_with_headers(
     max_redirects: usize,
     headers: &[(&str, &str)],
 ) -> Result<Vec<u8>, BluelineError> {
+    fetch_bounded_following(agent, base, url, max_bytes, max_redirects, headers)
+        .map(|(_status, bytes)| bytes)
+}
+
+/// As `download_bounded_with_headers`, but telling an authoritative "this does
+/// not exist" apart from a request that failed.
+///
+/// `Ok(None)` means the server answered 404, which for an optional-attestation
+/// endpoint is a real and common answer: the resource is not published. `Err` is
+/// every other outcome, and none of them is a statement that the resource is
+/// missing -- a refused connection, a 5xx, a body over the cap, a redirect that
+/// was refused, a malformed response. A caller that collapses the two cannot
+/// tell "nobody published this" from "we never found out", and in a tool that
+/// fails closed those are opposites.
+///
+/// Kept separate from `download_bounded` rather than folded into it: a 404 on a
+/// *tarball* is a broken release, and `BluelineError::NotFound` is read by
+/// `recursive.rs` as "referenced install could not be resolved", so widening the
+/// existing error type would silently reclassify those too.
+pub fn download_bounded_optional(
+    agent: &Agent,
+    base: &str,
+    url: &str,
+    max_bytes: u64,
+    max_redirects: usize,
+    headers: &[(&str, &str)],
+) -> Result<Option<Vec<u8>>, BluelineError> {
+    match fetch_bounded_following(agent, base, url, max_bytes, max_redirects, headers) {
+        Ok((404, _)) => Ok(None),
+        Ok((_status, bytes)) => Ok(Some(bytes)),
+        Err(e) => Err(e),
+    }
+}
+
+/// The one redirect-and-read loop. Split out so the optional-absence variant
+/// above can see the final status without a second copy of the hop validation.
+fn fetch_bounded_following(
+    agent: &Agent,
+    base: &str,
+    url: &str,
+    max_bytes: u64,
+    max_redirects: usize,
+    headers: &[(&str, &str)],
+) -> Result<(u16, Vec<u8>), BluelineError> {
     let mut current_url = url.to_string();
     let mut redirects_followed = 0;
 
@@ -157,6 +201,14 @@ pub fn download_bounded_with_headers(
                 })?;
                 current_url = resolve_redirect_url(&current_url, location)?;
             }
+            // `ureq` turns a 4xx into `Err(Status(..))` rather than an
+            // `Ok` response, so a 404 would otherwise be indistinguishable from
+            // a transport failure here. It is not: it is the registry stating
+            // that the resource does not exist, and an optional endpoint's
+            // callers need to tell that from a request that never completed.
+            // Reported as a status rather than a body because the body of a 404
+            // carries no attestation and nothing here consumes it.
+            Err(ureq::Error::Status(404, _response)) => return Ok((404, Vec::new())),
             Ok(response) => break response,
             Err(e) => {
                 return Err(BluelineError::Network(format!("GET {url}: {e}")));
@@ -164,6 +216,7 @@ pub fn download_bounded_with_headers(
         }
     };
 
+    let status = resp.status();
     let mut bytes = Vec::new();
     let mut reader = resp.into_reader().take(max_bytes + 1);
     reader
@@ -176,7 +229,7 @@ pub fn download_bounded_with_headers(
         )));
     }
 
-    Ok(bytes)
+    Ok((status, bytes))
 }
 
 pub fn resolve_redirect_url(base_url: &str, location: &str) -> Result<String, BluelineError> {
