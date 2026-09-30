@@ -161,8 +161,35 @@ fn review_json_with_policy(
         "json",
         "--yes",
     ]);
-    if let Some(policy) = policy {
-        cmd.arg("--policy").arg(policy);
+    match policy {
+        // An explicit `--policy` outranks the environment, so a caller that
+        // supplies one owns its advisory configuration.
+        Some(policy) => {
+            cmd.arg("--policy").arg(policy);
+        }
+        // Every other case here is about recursion, not advisory coverage, and
+        // the registry is a fixture on 127.0.0.1, so the OSV lookup cannot
+        // complete. A lookup that cannot complete is disclosed as
+        // `R09_ADVISORY_UNVERIFIED` at MEDIUM, and MEDIUM is above LOW, which
+        // `--yes` gates on, so a package the test had just marked clean came
+        // back MEDIUM and exited 2:
+        // `Cannot auto-approve clean@1.0.0: risk verdict is MEDIUM`, carrying
+        // "OSV advisory request failed: ... timed out reading response".
+        //
+        // The disclosure itself stays pinned by
+        // `advisory::tests::only_an_unverified_report_with_advisories_enabled_is_unknown_coverage`
+        // and `the_aur_never_claims_clean_advisory_coverage`, neither of which
+        // needs a network.
+        None => {
+            let policy_dir = tempfile::tempdir().unwrap();
+            let policy_path = policy_dir.path().join("blueline.toml");
+            std::fs::write(&policy_path, "[policy]\ncheck_advisories = false\n").unwrap();
+            // The child reads the file after this returns, so the directory has
+            // to outlive it. Leaking one per test process is the cost of a
+            // hermetic child; the alternative is a live third-party request.
+            std::mem::forget(policy_dir);
+            cmd.env("BLUELINE_POLICY", &policy_path);
+        }
     }
     let output = cmd.env("BLUELINE_DATA_DIR", temp.path()).output().unwrap();
     (
