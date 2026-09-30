@@ -171,7 +171,22 @@ fn agent(args: &[&str]) -> (i32, String, String) {
     let policy_path = policy_dir.path().join("blueline.toml");
     std::fs::write(
         &policy_path,
-        "[[allowlist.packages]]\nname = \"ok\"\nallow_unreviewed_baseline = true\n",
+        // `check_advisories = false` so these tests stop depending on
+        // `api.osv.dev` answering. Nothing here asserts on advisory coverage;
+        // every case is about the gate's exit codes and its decision shapes.
+        //
+        // Without it, a lookup that cannot complete is disclosed as
+        // `R09_ADVISORY_UNVERIFIED` at MEDIUM, and MEDIUM is above LOW, which
+        // `agent` gates on. So a package these tests had just marked clean came
+        // back BLOCK and `agent_gate_uses_exit_codes_and_native_decision_shapes`
+        // failed on `left: 2, right: 0`. Measured here at roughly 1 run in 4,
+        // varying with the third party's latency rather than with anything in
+        // this repo. The disclosure itself stays pinned by
+        // `advisory::tests::only_an_unverified_report_with_advisories_enabled_is_unknown_coverage`
+        // and `the_aur_never_claims_clean_advisory_coverage`, neither of which
+        // needs a network.
+        "[[allowlist.packages]]\nname = \"ok\"\nallow_unreviewed_baseline = true\n\
+         \n[policy]\ncheck_advisories = false\n",
     )
     .unwrap();
     let output = Command::cargo_bin("blueline")
