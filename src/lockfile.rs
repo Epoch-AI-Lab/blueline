@@ -106,8 +106,18 @@ pub fn parse_lockfile_packages(
                 continue;
             }
 
+            // An entry with no version is not a package that does not exist. Skipping
+            // it dropped the entry from the graph, so a lockfile whose entry
+            // was rewritten into a shape the parser cannot read still compared
+            // as fully reviewed and the delta reported nothing where the
+            // entry used to be. Refuse, naming the path, which is the
+            // fail-closed reading and matches how the alias mismatch below
+            // handles an entry whose identity is ambiguous.
             let Some(version) = pkg.version else {
-                continue;
+                return Err(LockfileError::InvalidData(format!(
+                    "`{path}` declares no version; refusing to review a lockfile \
+                     with an entry that cannot be read"
+                )));
             };
 
             let key_name = extract_package_name_from_path(&path);
@@ -712,6 +722,48 @@ mod tests {
         let err =
             LockfileError::from(serde_json::from_str::<serde_json::Value>("{{{{").unwrap_err());
         assert!(err.source().is_none(), "source must be None: {err:#}");
+    }
+
+    /// An entry that cannot be turned into a package is not a package that does
+    /// not exist. A silent `continue` dropped it from the graph, so a lockfile
+    /// whose head rewrote a pinned package into a shape the parser skips still
+    /// compares as fully reviewed, and the delta reports nothing where the
+    /// attacker's entry used to be. Refusing is the fail-closed reading and
+    /// matches how the alias mismatch below already handles ambiguity.
+    #[test]
+    fn an_entry_without_a_version_is_refused_rather_than_dropped() {
+        let json = r#"{
+            "name": "my-app",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "my-app",
+                    "version": "1.0.0"
+                },
+                "node_modules/lodash": {
+                    "version": "4.17.21",
+                    "integrity": "sha512-v2kDEe57lecTulaDIuNTPy3Ry4gLGJ6Z1O3vE1krgXZNrsQ+LFTGHVxVjcXPs17LhbZVGedAJv8XZ1tvj5FvSg=="
+                },
+                "node_modules/evil": {
+                    "resolved": "https://evil.example/evil.tgz",
+                    "integrity": "sha512-evil"
+                }
+            }
+        }"#;
+
+        let err = parse_lockfile_packages(json).expect_err(
+            "an entry with no version must be refused, not silently dropped: \
+             dropping it makes the lockfile look fully reviewed",
+        );
+        assert!(
+            matches!(err, LockfileError::InvalidData(_)),
+            "refuse with InvalidData, got: {err:?}"
+        );
+        assert!(
+            format!("{err}").contains("node_modules/evil"),
+            "the refusal must name the entry it refused: {err}"
+        );
     }
 
     #[test]

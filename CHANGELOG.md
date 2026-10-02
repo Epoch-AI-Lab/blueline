@@ -85,6 +85,25 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
 
 ### Fixed
 
+- An npm lockfile entry with **no `version`** is now refused instead of silently
+  dropped. `parse_lockfile_packages` did `let Some(version) = pkg.version else
+  { continue }`, so such an entry vanished from the parsed graph with no error
+  and no finding. The lockfile still parsed, so the comparison against the
+  baseline read as fully reviewed while the package the entry described was
+  absent from the graph — the delta reported nothing where the entry used to
+  be, which is the shape a rewritten lockfile entry takes.
+
+  It now refuses with the offending path named, which is the fail-closed
+  reading and matches how the npm alias mismatch a few lines below already
+  treats an entry whose identity is ambiguous. A root entry (`""` or `"."`) is
+  still skipped, as it legitimately is not an installed package.
+
+  `an_entry_without_a_version_is_refused_rather_than_dropped` fails against the
+  old code with the entry silently absent from the returned map, and passes with
+  the refusal. `cargo fmt --all --check`,
+  `cargo clippy --all-targets --locked -- -D warnings` and
+  `cargo test --all-targets --locked` clean at this head (776 tests).
+
 - The prebuilt-binary path of the `blueline-ci` composite action asked for an
   asset name that no release has ever published. It requested
   `blueline-$VER-binary-$TARGET`, while `release.yml:282-284` stages
