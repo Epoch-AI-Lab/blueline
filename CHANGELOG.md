@@ -85,7 +85,46 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
 
 ### Fixed
 
-- An npm lockfile entry with **no `version`** is now refused instead of silently
+- **PyPI dependencies are read again, and a PyPI artifact's declared name is now
+  bound to the name the registry resolved.** The PyPI arm looked for metadata at
+  `root.join("METADATA")`, but a wheel keeps it at
+  `<name>-<version>.dist-info/METADATA` (or `.egg-info`) and an sdist at
+  `PKG-INFO`, and `prepare_extracted_root` hands that arm the extraction root
+  without descending. The path therefore never existed for either artifact type,
+  and the read was `if let Ok(..)`, so it failed silently: `manifest.dependencies`
+  was **always empty** on PyPI, which meant `R04_DEPENDENCY_ADDED` and
+  `R04_DEPENDENCY_MODIFIED` could not fire on a wheel or an sdist at all. A
+  release that added `requests>=2.0` in its metadata was reviewed as a
+  zero-dependency package. The one test covering this wrote `METADATA` at the
+  tempdir root, a layout no published artifact has, so it passed while proving
+  nothing.
+
+  The same arm synthesized `name: canonical_name` — the resolved name echoed
+  back — which is why `review.rs` excluded PyPI from the archive-identity guard:
+  the comparison could not fail by construction. A wheel served for
+  `good-lib==1.0.0` whose metadata declares `Name: evil` was reviewed as
+  `good-lib`, with the allowlist, blocklist and baseline keys all evaluated
+  against `good-lib` while the reviewed bytes were the attacker's. That is the
+  same defeat the npm guard was added for.
+
+  Metadata is now located by `find_pypi_metadata`, the declared `Name:` is read,
+  and PyPI takes part in the identity guard. The PyPI comparison is made under
+  PEP 503 normalisation rather than string equality, because `Foo.Bar`,
+  `foo-bar`, `foo_bar` and `foo.bar` are one project and an honest wheel carries
+  the raw name while its filename carries the escaped one; a plain `!=` would
+  refuse legitimate releases.
+
+  Three tests, each failing without its half of the fix:
+  `pypi_metadata_is_read_from_its_real_location_in_a_wheel` (empty dependencies
+  before), `a_pypi_archive_declaring_another_project_is_refused` (the old code
+  accepted it), and `an_equivalent_pypi_name_is_still_accepted`, which pins that
+  `good-lib`, `Good_Lib` and `good.lib` are all still reviewed.
+
+  This may newly raise `R04` findings on PyPI releases whose dependencies were
+  previously invisible, which is the point: those releases were being reviewed
+  as dependency-free.
+
+- An npm lockfile entry with**no `version`** is now refused instead of silently
   dropped. `parse_lockfile_packages` did `let Some(version) = pkg.version else
   { continue }`, so such an entry vanished from the parsed graph with no error
   and no finding. The lockfile still parsed, so the comparison against the

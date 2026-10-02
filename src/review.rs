@@ -492,6 +492,33 @@ fn collect_install_refs(
     }
 }
 
+/// Locate a PyPI artifact's core metadata. PEP 427 puts a wheel's at
+/// `<name>-<version>.dist-info/METADATA`, `.egg-info` predates it, and an sdist
+/// carries `PKG-INFO` at the root of its single top-level directory. `None`
+/// when no metadata is found; the caller decides what that means.
+fn find_pypi_metadata(root: &std::path::Path) -> Option<std::path::PathBuf> {
+    for path in [root.join("METADATA"), root.join("PKG-INFO")] {
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    // One level down, which is where a wheel's dist-info and an sdist's single
+    // top-level directory both put it. A wheel has exactly one, so sorting makes
+    // the choice deterministic rather than readdir order.
+    let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .flat_map(|entry| {
+            let dir = entry.path();
+            [dir.join("METADATA"), dir.join("PKG-INFO")]
+        })
+        .filter(|path| path.is_file())
+        .collect();
+    found.sort();
+    found.into_iter().next()
+}
+
 fn extract_for_ecosystem(
     tarball: &[u8],
     dest: &std::path::Path,
@@ -551,9 +578,21 @@ fn prepare_extracted_root(
             manifest
         }
         Ecosystem::PyPi => {
-            let candidate = root.join("METADATA");
+            // A wheel keeps its metadata at `<name>-<version>.dist-info/METADATA`
+            // (or `.egg-info`), and an sdist at `PKG-INFO` under a single
+            // top-level directory. The old code read `root.join("METADATA")`
+            // with no descent, which never exists for either artifact type, so
+            // the read silently failed and PyPI dependencies were always empty:
+            // R04_DEPENDENCY_ADDED and R04_DEPENDENCY_MODIFIED could not fire on
+            // a wheel or an sdist at all.
+            let candidate = find_pypi_metadata(&root);
             let mut deps = std::collections::BTreeMap::new();
-            if let Ok(raw) = std::fs::read_to_string(&candidate) {
+            // The declared `Name`, kept so the archive-identity guard below can
+            // compare it against the name the registry resolved.
+            let mut declared_name: Option<String> = None;
+            if let Some(meta) = &candidate
+                && let Ok(raw) = std::fs::read_to_string(meta)
+            {
                 for line in raw.lines() {
                     if let Some(rest) = line.strip_prefix("Requires-Dist:") {
                         let dep = rest.trim().split(';').next().unwrap_or("").trim();
@@ -561,11 +600,20 @@ fn prepare_extracted_root(
                             let name = dep.split_whitespace().next().unwrap_or(dep).to_string();
                             deps.insert(name.clone(), dep.to_string());
                         }
+                    } else if declared_name.is_none()
+                        && let Some(rest) = line.strip_prefix("Name:")
+                    {
+                        let value = rest.trim();
+                        if !value.is_empty() {
+                            declared_name = Some(value.to_string());
+                        }
                     }
                 }
             }
             crate::manifest::PackageJson {
-                name: canonical_name.to_string(),
+                name: declared_name
+                    .clone()
+                    .unwrap_or_else(|| canonical_name.to_string()),
                 version: version.to_string(),
                 dependencies: deps,
                 ..Default::default()
@@ -580,7 +628,18 @@ fn prepare_extracted_root(
     // key are all evaluated against the resolved name while the installed
     // bytes are the attacker's, which defeats exact-match allowlisting for a
     // package that lies about its own identity.
-    if !matches!(ecosystem, Ecosystem::PyPi) && manifest.name != canonical_name {
+    // PyPI is compared under PEP 503 normalisation rather than by string
+    // equality: `Foo.Bar`, `foo-bar`, `foo_bar` and `foo.bar` are one project,
+    // and an honest wheel carries the raw name in METADATA while its filename
+    // carries the escaped one. A plain `!=` would refuse legitimate releases,
+    // which in a fail-closed tool is its own damage.
+    let name_matches = if ecosystem == Ecosystem::PyPi {
+        crate::version::canonicalize_name(&manifest.name)
+            == crate::version::canonicalize_name(canonical_name)
+    } else {
+        manifest.name == canonical_name
+    };
+    if !name_matches {
         return Err(crate::error::BluelineError::Manifest(
             canonical_name.to_string(),
             format!(
@@ -1461,8 +1520,87 @@ mod tests {
         assert!(res.is_ok());
     }
 
+    // A real wheel keeps its metadata at `<name>-<version>.dist-info/METADATA`, and
+    // a real sdist at `PKG-INFO`. The PyPI arm read `root.join("METADATA")`
+    // and `prepare_extracted_root` hands it the extraction root unaltered
+    // (`_ => temp_root.to_path_buf()`), so that path never exists for either
+    // artifact type and the read silently failed. Dependencies were
+    // therefore always empty on PyPI, which means R04_DEPENDENCY_ADDED and
+    // R04_DEPENDENCY_MODIFIED could never fire on a wheel or an sdist.
+    // The test above only passes because it writes METADATA at the
+    // tempdir root, a layout no published artifact has.
+    #[test]
+    fn pypi_metadata_is_read_from_its_real_location_in_a_wheel() {
+        for tag in ["dist-info", "egg-info"] {
+            let dir = tempfile::tempdir().unwrap();
+            let meta_dir = dir.path().join(format!("my_pkg-1.0.0.{tag}"));
+            std::fs::create_dir_all(&meta_dir).unwrap();
+            std::fs::write(
+                meta_dir.join("METADATA"),
+                "Metadata-Version: 2.1\nName: my-pkg\nVersion: 1.0.0\n\
+                     Requires-Dist: requests >= 2.0; python_version >= '3.8'\n",
+            )
+            .unwrap();
+
+            let (_root, manifest) =
+                prepare_extracted_root(dir.path(), Ecosystem::PyPi, "my-pkg", "1.0.0").unwrap();
+            assert_eq!(
+                manifest.dependencies.get("requests").map(String::as_str),
+                Some("requests >= 2.0"),
+                "a wheel's {tag}/METADATA must reach the manifest, got {:?}",
+                manifest.dependencies
+            );
+        }
+    }
+
+    /// The PyPI lane was excluded from the archive-identity guard because it
+    /// synthesized `manifest.name` from the resolved name, so the comparison
+    /// could never fail. Now that the declared `Name:` is actually read, a
+    /// wheel whose metadata names a different project must be refused: the
+    /// allowlist, blocklist and baseline keys are evaluated against the
+    /// resolved name while the reviewed bytes belong to the declared one.
+    #[test]
+    fn a_pypi_archive_declaring_another_project_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta_dir = dir.path().join("evil-1.0.0.dist-info");
+        std::fs::create_dir_all(&meta_dir).unwrap();
+        std::fs::write(
+            meta_dir.join("METADATA"),
+            "Metadata-Version: 2.1\nName: evil\nVersion: 1.0.0\n",
+        )
+        .unwrap();
+
+        let err = prepare_extracted_root(dir.path(), Ecosystem::PyPi, "good-lib", "1.0.0")
+            .expect_err("a wheel declaring another project must be refused");
+        assert!(
+            format!("{err}").contains("evil"),
+            "the refusal must name the declared project: {err}"
+        );
+    }
+
+    /// An honest wheel whose METADATA spells the name differently but
+    /// equivalently under PEP 503 must still be reviewed. Refusing these would
+    /// make the guard worse than the gap it closes.
+    #[test]
+    fn an_equivalent_pypi_name_is_still_accepted() {
+        for declared in ["good-lib", "Good_Lib", "good.lib"] {
+            let dir = tempfile::tempdir().unwrap();
+            let meta_dir = dir.path().join("good_lib-1.0.0.dist-info");
+            std::fs::create_dir_all(&meta_dir).unwrap();
+            std::fs::write(
+                meta_dir.join("METADATA"),
+                format!("Metadata-Version: 2.1\nName: {declared}\nVersion: 1.0.0\n"),
+            )
+            .unwrap();
+
+            prepare_extracted_root(dir.path(), Ecosystem::PyPi, "good-lib", "1.0.0")
+                .unwrap_or_else(|e| panic!("`{declared}` is the same project as `good-lib`: {e}"));
+        }
+    }
+
     #[test]
     fn prepare_extracted_root_requires_aur_archive_files() {
+        // prepare_extracted_root requires AUR archive files
         let dir = tempfile::tempdir().unwrap();
         let err = prepare_extracted_root(dir.path(), Ecosystem::Aur, "demo", "1.0-1")
             .unwrap_err()
