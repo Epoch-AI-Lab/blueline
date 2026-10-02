@@ -93,7 +93,12 @@ runs:
           [ -n "$TAG" ] || { echo "::error::could not resolve latest blueline release" && exit 1; }
         fi
         VER="${TAG#v}"
-        ASSET="blueline-$VER-binary-$TARGET"
+        # The name must match what release.yml stages, which is
+        # `blueline-$VERSION-$target` with the bare Rust target triple
+        # (release.yml:282-284). An extra `-binary-` segment here resolves to
+        # an asset that was never published, so the SHA256SUMS lookup below
+        # fails for every platform.
+        ASSET="blueline-$VER-$TARGET"
         case "$TARGET" in *windows*) ASSET="$ASSET.exe" ;; esac
 
         cd "$OUT_DIR"

@@ -85,6 +85,22 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
 
 ### Fixed
 
+- The prebuilt-binary path of the `blueline-ci` composite action asked for an
+  asset name that no release has ever published. It requested
+  `blueline-$VER-binary-$TARGET`, while `release.yml:282-284` stages
+  `blueline-$VERSION-$target` with the bare Rust target triple, so the
+  `-binary-` segment never existed. The download 404s, and the SHA256SUMS
+  lookup that follows fails at `[ -n "$EXPECTED" ] || exit 1` for **every**
+  platform. Nothing caught it because both dogfood jobs pass
+  `build-from-source: true` (`ci.yml:117`) and bypass this path entirely, so
+  the one gate this branch added to catch "a gate that reports success having
+  done nothing" was itself never executed. The name now matches the release
+  workflow.
+
+  The path stays unexercised by this repository's own CI. Exercising it needs a
+  tagged release, which is a separate piece of work and is not recorded here as
+  done.
+
 - A digest mismatch on the **npm** provenance lane is no longer cached as an
   attestation. `parse_attestation_payload` returns
   `Ok(ProvenanceReport::failed_mismatch(..))` rather than an `Err`, and the npm
@@ -362,8 +378,11 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
   aggregate reported success having mutated nothing. Verified by re-introducing
   the condition: a `src/cli.rs`-only diff produced zero mutants under the old
   list and three under the new one. The scope is now a `src/**/*.rs` glob, which
-  cannot drift when a module is added; the timeout is 180s and the ceiling 60
+  cannot drift when a module is added; the timeout is 300s and the ceiling 100
   minutes across 32 shards, sized from 503 mutants measured for this diff.
+  (An earlier version of this entry said 180s and 60 minutes, which is what an
+  intermediate measurement said; neither matched what ships. The numbers above
+  are the ones in `ci.yml`.)
 
   The comment claiming 16 shards "keep each runner around ~3-4 min" was false by
   roughly 4x, and it is the number a future maintainer would have sized the next
@@ -410,7 +429,7 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
   which is 2.8x the 64s an idle suite takes, two shards still timed out, and a
   timeout is an unknown fate rather than a caught mutant — cargo-mutants exits 3,
   so the gate went red over a mutant that may well have been caught. The
-  measured shard cost is ~55s per mutant against a 60 minute job ceiling, so the
+  measured shard cost is ~55s per mutant against a 100 minute job ceiling, so the
   ceiling is not the binding constraint. And one shard reported a single
   surviving mutant on `verify_schema` that an isolated `cargo mutants` run
   against the same line caught 6 times out of 6; a survivor that does not
