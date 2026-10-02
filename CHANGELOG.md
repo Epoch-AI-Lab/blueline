@@ -85,6 +85,29 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
 
 ### Fixed
 
+- **A PyPI simple index that names a different project is now refused.**
+  `resolve_package` adopted the `name` field out of the `/simple/{name}/`
+  response body as the reviewed package's name without ever comparing it to the
+  name that was requested, and without validating it as a project name. A
+  registry answering `/simple/innocent/` with `{"name": "evil", ...}` produced a
+  verdict filed under the registry's own string while pip installs whatever the
+  URL serves. npm has always bound this (`npm.rs:195`, plus
+  `validate_package_name`); PyPI now does the same half.
+
+  The comparison is made under PEP 503 normalisation, because an index is
+  entitled to spell a project the way that index does and `Foo.Bar`, `foo-bar`
+  and `foo.bar` are one project. The declared name is also run through
+  `validate_pypi_name`, so an index cannot introduce a name the tool would
+  otherwise refuse to accept on another path.
+
+  `a_simple_index_naming_another_project_is_refused` fails against the old code,
+  which resolved the package successfully.
+
+  **Behaviour change:** an index whose `name` disagrees with the requested
+  project now fails the review. That is the intent, but it is a new refusal on a
+  path that previously always succeeded, so it may surface on a mirror that
+  spells names unconventionally.
+
 - **PyPI dependencies are read again, and a PyPI artifact's declared name is now
   bound to the name the registry resolved.** The PyPI arm looked for metadata at
   `root.join("METADATA")`, but a wheel keeps it at

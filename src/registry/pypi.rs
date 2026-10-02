@@ -254,6 +254,36 @@ impl PyPIRegistry {
         let csum = Checksum::parse(&format!("sha256:{sha}"))
             .map_err(|e| BluelineError::Verification(format!("bad sha256: {e}")))?;
         validate_download_url(&self.base, &chosen.url)?;
+        // The `/simple/` body carries its own `name`, and it was adopted as the
+        // reviewed package's name without ever being compared to the name that
+        // was requested. A registry answering `/simple/innocent/` with
+        // `{"name": "evil", ...}` produced a verdict filed under the registry's
+        // own string while pip installs what the URL serves. npm binds the same
+        // thing at `npm.rs:195`; this is the PyPI half of that check.
+        //
+        // Compared under PEP 503 normalisation, because an index is entitled to
+        // spell a project the way that index does, and `Foo.Bar`, `foo-bar` and
+        // `foo.bar` are one project.
+        if canonicalize_name(&s.name) != norm {
+            return Err(BluelineError::Manifest(
+                norm.clone(),
+                format!(
+                    "registry metadata mismatch: requested `{norm}` but the simple index \
+                     declares `{}`; refusing to review it as the requested project",
+                    s.name
+                ),
+            ));
+        }
+        if !validate_pypi_name(&s.name) {
+            return Err(BluelineError::Manifest(
+                norm,
+                format!(
+                    "the simple index declares `{}`, which is not a legal project name; \
+                     refusing to review it",
+                    s.name
+                ),
+            ));
+        }
         Ok(Package {
             name: s.name,
             version: version.to_string(),
@@ -551,6 +581,45 @@ mod tests {
         for r in &releases {
             assert_eq!(r.yanked, r.yanked_reason.is_some(), "{}", r.version);
         }
+    }
+
+    /// The `/simple/` response carries a `name` field, and it was adopted as the
+    /// reviewed package's name without ever being compared to the name that was
+    /// requested. A registry answering `/simple/innocent/` with
+    /// `{"name": "evil", ...}` therefore produced a verdict filed under the
+    /// registry's own string while pip installs what the URL serves. npm binds
+    /// this at `npm.rs:195` (`if meta.name != name { .. }`) plus
+    /// `validate_package_name`; PyPI did neither.
+    #[test]
+    fn a_simple_index_naming_another_project_is_refused() {
+        let server = MockPyPIServer::spawn(|path, base| {
+            assert_eq!(path, "/simple/innocent/", "unexpected path {path}");
+            let sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+            (
+                SIMPLE_ACCEPT.to_string(),
+                serde_json::to_vec(&serde_json::json!({
+                    "name": "evil",
+                    "versions": ["1.0.0"],
+                    "files": [{
+                        "filename": "innocent-1.0.0-py3-none-any.whl",
+                        "url": format!("{base}/innocent-1.0.0-py3-none-any.whl"),
+                        "hashes": {"sha256": sha},
+                        "yanked": false
+                    }]
+                }))
+                .unwrap(),
+            )
+        });
+
+        let reg = PyPIRegistry::new(&server.base);
+        let err = reg
+            .resolve_package("innocent", "1.0.0")
+            .expect_err("an index naming another project must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("evil") || msg.contains("mismatch"),
+            "the refusal must name what the registry claimed: {msg}"
+        );
     }
 
     /// PEP 691 paginates with `meta.next`. The marker was deserialized and
