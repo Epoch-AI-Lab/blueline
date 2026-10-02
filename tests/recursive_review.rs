@@ -354,7 +354,15 @@ fn max_depth_1_reviews_children_but_discloses_grandchildren() {
 
     let policy_dir = tempfile::tempdir().unwrap();
     let policy_path = policy_dir.path().join("blueline.toml");
-    std::fs::write(&policy_path, "[recursion]\nmax_depth = 1\n").unwrap();
+    // `check_advisories = false` for the reason documented on the `None` arm
+    // of `review_json_with_policy`: an explicit `--policy` outranks
+    // `BLUELINE_POLICY`, so a caller that supplies its own file has to carry
+    // the key itself or the child reaches api.osv.dev.
+    std::fs::write(
+        &policy_path,
+        "[recursion]\nmax_depth = 1\n\n[policy]\ncheck_advisories = false\n",
+    )
+    .unwrap();
     let (code, stdout) = review_json_with_policy(&fixture.base, "a@1.0.0", Some(&policy_path));
     assert_eq!(code, 2, "second-order delivery must not be LOW: {stdout}");
     let verdict: serde_json::Value = serde_json::from_str(stdout.lines().next().unwrap())
@@ -396,7 +404,13 @@ fn clean_parent_without_references_reviews_normally() {
     let policy_path = policy_dir.path().join("blueline.toml");
     std::fs::write(
         &policy_path,
-        "[[allowlist.packages]]\nname = \"clean\"\nallow_unreviewed_baseline = true\n",
+        // `check_advisories = false` for the reason documented on the `None`
+        // arm of `review_json_with_policy`: this case asserts a clean package
+        // exits 0, and an unreachable advisory host adds an
+        // `R09_ADVISORY_UNVERIFIED` disclosure at MEDIUM, which is above the LOW
+        // that `--yes` gates on. It cannot inherit the file the `None` arm
+        // writes, because an explicit `--policy` outranks `BLUELINE_POLICY`.
+        "[[allowlist.packages]]\nname = \"clean\"\nallow_unreviewed_baseline = true\n\n[policy]\ncheck_advisories = false\n",
     )
     .unwrap();
     let (code, stdout) = review_json_with_policy(&fixture.base, "clean@1.0.0", Some(&policy_path));

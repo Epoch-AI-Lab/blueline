@@ -85,6 +85,21 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
 
 ### Fixed
 
+- The two tests in `tests/recursive_review.rs` that pass an explicit
+  `--policy` no longer depend on `api.osv.dev` answering. The advisory key was
+  disabled in the shared helper's `None` arm only, and an explicit `--policy`
+  outranks `BLUELINE_POLICY`, so both callers that supply their own policy file
+  kept advisories on. `clean_parent_without_references_reviews_normally` then
+  failed on `left: 2, right: 0`: the unreachable lookup disclosed
+  `R09_ADVISORY_UNVERIFIED` at MEDIUM, which is above the LOW that `--yes` gates
+  on, for a package the test had just marked clean. The band and its
+  assertion did not change, and nothing in the file asserts on advisory
+  coverage.
+
+  Verified with `api.osv.dev` blackholed in `/etc/hosts`: 1 failure before,
+  `4 passed; 0 failed` after. Reverting only the two policy strings restored
+  the failure, so those strings carry it.
+
 - The four tests in `tests/agent_cli.rs` no longer depend on `api.osv.dev`
   answering. They drive `blueline agent` against a fixture registry on
   127.0.0.1, so the advisory lookup cannot complete, and a lookup that cannot
