@@ -85,6 +85,30 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
 
 ### Fixed
 
+- A digest mismatch on the **npm** provenance lane is no longer cached as an
+  attestation. `parse_attestation_payload` returns
+  `Ok(ProvenanceReport::failed_mismatch(..))` rather than an `Err`, and the npm
+  lane cached on any `Ok` without looking at the status. The cache has no status
+  column and a cache hit replays as `Attested` unconditionally
+  (`src/provenance.rs:272`), so the first review of a release whose attestation
+  did not match the bytes under review refused correctly, wrote the failure into
+  SQLite, and every later review read that row back as `Attested`. Under
+  `require_provenance` that dropped the only finding that blocks, so a release
+  that failed its integrity check was reported as attested-and-not-cryptographically-verified
+  at Low from the second review onward. A digest mismatch refuses regardless of
+  the key, so this turned an integrity failure into a pass.
+
+  The PyPI lane already guarded its write with `status == Attested`
+  (`src/provenance.rs:604`) and was never affected; the npm lane now matches it.
+  The fix is the guard, not a schema change: a mismatch leaves no row, so the
+  next review re-fetches and refuses again.
+
+  Verified by removing the guard and watching the new test catch it:
+  `an_npm_digest_mismatch_is_not_cached_as_an_attestation` fails with the row
+  present and passes without it. `cargo fmt --all --check`,
+  `cargo clippy --all-targets --locked -- -D warnings` and
+  `cargo test --all-targets --locked` clean at this head (775 tests).
+
 - The two tests in `tests/recursive_review.rs` that pass an explicit
   `--policy` no longer depend on `api.osv.dev` answering. The advisory key was
   disabled in the shared helper's `None` arm only, and an explicit `--policy`

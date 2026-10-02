@@ -361,8 +361,15 @@ pub fn inspect_provenance(
                             report.registry_signature_present = has_sig;
                             report.registry_signature_key_id = sig_key_id.clone();
 
-                            // Cache in SQLite store
-                            if let Some(store) = store {
+                            // Cache in SQLite store, but only an attestation
+                            // that actually verified. A digest mismatch is an
+                            // integrity failure, and the cache has no status
+                            // column, so a cache hit replays as `Attested`
+                            // unconditionally: writing a mismatch would launder
+                            // it into a passing verdict on every later review.
+                            if report.status == ProvenanceStatus::Attested
+                                && let Some(store) = store
+                            {
                                 let _ = store.record_provenance(
                                     Ecosystem::Npm,
                                     package,
@@ -1095,6 +1102,81 @@ mod tests {
             cached.source_repo.as_deref(),
             Some("git+https://github.com/psf/requests"),
             "the cached row must carry what the statement said"
+        );
+    }
+
+    /// A digest mismatch is an integrity failure, and the cache has no status
+    /// column to tell a `FailedMismatch` row from an `Attested` one: a cache hit
+    /// replays as `Attested` unconditionally (`src/provenance.rs:272`). The PyPI
+    /// lane already guarded its write with `status == Attested`; the npm lane
+    /// did not, so it wrote the failure into the cache and every later review of
+    /// that release read back `Attested`, which under `require_provenance`
+    /// drops the only finding that blocks. A digest mismatch continues to refuse
+    /// regardless of the key, so this laundered an integrity failure into a pass.
+    #[test]
+    fn an_npm_digest_mismatch_is_not_cached_as_an_attestation() {
+        let expected = ck("tarball");
+        // The statement attests a *different* digest than the one under review,
+        // so the parse must produce a mismatch rather than an attestation.
+        let statement = serde_json::json!({
+            "_type": "https://in-toto.io/Statement/v0.1",
+            "subject": [{
+                "name": "pkg:npm/lodash@4.17.20",
+                "digest": {"sha512": "00".repeat(64)}
+            }],
+            "predicateType": "https://slsa.dev/provenance/v0.2",
+            "predicate": {
+                "builder": {"id": "https://github.com/actions/runner"},
+                "invocation": {
+                    "configSource": {
+                        "uri": "git+https://github.com/lodash/lodash",
+                        "digest": {"sha1": "deadbeef"},
+                        "entryPoint": ".github/workflows/w.yml"
+                    }
+                }
+            }
+        });
+        let b64 = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&statement).unwrap());
+        let body = format!(
+            r#"{{"attestations":[{{"bundle":{{"dsseEnvelope":{{"payload":"{b64}"}}}}}}]}}"#
+        );
+
+        // Control: the fixture really does mismatch, so a cache hit below could
+        // only come from the failure having been written.
+        assert_eq!(
+            parse_attestation_payload(&b64, &expected)
+                .expect("the fixture payload must parse")
+                .status,
+            ProvenanceStatus::FailedMismatch,
+            "control: this body must mismatch the digest under review"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&dir.path().join("blueline.db")).unwrap();
+        let server = provenance_fixture_server(body);
+
+        let report = inspect_provenance(
+            "lodash",
+            "4.17.20",
+            &expected,
+            None,
+            &server,
+            Some(&store),
+            &Policy::default(),
+        );
+        assert_eq!(
+            report.status,
+            ProvenanceStatus::FailedMismatch,
+            "the review itself must still refuse: {report:?}"
+        );
+
+        let cached = store
+            .get_cached_provenance(Ecosystem::Npm, "lodash", "4.17.20")
+            .expect("the cache read must not error");
+        assert!(
+            cached.is_none(),
+            "a digest mismatch must leave no provenance row: {cached:?}"
         );
     }
 
