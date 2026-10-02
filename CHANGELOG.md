@@ -134,8 +134,14 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
 
   It now refuses with the offending path named, which is the fail-closed
   reading and matches how the npm alias mismatch a few lines below already
-  treats an entry whose identity is ambiguous. A root entry (`""` or `"."`) is
-  still skipped, as it legitimately is not an installed package.
+  treats an entry whose identity is ambiguous. Two shapes are still skipped,
+  because neither is an installed package: a root entry (`""` or `"."`), and a
+  **workspace link** (`{"resolved": "packages/x", "link": true}`), which npm
+  writes with no `version` and no `integrity` because it points at a directory
+  in the repo rather than an artifact. Refusing those failed this repository's
+  own dogfood scan against `package-lock.json`, which is how the exemption was
+  found; `a_workspace_link_is_skipped_while_an_unreadable_entry_is_refused`
+  now pins both halves so neither can regress.
 
   `an_entry_without_a_version_is_refused_rather_than_dropped` fails against the
   old code with the entry silently absent from the returned map, and passes with

@@ -81,6 +81,10 @@ struct RawPackageV3 {
     integrity: Option<String>,
     resolved: Option<String>,
     dev: Option<bool>,
+    /// npm writes a workspace entry as `{"resolved": "packages/x", "link": true}`
+    /// with no `version` and no `integrity`: it points at a directory in the
+    /// repo, not at an installed artifact.
+    link: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -106,13 +110,21 @@ pub fn parse_lockfile_packages(
                 continue;
             }
 
-            // An entry with no version is not a package that does not exist. Skipping
-            // it dropped the entry from the graph, so a lockfile whose entry
-            // was rewritten into a shape the parser cannot read still compared
-            // as fully reviewed and the delta reported nothing where the
-            // entry used to be. Refuse, naming the path, which is the
-            // fail-closed reading and matches how the alias mismatch below
-            // handles an entry whose identity is ambiguous.
+            // A workspace link (`link: true`) points at a directory in the
+            // repo rather than an installed artifact, so npm writes it with no
+            // `version` and no `integrity`. It is not a package to review and
+            // is skipped, as the empty-string root entry above is.
+            if pkg.link.unwrap_or(false) {
+                continue;
+            }
+
+            // Every other entry with no version is not a package that does not
+            // exist. Skipping it dropped the entry from the graph, so a
+            // lockfile whose entry was rewritten into a shape the parser cannot
+            // read still compared as fully reviewed and the delta reported
+            // nothing where the entry used to be. Refuse, naming the path,
+            // which is the fail-closed reading and matches how the alias
+            // mismatch below handles an entry whose identity is ambiguous.
             let Some(version) = pkg.version else {
                 return Err(LockfileError::InvalidData(format!(
                     "`{path}` declares no version; refusing to review a lockfile \
@@ -763,6 +775,43 @@ mod tests {
         assert!(
             format!("{err}").contains("node_modules/evil"),
             "the refusal must name the entry it refused: {err}"
+        );
+    }
+
+    /// A workspace link is `{"resolved": "packages/x", "link": true}` with no
+    /// `version`, and npm writes it that way deliberately: it points at a
+    /// directory in the repo rather than an installed artifact. Refusing it
+    /// would fail every workspace monorepo's own lockfile, which is what the
+    /// dogfood CI job does to this repository. It must be skipped, while an
+    /// ordinary entry with no version is still refused.
+    #[test]
+    fn a_workspace_link_is_skipped_while_an_unreadable_entry_is_refused() {
+        let json = r#"{
+            "name": "blueline-monorepo",
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "blueline-monorepo", "workspaces": ["packages/*"] },
+                "node_modules/@kridaydave/blueline-cli": {
+                    "resolved": "packages/blueline",
+                    "link": true
+                },
+                "node_modules/blueline-cli": {
+                    "resolved": "packages/npx",
+                    "link": true
+                },
+                "node_modules/lodash": {
+                    "version": "4.17.21",
+                    "integrity": "sha512-v2kDEe57lecTulaDIuNTPy3Ry4gLGJ6Z1O3vE1krgXZNrsQ+LFTGHVxVjcXPs17LhbZVGedAJv8XZ1tvj5FvSg=="
+                }
+            }
+        }"#;
+
+        let pkgs = parse_lockfile_packages(json)
+            .expect("a workspace link is not an installed package and must be skipped");
+        assert_eq!(
+            pkgs.keys().cloned().collect::<Vec<_>>(),
+            vec!["node_modules/lodash".to_string()],
+            "only the real installed package belongs in the graph: {pkgs:?}"
         );
     }
 
