@@ -17,6 +17,25 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # GitHub compiles a workflow before it runs a single step, and a compile
+  # error produces a run with zero jobs that cannot be retried, so a bad
+  # expression takes out every check at once with a message that does not name
+  # the line. actionlint implements GitHub's expression grammar, which a YAML
+  # parser does not: `on: push:` filters, expression syntax and context typing
+  # are all invisible to `yaml.safe_load`.
+  lint-workflows:
+    name: Lint workflows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker://rhysd/actionlint:1.7.7
+        with:
+          # GitHub's expression and schema grammar only. The image also bundles
+          # shellcheck and pyflakes, which flag pre-existing quoting warnings in
+          # run blocks; whether a shell is tidy is not what takes a workflow
+          # down, and folding that cleanup in here would gate every PR on it.
+          args: -shellcheck= -pyflakes=
+
   fmt:
     name: Formatting
     runs-on: ubuntu-latest
@@ -72,10 +91,30 @@ jobs:
         with:
           fetch-depth: 0
       - uses: swatinem/rust-cache@v2
+      - name: Check the npm lockfile changed vs base
+        id: changed
+        env:
+          BASE_BRANCH: ${{ github.base_ref }}
+        run: |
+          # Same shape as the cargo dogfood job, and for the same reason: an
+          # empty delta is only healthy if nothing that would produce one
+          # changed. Without this the health gate below cannot tell a docs-only
+          # PR from a lockfile change the scanner silently failed to evaluate.
+          BASE="origin/$BASE_BRANCH"
+          CHANGED="$(git diff --name-only "$BASE"...HEAD)"
+          if printf '%s\n' "$CHANGED" | grep -qE '(^|/)package-lock\.json$'; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "package-lock.json unchanged vs $BASE — an empty delta is expected"
+          fi
       - uses: ./.github/actions/blueline-ci
         id: scan
         continue-on-error: true
         with:
+          # PR code is unreleased, so the action must build it from source:
+          # downloading the latest release binary would scan with stale logic.
+          build-from-source: true
           # First-party packages legitimately ship binaries and process-exec
           # primitives with no registry baseline, so fail-closed scanning
           # reports BLOCK on ourselves and CI runners keep no approval store.
@@ -84,9 +123,13 @@ jobs:
           fail-on: block
           output-file: blueline-dogfood.json
       - name: Gate on scanner health, report risk separately
+        env:
+          LOCKFILE_CHANGED: ${{ steps.changed.outputs.changed }}
         run: |
           python3 - <<'EOF'
-          import json, sys
+          import json, os, sys
+
+          lockfile_changed = os.environ["LOCKFILE_CHANGED"] == "true"
 
           r = json.load(open("blueline-dogfood.json"))
           names = {i["name"] for i in r["items"]}
@@ -108,14 +151,67 @@ jobs:
           # never gated.
           unknown = names - expected
           assert not unknown, f"scanner evaluated unknown packages: {unknown}"
-          if r["total_evaluated"] == 0:
-              print("dogfood scanner healthy: empty lockfile delta, nothing to evaluate")
-              sys.exit(0)
 
-          print(f"dogfood scanner healthy: evaluated {r['total_evaluated']}, "
-                f"unchanged {r['unchanged_count']}, max band {r['max_band']}")
-          for item in r["items"]:
-              print(f"  {item['name']}@{item['new_version']}: {item['verdict']['band']}")
+          # Scanner health, not risk level, is the gate. Our own first-party
+          # packages legitimately produce High findings: the binary-*
+          # packages ship an executable at the package root, so any PR bumping
+          # one is a first sighting of an executable and trips R02. Asserting
+          # no HIGH/BLOCK here made the job red on exactly the dependency-bump
+          # PRs it was made continue-on-error for, and it contradicted the
+          # design note above this step. Findings are reported where a human
+          # reads them instead.
+          rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "BLOCK": 3}
+          bands = [i["verdict"]["band"] for i in r["items"]]
+          unknown_bands = sorted({b for b in bands if b not in rank})
+          assert not unknown_bands, f"scanner emitted unknown bands: {unknown_bands}"
+
+          # An empty report is only healthy when nothing that would have
+          # produced one changed. Gating on health without this precondition
+          # meant a PR that changed package-lock.json and evaluated nothing was
+          # reported healthy, which is the exact under-reporting this gate
+          # exists to catch -- and `continue-on-error` above means this script
+          # is the only thing standing between a broken scanner and a green job.
+          if r["total_evaluated"] == 0:
+              assert not lockfile_changed, (
+                  "package-lock.json changed but the scan evaluated nothing: "
+                  "the scanner reviewed no shipped package while the delta it "
+                  "should have produced was non-empty"
+              )
+
+          # A scanner that under-reports inside a non-empty report is caught by
+          # re-deriving the summary it wrote from the items it carries.
+          if bands:
+              for item in r["items"]:
+                  assert item.get("name") and item.get("new_version"), (
+                      f"report carries an item with no name or version: {item}"
+                  )
+              assert rank[max(bands, key=lambda b: rank[b])] == rank[r["max_band"]], (
+                  f"max_band {r['max_band']} disagrees with the reported bands {bands}"
+              )
+
+          findings = [
+              (i["name"], i["new_version"], i["verdict"]["band"])
+              for i in r["items"]
+              if rank[i["verdict"]["band"]] >= rank["HIGH"]
+          ]
+
+          if r["total_evaluated"] == 0:
+              print("dogfood scanner healthy: lockfile unchanged, nothing to evaluate")
+          else:
+              print(f"dogfood scanner healthy: evaluated {r['total_evaluated']}, "
+                    f"unchanged {r['unchanged_count']}, max band {r['max_band']}")
+              for item in r["items"]:
+                  print(f"  {item['name']}@{item['new_version']}: {item['verdict']['band']}")
+
+          if findings:
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
+                  fh.write("## Dogfood risk findings (not gating)\n\n")
+                  fh.write("Our own distribution, reviewed by the shipped scanner. "
+                           "Expected on first-party binary bumps; investigate anything else.\n\n")
+                  fh.write("| package | version | band |\n| --- | --- | --- |\n")
+                  for name, version, band in findings:
+                      fh.write(f"| {name} | {version} | {band} |\n")
+              print(f"dogfood: {len(findings)} HIGH/BLOCK findings recorded in the step summary")
           EOF
       - uses: actions/upload-artifact@v4
         if: always()
@@ -134,9 +230,22 @@ jobs:
       - uses: swatinem/rust-cache@v2
       - name: Check Cargo.lock changed vs base
         id: changed
+        env:
+          BASE_BRANCH: ${{ github.base_ref }}
         run: |
-          BASE="origin/${{ github.base_ref }}"
-          if git diff --name-only "$BASE"...HEAD | grep -qE '(^|/)Cargo\.lock$'; then
+          # The base ref reaches the shell through the environment, never
+          # through expression interpolation: a branch may legally be named
+          # something like `main$(id)`, and an interpolated one would run.
+          # Note for future edits: GitHub expands expressions inside a run
+          # block even when they sit in a shell comment, so writing one out
+          # literally in a comment here is a parse error that takes the whole
+          # workflow down. That is not hypothetical; it did.
+          BASE="origin/$BASE_BRANCH"
+          # Read the whole list before matching. `git diff | grep -q` can take
+          # SIGPIPE under `pipefail` once grep has its answer, which turns a
+          # lockfile change into a silent skip of the cargo gate.
+          CHANGED="$(git diff --name-only "$BASE"...HEAD)"
+          if printf '%s\n' "$CHANGED" | grep -qE '(^|/)Cargo\.lock$'; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
@@ -144,8 +253,10 @@ jobs:
           fi
       - name: Run blueline on Cargo.lock (cargo)
         if: steps.changed.outputs.changed == 'true'
+        env:
+          BASE_BRANCH: ${{ github.base_ref }}
         run: |
-          BASE_REF="origin/${{ github.base_ref }}"
+          BASE_REF="origin/$BASE_BRANCH"
           if git show "$BASE_REF:blueline.toml" > /tmp/base_blueline.toml 2>/dev/null; then
             POLICY_ARG="--policy /tmp/base_blueline.toml"
           else
@@ -157,18 +268,65 @@ jobs:
   # catch a regression like the poisoned-baseline bug, so audits don't have to.
   # Warnings must NOT be denied here — a mutation IS the divergence, and
   # `-D warnings` would mask the signal (surviving mutants would look caught).
-  # Sharded across 16 parallel runners: a PR diff can generate hundreds of
-  # mutants and 16 shards keep each runner around ~3-4 min with --baseline=skip.
+  #
+  # These three numbers were all wrong, and each one cost the gate its meaning
+  # rather than its speed. Measured, not guessed:
+  #
+  #   * The scope was a hand-maintained --file list of 30 modules. It omitted
+  #     src/cli.rs, src/lib.rs, src/main.rs and src/error.rs, and cargo-mutants
+  #     exits 0 with "No mutants to filter" when a diff touches only an omitted
+  #     file — so the aggregate reported success having mutated nothing. A glob
+  #     cannot drift when a module is added.
+  #   * --timeout 30 sat BELOW the cost of the suite that has to run. The warm
+  #     full suite is 64s (`cargo test --all-targets --locked`), so any mutant
+  #     whose killer is not in the first 30 seconds was recorded as a TIMEOUT —
+  #     an unknown fate, not a caught mutant. A shard of this diff reported
+  #     "2 caught, 1 unviable, 29 timeouts" and exited 3.
+  #   * timeout-minutes 15 was below one shard's cost, so shards were CANCELLED
+  #     mid-run. cargo-mutants reports a timed-out job as `cancelled`, which
+  #     looks exactly like a fail-fast cancellation and reads as "the other
+  #     shards found survivors". They found nothing; they were killed at 15
+  #     minutes. 15 of 16 shards ended that way and the gate could not go green
+  #     for any reason other than a diff too small to mutate.
+  #
+  # Now: 503 mutants for this diff (measured via --list), 32 shards, so ~16
+  # mutants per shard, at up to 300s each.
+  #
+  # The job ceiling is 60 min against that 80 min worst case, and the two cannot
+  # both be right. A shard that reaches 60 min is CANCELLED, which the aggregate
+  # reads as failure and a human reads as a fail-fast cancellation — but the real
+  # cause is the ceiling, not a survivor. So the ceiling is raised to 100, above
+  # the 80 min arithmetic, with headroom for a cold runner: a job is now killed
+  # only when it would have overrun the per-mutant budget across the whole shard.
+  # Lowering --timeout instead would put the ceiling back in reach, and a timeout
+  # is an unknown fate rather than a caught mutant (it exits 3), so the gate would
+  # go red for a mutant that may well have been caught.
+  #
+  # --timeout is per-mutant, so it must clear the whole suite plus margin for a
+  # runner carrying 32 concurrent jobs. It was 180s, which is 2.8x the 64s the
+  # suite takes on an idle machine, and two shards still timed out: a timeout is
+  # an unknown fate rather than a caught mutant, and cargo-mutants exits 3, so
+  # the gate went red for a mutant that may well have been caught. 300s is ~4.7x
+  # the idle figure, and the measured shard cost is ~55s per mutant, so the
+  # job ceiling set above is not the binding constraint.
+  #
+  # A docs-only or Cargo.lock-only diff legitimately mutates nothing and exits 0.
+  # That is correct, not the scope bug above: the glob now makes "nothing to
+  # mutate" mean the diff really had no Rust in it.
   mutants-pr:
-    name: Mutation testing (PR diff, shard ${{ matrix.shard }}/16)
+    name: Mutation testing (PR diff, shard ${{ matrix.shard }}/32)
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     needs: [test]
-    timeout-minutes: 15
+    # Above the 80 min worst case in the comment above, not at it. See there for
+    # why a shard killed at 60 read as a fail-fast cancellation rather than a
+    # timeout.
+    timeout-minutes: 100
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+            21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
     env:
       CARGO_TERM_COLOR: always
       RUSTFLAGS: ""
@@ -184,17 +342,32 @@ jobs:
         env:
           BASE_REF: ${{ github.base_ref }}
         run: git diff "origin/${BASE_REF}"...HEAD -- > pr.diff
+      # This block used to wrap the run in a three-attempt retry for exit 143
+      # and 137, on the reading that a shard dying at 8m30s and again at 10m5s
+      # was the hosted runner being reclaimed. It was not. Shard 17 died that
+      # way on six runs across four days while the other 31 shards passed, and
+      # a random runner fault does not pick the same shard every time.
+      #
+      # The cause was in the diff. `parse_pkgbuild`'s function-body scan walked
+      # a line with a hand-incremented index, and its termination rested on
+      # every step moving forward. The step over `${` rewinding by two instead
+      # of advancing past the brace sent the scan back to the same character;
+      # `body` then grew a few bytes per pass until the process was killed for
+      # memory. So exit 137 was the gate working — it killed the mutant's
+      # process — and 143 was GitHub reclaiming the VM afterwards.
+      #
+      # Two things were wrong with retrying it. The mutant was never reported,
+      # so the shard had no verdict to report and each attempt re-ran the same
+      # OOM; and a retry on 137 hides the one case where the harness is
+      # correctly reporting a runaway, which is the signal worth keeping. The
+      # fix belongs in the scanner, which now advances by consuming an iterator
+      # rather than by arithmetic a mutant can invert. The step below stays a
+      # plain invocation, so a mutant that exhausts memory is loud again.
       - name: Mutate the changed lines
         run: |
-          cargo mutants --in-diff pr.diff --shard ${{ matrix.shard }}/16 \
-            --file src/extract.rs --file src/manifest.rs --file src/registry/npm.rs \
-            --file src/registry/pypi.rs --file src/wheel_extract.rs --file src/baseline.rs \
-            --file src/version.rs --file src/review.rs --file src/store.rs \
-            --file src/executor.rs --file src/lockfile.rs --file src/ci.rs \
-            --file src/mcp.rs --file src/install_ref.rs --file src/recursive.rs \
-            --file src/agent.rs --file src/recall.rs --file src/shim.rs \
-            --file src/pkgbuild.rs --file src/render.rs --file src/policy.rs \
-            --in-place --baseline=skip --timeout 30
+          cargo mutants --in-diff pr.diff --shard ${{ matrix.shard }}/32 \
+            --file 'src/**/*.rs' \
+            --in-place --baseline=skip --timeout 300
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -204,23 +377,40 @@ jobs:
   mutants-pr-aggregate:
     name: Mutation testing (PR diff)
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    if: always() && github.event_name == 'pull_request'
     needs: [mutants-pr]
     steps:
-      - name: All shards passed
-        run: echo "All 16 mutation testing shards completed successfully."
+      # Without always(), GitHub SKIPS this job when any shard fails, and a
+      # skipped required check counts as satisfied. The result is then read
+      # explicitly so a failed, cancelled, or timed-out shard fails the gate.
+      #
+      # A timed-out shard reports as `cancelled`, which is why this reads the
+      # job result rather than trusting a green run: `cancelled` and `failure`
+      # are the same verdict here, and neither is "no survivors".
+      - name: Every shard must have succeeded
+        env:
+          RESULT: ${{ needs.mutants-pr.result }}
+        run: |
+          if [ "$RESULT" != "success" ]; then
+            echo "::error::mutation testing shards reported '$RESULT'"
+            exit 1
+          fi
+          echo "All 32 mutation testing shards completed successfully."
 
-  # Sharded across 16 parallel runners for push to main.
+  # Sharded across 32 parallel runners for push to main, with the same scope and
+  # timeout arithmetic as mutants-pr above.
   mutants:
-    name: Mutation testing (push diff, shard ${{ matrix.shard }}/16)
+    name: Mutation testing (push diff, shard ${{ matrix.shard }}/32)
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [test]
-    timeout-minutes: 15
+    # Same arithmetic as mutants-pr above: 100, above the 80 min worst case.
+    timeout-minutes: 100
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+            21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
     env:
       CARGO_TERM_COLOR: always
       RUSTFLAGS: ""
@@ -236,15 +426,9 @@ jobs:
         run: git diff HEAD~1..HEAD -- > push.diff
       - name: Mutate the changed lines
         run: |
-          cargo mutants --in-diff push.diff --shard ${{ matrix.shard }}/16 \
-            --file src/extract.rs --file src/manifest.rs --file src/registry/npm.rs \
-            --file src/registry/pypi.rs --file src/wheel_extract.rs --file src/baseline.rs \
-            --file src/version.rs --file src/review.rs --file src/store.rs \
-            --file src/executor.rs --file src/lockfile.rs --file src/ci.rs \
-            --file src/mcp.rs --file src/install_ref.rs --file src/recursive.rs \
-            --file src/agent.rs --file src/recall.rs --file src/shim.rs \
-            --file src/pkgbuild.rs --file src/render.rs --file src/policy.rs \
-            --in-place --baseline=skip --timeout 30
+          cargo mutants --in-diff push.diff --shard ${{ matrix.shard }}/32 \
+            --file 'src/**/*.rs' \
+            --in-place --baseline=skip --timeout 300
       - uses: actions/upload-artifact@v4
         if: always()
         with:

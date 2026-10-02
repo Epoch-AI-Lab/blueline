@@ -6,20 +6,14 @@ Blueline is a release-diff review desk for the package install line. It renders
 every release as a proof sheet and demands sign-off before the byte runs.
 
 **Hard rule: nothing executes until judged.** Tarballs are fetched, **integrity-verified
-(sha512 SRI + registry signature, fail closed)**, then extracted read-only into a
-sandboxed temp dir — never executed, diffed, and scored. The package's own code is
+(sha512 SRI, fail closed)**, then extracted read-only into a sandboxed temp dir —
+never executed, diffed, and scored. The package's own code is
 never run: even on approve, install proceeds with `npm install --ignore-scripts`,
 and any `postinstall`/`preinstall` script is surfaced for a *separate* human decision.
 
-> Note: the README lists the "Diff rendering engine (Rust)" as done. As of the
-> initial commit only README, LICENSE, and brand assets exist. The engine is a
-> design target, not shipped code.
->
-> Update 2026-08-13: **Phase 0 shipped.** A `blueline` Rust binary exists:
-> `registry::npm` (fetch + sha512-verified tarball download), typed manifest
-> parsing, bounded sandbox extraction, and a SQLite `known_clean` baseline
-> store behind `blueline review <pkg@ver>`. Diff/verdict/card rendering are
-> Phase 1, still unshipped.
+> Status: Phases 0–4 plus the close-the-loop campaigns (recursive review,
+> agent enforcement, local-first recall, dogfood & distribution) are shipped.
+> See `ROADMAP.md`, `TODO.md`, and `CHANGELOG.md` for the per-release record.
 
 ---
 
@@ -81,22 +75,43 @@ registry plugged in later without refactoring the engine.
 
 ### Extraction & untrusted-input safety
 Every tarball and registry response is fully untrusted. The `extract` stage enforces:
-- **Integrity first:** stream-hash the tarball during download and compare to the
-  registry `dist.integrity` (sha512) and `dist.shasum`; verify the npm registry
-  signature when present. Mismatch → `Verdict::Block` (fail closed) *before* extraction.
-- **Bounded extraction:** hard caps on total unpacked bytes (e.g. 50× tarball size),
-  entry count, per-entry size, open file descriptors, and a gzip decompress-ratio
-  monitor (bomb guard). The temp dir is an RAII guard removed on drop/panic.
+- **Integrity first:** download the tarball under a hard byte cap, then hash the
+  buffered bytes and compare to the registry `dist.integrity` (sha512); a missing
+  or non-sha512 `dist.integrity` is refused rather than downgraded. A mismatch
+  aborts the review with a verification error *before* extraction — no verdict is
+  produced, so there is nothing to approve or override.
+- **Bounded extraction:** hard *absolute* caps, not multiples of the tarball
+  size — entry count (100 000, checked before any write), per-entry unpacked
+  size (128 MiB, checked against the header and again against the bytes actually
+  written), and cumulative unpacked bytes (512 MiB). Tar metadata entries (GNU
+  long name/link, pax extensions) carry their own 64 KiB cap when tar-rs hands
+  them to us. A header tar-rs recognises as ustar — magic *and* version — is
+  consumed inside its own iterator with an uncapped `read_all` of the declared
+  size, which the 12-octal-digit size field can put at 64 GiB minus one, so those
+  bytes pass a
+  separate decompressed-stream budget instead and never reach the per-entry
+  accounting at all. A directory entry that
+  declares payload is refused. There is no decompress-ratio monitor and no
+  open-FD cap: the guard is the byte and entry budget, enforced on the declared
+  size *and* on the inflated stream. The temp dir is an RAII guard removed on
+  drop/panic.
 - **Reject dangerous entry types:** symlinks, hardlinks, and special files
-  (char/block device, FIFO, socket) are rejected by default; absolute paths and `..`
-  traversal are rejected; setuid/setgid bits are stripped. Pin `tar` ≥ 0.4.45 and
-  prefer `cap-std`'s `Dir` for beneath-root (RESOLVE_BENEATH) resolution.
-- **Sandbox the step:** run extract + diff in a Landlock-restricted child
-  (read-only host FS, write only to the sandbox temp dir), capability-dropped,
-  optionally seccomp-filtered, non-root. Linux uses Landlock; macOS/Windows fall
-  back to the parser-level bounds above plus a dedicated non-writable temp dir.
+  (char/block device, FIFO, socket) are rejected by default; absolute paths, `..`
+  traversal, and drive prefixes are rejected, as is a second entry normalizing
+  onto a path already written (`a//b` and `a/b` are one entry, and the second
+  would otherwise overwrite the first); setuid/setgid bits are stripped. Pin
+  The manifest allows any `0.4.x`; `Cargo.lock` pins the exact version and CI
+  builds with `--locked`, so an unlocked local build can resolve a different one.
+- **Sandbox the step (planned, not implemented):** the intent is to run extract
+  + diff in a Landlock-restricted child (read-only host FS, write only to the
+  sandbox temp dir), capability-dropped, optionally seccomp-filtered, non-root,
+  with macOS/Windows falling back to the parser-level bounds above plus a
+  dedicated non-writable temp dir. No Landlock, seccomp, `cap-std` or
+  capability-drop code exists in `src/` today, and `Cargo.lock` carries none of
+  those crates. What actually bounds a hostile archive is the parser-level
+  budget above; there is no OS-level confinement behind it.
 - **Treat extracted bytes as hostile:** the extracted `package.json` (`scripts`,
-  `bin`, `dependencies`) is diffed/flagged as attack surface, not trusted.
+  `dependencies`) is diffed/flagged as attack surface, not trusted.
 
 ---
 
@@ -107,14 +122,17 @@ Every tarball and registry response is fully untrusted. The `extract` stage enfo
 | D1 | Rust core + Node shim                               | Security-critical path in a memory-safe, single-binary language; Node only for `npx` ergonomics. |
 | D2 | Local deterministic heuristic first                 | Transparent, auditable, offline. Hosted ML *refines* score when token present — never required. Keeps "the wedge stays open" honest. |
 | D3 | One registry deep, `Registry` trait seam, then four | Deepen one registry first; avoid speculative multi-registry code. npm, crates.io, PyPI, and review-only AUR now share the seam. |
-| D4 | Read-only sandbox extraction + integrity verify     | Core safety invariant. Verify sha512/signature *before* extract; bound size/entry/FD; reject symlinks/special files; Landlock-sandbox the step. Package code never runs. |
+| D4 | Read-only sandbox extraction + integrity verify     | Core safety invariant. Verify sha512/signature *before* extract; bound size/entry; reject symlinks/special files; Landlock-sandbox the step (planned). Package code never runs. |
 | D5 | Baseline = last known-clean version                 | Source: locally installed version in `node_modules` → else previous version in registry list (neutral verdict on first sighting). Overrides persisted in SQLite. |
 | D6 | Revocation = OSV + GitHub Advisory cache            | Reuse the open vulnerability corpus; paid tier adds human-verified recall (hosted index). |
 | D7 | Stable `Verdict` JSON schema                        | Same struct feeds CLI card, CI comment, and MCP tool. One source of truth.|
 | D8 | No default telemetry in OSS                         | Privacy-by-default; hosted tier reports only with explicit token.         |
-| D9 | Signed, SLSA-built release binaries                 | We audit supply chains — we must eat our own dog food.                    |
+| D9 | Build-provenance-attested release binaries         | We audit supply chains — we must eat our own dog food. The CI composite Action verifies each downloaded binary against the attestation `release.yml` publishes, not just a checksum from the same release. |
 | D10| Policy-as-code (`blueline.toml`)                    | Per-project + global thresholds, allow/blocklists, required-provenance flags. |
 | D11| Approve = `npm install --ignore-scripts`           | Honors "never execute": install proceeds without running lifecycle scripts; `postinstall` is surfaced for a separate human decision, not auto-run. |
+| D12| Recursive second-order review in the engine           | Install references found in reviewed payloads are re-reviewed with depth/budget caps, cycle detection, and child-to-parent roll-up (§3). Non-registry refs are disclosed, never resolved. |
+| D13| Local-first recall index, no hosted dependency        | Curated revocations sync as a validated JSON snapshot (never the SQLite store); hits BLOCK through the advisory engine, staleness is disclosed (§3). |
+| D14| Explicit agent tool primary, shim as backstop         | `review_install` is what well-behaved agents call; PATH shims and hook bindings enforce at the terminal/agent boundary with honest bypass docs (§3). |
 
 ### Verdict bands
 - `LOW` — auto-approve path
@@ -123,16 +141,66 @@ Every tarball and registry response is fully untrusted. The `extract` stage enfo
 - `BLOCK` — hard policy violation: new `postinstall`/`preinstall` script, known
   revocation, or unpinned dangerous delta
 
-### Heuristic rule set (local, v1)
-- New executable/binaries (executable bit, `.exe`, native bindings)
-- `scripts` field additions (`postinstall`, `preinstall`, etc.)
-- New/changed dependencies (transitive risk)
-- Install-script presence
-- Obfuscated / `base64` / `eval` in diff
-- Maintainer/author change vs baseline
-- Semver-major with large delta
-- Missing/forged provenance (surfaced, not auto-fail)
-- Revocation hit (BLOCK)
+### Heuristic rule set (local, v1 — full inventory; bands tunable via policy)
+Every `rule_id` the engine emits, `R00`–`R29` and `P01`–`P04`; the `P` rules
+are policy decisions, not heuristics, and are listed last.
+
+- R00 — fail-closed on a PKGBUILD that cannot be reviewed:
+  `R00_PKGBUILD_UNREADABLE`, `R00_PKGBUILD_UNPARSEABLE`,
+  `R00_BASELINE_UNPARSEABLE`, `R00_BASELINE_UNREADABLE` (all HIGH), plus
+  `R00_PKGBUILD_SCOPE` (LOW), the disclosure that only repo scripts are reviewed
+- R01 — `R01_LIFECYCLE_SCRIPT_ADDED` / `R01_LIFECYCLE_SCRIPT_MODIFIED`,
+  `R01_BINDING_GYP_ADDED` / `R01_BINDING_GYP_MODIFIED` (native build trigger)
+- R02 — `R02_EXECUTABLE_ADDED`, `R02_BINARY_BLOB_ADDED` /
+  `R02_BINARY_BLOB_MODIFIED`, `R02_OPAQUE_LARGE_FILE_ADDED`,
+  `R02_ENTRY_POINTS_SCRIPT` (PyPI: `entry_points.txt` / `.data/scripts`)
+- R03 — `R03_EVAL_USAGE`, `R03_CHILD_PROCESS`, `R03_VM_EXECUTION`,
+  `R03_NETWORK_PRIMITIVE`, `R03_BASE64_DECODE`, `R03_HIGH_ENTROPY` in the text diff
+- R04 — `R04_DEPENDENCY_ADDED` / `R04_DEPENDENCY_MODIFIED`,
+  `R04_SDIST_BUILD_CODE` (PyPI)
+- R05 — `R05_LARGE_PATCH_DIFF`, `R05_NON_STANDARD_VERSION`
+- R06 — `R06_FIRST_SIGHTING` (no baseline), `R06_NATIVE_PLATFORM_WHEEL` (PyPI)
+- R07 — `R07_UNREVIEWED_PREDECESSOR_BASELINE`
+- R08 — `R08_YANKED_PREDECESSOR` (MEDIUM)
+- R09 — `R09_ADVISORY_MALWARE` / `R09_ADVISORY_CRITICAL_CVE` (BLOCK),
+  `R09_ADVISORY_CVE`, `R09_ADVISORY_UNVERIFIED` (HIGH under
+  `fail_closed_network`, MEDIUM when policy accepts continuing without advisory
+  coverage), `R09_YANKED_TARGET`
+- R10 — `R10_MAINTAINER_TRANSITION` (AUR lane only — the author-transition
+  comparison needs a per-release identity, which only the AUR adapter
+  supplies), `R10_LOCKFILE_HASH_MISMATCH` (BLOCK, `blueline ci` only)
+- R11–R23, R29 — PKGBUILD static rules: `R11_CHECKSUM_SKIP`,
+  `R12_SOURCE_URL_DRIFT`, `R13_PIPE_TO_SHELL`, `R14_EVAL_FAMILY`,
+  `R15_DYNAMIC_INDIRECTION`, `R16_CMD_SUBST_IN_META`,
+  `R17_BUILD_TIME_NETWORK`, `R18_HOMOGLYPH`, `R19_VALIDPGPKEYS_CHANGE`,
+  `R20_INSTALL_HOOK_CHANGE`, `R21_UNPINNED_VCS_SOURCE`,
+  `R22_CONDITIONAL_EXECUTION`, `R23_NPM_DELIVERY`,
+  `R29_PKGBUILD_DEPENDS_NOT_IN_SRCINFO`; see §3 and `src/pkgbuild.rs`
+- R24–R27 — recursive review: `R24_LIFECYCLE_INSTALL_REF`,
+  `R25_RECURSION_DEPTH`, `R26_RECURSION_CYCLE`, `R27_SECOND_ORDER`; see §3
+- R28 — `R28_RECALL_STALE`, recall-index staleness; see §3
+- P01 — `P01_PACKAGE_BLOCKED` (BLOCK), the `blocklist.packages` hit
+- P02 — `P02_LIFECYCLE_SCRIPT_ALLOWED`, `P02_BINDING_GYP_ALLOWED` (LOW): the
+  allowlist's own disclosure that it allowed what R01 would otherwise fire on
+- P03 — `P03_PROVENANCE_DIGEST_MISMATCH` (BLOCK),
+  `P03_PROVENANCE_REQUIRED_UNVERIFIABLE` (BLOCK), `P03_SIGNATURE_REQUIRED_MISSING`,
+  `P03_UNAUTHORIZED_BUILD_REPO`,
+  `P03_UNAUTHORIZED_BUILD_BUILDER` (BLOCK), and, at LOW and score-neutral,
+  `P03_PROVENANCE_REQUIRED_MISSING` and
+  `P03_PROVENANCE_NOT_CRYPTO_VERIFIED` (the latter also raised with no policy
+  requirement at all when a release is merely attested). Under
+  `require_provenance` an *absent* attestation is disclosed at LOW and the
+  verdict is untouched, and only a *present-but-unverifiable* claim is refused:
+  a release nobody published provenance for is not the same as one whose
+  provenance does not hold up, and conflating the two blocked every user who set
+  the key before blueline could check a signature.
+
+  LOW specifically, not MEDIUM, because the band gates the exit code. `review
+  --yes`, the non-interactive path, and `agent` all refuse above LOW, so a
+  MEDIUM absence is a refusal wearing a warning's label — it still exits 2.
+- P04 — `P04_MAINTAINER_BLOCKED` (BLOCK), `[blocklist] maintainers`; AUR lane
+  only, since the other three take the `Registry::release_author` `None`
+  default (see §3)
 
 ### MCP design
 Explicit `review_install` tool (agent calls before install) is primary; optional
@@ -141,7 +209,7 @@ Recommend the explicit tool to avoid breaking agent toolchains.
 
 ---
 
-## 5. Second-order lanes (agent / recall / shim)
+## 3. Second-order lanes (agent / recall / shim)
 
 Install-time references (npm lifecycle scripts, wheel `.data/scripts`,
 PKGBUILD npm/bun delivery) are first-class findings, reviewed recursively:
@@ -199,16 +267,59 @@ Known bypasses stay documented in the README.
 | `thresholds` | `max_low_score` (19), `max_medium_score` (49), `block_score` (80) |
 | `policy` | `require_provenance`, `block_unreviewed_scripts`, `allow_git_dependencies`, `check_advisories`, `fail_closed_network` |
 | `advisories` | `block_on_malware`, `block_on_critical_cve`, cache TTLs |
-| `provenance` | `require_provenance`, `require_signatures`, builders/repos |
+| `provenance` | `require_provenance`, `require_signatures`, `allowed_builders`, `allowed_repositories` (the last two enforced at Block) |
+| `provenance.require_provenance` | Either this or `policy.require_provenance` turns the requirement on; they are honoured identically. Absence of an attestation is disclosed (LOW, score-neutral, exit 0); a present-but-unverifiable attestation is refused (BLOCK, exit 2). See P03 above. |
 | `allowlist.packages` | exact `name` (+optional `ecosystem`), `allowed_scripts`, `allow_unreviewed_baseline` |
-| `blocklist` | glob `packages` (+optional `ecosystem`), `maintainers` |
-| `ci` | `fail_on`, `max_evaluations`, `include_dev` |
+| `blocklist` | glob `packages` (+optional `ecosystem`) — every lane; `maintainers` — **AUR only** (see below) |
+| `ci` | `fail_on`, `max_evaluations`, `include_dev`, `allow_requirements_options` |
 | `recursion` | `max_depth` (3, cap 16), `max_child_reviews` (8, cap 256), `child_block_band` (HIGH) |
 | `recall` | `max_age_hours` (48), `block_on_stale` |
 
+### `blocklist.maintainers` coverage (AUR only)
+
+`[blocklist] maintainers` is enforced through `Registry::release_author`, and
+only the AUR adapter overrides it. **The key is therefore live on the AUR lane
+alone**: npm, crates.io and PyPI supply no publishing identity, take the trait's
+`None` default, and produce no `P04_MAINTAINER_BLOCKED`. On those lanes the key
+is **inert** — P04 fires only when `release_author` returns `Some`, and `None`
+yields no finding, no card line and no warning, so a review there is
+indistinguishable from one on a policy that never set the key. That is the shape
+this tool exists to refuse, and on those three lanes it is still live: a registry
+that publishes no author is a **silent no-signal, not a pass**, and a policy that
+sets the key is protecting the AUR install line and nothing else.
+
+The AUR lane reads two identity channels: the pinned commit's self-declared
+author email (`commit_author`), falling back to the `Maintainer` field the RPC
+declares, so a package whose clone cannot be pinned is still checked.
+
+npm is not wired, deliberately, and not for want of a field. Two things would
+have to be decided first:
+
+- The npm adapter asks for the **abbreviated** packument
+  (`application/vnd.npm.install-v1+json`), whose top-level members are `name`,
+  `dist-tags`, `modified` and `versions`. A `maintainers` array exists only in
+  the full packument (`Accept: application/json`), so reading it means either
+  switching the adapter's media type — the body grows 2.4x-10.5x (measured:
+  `express` 341 KB -> 809 KB, `react` 2.9 MB -> 7.0 MB, `npm` 2.5 MB ->
+  25.7 MB) against a 64 MiB fail-closed packument cap, i.e. every review pays
+  for a blocklist signal and the largest packages get closest to a cap breach,
+  which reads as "refuse to review" — or a second full fetch per review.
+- npm publishes a **list**, not one identity (`express` 5, `typescript` 7,
+  `react` 2, `lodash` 1), and some entries are bots (`react-bot`,
+  `typescript-bot`). The seam carries a single `Option<String>` and P04 compares
+  that one string, so any selection rule checks one of N and leaves the rest
+  unchecked while the card claims an identity was checked. Carrying the list
+  needs a second identity channel on `Registry` and on
+  `Policy::is_maintainer_blocked`.
+
+Note also that npm's author is **per package, not per release**: both the
+target and baseline reads hit the same live packument, so `R10`'s
+author-transition comparison can never differ on that lane. Wiring npm would
+add the blocklist signal and leave `R10` structurally dead there, not firing.
+
 ---
 
-## 3. Tech Stack (Rust core)
+## 4. Tech Stack (Rust core)
 
 | Concern            | Crate / Tool                          |
 |--------------------|---------------------------------------|
@@ -224,11 +335,34 @@ Known bypasses stay documented in the README.
 
 ---
 
-## 4. Open Risks
+## 5. Open Risks
 
 - **First-sighting bootstrap:** no baseline on initial install → default to a
   *neutral* verdict and flag "no known-clean baseline" rather than BLOCK.
 - **`scripts` false positives:** legit packages (esbuild, core-js) use
   postinstall. Need an allowlist-by-maintainer or "review once, remember" flow.
 - **Lockfile vs manifest:** `review` diffs a single package; `ci` must diff the
-  whole lockfile. Two code paths — `ci` is Phase 3, not Phase 1.
+  whole lockfile. Two code paths. (This note used to read "`ci` is Phase 3, not
+  Phase 1", which was stale: Phases 0–4 are all shipped, per the status note
+  above and `ROADMAP.md`.)
+
+## 6. Defect policy
+
+A defect is a defect regardless of when it arrived. "Pre-existing", "out of
+scope", and "unrelated to this diff" describe the diff, not the bug, and none
+of them is a reason to leave a hole in a tool whose whole promise is failing
+loud on doubt.
+
+Two consequences worth stating because they are easy to get wrong:
+
+- **The store verifies its own schema.** `PRAGMA user_version` records how many
+  migrations ran, not that they produced the schema the store queries. Opening
+  checks every table and column in `EXPECTED_SCHEMA` directly
+  (`src/store.rs::verify_schema`), so a file carrying a correct version counter
+  with the wrong shape behind it is refused at open rather than failing
+  mid-review on a missing column. The check is unconditional, so it also
+  decides a lost migration race rather than a counter read.
+- **A fix without a test that fails without it is a guess.** Mutation testing is
+  the check on that: a surviving mutant is a gap in the suite, not a flake.
+  Re-introduce the mutation, watch the test catch it, then restore.
+

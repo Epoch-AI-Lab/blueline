@@ -10,15 +10,63 @@ fail closed on any doubt.
 - Format: `cargo fmt --all`
 - Lint:   `cargo clippy --all-targets -- -D warnings`
 - Test:   `cargo test --all-targets --locked`
+- Workflows: `actionlint -shellcheck= -pyflakes=` (run it after touching
+  `.github/`; see the Guardrails section)
 
-These three are exactly the CI gate (`.github/workflows/ci.yml`). If a change
-passes locally it passes CI. The toolchain is pinned in `rust-toolchain.toml`
-— do not run a different one.
+The first three are the Rust gate (`.github/workflows/ci.yml`), and if a change
+passes them it passes CI's Rust jobs. They are no longer *exactly* the gate: the
+same workflow also runs `actionlint` over the workflows, a supply-chain audit,
+and two dogfood jobs that run the built binary against this repository's own
+`Cargo.lock` and `package-lock.json`. Mutant scope is `src/**/*.rs`, so a change
+to a module outside `src/` is not mutation-tested at all. The toolchain is
+pinned in `rust-toolchain.toml` — do not run a different one.
+
+Two of those cannot be reproduced by the three commands above. A green local
+run is necessary, not sufficient.
+
+## Delegating
+Review agents grade an answer. They do not derive one, and they inherit the
+premise you hand them.
+
+- Never hand a reviewer your own conclusion and ask it to check. A finding
+  that says "there is a hole here" gets investigated by someone who has not
+  seen your fixture, your reading of the dependency, or your test output.
+  Verification that starts from your answer cannot escape your answer.
+- When a finding contradicts you, treat your own reproduction as the suspect.
+  A hand-built fixture proves only that the code does what the fixture
+  exercises. Check that the fixture reaches the path its comment claims before
+  you use it to close a finding: an extract.rs fixture that omitted the ustar
+  version field let tar-rs yield the header instead of consuming it, and the
+  resulting "false positive" shipped a 256 MiB allocation hole for a day.
+- For a problem with an open answer and an expensive failure, draft several
+  solutions in parallel and have a second group review the candidates. One
+  candidate graded by one reviewer is a single point of failure wearing two
+  hats. Comparing candidates also surfaces the combination nobody would have
+  proposed alone.
+- Confirm a mutation actually applied. Roughly one in three revert-and-test
+  cycles in this repo silently changed nothing: a string replace that did not
+  match, a stale `/tmp` backup restored over newer work, a `--lib` run against
+  a `blueline` binary cargo had not rebuilt. Each one read as "verified".
+- Treat a hand-picked revert as a floor, not evidence. It tests the one change
+  you thought of. CI's `cargo mutants` enumerates the rest, and it found a
+  survivor in the CVSS v2 scoring that six review passes and every manual check
+  had cleared, because all six reference vectors used `AV:N` and its weight is
+  1.0, so multiplying and dividing by it agree. Vary a fixture's constant
+  before trusting it to pin the expression around it.
+- Skip the fan-out for one-line changes. Deleting dead code does not need four
+  agents. The bar is an open answer space and an expensive miss.
 
 ## Guardrails
 
 **Always**
 - Run the three commands above before finishing any work.
+- Lint workflows with `actionlint` after touching `.github/`. GitHub compiles a
+  workflow before running any step, so one bad expression yields a run with zero
+  jobs that cannot be retried, and a message that does not name the line. It
+  also expands expressions inside a `run:` block even when they sit in a shell
+  comment, so writing `${{ }}` out literally in a comment takes the whole
+  workflow down. That happened, and it failed every check in the repo for a day
+  while a YAML parser reported the file as valid.
 - Fail closed: on any doubt in extraction, parsing, or verification, error
   out loud rather than guess.
 - Use `anyhow` at the boundary (`run()` → `main`), `thiserror` inside modules.
@@ -27,6 +75,12 @@ passes locally it passes CI. The toolchain is pinned in `rust-toolchain.toml`
 - Read `ARCHITECTURE.md` before touching module boundaries.
 - After each merged PR, add an entry to `CHANGELOG.md` under `[Unreleased]`
   in the same branch.
+- Fix a bug you found, even when it predates the current branch. "Pre-existing",
+  "out of scope", "unrelated to this diff", and "would widen the PR" are not
+  reasons to leave a defect live in a fail-closed tool. Age is a fact about when
+  a bug arrived, not an argument for keeping it. If a fix genuinely belongs in
+  its own change, say so and open that change in the same session — do not
+  report the finding and stop.
 
 **Ask first**
 - Adding a dependency — propose it and wait for a decision.
@@ -38,6 +92,8 @@ passes locally it passes CI. The toolchain is pinned in `rust-toolchain.toml`
 - New `unwrap()`/`expect()` on untrusted input. Unreachable-reference unwraps
   in database loops are the only acceptable case; everything else must error.
 - Skipping the CI gate. If CI breaks, fix it in the same branch.
+- Shipping a fix you could not verify. A patch with no test that fails without
+  it is a guess. Re-introduce the bug, watch the test catch it, then restore.
 
 ## Conventions
 - Do NOT USE Other languages to code. Use your harness tools

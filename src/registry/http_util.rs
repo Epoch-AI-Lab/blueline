@@ -3,10 +3,49 @@
 //! nothing in this module knows about packuments or checksums.
 
 use std::io::Read;
+use std::time::Duration;
 
 use ureq::Agent;
 
 use crate::error::BluelineError;
+
+/// Ceiling on establishing the connection. Applied alongside the whole-request
+/// deadline below, because `ureq` derives read and write timeouts from that
+/// deadline rather than from the per-operation settings.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Ceiling on one registry request end to end. This is the only thing bounding
+/// a peer that dribbles a byte every few seconds: a per-read ceiling alone
+/// cannot, since every individual read stays inside it. Generous because a
+/// large tarball legitimately takes a while, and because `ureq` 2.x cannot
+/// express both a short per-operation stall guard and a long total budget.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Shared agent for every registry adapter. Redirects stay off so each hop can
+/// be SSRF-validated by `follow_redirects` instead of followed blindly.
+pub fn registry_agent(user_agent: &str, base: &str) -> Agent {
+    registry_agent_with_timeout(user_agent, base, REQUEST_TIMEOUT)
+}
+
+/// As `registry_agent`, with a caller-chosen end-to-end budget. The SSRF
+/// properties are identical and are the point of this function: a validating
+/// resolver and `redirects(0)`. A caller that wants a short budget must not have
+/// to give that up to get one -- building a bare `ureq::AgentBuilder` is how the
+/// two provenance fetches ended up following redirects to any host.
+pub fn registry_agent_with_timeout(user_agent: &str, base: &str, total: Duration) -> Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(CONNECT_TIMEOUT)
+        .timeout(total)
+        .user_agent(user_agent)
+        .redirects(0)
+        .resolver(validating_resolver_for(base))
+        .build()
+}
+
+fn validating_resolver_for(base: &str) -> ValidatingResolver {
+    ValidatingResolver {
+        base_host: authority_of(base),
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct RegistryLimits {
@@ -75,12 +114,77 @@ pub fn download_bounded(
     max_bytes: u64,
     max_redirects: usize,
 ) -> Result<Vec<u8>, BluelineError> {
+    download_bounded_with_headers(agent, base, url, max_bytes, max_redirects, &[])
+}
+
+/// As `download_bounded`, additionally sending request headers on every hop.
+///
+/// The headers are re-sent on each redirect rather than only the first, because
+/// a redirect is a fresh request to a host that has not been vetted for
+/// credentials: only call this with headers that are safe to send to whatever
+/// host the chain lands on.
+pub fn download_bounded_with_headers(
+    agent: &Agent,
+    base: &str,
+    url: &str,
+    max_bytes: u64,
+    max_redirects: usize,
+    headers: &[(&str, &str)],
+) -> Result<Vec<u8>, BluelineError> {
+    fetch_bounded_following(agent, base, url, max_bytes, max_redirects, headers)
+        .map(|(_status, bytes)| bytes)
+}
+
+/// As `download_bounded_with_headers`, but telling an authoritative "this does
+/// not exist" apart from a request that failed.
+///
+/// `Ok(None)` means the server answered 404, which for an optional-attestation
+/// endpoint is a real and common answer: the resource is not published. `Err` is
+/// every other outcome, and none of them is a statement that the resource is
+/// missing -- a refused connection, a 5xx, a body over the cap, a redirect that
+/// was refused, a malformed response. A caller that collapses the two cannot
+/// tell "nobody published this" from "we never found out", and in a tool that
+/// fails closed those are opposites.
+///
+/// Kept separate from `download_bounded` rather than folded into it: a 404 on a
+/// *tarball* is a broken release, and `BluelineError::NotFound` is read by
+/// `recursive.rs` as "referenced install could not be resolved", so widening the
+/// existing error type would silently reclassify those too.
+pub fn download_bounded_optional(
+    agent: &Agent,
+    base: &str,
+    url: &str,
+    max_bytes: u64,
+    max_redirects: usize,
+    headers: &[(&str, &str)],
+) -> Result<Option<Vec<u8>>, BluelineError> {
+    match fetch_bounded_following(agent, base, url, max_bytes, max_redirects, headers) {
+        Ok((404, _)) => Ok(None),
+        Ok((_status, bytes)) => Ok(Some(bytes)),
+        Err(e) => Err(e),
+    }
+}
+
+/// The one redirect-and-read loop. Split out so the optional-absence variant
+/// above can see the final status without a second copy of the hop validation.
+fn fetch_bounded_following(
+    agent: &Agent,
+    base: &str,
+    url: &str,
+    max_bytes: u64,
+    max_redirects: usize,
+    headers: &[(&str, &str)],
+) -> Result<(u16, Vec<u8>), BluelineError> {
     let mut current_url = url.to_string();
     let mut redirects_followed = 0;
 
     let resp = loop {
         validate_download_url(base, &current_url)?;
-        let res = agent.get(&current_url).call();
+        let mut req = agent.get(&current_url);
+        for (name, value) in headers {
+            req = req.set(name, value);
+        }
+        let res = req.call();
         match res {
             Ok(response) if (301..=308).contains(&response.status()) => {
                 redirects_followed += 1;
@@ -97,6 +201,14 @@ pub fn download_bounded(
                 })?;
                 current_url = resolve_redirect_url(&current_url, location)?;
             }
+            // `ureq` turns a 4xx into `Err(Status(..))` rather than an
+            // `Ok` response, so a 404 would otherwise be indistinguishable from
+            // a transport failure here. It is not: it is the registry stating
+            // that the resource does not exist, and an optional endpoint's
+            // callers need to tell that from a request that never completed.
+            // Reported as a status rather than a body because the body of a 404
+            // carries no attestation and nothing here consumes it.
+            Err(ureq::Error::Status(404, _response)) => return Ok((404, Vec::new())),
             Ok(response) => break response,
             Err(e) => {
                 return Err(BluelineError::Network(format!("GET {url}: {e}")));
@@ -104,6 +216,7 @@ pub fn download_bounded(
         }
     };
 
+    let status = resp.status();
     let mut bytes = Vec::new();
     let mut reader = resp.into_reader().take(max_bytes + 1);
     reader
@@ -116,7 +229,7 @@ pub fn download_bounded(
         )));
     }
 
-    Ok(bytes)
+    Ok((status, bytes))
 }
 
 pub fn resolve_redirect_url(base_url: &str, location: &str) -> Result<String, BluelineError> {
@@ -262,7 +375,12 @@ pub fn is_private_or_local_host(host: &str) -> bool {
         return is_private_ip(ip);
     }
 
-    // Resolve hostname to IP to prevent DNS rebinding or hostname-based SSRF
+    // Resolves the name to check for a private answer. A name that does not
+    // resolve is reported as not-private here, because refusing it would break
+    // every offline or DNS-less environment, and it cannot be exploited: the
+    // registry agent carries a ValidatingResolver that re-resolves and
+    // re-checks at connection time, so an unresolvable or empty answer fails
+    // the request there. This function is the early-out, not the guard.
     use std::net::ToSocketAddrs;
     if let Ok(addrs) = (host, 443).to_socket_addrs() {
         for socket_addr in addrs {
@@ -275,9 +393,163 @@ pub fn is_private_or_local_host(host: &str) -> bool {
     false
 }
 
+/// The `host:port` authority of a registry base URL, which is the form
+/// `ureq` hands its resolver: `stream.rs` passes `format!("{host}:{port}")`
+/// from the parsed URL, with the default port filled in and any userinfo
+/// already stripped. Everything from the first `/`, `?` or `#` on is path,
+/// query and fragment, and keeping it made a base like
+/// `http://127.0.0.1:8080/registry` unmatchable, so a mirror mounted under a
+/// subpath was refused every request as a private target. A base with no port
+/// is compared on the host alone, since that is all the two strings can
+/// share.
+fn authority_of(base: &str) -> String {
+    let lower = base.trim().to_ascii_lowercase();
+    let without_scheme = lower
+        .strip_prefix("http://")
+        .or_else(|| lower.strip_prefix("https://"))
+        .unwrap_or(&lower);
+    let netloc = without_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    match netloc.rsplit_once('@') {
+        Some((_, host_port)) => host_port.to_string(),
+        None => netloc.to_string(),
+    }
+}
+
+/// Resolver that is the SSRF guard rather than a duplicate of it.
+///
+/// `is_private_or_local_host` resolved a name once for validation while
+/// `ureq` resolved it again for the connection, so a name that answered
+/// publicly and then privately passed the check and connected to loopback,
+/// RFC1918, or a metadata address. This runs at the only point where a name
+/// becomes an address, validates every answer it hands back, and the
+/// connection then uses that same answer by construction.
+///
+/// The configured registry base is exempt, because pointing a review at a
+/// local fixture registry is a supported use and every integration test does
+/// it. Addresses are validated per call rather than pinned, since the agent
+/// is long-lived in the MCP server and pinned addresses would never refresh.
+struct ValidatingResolver {
+    base_host: String,
+}
+
+impl ureq::Resolver for ValidatingResolver {
+    fn resolve(&self, netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        use std::net::ToSocketAddrs;
+        let addrs: Vec<std::net::SocketAddr> = netloc.to_socket_addrs()?.collect();
+        if addrs.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("{netloc} resolved to no addresses"),
+            ));
+        }
+        let netloc_lower = netloc.to_ascii_lowercase();
+        if self.base_host == netloc_lower
+            || self
+                .base_host
+                .split_once(':')
+                .is_some_and(|(h, _)| *h == netloc_lower)
+        {
+            return Ok(addrs);
+        }
+        if let Some(bad) = addrs.iter().find(|a| is_private_ip(a.ip())) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("{netloc} resolves to private or local address {bad}"),
+            ));
+        }
+        Ok(addrs)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ureq::Resolver as _;
+
+    #[test]
+    fn the_resolver_refuses_private_and_unresolvable_targets() {
+        let r = ValidatingResolver {
+            base_host: "registry.npmjs.org".to_string(),
+        };
+        // The guard runs where the name becomes an address, so these are
+        // refused there rather than by a separate check that could disagree.
+        for target in ["127.0.0.1:8080", "169.254.169.254:443", "10.0.0.1:443"] {
+            assert!(
+                r.resolve(target).is_err(),
+                "`{target}` must be refused by the resolver"
+            );
+        }
+        // A dead name fails rather than connecting somewhere unexpected.
+        assert!(r.resolve("nx-host.invalid:443").is_err());
+    }
+
+    #[test]
+    fn the_resolver_exempts_only_the_configured_base() {
+        // Pointing a review at a local fixture registry is supported, and every
+        // integration test does it, so the base is exempt. Nothing else is.
+        let r = ValidatingResolver {
+            base_host: "127.0.0.1:8080".to_string(),
+        };
+        assert!(r.resolve("127.0.0.1:8080").is_ok());
+        assert!(r.resolve("127.0.0.1:9090").is_err());
+    }
+
+    #[test]
+    fn authority_of_extracts_the_host_port_a_resolver_sees() {
+        assert_eq!(
+            authority_of("https://registry.npmjs.org/"),
+            "registry.npmjs.org"
+        );
+        assert_eq!(authority_of("http://127.0.0.1:8080"), "127.0.0.1:8080");
+        assert_eq!(authority_of("HTTP://Example.COM:80/"), "example.com:80");
+    }
+
+    /// A registry base with a path prefix is a supported shape (a mirror
+    /// mounted under a subpath). `authority_of` kept the path, so the stored
+    /// base could never equal the bare `host:port` netloc `ureq` hands the
+    /// resolver, and every request to that base was refused as a private
+    /// target.
+    #[test]
+    fn a_base_with_a_path_prefix_still_exempts_its_own_netloc() {
+        for base in [
+            "http://127.0.0.1:8080/registry",
+            "http://127.0.0.1:8080/registry/",
+            "http://user:pass@127.0.0.1:8080/registry",
+            "http://127.0.0.1:8080/registry?x=1",
+            "http://127.0.0.1:8080/registry#f",
+        ] {
+            assert_eq!(authority_of(base), "127.0.0.1:8080", "{base}");
+            assert!(
+                validating_resolver_for(base)
+                    .resolve("127.0.0.1:8080")
+                    .is_ok(),
+                "{base}"
+            );
+        }
+    }
+
+    /// The exemption is that one netloc and nothing else: a path-prefixed
+    /// local base must not hand the whole private range an exemption.
+    #[test]
+    fn a_path_prefixed_base_exempts_only_its_own_netloc() {
+        let r = validating_resolver_for("http://127.0.0.1:8080/registry");
+        for target in [
+            "127.0.0.1:9090",
+            "127.0.0.2:8080",
+            "10.0.0.1:8080",
+            "169.254.169.254:80",
+            "localhost:8080",
+        ] {
+            assert!(r.resolve(target).is_err(), "`{target}` must stay refused");
+        }
+        // A path-prefixed public base exempts its own netloc and still
+        // refuses a private one. A literal address keeps this test off DNS:
+        // the resolver resolves before it compares, so a name would fail here
+        // for a reason that has nothing to do with the path prefix.
+        let r = validating_resolver_for("https://203.0.113.1:8443/npm/");
+        assert!(r.resolve("203.0.113.1:8443").is_ok());
+        assert!(r.resolve("127.0.0.1:8080").is_err());
+    }
 
     #[test]
     fn validates_download_url_ssrf_and_schemes() {
@@ -460,5 +732,59 @@ mod tests {
             resolve_redirect_url(base, "https://cdn.npmjs.org/pkg.tgz").unwrap(),
             "https://cdn.npmjs.org/pkg.tgz"
         );
+    }
+
+    /// A redirect chain that leaves the registry is the SSRF shape, and the hop
+    /// that matters is the one the *registry* chose. This is the property the two
+    /// provenance attestation fetches were missing: both built a bare
+    /// `ureq::AgentBuilder`, which follows up to five redirects to any host, so
+    /// a registry answering `302 Location: http://169.254.169.254/...` reached
+    /// the cloud metadata service. `registry_agent` disables ureq's own
+    /// redirect handling precisely so that each hop comes through
+    /// `validate_download_url` instead.
+    ///
+    /// The listener binds loopback, which is why the base host is exempted by
+    /// `ValidatingResolver`: the fixture has to be reachable to be able to
+    /// prove anything. The redirect *target* is a link-local address, which is
+    /// never exempt, so the chain must stop at hop one.
+    #[test]
+    fn a_redirect_off_the_registry_host_is_refused() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let body = "{\"attestations\":[]}";
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 302 Found\r\n\
+                     Location: http://169.254.169.254/latest/meta-data/\r\n\
+                     Content-Length: 0\r\n\
+                     Connection: close\r\n\r\n"
+                );
+                let _ = stream.flush();
+                let _ = body;
+            }
+        });
+
+        let agent = registry_agent_with_timeout(
+            "blueline-security/test",
+            &base,
+            std::time::Duration::from_secs(5),
+        );
+        let url = format!("{base}/-/npm/v1/attestations/pkg@1.0.0");
+        let err = download_bounded_with_headers(&agent, &base, &url, 1024, 5, &[])
+            .expect_err("a redirect to a link-local address must be refused");
+
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("private/local host") || rendered.contains("169.254.169.254"),
+            "the refusal must name the private target it stopped at: {rendered}"
+        );
+
+        drop(handle);
     }
 }

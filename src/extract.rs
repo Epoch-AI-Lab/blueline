@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io::{Cursor, Read, Write};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use crate::error::BluelineError;
 
@@ -34,6 +34,125 @@ pub struct ExtractStats {
     pub unpacked_bytes: u64,
 }
 
+/// Ceiling on the decompressed tar stream, applied between the gunzip and the
+/// archive reader.
+///
+/// This is not belt-and-braces. tar-rs recognises a header as ustar only when
+/// both the `ustar\0` magic and the `"00"` version are present, and in that case
+/// `next_entry` consumes pax and GNU long-name entries *internally*, calling
+/// `read_all` on the declared size, which preallocates and then `read_to_end`s
+/// with no cap. Those bytes never reach `safe_extract`'s loop, so the
+/// per-entry metadata cap and the total-unpacked accounting both never see
+/// them. The declared size field is 12 octal digits, so one small gzip can
+/// name 64 GiB minus one and have tar-rs try to hold it.
+///
+/// The per-entry cap is kept as well: it still covers a header tar-rs does not
+/// recognise, which it then hands to us.
+fn decompressed_stream_cap(tarball_len: usize, limits: &ExtractionLimits) -> u64 {
+    // Enough for every declared payload byte, plus a 512-byte header and
+    // padding per entry, plus room for the metadata entries the per-entry cap
+    // still admits. Deliberately not a ratio on the compressed size: a
+    // legitimately incompressible package is the case a ratio gets wrong.
+    limits
+        .max_unpacked_bytes
+        .saturating_add(limits.max_entries as u64 * 1024)
+        .saturating_add(16 * 1024 * 1024)
+        .max(tarball_len as u64)
+}
+
+/// A `Read` that refuses once more than `remaining` bytes have been handed out.
+struct Budgeted<R> {
+    inner: R,
+    remaining: u64,
+}
+
+impl<R: std::io::Read> Budgeted<R> {
+    fn new(inner: R, budget: u64) -> Self {
+        Self {
+            inner,
+            remaining: budget,
+        }
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for Budgeted<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            return Err(std::io::Error::other(BudgetExceeded));
+        }
+        let want = usize::try_from(self.remaining)
+            .unwrap_or(usize::MAX)
+            .min(buf.len());
+        let n = self.inner.read(&mut buf[..want])?;
+        self.remaining -= n as u64;
+        Ok(n)
+    }
+}
+
+/// The error `Budgeted` raises. A zero-sized type, so identifying it costs
+/// nothing and — unlike matching on a message — cannot be spoofed by an
+/// archive that happens to contain the same words.
+#[derive(Debug)]
+struct BudgetExceeded;
+
+impl std::fmt::Display for BudgetExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("decompressed tar stream exceeds its budget")
+    }
+}
+
+impl std::error::Error for BudgetExceeded {}
+
+/// Budget exhaustion has to be recognised by type rather than by message:
+/// tar-rs wraps I/O errors in its own `TarError`, whose `Display` prints only
+/// tar-rs's description and drops the inner error, so on the `unpack_in` path
+/// the message is all that survives and it never mentions the budget. Walking
+/// the `source` chain recovers the original. Going the other way, tar-rs
+/// echoes raw header bytes into its messages, so a header containing the
+/// budget's wording would otherwise be filed as a limit breach.
+fn budget_breached(err: &(dyn std::error::Error + 'static)) -> bool {
+    if err.downcast_ref::<BudgetExceeded>().is_some() {
+        return true;
+    }
+    // `io::Error` boxes a custom payload instead of exposing it as its own
+    // `source`, so the wrapped marker has to be reached through `get_ref`.
+    err.downcast_ref::<std::io::Error>()
+        .and_then(std::io::Error::get_ref)
+        .is_some_and(|inner| inner.downcast_ref::<BudgetExceeded>().is_some())
+}
+
+fn budget_breach_in_chain<E: std::error::Error + 'static>(e: &E) -> bool {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = cause {
+        if budget_breached(err) {
+            return true;
+        }
+        cause = err.source();
+    }
+    false
+}
+
+fn map_stream_error<E: std::error::Error + 'static>(context: &str, e: E) -> BluelineError {
+    if budget_breach_in_chain(&e) {
+        return BluelineError::ExtractionLimit(format!(
+            "{context}: the decompressed archive exceeds its budget"
+        ));
+    }
+    BluelineError::Extraction(format!("{context}: {e}"))
+}
+
+/// One definition of "lands on the same file", shared by the tar and wheel
+/// paths. `Path::components` drops `CurDir` and collapses `a//b` to `a/b`, so a
+/// plain string comparison of the raw entry name would miss those duplicates
+/// and let the second one overwrite the first.
+fn normalized_entry_key(path: &Path) -> String {
+    path.components()
+        .filter(|c| !matches!(c, Component::CurDir))
+        .collect::<PathBuf>()
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Extract a gzipped tarball into `dest` under hard bounds.
 ///
 /// Safety invariants:
@@ -48,13 +167,15 @@ pub fn safe_extract(
     limits: &ExtractionLimits,
 ) -> Result<ExtractStats, BluelineError> {
     let decoder = flate2::read::GzDecoder::new(tarball);
-    let mut archive = tar::Archive::new(decoder);
+    let budget = decompressed_stream_cap(tarball.len(), limits);
+    let mut archive = tar::Archive::new(Budgeted::new(decoder, budget));
     let entries = archive
         .entries()
-        .map_err(|e| BluelineError::Extraction(format!("reading tar stream: {e}")))?;
+        .map_err(|e| map_stream_error("reading tar stream", e))?;
 
     let mut stats = ExtractStats::default();
     let mut seen = 0usize;
+    let mut seen_paths: HashSet<String> = HashSet::new();
 
     for entry in entries {
         seen += 1;
@@ -65,8 +186,7 @@ pub fn safe_extract(
             )));
         }
 
-        let mut entry =
-            entry.map_err(|e| BluelineError::Extraction(format!("reading tar entry: {e}")))?;
+        let mut entry = entry.map_err(|e| map_stream_error("reading tar entry", e))?;
 
         let entry_type = entry.header().entry_type();
         let size = entry.size();
@@ -106,6 +226,25 @@ pub fn safe_extract(
             .to_path_buf();
         validate_entry_path(&path).map_err(BluelineError::Extraction)?;
 
+        let normalized_key = normalized_entry_key(&path);
+        if !seen_paths.insert(normalized_key.clone()) {
+            return Err(BluelineError::Extraction(format!(
+                "duplicate entry `{}` (normalized `{normalized_key}`)",
+                path.display()
+            )));
+        }
+
+        if entry_type.is_dir() && size != 0 {
+            // No tar writer emits payload for a directory, and tar-rs cannot
+            // seek past one, so a declared size here is inflated in full while
+            // counting as zero against every byte cap. Refuse rather than
+            // count, which is what the wheel path already does.
+            return Err(BluelineError::ExtractionLimit(format!(
+                "directory entry `{}` declares {size} payload bytes",
+                path.display()
+            )));
+        }
+
         if entry_type.is_file() {
             if size > limits.max_entry_bytes {
                 return Err(BluelineError::ExtractionLimit(format!(
@@ -122,9 +261,9 @@ pub fn safe_extract(
             }
         }
 
-        entry.unpack_in(dest).map_err(|e| {
-            BluelineError::Extraction(format!("unpacking `{}`: {e}", path.display()))
-        })?;
+        entry
+            .unpack_in(dest)
+            .map_err(|e| map_stream_error(&format!("unpacking `{}`", path.display()), e))?;
 
         strip_special_bits(&dest.join(&path));
         if entry_type.is_file() {
@@ -197,12 +336,7 @@ pub fn safe_extract_wheel(
 
         validate_entry_path(&enclosed_path).map_err(BluelineError::Extraction)?;
 
-        let normalized_key = enclosed_path
-            .components()
-            .filter(|c| !matches!(c, std::path::Component::CurDir))
-            .collect::<std::path::PathBuf>()
-            .to_string_lossy()
-            .into_owned();
+        let normalized_key = normalized_entry_key(&enclosed_path);
         if !seen.insert(normalized_key.clone()) {
             return Err(BluelineError::Extraction(format!(
                 "duplicate entry `{raw_name}` (normalized `{normalized_key}`)"
@@ -464,6 +598,28 @@ mod tests {
         let chksum = format!("{:06o}\x00 ", sum);
         h[148..156].copy_from_slice(chksum.as_bytes());
         h.to_vec()
+    }
+
+    /// A header tar-rs recognises as ustar, which needs the `ustar\0` magic at
+    /// 257..263 *and* the `"00"` version at 263..265 -- it checks both. With
+    /// only the magic set, `as_ustar()` is `None`, tar-rs hands the metadata
+    /// entry to us, and the per-entry cap catches it. That is the path a
+    /// hand-built fixture takes by default, and mistaking it for the real one
+    /// is how this cap came to look like dead code.
+    ///
+    /// With both set, tar-rs consumes pax and GNU long-name entries inside
+    /// `next_entry` and `read_all`s the declared size uncapped, so nothing in
+    /// our loop ever sees them. Only the decompressed-stream budget stops that.
+    fn raw_ustar_header(name: &str, typeflag: u8, size: u64) -> Vec<u8> {
+        let mut h = raw_header(name, typeflag, size, "", 0o644);
+        h[257..263].copy_from_slice(b"ustar\x00");
+        h[263..265].copy_from_slice(b"00");
+        // Blank the checksum field before summing, or the old value is counted.
+        h[148..156].fill(b' ');
+        let sum: u64 = h.iter().map(|&b| u64::from(b)).sum();
+        let chksum = format!("{:06o}\x00 ", sum);
+        h[148..156].copy_from_slice(chksum.as_bytes());
+        h
     }
 
     fn raw_tarball(entries: &[(String, u8, &str)]) -> Vec<u8> {
@@ -772,6 +928,251 @@ mod tests {
         enc.finish().unwrap()
     }
 
+    /// The cap's exact arithmetic, and the reason the terms are separate.
+    ///
+    /// Every one of these mutants is a `*` that could become a `+` or a `/`, and
+    /// each changes the total for the limits used here:
+    ///
+    /// ```text
+    /// 1000 + (10*1024)   + 16*1024*1024        = 16_788_456
+    /// 1000 + (10+1024)   + 16*1024*1024        = 16_779_250   (entries `*` -> `+`)
+    /// 1000 + (10/1024)   + 16*1024*1024        = 16_778_216   (entries `*` -> `/`)
+    /// 1000 + (10*1024)   + (16+1024*1024)      =  1_059_832   (slack first `*` -> `+`)
+    /// 1000 + (10*1024)   + (16/1024*1024)      =     11_240   (slack first `*` -> `/`)
+    /// 1000 + (10*1024)   + (16*1024+1024)      =     28_648   (slack second `*` -> `+`)
+    /// ```
+    ///
+    /// The slack term matters more than its size suggests: it is what leaves room
+    /// for the headers of `max_entries` entries at 512 bytes plus padding, and
+    /// for the metadata entries the per-entry cap still admits. Dividing it away
+    /// instead of multiplying would leave a cap that a header-heavy archive
+    /// could cross while every entry was individually legal.
+    ///
+    /// Asserting the total rather than "the cap is some large number" is the
+    /// point. The behavioural tests above all pass with any cap comfortably
+    /// above their fixtures, which is exactly why every arithmetic mutant here
+    /// survived: they all still let those fixtures through.
+    #[test]
+    fn the_stream_cap_is_the_sum_of_its_three_terms() {
+        let limits = ExtractionLimits {
+            max_unpacked_bytes: 1_000,
+            max_entries: 10,
+            max_entry_bytes: 0,
+        };
+        assert_eq!(decompressed_stream_cap(0, &limits), 16_788_456);
+
+        // The `.max(tarball_len)` arm: a tarball bigger than the computed budget
+        // raises the cap to itself rather than being capped below its own size,
+        // which would make every extraction of such a package fail.
+        assert_eq!(decompressed_stream_cap(20_000_000, &limits), 20_000_000);
+        // ...and it must not *lower* a budget that is already larger.
+        assert_eq!(decompressed_stream_cap(5, &limits), 16_788_456);
+
+        // The shipped defaults, so a change to any of the three constants is
+        // visible here rather than only as a mysterious budget shift.
+        assert_eq!(
+            decompressed_stream_cap(0, &ExtractionLimits::default()),
+            536_870_912 + 102_400_000 + 16_777_216
+        );
+    }
+
+    /// The budget error is identified by type, but a zero-sized type whose
+    /// `Display` returned nothing would still be *found* by the type walk while
+    /// telling an operator nothing. Pin the wording, since that wording is the
+    /// only thing a human reads when a real archive trips the ceiling.
+    #[test]
+    fn the_budget_exceeded_error_says_what_was_exceeded() {
+        assert_eq!(
+            BudgetExceeded.to_string(),
+            "decompressed tar stream exceeds its budget"
+        );
+    }
+
+    #[test]
+    fn ustar_metadata_headers_are_capped() {
+        use std::io::Write;
+        // Limits chosen so the stream budget is small enough to bite in a test:
+        // the budget is max_unpacked_bytes + max_entries*1024 + 16 MiB of slack,
+        // so 1 MiB and 16 entries put it near 17 MiB and a 64 MiB declared
+        // payload blows straight through it. Defaults would mean a payload over
+        // 628 MiB, which is a slow test for the same assertion.
+        let limits = ExtractionLimits {
+            max_unpacked_bytes: 1024 * 1024,
+            max_entries: 16,
+            max_entry_bytes: 64 * 1024,
+        };
+        // The four header kinds that can carry a long name or extended
+        // attributes. The header is a real ustar one -- magic *and* version --
+        // so tar-rs consumes three of the four itself inside `next_entry`,
+        // `read_all`s the declared size uncapped, and our per-entry cap never
+        // sees them. Only the decompressed-stream budget refuses those. This is
+        // the only test on the branch that exercises that path, and it is the
+        // reason the budget exists.
+        const PAYLOAD: usize = 64 * 1024 * 1024;
+        for (label, typeflag, meta_name) in [
+            ("pax-local", b'x', "PaxHeaders/demo"),
+            ("pax-global", b'g', "pax_global_header"),
+            ("gnu-longname", b'L', "././@LongLink"),
+            ("gnu-longlink", b'K', "././@LongLink"),
+        ] {
+            let mut out = Vec::new();
+            out.extend_from_slice(&raw_ustar_header(meta_name, typeflag, PAYLOAD as u64));
+            out.extend(std::iter::repeat_n(b'A', PAYLOAD));
+            out.extend_from_slice(&raw_header("package/demo", 0x30, 1, "", 0o644));
+            out.push(b'z');
+            out.extend_from_slice(&[0u8; 1024]);
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            enc.write_all(&out).unwrap();
+            let tgz = enc.finish().unwrap();
+            assert!(
+                tgz.len() * 100 < PAYLOAD,
+                "[{label}] fixture must be far smaller than it declares"
+            );
+
+            let dir = tempfile::tempdir().unwrap();
+            match safe_extract(&tgz, dir.path(), &limits) {
+                Ok(stats) => panic!(
+                    "[{label}] a {PAYLOAD}-byte metadata header was accepted \
+                     (files={})",
+                    stats.files
+                ),
+                Err(e) => assert!(
+                    matches!(e, BluelineError::ExtractionLimit(_)),
+                    "[{label}] must hit a declared cap, got {e:?}"
+                ),
+            }
+        }
+    }
+
+    /// The 64 KiB per-entry cap still has a job: a metadata header tar-rs does
+    /// not recognise is handed to us rather than consumed internally, and that
+    /// is the case this cap catches. Setting only the magic and not the version
+    /// is what makes tar-rs yield the entry.
+    #[test]
+    fn an_unrecognised_metadata_header_hits_the_per_entry_cap() {
+        use std::io::Write;
+        const PAYLOAD: usize = 4 * 1024 * 1024;
+        let mut out = Vec::new();
+        out.extend_from_slice(&raw_header(
+            "PaxHeaders/demo",
+            b'x',
+            PAYLOAD as u64,
+            "",
+            0o644,
+        ));
+        out.extend(std::iter::repeat_n(b'A', PAYLOAD));
+        out.extend_from_slice(&raw_header("package/demo", 0x30, 1, "", 0o644));
+        out.push(b'z');
+        out.extend_from_slice(&[0u8; 1024]);
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(&out).unwrap();
+        let tgz = enc.finish().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let err = safe_extract(&tgz, dir.path(), &ExtractionLimits::default()).unwrap_err();
+        assert!(
+            matches!(err, BluelineError::ExtractionLimit(ref m) if m.contains("metadata entry exceeds cap")),
+            "an unrecognised metadata header must hit the 64 KiB cap, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn stream_budget_does_not_reject_a_header_heavy_archive() {
+        // The budget is a headroom allowance, so the risk is that it is set too
+        // tight and refuses an archive that is merely legal. 1000 entries of one
+        // byte each is the shape that stresses it: 1023 of every 1024 bytes in
+        // the stream is a 512-byte header plus 511 bytes of padding, and no
+        // payload accounting sees any of it.
+        use std::io::Write;
+        let mut out = Vec::new();
+        for i in 0..1000 {
+            out.extend_from_slice(&raw_ustar_header(&format!("package/f{i}"), 0x30, 1));
+            out.push(b'x');
+            out.extend_from_slice(&[0u8; 511]);
+        }
+        out.extend_from_slice(&[0u8; 1024]);
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(&out).unwrap();
+        let tgz = enc.finish().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let stats = safe_extract(
+            &tgz,
+            dir.path(),
+            &ExtractionLimits {
+                max_unpacked_bytes: 64 * 1024,
+                max_entries: 1000,
+                max_entry_bytes: 1024,
+            },
+        )
+        .expect("a legal header-heavy archive must still extract");
+        assert_eq!(stats.files, 1000);
+    }
+
+    #[test]
+    fn tar_duplicate_entry_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let tgz = raw_tarball_with_payload(&[
+            ("package/a.txt".into(), 0x30, b"first".to_vec()),
+            ("package/a.txt".into(), 0x30, b"second".to_vec()),
+        ]);
+        let err = safe_extract(&tgz, dir.path(), &ExtractionLimits::default()).unwrap_err();
+        assert!(
+            format!("{err}").contains("duplicate entry"),
+            "a repeated path must be refused, not silently overwritten: {err}"
+        );
+    }
+
+    #[test]
+    fn tar_duplicate_entry_that_normalizes_to_one_path_is_refused() {
+        // The case a string-keyed duplicate check misses: `a/b` and `a//b` are
+        // the same destination, so the second overwrites the first and the
+        // reviewed tree depends on entry order.
+        let dir = tempfile::tempdir().unwrap();
+        for second in ["package//a.txt", "./package/a.txt"] {
+            let tgz = raw_tarball_with_payload(&[
+                ("package/a.txt".into(), 0x30, b"first".to_vec()),
+                (second.into(), 0x30, b"second".to_vec()),
+            ]);
+            let err = safe_extract(&tgz, dir.path(), &ExtractionLimits::default())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("duplicate entry"),
+                "`{second}` normalizes onto an existing path and must be refused: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn tar_distinct_paths_still_extract() {
+        let dir = tempfile::tempdir().unwrap();
+        let tgz = raw_tarball_with_payload(&[
+            ("package/a.txt".into(), 0x30, b"a".to_vec()),
+            ("package/b.txt".into(), 0x30, b"b".to_vec()),
+            ("./package/c.txt".into(), 0x30, b"c".to_vec()),
+        ]);
+        let stats = safe_extract(&tgz, dir.path(), &ExtractionLimits::default()).unwrap();
+        assert_eq!(stats.files, 3, "distinct paths must not be confused");
+    }
+
+    #[test]
+    fn tar_directory_declaring_payload_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        // No tar writer emits payload for a directory, and tar-rs cannot seek
+        // past one, so a declared size is decompressed in full while counting
+        // as zero against every byte cap.
+        let tgz = raw_tarball_with_payload(&[
+            ("package/d".into(), 0x35, vec![b'A'; 64 * 1024]),
+            ("package/d/ok.txt".into(), 0x30, b"ok".to_vec()),
+        ]);
+        let err = safe_extract(&tgz, dir.path(), &ExtractionLimits::default()).unwrap_err();
+        assert!(
+            matches!(err, BluelineError::ExtractionLimit(_)),
+            "a directory with a declared payload must hit the byte budget, got {err:?}"
+        );
+    }
+
     #[test]
     fn metadata_entry_size_limits() {
         let dir = tempfile::tempdir().unwrap();
@@ -846,6 +1247,133 @@ mod tests {
                 .contains("total unpacked size would exceed cap")
         );
     }
+
+    /// The budget marker must be recognised through tar-rs's own `TarError`,
+    /// whose Display prints only tar-rs's description and drops the inner I/O
+    /// error, and through the `io::Error` that boxes it. A breach during
+    /// `unpack_in` was therefore being filed as a plain extraction failure --
+    /// the exact misclassification `map_stream_error` exists to prevent. The
+    /// other direction matters too: tar-rs echoes raw header bytes into its
+    /// messages, so matching on that text would file a malformed archive as a
+    /// limit breach.
+    #[test]
+    fn budget_breach_is_classified_by_type_not_by_message() {
+        let marker: std::io::Error = std::io::Error::other(BudgetExceeded);
+        assert!(
+            budget_breached(&marker),
+            "our marker must be recognised through the io::Error payload"
+        );
+
+        let spoofed: std::io::Error = std::io::Error::other(
+            "numeric field was not a number: decompressed tar stream exceeds its budget",
+        );
+        assert!(
+            !budget_breached(&spoofed),
+            "an unrelated error must not be mistaken for a breach"
+        );
+
+        assert!(
+            matches!(
+                map_stream_error("ctx", BudgetExceeded),
+                BluelineError::ExtractionLimit(_)
+            ),
+            "a direct marker is a limit"
+        );
+        let unrelated = std::io::Error::other("some other failure");
+        assert!(
+            matches!(
+                map_stream_error("ctx", unrelated),
+                BluelineError::Extraction(_)
+            ),
+            "an unrelated error is a plain extraction failure"
+        );
+
+        // Wrapped the way tar-rs wraps it: TarError::source() yields the
+        // io::Error, which boxes the marker, so the walk has to cross two
+        // levels. Asserted here with a stand-in chain because a real breach
+        // through `unpack_in` needs a multi-megabyte archive.
+        #[derive(Debug)]
+        struct Wrapper(std::io::Error);
+        impl std::fmt::Display for Wrapper {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("wrapped")
+            }
+        }
+        impl std::error::Error for Wrapper {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let two_deep = Wrapper(std::io::Error::other(BudgetExceeded));
+        assert!(
+            budget_breach_in_chain(&two_deep),
+            "a marker two levels down must still be found"
+        );
+        assert!(
+            matches!(
+                map_stream_error("ctx", two_deep),
+                BluelineError::ExtractionLimit(_)
+            ),
+            "a marker under a tar-rs-style wrapper is a limit, not a parse failure"
+        );
+
+        let tar_err = tar::Archive::new(std::io::Cursor::new(b"not a tar".to_vec()))
+            .unpack("nowhere")
+            .unwrap_err();
+        assert!(
+            !budget_breached(&tar_err),
+            "a real tar-rs error is not a breach"
+        );
+    }
+
+    /// A breach raised while unpacking a file, rather than between entries, is
+    /// classified as a limit too.
+    ///
+    /// Driven through the real types and not through `safe_extract`: a
+    /// `Budgeted` reader whose budget covers the 512-byte header block but not
+    /// the file's payload, so exhaustion happens while tar-rs is copying the
+    /// entry. An earlier version went through `safe_extract` with production
+    /// limits small enough that the pre-flight total check fired first, so
+    /// `unpack_in` was never reached and the test passed with the
+    /// classification disabled.
+    ///
+    /// What this pins: that a breach from `unpack_in` is an `ExtractionLimit`
+    /// rather than a plain extraction failure. tar-rs wraps it in a `TarError`
+    /// whose `Display` is only "failed to unpack `<path>`", so the budget's
+    /// wording is gone and the walk through `source` is what recovers the
+    /// marker. `budget_breach_is_classified_by_type_not_by_message` pins the
+    /// same walk synthetically, at a nesting level this path does not reach.
+    #[test]
+    fn a_breach_during_unpack_is_reported_as_a_limit() {
+        let mut tar_bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_bytes);
+            let data = vec![b'A'; 8 * 1024];
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "package/big", &data[..])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let mut archive = tar::Archive::new(Budgeted::new(std::io::Cursor::new(tar_bytes), 1024));
+        let dir = tempfile::tempdir().unwrap();
+        let mut breach = None;
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if let Err(e) = entry.unpack_in(dir.path()) {
+                breach = Some(map_stream_error("unpacking", e));
+                break;
+            }
+        }
+        let err = breach.expect("the budget must be exhausted inside unpack_in");
+        assert!(
+            matches!(err, BluelineError::ExtractionLimit(_)),
+            "a breach while unpacking a file must be a limit, got {err:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -859,27 +1387,6 @@ mod wheel_tests {
         let mut zw = zip::ZipWriter::new(&mut buf);
         for (name, data, method) in entries {
             let opts = SimpleFileOptions::default().compression_method(*method);
-            if name.ends_with('/') {
-                zw.add_directory(*name, opts).unwrap();
-            } else {
-                zw.start_file(*name, opts).unwrap();
-                zw.write_all(data).unwrap();
-            }
-        }
-        zw.finish().unwrap();
-        buf.into_inner()
-    }
-
-    #[allow(dead_code)]
-    fn make_wheel_with_unix_mode(
-        entries: &[(&str, &[u8], zip::CompressionMethod, u32)],
-    ) -> Vec<u8> {
-        let mut buf = Cursor::new(Vec::new());
-        let mut zw = zip::ZipWriter::new(&mut buf);
-        for (name, data, method, mode) in entries {
-            let opts = SimpleFileOptions::default()
-                .compression_method(*method)
-                .unix_permissions(*mode);
             if name.ends_with('/') {
                 zw.add_directory(*name, opts).unwrap();
             } else {

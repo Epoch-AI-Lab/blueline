@@ -7,25 +7,19 @@ pub fn build_install_command(
 ) -> anyhow::Result<Command> {
     validate_extra_args(extra_args)?;
 
-    let mut cmd = match std::env::var("npm_execpath") {
-        Ok(execpath) if !execpath.is_empty() => {
-            if execpath.ends_with(".js") || execpath.ends_with(".cjs") || execpath.ends_with(".mjs")
-            {
-                let node_bin = std::env::var("NODE").unwrap_or_else(|_| "node".to_string());
-                let mut c = Command::new(node_bin);
-                c.arg(execpath);
-                c
-            } else {
-                Command::new(execpath)
-            }
-        }
-        _ => Command::new("npm"),
-    };
+    // Resolved from PATH, never from `npm_execpath`. That variable decides
+    // which program runs, and it is environment-supplied: TODO.md records it
+    // as user-controllable and unfit for a security decision. `NODE` was the
+    // same story, choosing the interpreter. The shim layer already resolves a
+    // real manager this way, so this reuses it and excludes the shim
+    // directory, which also stops a shimmed PATH recursing into itself.
+    let mut cmd = Command::new(crate::shim::resolve_package_manager("npm")?);
 
     // Scrub sensitive environment variables to enforce script isolation.
-    // Iterating over std::env::vars() ensures mixed-case keys (e.g. Npm_Config_*) are stripped on Unix.
-    for (key, _) in std::env::vars() {
-        let lower = key.to_ascii_lowercase();
+    // Mixed-case keys (e.g. Npm_Config_*) are stripped too, and `vars_os` is
+    // used because `vars()` panics on a non-UTF-8 entry.
+    for (key, _) in std::env::vars_os() {
+        let lower = key.to_string_lossy().to_ascii_lowercase();
         if lower.starts_with("npm_config_")
             || lower == "node_options"
             || lower == "node_extra_ca_certs"
@@ -47,8 +41,8 @@ pub fn build_install_command(
 
 /// Executes `npm install --ignore-scripts --registry <registry> [extra_args...] -- <pkg>`.
 ///
-/// Delegates to `$npm_execpath` if set (e.g. when invoked through `npm` or `npx`),
-/// otherwise defaults to `npm` on PATH.
+/// The real `npm` is resolved from PATH. It is never taken from
+/// `npm_execpath`, which is attacker-shapeable.
 pub fn install_with_ignore_scripts(
     pkg: &str,
     registry_base: &str,

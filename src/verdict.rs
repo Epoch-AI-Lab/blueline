@@ -16,6 +16,26 @@ pub enum VerdictBand {
     Block,
 }
 
+impl VerdictBand {
+    /// Parse a band name. Shared so a policy key and a CLI flag agree on
+    /// spelling, and so a typo is one refusal rather than two silent
+    /// fallbacks pointing different ways.
+    pub fn parse(s: &str) -> Option<Self> {
+        let t = s.trim();
+        if t.eq_ignore_ascii_case("low") {
+            Some(VerdictBand::Low)
+        } else if t.eq_ignore_ascii_case("medium") {
+            Some(VerdictBand::Medium)
+        } else if t.eq_ignore_ascii_case("high") {
+            Some(VerdictBand::High)
+        } else if t.eq_ignore_ascii_case("block") {
+            Some(VerdictBand::Block)
+        } else {
+            None
+        }
+    }
+}
+
 impl std::fmt::Display for VerdictBand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
