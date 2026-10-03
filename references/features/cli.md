@@ -67,3 +67,6 @@ Exit codes, all measured against `target/debug/blueline`:
   `VerdictBand::Low`; anything else prints a refusal and exits 2.
 - `install` has **no `--output` flag** and always renders the text card, even
   under a pipe. Do not assume `--output json` parity with `review`.
+- `lib.rs` declares `#![forbid(unsafe_code)]` and `main.rs` repeats it — lint
+  levels do not cross crate boundaries, so the binary root does not inherit the
+  lib's. Both must be set or the binary is unguarded.

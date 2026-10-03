@@ -14,8 +14,14 @@ actually fetched** — and explicitly does *not* claim signature verification.
 ```sh
 blueline review express@4.21.2 --output json | jq '.trust_sources.provenance'
 # {"status":"Missing","slsa_level":0,"registry_signature_present":true,…}
-blueline --policy <(printf '[provenance]\nrequire_provenance = true\n') \
-  review express@4.21.2
+blueline --policy /tmp/bl.toml review express@4.21.2
+```
+
+where `/tmp/bl.toml` holds:
+
+```toml
+[provenance]
+require_provenance = true
 ```
 
 ## Driving it

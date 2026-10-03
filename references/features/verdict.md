@@ -51,3 +51,8 @@ Only two fields are omitted when empty: `trust_sources` (`Option::is_none`) and
   fixed. `recall.rs` still does this for a data-dir resolution failure.
 - `LockfileError` implements `From<serde_json::Error>` manually instead of
   `#[from]` so `{e:#}` does not print the serde cause twice. Do not "simplify" it.
+- `BluelineError::NotFound` is load-bearing beyond messaging: `recursive.rs`
+  downcasts the error chain to pick **Medium** for an unresolvable referenced
+  install, while every other failure becomes **High** ("Recursive review
+  failed"). Widening the variant or losing it from the chain silently demotes
+  real recursive-review failures.
