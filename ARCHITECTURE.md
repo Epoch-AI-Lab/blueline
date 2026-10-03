@@ -11,15 +11,20 @@ sandboxed temp dir — never executed, diffed, and scored. The package's own cod
 never run: even on approve, install proceeds with `npm install --ignore-scripts`,
 and any `postinstall`/`preinstall` script is surfaced for a *separate* human decision.
 
-> Note: the README lists the "Diff rendering engine (Rust)" as done. As of the
-> initial commit only README, LICENSE, and brand assets exist. The engine is a
-> design target, not shipped code.
+> Note: the engine is **shipped code**, not a design target. At v0.3.1
+> `src/` is 34 tracked Rust files across 27 modules (plus a `registry/`
+> directory module) with ~650 tests, all hermetic — the test suite runs
+> against loopback registries and makes no real network calls. Every box in
+> the overview below is implemented: the diff engine, the verdict/card
+> rendering, the `ci` lockfile lane, the MCP server, the agent lane, the
+> recall index, and the eleven-manager shim.
 >
-> Update 2026-08-13: **Phase 0 shipped.** A `blueline` Rust binary exists:
-> `registry::npm` (fetch + sha512-verified tarball download), typed manifest
-> parsing, bounded sandbox extraction, and a SQLite `known_clean` baseline
-> store behind `blueline review <pkg@ver>`. Diff/verdict/card rendering are
-> Phase 1, still unshipped.
+> `./scripts/verify.sh` is the gate (see `AGENTS.md`). `references/README.md`
+> maps each feature to the code and tests that implement it.
+
+For the module-level view — which file owns which decision, and where a
+change should land — see the Feature Map at
+[`references/README.md`](references/README.md).
 
 ---
 
@@ -141,7 +146,7 @@ Recommend the explicit tool to avoid breaking agent toolchains.
 
 ---
 
-## 5. Second-order lanes (agent / recall / shim)
+## 3. Second-order lanes (agent / recall / shim)
 
 Install-time references (npm lifecycle scripts, wheel `.data/scripts`,
 PKGBUILD npm/bun delivery) are first-class findings, reviewed recursively:
@@ -208,7 +213,7 @@ Known bypasses stay documented in the README.
 
 ---
 
-## 3. Tech Stack (Rust core)
+## 4. Tech Stack (Rust core)
 
 | Concern            | Crate / Tool                          |
 |--------------------|---------------------------------------|
@@ -224,11 +229,49 @@ Known bypasses stay documented in the README.
 
 ---
 
-## 4. Open Risks
+## 5. Risks
 
-- **First-sighting bootstrap:** no baseline on initial install → default to a
-  *neutral* verdict and flag "no known-clean baseline" rather than BLOCK.
-- **`scripts` false positives:** legit packages (esbuild, core-js) use
-  postinstall. Need an allowlist-by-maintainer or "review once, remember" flow.
-- **Lockfile vs manifest:** `review` diffs a single package; `ci` must diff the
-  whole lockfile. Two code paths — `ci` is Phase 3, not Phase 1.
+### Resolved
+
+These were listed here as open risks while the engine was being built. Each
+is now implemented; they are kept because the reasoning behind the final
+answer is not obvious from the code alone.
+
+- **First-sighting bootstrap — resolved, and stricter than planned.**
+  Originally the intent was a *neutral* verdict when no known-clean baseline
+  exists. Shipped behaviour is `BaselineResolution::FirstSighting`
+  (`src/baseline.rs`) plus an `R06_FIRST_SIGHTING` finding
+  (`src/heuristic.rs`) that is deliberately **elevated to MEDIUM** — it
+  scores +15 where an ordinary MEDIUM finding scores +10
+  (`first_sighting_elevated_to_medium`). A package nobody has reviewed
+  before does not get the benefit of the doubt. `allows_unreviewed_baseline`
+  in `blueline.toml` is the opt-out, and it is exact-name only: a pattern
+  like `@scope/*` grants nothing.
+- **`scripts` false positives — resolved.** Legitimate postinstall packages
+  (esbuild, core-js) are handled by `allowlist.packages[].allowed_scripts`
+  (`Policy::is_script_allowed`, `src/policy.rs`), and the "review once,
+  remember" half by the SQLite `known_clean` table in `src/store.rs`, which
+  persists approvals across runs.
+- **Lockfile vs manifest — resolved.** `blueline ci` is shipped, not Phase 3:
+  `src/ci.rs` (~2k lines) diffs a whole lockfile via `src/lockfile.rs`
+  (`compute_lockfile_delta`), and `is_cargo_lockfile` dispatches npm and
+  Cargo lockfile shapes. It is dogfooded in CI — the `dogfood-cargo` job
+  runs blueline against this repository's own `Cargo.lock` on every PR that
+  touches it.
+
+### Still open
+
+- **`review` and `ci` are two code paths** over similar input. They share
+  `src/diff.rs` and the verdict schema, but the lockfile lane has its own
+  scoring path. A rule added to one does not automatically apply to the
+  other; this is exactly what `cargo mutants` over both `ci.rs` and
+  `diff.rs` is there to catch.
+- **Mutation coverage is derived from the repo, so it grows silently.** The
+  CI target list comes from `git ls-files`, which means a newly added module
+  is mutation-tested with no edit to any workflow. That is the intent, but
+  it also means total mutant count grows with the codebase and the 15-minute
+  per-shard timeout is the thing that will break first.
+- **Bypass paths are documented, not closed.** The shim lane routes eleven
+  managers through `agent gate`, but the README still lists the known
+  bypasses. The enforcement is opt-in; a user who does not install the shim
+  gets no gate.

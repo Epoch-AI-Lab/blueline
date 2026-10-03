@@ -1,4 +1,19 @@
 [toolchain]
 channel = "1.97.1"
+# clippy and rustfmt are the only two components this project uses. Keep this
+# list to names rustup actually ships: rustup hard-fails every cargo
+# invocation for an unknown component ("toolchain '1.97.1' does not support
+# components: ..."), so a stray name here breaks the whole toolchain.
+#
+# cargo-mutants and cargo-deny are NOT rustup components. They are
+# `cargo install`ed subcommands, and CI installs them the same way — as
+# standalone binaries via `taiki-e/install-action` in
+# `.github/workflows/ci.yml`, never via `rustup component add`.
+#
+# To match CI locally:
+#   cargo install cargo-mutants cargo-deny --locked
+# or, faster:
+#   cargo binstall cargo-mutants cargo-deny
+# `scripts/verify.sh` checks for them and tells you when they are missing.
 components = ["clippy", "rustfmt"]
 profile = "minimal"

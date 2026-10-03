@@ -15,6 +15,18 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Mutation-testing target list, defined ONCE and derived from the repo by
+  # both mutation jobs below (`git ls-files 'src/*.rs' 'src/registry/*.rs'`
+  # minus this skip list). Do not hand-maintain a --file list in a job body:
+  # that is how the two jobs drifted apart before.
+  #
+  # Only files with no mutable expressions are skipped. Both are pure
+  # declarations — `lib.rs` is `pub mod` lines, `error.rs` is an enum of
+  # thiserror derives. Everything else is in scope, including the
+  # heuristic.rs rule engine and the registry adapters.
+  BLUELINE_MUTANTS_SKIP: |
+    src/lib.rs
+    src/error.rs
 
 jobs:
   fmt:
@@ -186,14 +198,14 @@ jobs:
         run: git diff "origin/${BASE_REF}"...HEAD -- > pr.diff
       - name: Mutate the changed lines
         run: |
+          set -euo pipefail
+          mapfile -t files < <(git ls-files 'src/*.rs' 'src/registry/*.rs' \
+            | grep -vxFf <(printf '%s' "$BLUELINE_MUTANTS_SKIP"))
+          test "${#files[@]}" -gt 0 || { echo "no mutation targets resolved" >&2; exit 1; }
+          args=(); for f in "${files[@]}"; do args+=(--file "$f"); done
+          echo "mutating ${#files[@]} files (shard ${{ matrix.shard }}/16)"
           cargo mutants --in-diff pr.diff --shard ${{ matrix.shard }}/16 \
-            --file src/extract.rs --file src/manifest.rs --file src/registry/npm.rs \
-            --file src/registry/pypi.rs --file src/wheel_extract.rs --file src/baseline.rs \
-            --file src/version.rs --file src/review.rs --file src/store.rs \
-            --file src/executor.rs --file src/lockfile.rs --file src/ci.rs \
-            --file src/mcp.rs --file src/install_ref.rs --file src/recursive.rs \
-            --file src/agent.rs --file src/recall.rs --file src/shim.rs \
-            --file src/pkgbuild.rs --file src/render.rs --file src/policy.rs \
+            "${args[@]}" \
             --in-place --baseline=skip --timeout 30
       - uses: actions/upload-artifact@v4
         if: always()
@@ -236,14 +248,14 @@ jobs:
         run: git diff HEAD~1..HEAD -- > push.diff
       - name: Mutate the changed lines
         run: |
+          set -euo pipefail
+          mapfile -t files < <(git ls-files 'src/*.rs' 'src/registry/*.rs' \
+            | grep -vxFf <(printf '%s' "$BLUELINE_MUTANTS_SKIP"))
+          test "${#files[@]}" -gt 0 || { echo "no mutation targets resolved" >&2; exit 1; }
+          args=(); for f in "${files[@]}"; do args+=(--file "$f"); done
+          echo "mutating ${#files[@]} files (shard ${{ matrix.shard }}/16)"
           cargo mutants --in-diff push.diff --shard ${{ matrix.shard }}/16 \
-            --file src/extract.rs --file src/manifest.rs --file src/registry/npm.rs \
-            --file src/registry/pypi.rs --file src/wheel_extract.rs --file src/baseline.rs \
-            --file src/version.rs --file src/review.rs --file src/store.rs \
-            --file src/executor.rs --file src/lockfile.rs --file src/ci.rs \
-            --file src/mcp.rs --file src/install_ref.rs --file src/recursive.rs \
-            --file src/agent.rs --file src/recall.rs --file src/shim.rs \
-            --file src/pkgbuild.rs --file src/render.rs --file src/policy.rs \
+            "${args[@]}" \
             --in-place --baseline=skip --timeout 30
       - uses: actions/upload-artifact@v4
         if: always()
