@@ -3334,4 +3334,127 @@ mod tests {
             verdict.findings
         );
     }
+    fn pin_verdict() -> Verdict {
+        Verdict {
+            name: "pin-pkg".into(),
+            target_version: "2.0.0".into(),
+            baseline_version: Some("1.0.0".into()),
+            integrity: "sha512-pin".into(),
+            ecosystem: Ecosystem::Npm,
+            band: VerdictBand::Low,
+            risk_score: 0,
+            findings: Vec::new(),
+            diff_summary: DiffSummary {
+                files_added: 0,
+                files_removed: 0,
+                files_modified: 0,
+                lines_added: 0,
+                lines_deleted: 0,
+            },
+            trust_sources: None,
+            recursive: Vec::new(),
+        }
+    }
+
+    fn pin_finding(rule_id: &str, severity: VerdictBand) -> Finding {
+        Finding {
+            rule_id: rule_id.into(),
+            severity,
+            title: format!("pin finding {rule_id}"),
+            description: "pinned".into(),
+        }
+    }
+
+    #[test]
+    fn apply_extra_findings_scores_every_finding_not_just_the_extras() {
+        // The verdict already carried one HIGH before the extras arrived. The
+        // recompute reads `verdict.findings` in full, so the pre-existing
+        // finding still contributes to the score.
+        let mut verdict = pin_verdict();
+        verdict
+            .findings
+            .push(pin_finding("R01_PINNED_PRIOR", VerdictBand::High));
+
+        apply_extra_findings(
+            &mut verdict,
+            vec![pin_finding("R02_PINNED_EXTRA", VerdictBand::High)],
+            &Policy::default(),
+        );
+
+        assert_eq!(
+            verdict.findings.len(),
+            2,
+            "extras are appended, not replaced"
+        );
+        assert_eq!(verdict.risk_score, 50, "25 + 25 across both findings");
+    }
+
+    #[test]
+    fn apply_extra_findings_uses_the_per_rule_weight_for_first_sighting() {
+        let mut plain = pin_verdict();
+        apply_extra_findings(
+            &mut plain,
+            vec![pin_finding("R99_PLAIN", VerdictBand::Medium)],
+            &Policy::default(),
+        );
+
+        let mut first_sighting = pin_verdict();
+        apply_extra_findings(
+            &mut first_sighting,
+            vec![pin_finding("R06_FIRST_SIGHTING", VerdictBand::Medium)],
+            &Policy::default(),
+        );
+
+        assert_eq!(plain.risk_score, 10);
+        assert_eq!(first_sighting.risk_score, 15);
+    }
+
+    #[test]
+    fn apply_extra_findings_caps_the_score_at_one_hundred() {
+        let mut verdict = pin_verdict();
+        let extras = (0..4)
+            .map(|i| pin_finding(&format!("R{i}_BLOCK"), VerdictBand::Block))
+            .collect();
+
+        apply_extra_findings(&mut verdict, extras, &Policy::default());
+
+        assert_eq!(verdict.risk_score, 100, "4 x 50 raw saturates to the cap");
+        assert_eq!(verdict.band, VerdictBand::Block);
+    }
+
+    #[test]
+    fn apply_extra_findings_escalates_on_thresholds_without_downgrading() {
+        // Defaults are max_low_score 19, max_medium_score 49, block_score 80.
+        // Five HIGHs score 125 -> capped 100 -> Block by threshold.
+        let mut verdict = pin_verdict();
+        let extras = (0..5)
+            .map(|i| pin_finding(&format!("H{i}"), VerdictBand::High))
+            .collect();
+
+        apply_extra_findings(&mut verdict, extras, &Policy::default());
+
+        assert_eq!(verdict.risk_score, 100);
+        assert_eq!(
+            verdict.band,
+            VerdictBand::Block,
+            "a Block earned by score must not be demoted back to High"
+        );
+    }
+
+    #[test]
+    fn apply_extra_findings_keeps_a_block_finding_block_when_score_alone_means_high() {
+        // A BLOCK-severity finding sets the band directly in the accumulation
+        // loop. Score 50 clears max_medium_score (49), so the threshold pass
+        // would pick High on its own. The no-downgrade guard keeps the Block
+        // the finding already earned.
+        let mut verdict = pin_verdict();
+        apply_extra_findings(
+            &mut verdict,
+            vec![pin_finding("R02_NEW_INSTALL_SCRIPT", VerdictBand::Block)],
+            &Policy::default(),
+        );
+
+        assert_eq!(verdict.risk_score, 50);
+        assert_eq!(verdict.band, VerdictBand::Block);
+    }
 }
