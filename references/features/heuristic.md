@@ -51,13 +51,15 @@ Policy outcomes in the same function: `P01_PACKAGE_BLOCKED`,
   `ENTRY_POINTS_SCRIPT`. `R09` = three advisory ids + `YANKED_TARGET`. `R06` =
   `FIRST_SIGHTING` (15 pts) and `NATIVE_PLATFORM_WHEEL` (0 pts). `R00`/`R10` are
   emitted from `review.rs`/`pkgbuild.rs`/`ci.rs`. Grep the full id, never `R02`.
-- **The scoring block is copy-pasted.** `evaluate_with_trust` and
-  `apply_extra_findings` carry identical weights *and* the identical
-  `rule_id == "R06_FIRST_SIGHTING"` string special case. Editing one and not the
-  other makes late PKGBUILD/R24–R28 findings ride along without moving the band.
-- **`Policy::calculate_band` is a dead third copy** (`#[allow(dead_code)]`) and
-  it is the function `calculates_bands_correctly` tests. Editing thresholds will
-  make that test fail while live behavior is governed by the other two loops.
+- **The scoring block is shared, not copy-pasted.** `score_findings` owns the
+  weight table including the single `rule_id == "R06_FIRST_SIGHTING"` string
+  special case; `Policy::escalate_band` owns the threshold pass.
+  `evaluate_with_trust` and `apply_extra_findings` both call them, so a late
+  PKGBUILD/R24–R28 finding moves the band on the same terms as an original one.
+- **The threshold pass never downgrades.** A band earned by a specific finding
+  outranks the band the score alone would imply, so a BLOCK finding stays BLOCK
+  even when its score lands in the HIGH range. `escalate_band` takes the
+  finding-earned band as `current` and only ever moves it up.
 - **Renaming or re-banding a rule changes the score.** Promoting a `Low` finding
   to `Medium` adds 10; two of them (20) cross `max_low_score: 19` and flip a
   LOW verdict to MEDIUM. `R02_ENTRY_POINTS_SCRIPT` alone is enough.

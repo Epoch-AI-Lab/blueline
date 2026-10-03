@@ -7,8 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **The score-to-band rule has one implementation.** The weight table and the
+  threshold pass were copy-pasted between `heuristic::evaluate_with_trust` and
+  `heuristic::apply_extra_findings`, with a third divergent copy of the
+  threshold pass sitting dead in `policy.rs` as `Policy::calculate_band`. That
+  dead copy was the function the threshold test exercised, so editing a
+  threshold failed that test while live behavior stayed governed by the other
+  two copies. The table is now `heuristic::score_findings` and the threshold
+  pass is `Policy::escalate_band`, each with one copy and its own tests.
+  Behavior is unchanged; 576 lib tests and the 22 attack scenarios pass before
+  and after.
+- `Policy::escalate_band` never downgrades a band a finding already earned. The
+  old `calculate_band` ignored the incoming band entirely and computed from
+  score alone, which is why its tests could not express the rule production
+  actually follows.
+
 ### Added
 
+- `heuristic.rs` gained its first direct tests for `apply_extra_findings`, which
+  previously had none. They pin that it re-scores *all* findings rather than just
+  the extras, the `R06_FIRST_SIGHTING` weight, the cap at 100, and the
+  no-downgrade guard.
 - **Feature map** (`references/`) — materialized memory for agents. A scannable
   index plus one file per lane, each with sub-features, user-POV invocation, the
   CLI commands that drive it, and a Gotchas section. Replaces the need to read

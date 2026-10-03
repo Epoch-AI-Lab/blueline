@@ -606,46 +606,10 @@ pub fn evaluate_with_trust(
         });
     }
 
-    let mut score: u32 = 0;
-    let mut band = VerdictBand::Low;
-
-    for f in &findings {
-        match f.severity {
-            VerdictBand::Block => {
-                score = score.saturating_add(50);
-                band = VerdictBand::Block;
-            }
-            VerdictBand::High => {
-                score = score.saturating_add(25);
-                if band < VerdictBand::High {
-                    band = VerdictBand::High;
-                }
-            }
-            VerdictBand::Medium => {
-                let add = if f.rule_id == "R06_FIRST_SIGHTING" {
-                    15
-                } else {
-                    10
-                };
-                score = score.saturating_add(add);
-                if band < VerdictBand::Medium {
-                    band = VerdictBand::Medium;
-                }
-            }
-            VerdictBand::Low => {}
-        }
-    }
-
-    let capped_score = score.min(100);
+    let (capped_score, earned) = score_findings(&findings);
 
     // Escalate according to policy thresholds if accumulated score exceeds them
-    if capped_score >= policy.thresholds.block_score {
-        band = VerdictBand::Block;
-    } else if capped_score > policy.thresholds.max_medium_score && band < VerdictBand::High {
-        band = VerdictBand::High;
-    } else if capped_score > policy.thresholds.max_low_score && band < VerdictBand::Medium {
-        band = VerdictBand::Medium;
-    }
+    let band = policy.escalate_band(capped_score, earned);
 
     Verdict {
         name: name.to_string(),
@@ -675,15 +639,16 @@ pub fn evaluate_with_trust(
     }
 }
 
-/// Recompute band and score after late findings (e.g. PKGBUILD heuristics)
-/// are appended post-evaluation. Same weights and policy thresholds as the
-/// initial computation, so late HIGHs move the band instead of riding along
-/// silently.
-pub fn apply_extra_findings(verdict: &mut Verdict, extra: Vec<Finding>, policy: &Policy) {
-    verdict.findings.extend(extra);
+/// Accumulate the risk score and the finding-derived band from a set of
+/// findings, capped at 100. The threshold pass is separate and lives on
+/// `Policy::escalate_band`.
+///
+/// Returns the capped score and the band the findings earned on their own,
+/// before any threshold escalation.
+fn score_findings(findings: &[Finding]) -> (u32, VerdictBand) {
     let mut score: u32 = 0;
     let mut band = VerdictBand::Low;
-    for f in &verdict.findings {
+    for f in findings {
         match f.severity {
             VerdictBand::Block => {
                 score = score.saturating_add(50);
@@ -709,15 +674,17 @@ pub fn apply_extra_findings(verdict: &mut Verdict, extra: Vec<Finding>, policy: 
             VerdictBand::Low => {}
         }
     }
-    let capped_score = score.min(100);
-    if capped_score >= policy.thresholds.block_score {
-        band = VerdictBand::Block;
-    } else if capped_score > policy.thresholds.max_medium_score && band < VerdictBand::High {
-        band = VerdictBand::High;
-    } else if capped_score > policy.thresholds.max_low_score && band < VerdictBand::Medium {
-        band = VerdictBand::Medium;
-    }
-    verdict.band = band;
+    (score.min(100), band)
+}
+
+/// Recompute band and score after late findings (e.g. PKGBUILD heuristics)
+/// are appended post-evaluation. Same weights and policy thresholds as the
+/// initial computation, so late HIGHs move the band instead of riding along
+/// silently.
+pub fn apply_extra_findings(verdict: &mut Verdict, extra: Vec<Finding>, policy: &Policy) {
+    verdict.findings.extend(extra);
+    let (capped_score, earned) = score_findings(&verdict.findings);
+    verdict.band = policy.escalate_band(capped_score, earned);
     verdict.risk_score = capped_score;
 }
 
@@ -3334,6 +3301,7 @@ mod tests {
             verdict.findings
         );
     }
+
     fn pin_verdict() -> Verdict {
         Verdict {
             name: "pin-pkg".into(),

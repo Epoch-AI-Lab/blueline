@@ -83,9 +83,10 @@ and fix this file in the same branch.
 - **Rule IDs collide by number.** `R02` covers five distinct production rules;
   `R09` covers four; `R00` and `R10` are emitted from two different modules.
   Never grep a bare `R0x` and assume one rule.
-- **Scoring is duplicated, not shared.** `evaluate_with_trust` and
-  `apply_extra_findings` carry identical weight tables. A `Policy::calculate_band`
-  third copy is `#[allow(dead_code)]` and is what the threshold test exercises.
+- **Scoring is shared, not duplicated.** `evaluate_with_trust` and
+  `apply_extra_findings` both call `heuristic::score_findings` for the weight
+  table and `Policy::escalate_band` for the threshold pass. One copy of each.
+  The threshold pass never downgrades a band a finding already earned.
 - **The engine is fail-closed at boundaries and fail-*loud* in the middle.**
   Unresolvable references, unreadable baselines, and cycle cuts become HIGH
   findings; only structural corruption becomes an `Err`.

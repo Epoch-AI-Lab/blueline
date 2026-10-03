@@ -176,17 +176,23 @@ impl Policy {
         Ok(())
     }
 
-    /// Determine the verdict band given an accumulated score and hard block flag.
-    #[allow(dead_code)]
-    pub fn calculate_band(&self, score: u32, has_block_latch: bool) -> VerdictBand {
-        if has_block_latch || score >= self.thresholds.block_score {
+    /// Escalate the band a set of findings already earned when the accumulated
+    /// score crosses a policy threshold.
+    ///
+    /// Never downgrades. A band earned by a specific finding outranks the band
+    /// the score alone would imply, so a BLOCK finding stays BLOCK even when its
+    /// score lands in the HIGH range. This is the only score-to-band rule in the
+    /// engine; `heuristic::evaluate_with_trust` and
+    /// `heuristic::apply_extra_findings` both route through it.
+    pub fn escalate_band(&self, score: u32, current: VerdictBand) -> VerdictBand {
+        if score >= self.thresholds.block_score {
             VerdictBand::Block
-        } else if score > self.thresholds.max_medium_score {
+        } else if score > self.thresholds.max_medium_score && current < VerdictBand::High {
             VerdictBand::High
-        } else if score > self.thresholds.max_low_score {
+        } else if score > self.thresholds.max_low_score && current < VerdictBand::Medium {
             VerdictBand::Medium
         } else {
-            VerdictBand::Low
+            current
         }
     }
 
@@ -576,17 +582,32 @@ block_score = 101
     }
 
     #[test]
-    fn calculates_bands_correctly() {
+    fn escalates_bands_at_the_policy_threshold_boundaries() {
         let p = Policy::default();
-        assert_eq!(p.calculate_band(0, false), VerdictBand::Low);
-        assert_eq!(p.calculate_band(19, false), VerdictBand::Low);
-        assert_eq!(p.calculate_band(20, false), VerdictBand::Medium);
-        assert_eq!(p.calculate_band(49, false), VerdictBand::Medium);
-        assert_eq!(p.calculate_band(50, false), VerdictBand::High);
-        assert_eq!(p.calculate_band(79, false), VerdictBand::High);
-        assert_eq!(p.calculate_band(80, false), VerdictBand::Block);
-        assert_eq!(p.calculate_band(100, false), VerdictBand::Block);
-        assert_eq!(p.calculate_band(5, true), VerdictBand::Block);
+        let from_low = |score| p.escalate_band(score, VerdictBand::Low);
+        assert_eq!(from_low(0), VerdictBand::Low);
+        assert_eq!(from_low(19), VerdictBand::Low);
+        assert_eq!(from_low(20), VerdictBand::Medium);
+        assert_eq!(from_low(49), VerdictBand::Medium);
+        assert_eq!(from_low(50), VerdictBand::High);
+        assert_eq!(from_low(79), VerdictBand::High);
+        assert_eq!(from_low(80), VerdictBand::Block);
+        assert_eq!(from_low(100), VerdictBand::Block);
+    }
+
+    #[test]
+    fn escalate_band_never_downgrades_a_band_a_finding_already_earned() {
+        let p = Policy::default();
+        // Score 50 alone means High, but a BLOCK finding outranks it.
+        assert_eq!(p.escalate_band(50, VerdictBand::Block), VerdictBand::Block);
+        // Score 0 must not walk a finding-earned band back down to Low.
+        assert_eq!(p.escalate_band(0, VerdictBand::Block), VerdictBand::Block);
+        assert_eq!(p.escalate_band(0, VerdictBand::High), VerdictBand::High);
+        assert_eq!(p.escalate_band(0, VerdictBand::Medium), VerdictBand::Medium);
+        // Score in the MEDIUM range must not demote an earned High.
+        assert_eq!(p.escalate_band(20, VerdictBand::High), VerdictBand::High);
+        // Escalation still applies on top of an earned band.
+        assert_eq!(p.escalate_band(80, VerdictBand::Medium), VerdictBand::Block);
     }
 
     #[test]

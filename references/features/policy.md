@@ -81,6 +81,10 @@ otherwise exact `==` (**case-sensitive**). No `?`, no `[...]`, no escaping.
 - **Malformed or unreadable always fails closed.** A `BLUELINE_POLICY` that is
   set but unreadable is `Err`, not a fallback to defaults
   (`blueline_policy_env_scopes_policy_loading_fail_closed`).
+- **`Policy::escalate_band` is the only score-to-band rule in the engine.** It
+  takes the band the findings already earned as `current` and escalates on
+  `thresholds` without ever downgrading it. Both scoring paths
+  (`evaluate_with_trust`, `apply_extra_findings`) route through it.
 - **`is_maintainer_blocked` is `#[allow(dead_code)]`** — exact trim+lowercase
   match, *not* glob. `blocklist.maintainers` has no production effect.
   `R10_MAINTAINER_TRANSITION` uses registry authorship, not this list.

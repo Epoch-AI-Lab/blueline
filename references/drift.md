@@ -24,7 +24,7 @@ Severity is this file's own judgement, not the project's.
 | 9 | `hex_to_bytes` uses `.unwrap_or(0)`, mapping invalid hex to byte `0` | Low — fails toward "valid-looking" |
 | 5 | `registry/mod.rs` doc comments are stale ("npm is the only full impl for now") | Low — four ecosystems are implemented |
 | 6 | Manager count is six in `CHANGELOG` 0.3.1, eleven in `ARCHITECTURE.md` §5; `--help` says eleven | Low — `--help` is authoritative |
-| 7 | Dead code: `Policy::calculate_band`, `Policy::is_maintainer_blocked`, `blocklist.maintainers`, `allowlist.packages[].max_risk` / `.integrity`, `BaselineStore::clear_advisory_cache`, `BaselineResolution::display_summary` | Low — `calculate_band` is the one the threshold test exercises |
+| 7 | Dead code: `Policy::is_maintainer_blocked`, `blocklist.maintainers`, `allowlist.packages[].max_risk` / `.integrity`, `BaselineStore::clear_advisory_cache`, `BaselineResolution::display_summary` | Low — all four functions are test-only |
 
 ## Lane verification basis
 
@@ -75,12 +75,21 @@ Each finding is cited in its lane file with the exact source location.
    eleven** (`npm npx pnpm yarn bun bunx pip pip3 cargo yay paru`) while the
    0.3.1 entry lists six. Both counts appear in the project's own docs; the
    `--help` text is authoritative and says eleven.
-7. **`Policy::calculate_band`, `Policy::is_maintainer_blocked`,
-   `blocklist.maintainers`, `allowlist.packages[].max_risk` and `.integrity`,
+7. **`Policy::is_maintainer_blocked`, `blocklist.maintainers`,
+   `allowlist.packages[].max_risk` and `.integrity`,
    `BaselineStore::clear_advisory_cache`, and
    `BaselineResolution::display_summary` are all dead.** Maintainer transitions
-   come from `registry.release_author()` diffing instead. See
-   [policy](features/policy.md) and [store](features/store.md).
+   come from `registry.release_author()` diffing instead. The first three are
+   the sharp end: they are `serde` fields a user can set in `blueline.toml` that
+   parse cleanly and change nothing, so a maintainer blocklist reads as active
+   protection and is not. See [policy](features/policy.md) and
+   [store](features/store.md).
+
+   `Policy::calculate_band` was originally listed here too. It was worse than
+   dead: a third copy of the score-to-band rule with *different* semantics, whose
+   tests were the only executable spec of the thresholds. Resolved — the weight
+   table is now `heuristic::score_findings` and the threshold pass is
+   `Policy::escalate_band`, each with one copy and its own tests.
 8. **The SSRF guard is fail-open on DNS resolution failure**, with port 443
    hard-coded regardless of the actual URL port — contradicting its own
    "prevent DNS rebinding" comment. See [registry](features/registry.md).
