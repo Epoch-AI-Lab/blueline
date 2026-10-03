@@ -173,6 +173,50 @@ impl Policy {
             )));
         }
 
+        self.reject_unimplemented_keys()?;
+
+        Ok(())
+    }
+
+    /// Refuse policy keys that parse but govern nothing.
+    ///
+    /// These are `serde` fields, so before this check they were accepted and
+    /// ignored: a user who blocklisted a maintainer or pinned a package's
+    /// integrity got a config that read as active protection and was not. In a
+    /// tool that fails closed, a silently-ignored security control is worse
+    /// than a rejected one, because the operator has no way to notice. Erroring
+    /// here is the only point where the key is still visible; once the field is
+    /// gone, serde would drop it without a word.
+    fn reject_unimplemented_keys(&self) -> Result<(), BluelineError> {
+        if !self.blocklist.maintainers.is_empty() {
+            return Err(BluelineError::Policy(
+                "blocklist.maintainers is not implemented and would otherwise be silently ignored. \
+                 Maintainer transitions are detected by R10_MAINTAINER_TRANSITION, which compares \
+                 registry authorship between the baseline and the target release. To stop trusting a \
+                 maintainer, blocklist the package instead."
+                    .into(),
+            ));
+        }
+
+        for (i, rule) in self.allowlist.packages.iter().enumerate() {
+            if rule.max_risk.is_some() {
+                return Err(BluelineError::Policy(format!(
+                    "allowlist.packages[{i}].max_risk (rule `{}`) is not implemented and would \
+                     otherwise be silently ignored. Risk bands come from the heuristic engine and \
+                     cannot be pinned per package. Remove the key.",
+                    rule.name
+                )));
+            }
+            if rule.integrity.is_some() {
+                return Err(BluelineError::Policy(format!(
+                    "allowlist.packages[{i}].integrity (rule `{}`) is not implemented and would \
+                     otherwise be silently ignored. Integrity is verified per release against the \
+                     registry's own dist.integrity and cannot be pinned per package. Remove the key.",
+                    rule.name
+                )));
+            }
+        }
+
         Ok(())
     }
 
@@ -204,16 +248,6 @@ impl Policy {
             rule.ecosystem.is_none_or(|rule_eco| rule_eco == ecosystem)
                 && glob_match(&rule.pattern, name)
         })
-    }
-
-    /// Check if a maintainer email is on the blocklist.
-    #[allow(dead_code)]
-    pub fn is_maintainer_blocked(&self, email: &str) -> bool {
-        let email_trimmed = email.trim().to_lowercase();
-        self.blocklist
-            .maintainers
-            .iter()
-            .any(|b| b.trim().to_lowercase() == email_trimmed)
     }
 
     /// Check if a lifecycle script is explicitly permitted for a package in
@@ -529,11 +563,9 @@ allow_git_dependencies = false
 [[allowlist.packages]]
 name = "esbuild"
 allowed_scripts = ["postinstall"]
-max_risk = "MEDIUM"
 
 [blocklist]
 packages = ["evil-*", "@badscope/*"]
-maintainers = ["badactor@example.com"]
 "#;
 
         let policy = Policy::from_toml_str(toml_content).unwrap();
@@ -553,9 +585,88 @@ maintainers = ["badactor@example.com"]
         );
         assert!(policy.is_package_blocked("@badscope/lib", Ecosystem::Npm));
         assert!(!policy.is_package_blocked("good-pkg", Ecosystem::Npm));
+    }
 
-        assert!(policy.is_maintainer_blocked("badactor@example.com"));
-        assert!(!policy.is_maintainer_blocked("gooddev@example.com"));
+    #[test]
+    fn accepts_an_empty_maintainers_blocklist() {
+        // Present but empty is not a claim about anything, so it still parses.
+        // Only a populated list is a security claim the tool cannot honor.
+        let policy = Policy::from_toml_str(
+            r#"
+[blocklist]
+maintainers = []
+"#,
+        )
+        .unwrap();
+        assert!(policy.blocklist.maintainers.is_empty());
+    }
+
+    #[test]
+    fn rejects_a_populated_maintainers_blocklist() {
+        let err = Policy::from_toml_str(
+            r#"
+[blocklist]
+maintainers = ["badactor@example.com"]
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("blocklist.maintainers"), "got: {err}");
+        assert!(
+            err.contains("R10_MAINTAINER_TRANSITION"),
+            "the error must name the mechanism that does govern maintainers, got: {err}"
+        );
+        assert!(
+            err.contains("blocklist the package instead"),
+            "the error must offer the route that works, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_an_allowlist_max_risk_pin() {
+        let err = Policy::from_toml_str(
+            r#"
+[[allowlist.packages]]
+name = "esbuild"
+max_risk = "MEDIUM"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("max_risk"), "got: {err}");
+        assert!(
+            err.contains("esbuild"),
+            "the error must name the rule, got: {err}"
+        );
+        assert!(
+            err.contains("heuristic engine"),
+            "the error must say why it cannot be pinned, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_an_allowlist_integrity_pin() {
+        let err = Policy::from_toml_str(
+            r#"
+[[allowlist.packages]]
+name = "esbuild"
+integrity = "sha512-deadbeef"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("integrity"), "got: {err}");
+        assert!(
+            err.contains("esbuild"),
+            "the error must name the rule, got: {err}"
+        );
+        assert!(
+            err.contains("dist.integrity"),
+            "the error must name the integrity check that does exist, got: {err}"
+        );
     }
 
     #[test]
