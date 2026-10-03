@@ -6,10 +6,10 @@
 # flags included. Do not "fix" a command here to make it faster or quieter:
 # if this script diverges from CI, the script is the bug.
 #
-#   ./scripts/verify.sh            fmt + clippy + test  (the Rust gate)
+#   ./scripts/verify.sh            fmt + clippy + test + references  (the gate)
 #   ./scripts/verify.sh --fast     same as above; accepted for symmetry
-#   ./scripts/verify.sh --mutants  the Rust gate, then mutation testing
-#   ./scripts/verify.sh --all      the Rust gate, mutants, + supply-chain audit
+#   ./scripts/verify.sh --mutants  the gate, then mutation testing
+#   ./scripts/verify.sh --all      the gate, mutants, + supply-chain audit
 #
 # Works from any cwd: the repo root is resolved from this script's location.
 
@@ -31,10 +31,10 @@ usage() {
     cat <<'EOF'
 usage: scripts/verify.sh [--fast] [--mutants] [--all]
 
-  (default)  fmt + clippy + test — the Rust gate CI enforces
+  (default)  fmt + clippy + test + references — the gate CI enforces
   --fast     same as default
-  --mutants  the Rust gate, then cargo-mutants over the security-critical engine
-  --all      the Rust gate, mutants, plus the cargo-deny supply-chain audit
+  --mutants  the gate, then cargo-mutants over the security-critical engine
+  --all      the gate, mutants, plus the cargo-deny supply-chain audit
 EOF
 }
 
@@ -91,7 +91,7 @@ stage_deny() {
     cargo deny check
 }
 
-stages="fmt, clippy, test"
+stages="fmt, clippy, test, references"
 [ "$RUN_MUTANTS" -eq 1 ] && stages="$stages, mutants"
 [ "$RUN_ALL" -eq 1 ] && stages="$stages, cargo-deny"
 
@@ -106,6 +106,11 @@ echo "stages:    $stages"
 stage "Format"    cargo fmt --all -- --check
 stage "Clippy"    cargo clippy --all-targets --locked -- -D warnings
 stage "Tests"     cargo test --all-targets --locked
+
+# The agent-facing map is prose, so no Rust gate can see it rot. This resolves
+# every citation in references/ against the tracked tree. Not part of "the Rust
+# gate" the comment above describes; it is a separate claim about the docs.
+stage "References" scripts/check-references.sh
 
 if [ "$RUN_ALL" -eq 1 ]; then
     stage "Supply-chain audit"   stage_deny

@@ -8,9 +8,10 @@ boundary. Protects the property that **the agent entry points ignore ambient
 ## Sub-features
 - `Policy` — nine tables, all `#[serde(default)]`.
 - `load_with_env` / `load_or_default` / `load_for_agent`.
-- `validate()` — six fail-closed checks.
+- `validate()` — the threshold, recursion, recall, and recall-bound checks, plus
+  `reject_unimplemented_keys`.
 - Matchers: `is_script_allowed`, `allows_unreviewed_baseline`,
-  `is_package_blocked`, `is_maintainer_blocked`, `glob_match`.
+  `is_package_blocked`, `glob_match`.
 - `parse_band_str` lives in `ci.rs`, not here.
 
 ## How to get to it (user POV)
@@ -81,9 +82,14 @@ otherwise exact `==` (**case-sensitive**). No `?`, no `[...]`, no escaping.
 - **Malformed or unreadable always fails closed.** A `BLUELINE_POLICY` that is
   set but unreadable is `Err`, not a fallback to defaults
   (`blueline_policy_env_scopes_policy_loading_fail_closed`).
-- **`is_maintainer_blocked` is `#[allow(dead_code)]`** — exact trim+lowercase
-  match, *not* glob. `blocklist.maintainers` has no production effect.
-  `R10_MAINTAINER_TRANSITION` uses registry authorship, not this list.
+- **`Policy::escalate_band` is the only score-to-band rule in the engine.** It
+  takes the band the findings already earned as `current` and escalates on
+  `thresholds` without ever downgrading it. Both scoring paths
+  (`evaluate_with_trust`, `apply_extra_findings`) route through it.
+- **`blocklist.maintainers` is refused at load when populated.** Setting it used
+  to be a silent no-op that read as active protection. `R10_MAINTAINER_TRANSITION`
+  compares registry authorship between baseline and target instead.
+  `Policy::is_maintainer_blocked` has been deleted; nothing can reach it.
 - **Allowlist `name` and `allowed_scripts` are exact string equality, no glob.**
   `"@scope/*"` grants nothing for `allows_unreviewed_baseline`.
 - **Absent `ecosystem` means "matches every ecosystem"** (`Option::is_none_or`).
@@ -96,8 +102,11 @@ otherwise exact `==` (**case-sensitive**). No `?`, no `[...]`, no escaping.
   per-crate rules.
 - **Two `require_provenance` fields exist** (`[policy]` and `[provenance]`) and
   are OR'd in `heuristic.rs`. Setting only one is ambiguous; set both.
-- **`allowed_builders`, `allowlist[].max_risk`, and `allowlist[].integrity` are
-  dead knobs.** `max_risk` is only ever constructed as `None` in tests.
+- **`provenance.allowed_builders` is a dead knob.** `max_risk` and
+  `allowlist.packages[].integrity` were dead too and are now **refused at load**
+  by `Policy::reject_unimplemented_keys`, with an error naming the rule and the
+  check that does apply. `blocklist.maintainers` is likewise refused when
+  non-empty, and an empty list still parses.
 - **`recursion.child_block_band` compares with `>=`**, so lowering it to
   `MEDIUM` rolls up medium children (`child_block_band_policy_lowering_rolls_up_medium_children`).
 - **`glob_match("**")` is `true`** (`contains("")`), and `a*b*c` degrades to an

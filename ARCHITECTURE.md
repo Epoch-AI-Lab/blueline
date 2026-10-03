@@ -206,7 +206,7 @@ Known bypasses stay documented in the README.
 | `advisories` | `block_on_malware`, `block_on_critical_cve`, cache TTLs |
 | `provenance` | `require_provenance`, `require_signatures`, builders/repos |
 | `allowlist.packages` | exact `name` (+optional `ecosystem`), `allowed_scripts`, `allow_unreviewed_baseline` |
-| `blocklist` | glob `packages` (+optional `ecosystem`), `maintainers` |
+| `blocklist` | glob `packages` (+optional `ecosystem`). `maintainers` parses but is refused when populated. |
 | `ci` | `fail_on`, `max_evaluations`, `include_dev` |
 | `recursion` | `max_depth` (3, cap 16), `max_child_reviews` (8, cap 256), `child_block_band` (HIGH) |
 | `recall` | `max_age_hours` (48), `block_on_stale` |

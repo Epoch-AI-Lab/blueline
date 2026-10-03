@@ -62,11 +62,11 @@ Audit `action` values actually written (free-form `&str`, not an enum):
 - **`clean` defaults to 0 and `record_verified` does not write the column.**
   Doc comment: "only a verdict may mark a version clean, so merely running a
   review never blesses a release." `records_verified_witness_as_unclean` pins it.
-- **`allow_git_dependencies`, `provenance.allowed_builders`,
-  `allowlist.packages[].max_risk`, and `allowlist.packages[].integrity` are
-  declared policy keys that nothing reads.** `blocklist.maintainers` is read only
-  by `is_maintainer_blocked`, which is itself `#[allow(dead_code)]` — so that
-  list is inert outside tests.
+- **`allow_git_dependencies` and `provenance.allowed_builders` are declared
+  policy keys that nothing reads.** `blocklist.maintainers`,
+  `allowlist.packages[].max_risk`, and `allowlist.packages[].integrity` used to
+  be silently inert too. `Policy::validate` now refuses all three, so setting
+  them is a load-time error naming the mechanism that does govern the concern.
 - **v1→v3 rebuilds `known_clean`, `advisory_cache`, and `provenance_cache` via
   `_new` copies** (PKs change to composites) and only `ALTER`s `audit_log`. The
   advisory expiry index is dropped with the old table and must be recreated
