@@ -22,7 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `Policy::escalate_band` never downgrades a band a finding already earned. The
   old `calculate_band` ignored the incoming band entirely and computed from
   score alone, which is why its tests could not express the rule production
-  actually follows.
+  actually follows. It is written as `current.max(from_score)` rather than a
+  chain of `current < Band` guards, because those guards generate `<` to `<=`
+  mutants that are unkillable by construction.
 
 ### Added
 

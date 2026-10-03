@@ -185,15 +185,16 @@ impl Policy {
     /// engine; `heuristic::evaluate_with_trust` and
     /// `heuristic::apply_extra_findings` both route through it.
     pub fn escalate_band(&self, score: u32, current: VerdictBand) -> VerdictBand {
-        if score >= self.thresholds.block_score {
+        let from_score = if score >= self.thresholds.block_score {
             VerdictBand::Block
-        } else if score > self.thresholds.max_medium_score && current < VerdictBand::High {
+        } else if score > self.thresholds.max_medium_score {
             VerdictBand::High
-        } else if score > self.thresholds.max_low_score && current < VerdictBand::Medium {
+        } else if score > self.thresholds.max_low_score {
             VerdictBand::Medium
         } else {
-            current
-        }
+            VerdictBand::Low
+        };
+        current.max(from_score)
     }
 
     /// Check if a package name matches any blocked package pattern for the
