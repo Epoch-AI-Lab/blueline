@@ -9,7 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- **The score-to-band rule has one implementation.** The weight table and the
+- **Policy keys that govern nothing are now refused at load.** `blocklist.maintainers`,
+  `allowlist.packages[].max_risk`, and `allowlist.packages[].integrity` were
+  `serde` fields that parsed cleanly and were then ignored. A user who
+  blocklisted a malicious maintainer, or pinned a package's integrity, got a
+  config that read as active protection and was not. In a fail-closed tool that
+  is fail-open, and it was silent. `Policy::reject_unimplemented_keys` now
+  returns an error naming the offending rule and the check that does apply, for
+  example pointing `maintainers` at `R10_MAINTAINER_TRANSITION` and
+  `integrity` at the registry's `dist.integrity` check.
+
+  **Breaking.** A config that sets any of the three now fails to load instead of
+  loading inert. An empty `maintainers = []` still parses, since it claims
+  nothing. There is no `deny_unknown_fields` anywhere, so deleting the struct
+  fields would have kept the behavior identical and the trap just as silent. The
+  fields stay precisely so the key is still visible at the point of refusal.
+
+- `Policy::is_maintainer_blocked` is deleted. With a populated list refused at
+  load, no accepted config can reach it.
+- The score-to-band rule has one implementation. The weight table and the
   threshold pass were copy-pasted between `heuristic::evaluate_with_trust` and
   `heuristic::apply_extra_findings`, with a third divergent copy of the
   threshold pass sitting dead in `policy.rs` as `Policy::calculate_band`. That
@@ -28,6 +46,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`scripts/check-references.sh` + a `Feature map citations` CI job.** The
+  feature map in `references/` is prose, so no Rust gate could see it rot. The
+  script resolves every source citation in `references/` against `git ls-files`
+  and fails when a cited path no longer exists, a cited line falls past the end
+  of its file, a lane file is unreachable from the index, or the index links a
+  lane file that is gone. It runs as a stage in `./scripts/verify.sh` and as its
+  own CI job. Globs (`src/registry/*.rs`) and brace forms
+  (`src/registry/{mod,http_util}.rs`) are accepted so prose citations are not
+  read as broken. Currently 36 path citations, 5 line citations, and 28 lane
+  files.
 - `heuristic.rs` gained its first direct tests for `apply_extra_findings`, which
   previously had none. They pin that it re-scores *all* findings rather than just
   the extras, the `R06_FIRST_SIGHTING` weight, the cap at 100, and the

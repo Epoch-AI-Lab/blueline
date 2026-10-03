@@ -29,6 +29,14 @@ env:
     src/error.rs
 
 jobs:
+  references:
+    name: Feature map citations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve every citation in references/
+        run: ./scripts/check-references.sh
+
   fmt:
     name: Formatting
     runs-on: ubuntu-latest

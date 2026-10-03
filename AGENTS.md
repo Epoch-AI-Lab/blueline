@@ -8,7 +8,7 @@ fail closed on any doubt.
 ## Commands (run from repo root)
 
 ```sh
-./scripts/verify.sh            # fmt + clippy + test — the Rust gate
+./scripts/verify.sh            # fmt + clippy + test + references — the gate
 ./scripts/verify.sh --mutants  # the gate, then mutation testing
 ./scripts/verify.sh --all      # the gate, plus mutation testing + cargo-deny
 ```
@@ -120,3 +120,9 @@ use is `{ path = "unwrap", allow-invalid = true }`.
 `references/README.md` maps each user-visible feature to the code that
 implements it and the tests that prove it. Read it before changing a
 feature's behaviour.
+
+`scripts/check-references.sh` resolves every source citation in `references/`
+against the tracked tree and fails if a cited path is gone, a cited line falls
+past the end of its file, or a lane file is unreachable from the index. It runs
+in `./scripts/verify.sh` and as its own CI job. If you rename or move a source
+file, run it rather than assuming the map still points at it.
