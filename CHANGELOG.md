@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Feature map** (`references/`) — materialized memory for agents. A scannable
+  index plus one file per lane, each with sub-features, user-POV invocation, the
+  CLI commands that drive it, and a Gotchas section. Replaces the need to read
+  the full source or the research docs to learn what a lane does.
+- **Attack-scenario harness** (`tests/support/`, `tests/scenarios.rs`) — 22
+  named scenarios that stand up a known-bad release over loopback and assert the
+  band or refusal: postinstall injection, tar absolute-path / parent-traversal /
+  symlink-escape / hardlink-escape entries, GNU longname and longlink and pax
+  absolute-path overrides, gzip bomb over the per-entry cap, entry-count over
+  the cap, sha512 integrity mismatch refused before any verdict, release
+  published without integrity, install-time dependency reach reviewed as a child
+  verdict, PKGBUILD curl-pipe-to-shell, recall backward-sequence replay refused
+  without writing, and the shim failing closed when its binary is missing.
+  `scenario_harness_never_opens_a_non_loopback_socket` keeps the suite hermetic
+  by test rather than by convention. Run one with
+  `scripts/scenarios/run.sh <name>`.
+- `scripts/verify.sh` — the single source of truth for "did I pass". Runs the
+  exact command lines `.github/workflows/ci.yml` runs, flags included. `--fast`
+  (default), `--mutants`, `--all`.
+- `clippy.toml` + `#![deny(clippy::unwrap_used)]` — the AGENTS.md rule against
+  `unwrap()` on untrusted input is now a compile error rather than a convention.
+  Tests are exempt via `allow-unwrap-in-tests`; the six invariant sites in
+  `src/diff.rs` carry a per-site `#[allow]` and a stated reason.
+- `references/drift.md` — twelve cited places where the shipped code and the
+  project's own docs disagree, four of them fail-open paths. Evidence, not fixes.
+
+### Changed
+
+- Mutation testing in CI derives its file list from
+  `git ls-files 'src/*.rs' 'src/registry/*.rs'` via one shared `env:` skip list,
+  replacing a 21-file list duplicated across two jobs. Coverage goes 21 → 32
+  files: `heuristic.rs` (the risk-band rule engine) and the registry adapters,
+  `diff.rs`, `advisory.rs`, `provenance.rs` and `verdict.rs` are now mutated too.
+- `AGENTS.md` no longer claims the three bare cargo commands are the CI gate —
+  they are not (`cargo fmt` without `--check` rewrites files instead of failing;
+  `cargo clippy` without `--locked` may lint a different dependency graph). It
+  now points at `scripts/verify.sh`, scopes the Rust-only rule so it no longer
+  contradicts the repo's own Node shims and Python benchmark harness, and notes
+  that the `rust-toolchain.toml` pin is inert without rustup.
+- `ARCHITECTURE.md` sections renumbered (they read 1, 2, 5, 3, 4), the stale
+  "design target, not shipped code" header replaced, and resolved open risks
+  marked as resolved.
+
+### Fixed
+
+- `references/` link integrity: `error.md` and `wheel_extract.md` existed but
+  were unreachable from the map index.
+
 ## [0.3.1] - 2026-09-21
 
 ### Added

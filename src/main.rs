@@ -1,4 +1,7 @@
 #![forbid(unsafe_code)]
+// Lint levels do not cross crate boundaries, so the binary root repeats the
+// lib's `unwrap_used` deny rather than inheriting it.
+#![deny(clippy::unwrap_used)]
 
 use blueline::{agent, ci, cli, mcp, recall, review, shim};
 

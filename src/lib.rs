@@ -1,4 +1,8 @@
 #![forbid(unsafe_code)]
+// Activated by `disallowed-methods` in clippy.toml. Tests are exempt via
+// `allow-unwrap-in-tests`; `expect_used` is deliberately not denied
+// crate-wide — see the comment in clippy.toml.
+#![deny(clippy::unwrap_used)]
 
 pub mod advisory;
 pub mod agent;
