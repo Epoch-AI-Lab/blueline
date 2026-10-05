@@ -174,7 +174,6 @@ fn find_matching(input: &str, start: usize, open: char, close: char) -> Option<u
     let mut in_double = false;
     let mut escaped = false;
     for (idx, ch) in input.char_indices().skip_while(|(i, _)| *i < start) {
-        let _ = idx;
         if escaped {
             escaped = false;
             continue;
@@ -3079,7 +3078,6 @@ mod tests {
     fn r20_fires_on_install_file_change() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("PKGBUILD"), "pkgver=1.0\n").unwrap();
-        let folded = parse_pkgbuild("pkgver=1.0\n").unwrap();
         let mut delta = empty_delta();
         delta.files_modified.push(crate::diff::FileChange {
             relative_path: "demopkg.install".to_string(),
@@ -3095,7 +3093,6 @@ mod tests {
                 .iter()
                 .any(|finding| finding.rule_id == "R20_INSTALL_HOOK_CHANGE")
         );
-        let _ = folded;
     }
 
     #[test]
