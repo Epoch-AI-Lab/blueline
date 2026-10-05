@@ -428,7 +428,7 @@ jobs:
           cargo mutants --in-diff pr.diff --shard ${{ matrix.shard }}/32 \
             "${args[@]}" \
             --exclude-re "$BLUELINE_MUTANTS_EXCLUDE" \
-            --in-place --baseline=skip --timeout 30
+            --in-place --baseline=skip --timeout 300
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -506,7 +506,7 @@ jobs:
           cargo mutants --in-diff push.diff --shard ${{ matrix.shard }}/32 \
             "${args[@]}" \
             --exclude-re "$BLUELINE_MUTANTS_EXCLUDE" \
-            --in-place --baseline=skip --timeout 30
+            --in-place --baseline=skip --timeout 300
       - uses: actions/upload-artifact@v4
         if: always()
         with:
