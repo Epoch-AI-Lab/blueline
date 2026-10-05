@@ -197,16 +197,14 @@ impl Policy {
     /// here is the only point where the key is still visible; once the field is
     /// gone, serde would drop it without a word.
     fn reject_unimplemented_keys(&self) -> Result<(), BluelineError> {
-        if !self.blocklist.maintainers.is_empty() {
-            return Err(BluelineError::Policy(
-                "blocklist.maintainers is not implemented and would otherwise be silently ignored. \
-                 Maintainer transitions are detected by R10_MAINTAINER_TRANSITION, which compares \
-                 registry authorship between the baseline and the target release. To stop trusting a \
-                 maintainer, blocklist the package instead."
-                    .into(),
-            ));
-        }
-
+        // `blocklist.maintainers` is deliberately absent from this check. It
+        // used to be refused here because nothing read it, which was true
+        // before `P04_MAINTAINER_BLOCKED` existed and is false now: AUR
+        // resolves a per-release commit author and the rule consumes it. Where
+        // a registry supplies no identity the rule cannot be applied, and that
+        // is reported per review as `P04_MAINTAINER_UNEVALUABLE` rather than
+        // turned into a load-time error, because the policy is loaded without
+        // ecosystem context and the answer differs per lane.
         for (i, rule) in self.allowlist.packages.iter().enumerate() {
             if rule.max_risk.is_some() {
                 return Err(BluelineError::Policy(format!(
@@ -635,25 +633,39 @@ maintainers = []
         assert!(policy.blocklist.maintainers.is_empty());
     }
 
+    /// A populated maintainer blocklist loads rather than being refused.
+    ///
+    /// This test used to assert the opposite, and the reason it changed is the
+    /// whole point: the key was refused because nothing read it, which was true
+    /// while `is_maintainer_blocked` had no caller and false once
+    /// `P04_MAINTAINER_BLOCKED` started calling it. AUR resolves a per-release
+    /// commit author and that identity reaches the rule, so refusing the key
+    /// would forbid a protection that works.
+    ///
+    /// The lane where it cannot work is not expressible here, because a policy
+    /// is loaded without ecosystem context. That case is reported per review as
+    /// `P04_MAINTAINER_UNEVALUABLE` in `heuristic.rs`.
     #[test]
-    fn rejects_a_populated_maintainers_blocklist() {
-        let err = Policy::from_toml_str(
+    fn accepts_a_populated_maintainers_blocklist() {
+        let policy = Policy::from_toml_str(
             r#"
 [blocklist]
 maintainers = ["badactor@example.com"]
 "#,
         )
-        .unwrap_err()
-        .to_string();
+        .expect(
+            "the key is enforced by P04 wherever the registry supplies an identity, so \
+             refusing it at load would forbid a protection that works",
+        );
 
-        assert!(err.contains("blocklist.maintainers"), "got: {err}");
-        assert!(
-            err.contains("R10_MAINTAINER_TRANSITION"),
-            "the error must name the mechanism that does govern maintainers, got: {err}"
+        assert_eq!(
+            policy.blocklist.maintainers,
+            vec!["badactor@example.com".to_string()],
+            "the list must survive the load intact or the rule has nothing to match"
         );
         assert!(
-            err.contains("blocklist the package instead"),
-            "the error must offer the route that works, got: {err}"
+            policy.is_maintainer_blocked("badactor@example.com"),
+            "a loaded entry must actually be matchable, or the key is decorative again"
         );
     }
 

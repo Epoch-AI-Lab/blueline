@@ -110,17 +110,47 @@ pub fn evaluate_with_trust(
     // existed and was never called, so `[blocklist] maintainers` parsed,
     // validated, and then did nothing: a policy that asserts a protection and
     // gets none, with no warning anywhere.
-    if let Some(author) = release_author
-        && policy.is_maintainer_blocked(author)
-    {
-        findings.push(Finding {
-            rule_id: "P04_MAINTAINER_BLOCKED".into(),
-            severity: VerdictBand::Block,
-            title: format!("Maintainer `{author}` is blocked by policy"),
-            description:
-                "The publishing identity of this release matches an active blocklist entry in blueline.toml."
-                    .into(),
-        });
+    //
+    // The key is honoured rather than refused at load, because it is enforced
+    // wherever the registry supplies an identity: AUR resolves a per-release
+    // commit author and that reaches this rule. `reject_unimplemented_keys`
+    // used to refuse the key on the grounds that nothing read it, which was
+    // true before P04 existed and is false now.
+    //
+    // Where no identity is available the blocklist cannot be applied, and that
+    // is the one case that must not pass as a clean review. npm's abbreviated
+    // packument publishes no `maintainers` member at all, so on that lane an
+    // operator's blocklist entry would silently protect nothing. Emitting
+    // nothing there is the fail-open this rule was written to stop, so the
+    // unevaluable case is a finding of its own.
+    if !policy.blocklist.maintainers.is_empty() {
+        match release_author {
+            Some(author) if policy.is_maintainer_blocked(author) => {
+                findings.push(Finding {
+                    rule_id: "P04_MAINTAINER_BLOCKED".into(),
+                    severity: VerdictBand::Block,
+                    title: format!("Maintainer `{author}` is blocked by policy"),
+                    description:
+                        "The publishing identity of this release matches an active blocklist entry in blueline.toml."
+                            .into(),
+                });
+            }
+            Some(_) => {}
+            None => {
+                findings.push(Finding {
+                    rule_id: "P04_MAINTAINER_UNEVALUABLE".into(),
+                    severity: VerdictBand::Block,
+                    title:
+                        "Maintainer blocklist could not be applied: this registry supplies no publishing identity"
+                            .into(),
+                    description:
+                        "blueline.toml sets [blocklist] maintainers, but this ecosystem exposes no per-release \
+                         publishing identity, so the list was not applied to this review. Treat the release as \
+                         unreviewed by that rule, or blocklist the package instead."
+                            .into(),
+                });
+            }
+        }
     }
 
     // Advisory Findings (Phase 2)
@@ -3994,12 +4024,10 @@ maintainers = ["  BadActor@Example.com "]
         );
     }
 
-    /// An unlisted identity, and an absent identity, must both stay clean. A
-    /// registry that exposes no authorship yields no `P04` at all, and nothing
-    /// discloses the absence — no finding, no card line, no warning — so it is a
-    /// silent no-signal, not a finding and not a block.
+    /// An unlisted identity stays clean: the blocklist was applied, the release
+    /// simply is not on it.
     #[test]
-    fn unlisted_or_absent_author_is_not_a_finding() {
+    fn an_unlisted_author_is_not_a_finding() {
         let policy = Policy::from_toml_str(
             r#"
 [blocklist]
@@ -4024,31 +4052,233 @@ maintainers = ["badactor@example.com"]
             modified_dependencies: vec![],
             binding_gyp_added: false,
         };
-        for author in [None, Some("gooddev@example.com")] {
-            let verdict = evaluate_with_trust(
-                "pkg",
-                Ecosystem::Npm,
-                "verified (sha512)",
-                &delta,
-                false,
-                false,
-                None,
-                false,
-                None,
-                false,
-                author,
-                &policy,
-                None,
-                None,
-            );
-            assert!(
-                !verdict
-                    .findings
-                    .iter()
-                    .any(|f| f.rule_id == "P04_MAINTAINER_BLOCKED"),
-                "author {author:?} must not produce P04"
-            );
-        }
+        let verdict = evaluate_with_trust(
+            "pkg",
+            Ecosystem::Npm,
+            "verified (sha512)",
+            &delta,
+            false,
+            false,
+            None,
+            false,
+            None,
+            false,
+            Some("gooddev@example.com"),
+            &policy,
+            None,
+            None,
+        );
+        assert!(
+            !verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "P04_MAINTAINER_BLOCKED"),
+            "an identity that is not on the list must not block"
+        );
+        assert!(
+            !verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "P04_MAINTAINER_UNEVALUABLE"),
+            "the list was applied here, so there is nothing to disclose"
+        );
+    }
+
+    /// The case this rule was wrong about, pinned so it cannot go back.
+    ///
+    /// This test used to assert that an absent identity produces no `P04` at
+    /// all, on the reasoning that "no signal" is not "a finding". That is true
+    /// of `author_changed`, which feeds `R10_MAINTAINER_TRANSITION` and compares
+    /// one identity against another. It is not true of a blocklist: an operator
+    /// who wrote `maintainers = ["badactor@example.com"]` asked for a check, and
+    /// on a lane that supplies no identity the check cannot run. Reporting
+    /// nothing there means the card reads clean while the protection the
+    /// operator configured protected nothing, which is the silent no-signal this
+    /// whole rule exists to remove.
+    ///
+    /// npm is that lane. The abbreviated packument publishes no `maintainers`
+    /// member, and `Registry::release_author` returns `None` for it.
+    #[test]
+    fn an_absent_identity_under_a_maintainer_blocklist_is_disclosed() {
+        let policy = Policy::from_toml_str(
+            r#"
+[blocklist]
+maintainers = ["badactor@example.com"]
+"#,
+        )
+        .unwrap();
+        let delta = Delta {
+            baseline_version: Some("1.0.0".into()),
+            target_version: "1.0.1".into(),
+            files_added: vec![],
+            files_removed: vec![],
+            files_modified: vec![],
+            total_lines_added: 0,
+            total_lines_deleted: 0,
+            new_executables: vec![],
+            new_binaries: vec![],
+            modified_binaries: vec![],
+            new_lifecycle_scripts: vec![],
+            modified_lifecycle_scripts: vec![],
+            new_dependencies: vec![],
+            modified_dependencies: vec![],
+            binding_gyp_added: false,
+        };
+        let verdict = evaluate_with_trust(
+            "pkg",
+            Ecosystem::Npm,
+            "verified (sha512)",
+            &delta,
+            false,
+            false,
+            None,
+            false,
+            None,
+            false,
+            None,
+            &policy,
+            None,
+            None,
+        );
+        let finding = verdict
+            .findings
+            .iter()
+            .find(|f| f.rule_id == "P04_MAINTAINER_UNEVALUABLE")
+            .unwrap_or_else(|| {
+                panic!(
+                    "a blocklist that could not be applied must be disclosed, got: {:?}",
+                    verdict.findings
+                )
+            });
+        assert_eq!(
+            finding.severity,
+            VerdictBand::Block,
+            "an unevaluable security control must not pass as a clean review"
+        );
+        assert!(
+            finding.description.contains("not applied"),
+            "the finding must say the list was not applied, not merely that a \
+             maintainer matched: {finding:?}"
+        );
+    }
+
+    /// The lane the key exists for: AUR, where the identity is real.
+    ///
+    /// `AurRegistry::release_author` returns the pinned commit author email, and
+    /// `review.rs` passes it straight into this rule, so a populated blocklist
+    /// blocks here. This is why the key is not refused at load, and the test is
+    /// stated on the AUR ecosystem rather than npm so that reading the rule does
+    /// not depend on which lane a reader assumes.
+    #[test]
+    fn a_blocklisted_aur_commit_author_blocks() {
+        let policy = Policy::from_toml_str(
+            r#"
+[blocklist]
+maintainers = ["badactor@example.com"]
+"#,
+        )
+        .unwrap();
+        let delta = Delta {
+            baseline_version: Some("1.0.0-1".into()),
+            target_version: "1.2.0-1".into(),
+            files_added: vec![],
+            files_removed: vec![],
+            files_modified: vec![],
+            total_lines_added: 0,
+            total_lines_deleted: 0,
+            new_executables: vec![],
+            new_binaries: vec![],
+            modified_binaries: vec![],
+            new_lifecycle_scripts: vec![],
+            modified_lifecycle_scripts: vec![],
+            new_dependencies: vec![],
+            modified_dependencies: vec![],
+            binding_gyp_added: false,
+        };
+        let verdict = evaluate_with_trust(
+            "yay",
+            Ecosystem::Aur,
+            "verified (sha512)",
+            &delta,
+            false,
+            false,
+            None,
+            false,
+            None,
+            false,
+            Some("badactor@example.com"),
+            &policy,
+            None,
+            None,
+        );
+        assert_eq!(verdict.band, VerdictBand::Block);
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "P04_MAINTAINER_BLOCKED"),
+            "an AUR commit author on the blocklist must block, got {:?}",
+            verdict
+                .findings
+                .iter()
+                .map(|f| &f.rule_id)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "P04_MAINTAINER_UNEVALUABLE"),
+            "the identity was available, so there is nothing to disclose"
+        );
+    }
+
+    /// An empty blocklist must not manufacture a disclosure. Nothing was
+    /// configured, so nothing was withheld, and emitting a finding here would
+    /// block every npm review for every user who never asked for the check.
+    #[test]
+    fn an_empty_maintainer_blocklist_discloses_nothing() {
+        let delta = Delta {
+            baseline_version: Some("1.0.0".into()),
+            target_version: "1.0.1".into(),
+            files_added: vec![],
+            files_removed: vec![],
+            files_modified: vec![],
+            total_lines_added: 0,
+            total_lines_deleted: 0,
+            new_executables: vec![],
+            new_binaries: vec![],
+            modified_binaries: vec![],
+            new_lifecycle_scripts: vec![],
+            modified_lifecycle_scripts: vec![],
+            new_dependencies: vec![],
+            modified_dependencies: vec![],
+            binding_gyp_added: false,
+        };
+        let verdict = evaluate_with_trust(
+            "pkg",
+            Ecosystem::Npm,
+            "verified (sha512)",
+            &delta,
+            false,
+            false,
+            None,
+            false,
+            None,
+            false,
+            None,
+            &Policy::default(),
+            None,
+            None,
+        );
+        assert!(
+            !verdict
+                .findings
+                .iter()
+                .any(|f| f.rule_id.starts_with("P04_")),
+            "no blocklist configured means no disclosure, got: {:?}",
+            verdict.findings
+        );
     }
 
     fn opaque_large_file(name: &str) -> FileChange {

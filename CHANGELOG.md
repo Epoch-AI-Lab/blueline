@@ -85,6 +85,28 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
 
 ### Fixed
 
+- **A maintainer blocklist that cannot be applied is now disclosed instead of
+  silently passing.** `P04_MAINTAINER_BLOCKED` blocked a release whose publishing
+  identity was on `[blocklist] maintainers`, but the rule had one exit: a
+  registry that exposes no per-release authorship made it emit nothing at all.
+  That is the right reading for `author_changed`, which compares one identity
+  against another and has nothing to say when neither exists. It is the wrong
+  reading for a blocklist. An operator who wrote `maintainers = [...]` asked for
+  a check, and on a lane that supplies no identity the check cannot run, so a
+  clean card was reporting a protection that protected nothing.
+
+  npm is that lane: the abbreviated packument publishes no `maintainers` member
+  at all, so `Registry::release_author` returns `None`. Such a review now carries
+  `P04_MAINTAINER_UNEVALUABLE` at `BLOCK`, saying the list was not applied and
+  naming the package blocklist as the route that works. An empty
+  `maintainers = []` discloses nothing, since nothing was configured.
+
+  This is a deliberate reversal of refusing the key at load, which the 0.4.0 entry
+  below describes. That refusal was correct while nothing read the key and wrong
+  once the rule existed, and a load-time refusal cannot be ecosystem-scoped
+  because the policy is loaded without ecosystem context. Per-review disclosure
+  can be, and is.
+
 - **`"link": true` in an npm lockfile can no longer hide a version or an
   integrity swap.** The skip added for workspace links keyed on the `link` field
   alone, so any entry could add it and leave the graph carrying nothing: the
@@ -1184,24 +1206,31 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
 
 ### Changed
 
-- **Policy keys that govern nothing are now refused at load.** `blocklist.maintainers`,
-  `allowlist.packages[].max_risk`, and `allowlist.packages[].integrity` were
-  `serde` fields that parsed cleanly and were then ignored. A user who
-  blocklisted a malicious maintainer, or pinned a package's integrity, got a
-  config that read as active protection and was not. In a fail-closed tool that
-  is fail-open, and it was silent. `Policy::reject_unimplemented_keys` now
-  returns an error naming the offending rule and the check that does apply, for
-  example pointing `maintainers` at `R10_MAINTAINER_TRANSITION` and
-  `integrity` at the registry's `dist.integrity` check.
+- **Policy keys that govern nothing are now refused at load.**
+  `allowlist.packages[].max_risk` and `allowlist.packages[].integrity` were
+  `serde` fields that parsed cleanly and were then ignored. A user who pinned a
+  package's integrity got a config that read as active protection and was not. In
+  a fail-closed tool that is fail-open, and it was silent.
+  `Policy::reject_unimplemented_keys` now returns an error naming the offending
+  rule and the check that does apply, pointing `integrity` at the registry's
+  `dist.integrity` check.
 
-  **Breaking.** A config that sets any of the three now fails to load instead of
-  loading inert. An empty `maintainers = []` still parses, since it claims
-  nothing. There is no `deny_unknown_fields` anywhere, so deleting the struct
-  fields would have kept the behavior identical and the trap just as silent. The
-  fields stay precisely so the key is still visible at the point of refusal.
+  **Breaking.** A config that sets either key now fails to load instead of
+  loading inert. There is no `deny_unknown_fields` anywhere, so deleting the
+  struct fields would have kept the behavior identical and the trap just as
+  silent. The fields stay precisely so the key is still visible at the point of
+  refusal.
 
-- `Policy::is_maintainer_blocked` is deleted. With a populated list refused at
-  load, no accepted config can reach it.
+  `blocklist.maintainers` was on that list and is no longer. It was refused
+  because nothing read it, which was true while `is_maintainer_blocked` had no
+  caller and false once `P04_MAINTAINER_BLOCKED` began calling it. AUR resolves a
+  per-release commit author and that identity reaches the rule, so refusing the
+  key would have forbidden a protection that works. `Policy::is_maintainer_blocked`
+  is therefore not deleted.
+
+  A policy is loaded without ecosystem context, so which lanes can apply the key
+  is not knowable at load time. The lane that cannot is disclosed per review
+  instead: see `P04_MAINTAINER_UNEVALUABLE` below.
 - The score-to-band rule has one implementation. The weight table and the
   threshold pass were copy-pasted between `heuristic::evaluate_with_trust` and
   `heuristic::apply_extra_findings`, with a third divergent copy of the
