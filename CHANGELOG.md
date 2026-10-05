@@ -85,6 +85,67 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
 
 ### Fixed
 
+- **`"link": true` in an npm lockfile can no longer hide a version or an
+  integrity swap.** The skip added for workspace links keyed on the `link` field
+  alone, so any entry could add it and leave the graph carrying nothing: the
+  delta put the base entry in `removed`, and `ci` evaluates only `added` chained
+  with `upgraded`. A reviewer repro at this head, base `lodash@4.17.20` against a
+  head entry of `{"resolved": "packages/x", "link": true, "version": "4.17.21",
+  "integrity": "sha512-bbbb"}`, produced `added=0 upgraded=0 removed=1` and
+  `passed: true`. Adding one field to a lockfile was the whole attack.
+
+  npm writes a link as `{"resolved": "packages/x", "link": true}` with neither a
+  version nor an integrity (verified against npm for both a workspace member and
+  a `file:` dependency), so a link that declares either has no honest reading and
+  is refused with the path named. The existing test only pinned that a link
+  leaves the graph; `a_link_entry_carrying_a_version_or_an_integrity_is_refused`
+  and `a_link_smuggled_version_swap_cannot_reach_the_delta_as_a_removal` pin the
+  refusal and the delta shape.
+
+- **An npm lockfile entry whose path names no package is refused rather than
+  dropped.** `if name.is_empty() { continue; }` was the same hole one branch
+  further down: `{"packages": {"node_modules/": {"version": "1.0.0"}}}` yields an
+  empty name from `extract_package_name_from_path`, the entry left the graph, and
+  the delta reported nothing where the entry used to be.
+
+- **A PyPI artifact's identity can no longer be synthesized on a failed
+  metadata read.** `e38d917` added the archive-identity guard and read the
+  declared `Name:`, but left both fallback paths alone: when no metadata was
+  found, or when it could not be read, the manifest was built with
+  `name: declared_name.unwrap_or_else(|| canonical_name)` and
+  `version: version.to_string()`, so the guard compared each against itself and
+  could not fire. Four probes against `prepare_extracted_root(dir, PyPi,
+  "good-lib", "1.0.0")` all returned `Ok` with zero dependencies, which is the
+  state `R04` cannot fire on:
+
+  | probe | before |
+  |---|---|
+  | wheel holding only `evil_pkg/__init__.py` | `Ok(("good-lib", 0))` |
+  | `Name: evil` then a `0xff` byte | `Ok(("good-lib", 0))` |
+  | `evil-1.0.0.dist-info` plus a decoy `aaa_good_lib-1.0.0.dist-info` | `Ok(("good-lib"))` |
+  | `Version: 9.9.9` against a review of `1.0.0` | `Ok(("good-lib", "1.0.0"))` |
+
+  The third was reachable because `find_pypi_metadata` sorted its candidates and
+  returned the first, so an archive could ship a decoy that sorts ahead of the
+  metadata pip actually installs.
+
+  Missing, unreadable, ambiguous or contradicting metadata is now a refusal
+  naming the path and, for the ambiguous case, each candidate so the operator can
+  see which one pip would install. The declared `Version:` is bound to the
+  resolved version under PEP 440 equality, which is what keeps `1.0`, `1.0.0`
+  and `1.0.0.0` reviewable while refusing `9.9.9`.
+
+  Four tests, each failing against the old arm:
+  `a_pypi_archive_whose_metadata_cannot_be_read_is_refused`,
+  `a_pypi_archive_with_two_metadata_files_is_refused`,
+  `a_pypi_archive_contradicting_the_resolved_version_is_refused`, and
+  `an_equivalent_pypi_version_is_still_accepted`.
+
+  **Behaviour change:** a PyPI review now fails where it previously returned a
+  confident verdict: an artifact with no readable core metadata, one carrying
+  more than one, and one whose declared version is not the version resolved. That
+  is the fail-closed reading, and a mirror that ships unusual layouts will see it.
+
 - **A PyPI simple index that names a different project is now refused.**
   `resolve_package` adopted the `name` field out of the `/simple/{name}/`
   response body as the reviewed package's name without ever comparing it to the

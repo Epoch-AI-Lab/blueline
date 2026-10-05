@@ -110,11 +110,26 @@ pub fn parse_lockfile_packages(
                 continue;
             }
 
-            // A workspace link (`link: true`) points at a directory in the
-            // repo rather than an installed artifact, so npm writes it with no
-            // `version` and no `integrity`. It is not a package to review and
-            // is skipped, as the empty-string root entry above is.
+            // A workspace link (`link: true`) points at a directory in the repo
+            // rather than an installed artifact, so npm writes it with no
+            // `version` and no `integrity`, and it is skipped, as the
+            // empty-string root entry above is.
+            //
+            // The skip is narrow on purpose. Keying it on `link` alone meant any
+            // entry could add `"link": true` and leave the graph carrying
+            // nothing at all: the delta put the entry in `removed`, which
+            // `ci` never evaluates, so a version or an integrity swap became
+            // silence while `passed` stayed true. npm does not write a link
+            // entry that also declares a version or an integrity, so that shape
+            // is a hand edit and there is no honest reading of it.
             if pkg.link.unwrap_or(false) {
+                if pkg.version.is_some() || pkg.integrity.is_some() {
+                    return Err(LockfileError::InvalidData(format!(
+                        "`{path}` is a link but declares a version or an integrity; \
+                         npm writes a link as `{{\"resolved\": ..., \"link\": true}}` \
+                         with neither, refusing to review an entry that cannot be read"
+                    )));
+                }
                 continue;
             }
 
@@ -139,8 +154,16 @@ pub fn parse_lockfile_packages(
                 None => key_name.clone(),
             };
 
+            // A path that yields no name is not a package with an empty name.
+            // Skipping it dropped the entry from the graph, so a lockfile whose
+            // entry was rewritten into a shape this parser cannot name still
+            // compared as fully reviewed. Refuse, naming the path, for the same
+            // reason the versionless entry above is refused.
             if name.is_empty() {
-                continue;
+                return Err(LockfileError::InvalidData(format!(
+                    "`{path}` yields no package name; refusing to review a lockfile \
+                     with an entry that cannot be read"
+                )));
             }
 
             // Under node_modules, a declared name that differs from the
@@ -812,6 +835,145 @@ mod tests {
             pkgs.keys().cloned().collect::<Vec<_>>(),
             vec!["node_modules/lodash".to_string()],
             "only the real installed package belongs in the graph: {pkgs:?}"
+        );
+    }
+
+    /// `a_workspace_link_is_skipped_while_an_unreadable_entry_is_refused` above
+    /// only pins that a link entry leaves the graph. It never covers a link entry
+    /// that *also* declares a version and an integrity, and the skip keyed on
+    /// `link` alone accepted one. The entry then left the graph entirely, so the
+    /// delta put the base entry in `removed`, and `ci` evaluates only `added`
+    /// chained with `upgraded`: a version or an integrity swap became silence
+    /// while `passed` stayed true. Adding `"link": true` to any entry was the
+    /// whole attack.
+    ///
+    /// npm writes a link as `{"resolved": "packages/x", "link": true}` and never
+    /// gives one a version or an integrity, so this shape is refused rather than
+    /// guessed at.
+    #[test]
+    fn a_link_entry_carrying_a_version_or_an_integrity_is_refused() {
+        let head = r#"{
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "app", "version": "1.0.0" },
+                "node_modules/lodash": {
+                    "resolved": "packages/x",
+                    "link": true,
+                    "version": "4.17.21",
+                    "integrity": "sha512-bbbb"
+                }
+            }
+        }"#;
+
+        let err = parse_lockfile_packages(head).expect_err(
+            "a link carrying a version and an integrity must be refused: skipping it \
+             hides the change in the `removed` bucket, which ci never evaluates",
+        );
+        assert!(
+            matches!(err, LockfileError::InvalidData(_)),
+            "refuse with InvalidData, got: {err:?}"
+        );
+        assert!(
+            format!("{err}").contains("node_modules/lodash"),
+            "the refusal must name the entry it refused: {err}"
+        );
+
+        // A link carrying only a version is refused the same way, and so is one
+        // carrying only an integrity. Keying the skip on the presence of either
+        // field is what makes it narrow.
+        for extra in [r#""version": "4.17.21""#, r#""integrity": "sha512-bbbb""#] {
+            let json = format!(
+                r#"{{
+                    "name": "app",
+                    "lockfileVersion": 3,
+                    "packages": {{
+                        "": {{ "name": "app", "version": "1.0.0" }},
+                        "node_modules/lodash": {{ "resolved": "packages/x", "link": true, {extra} }}
+                    }}
+                }}"#
+            );
+            parse_lockfile_packages(&json).unwrap_err();
+        }
+    }
+
+    /// The delta shape the fix exists for, stated as one test. A version and an
+    /// integrity swap smuggled behind `"link": true` used to read as
+    /// `added=0 upgraded=0 removed=1`, which `ci` evaluates as nothing at all.
+    /// The refusal is what stops it, and this pins that it stops it at the delta
+    /// rather than at one parser call.
+    #[test]
+    fn a_link_smuggled_version_swap_cannot_reach_the_delta_as_a_removal() {
+        let base = r#"{
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "app", "version": "1.0.0" },
+                "node_modules/lodash": {
+                    "version": "4.17.20",
+                    "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.20.tgz",
+                    "integrity": "sha512-aaaa"
+                }
+            }
+        }"#;
+        let head = r#"{
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "app", "version": "1.0.0" },
+                "node_modules/lodash": {
+                    "resolved": "packages/x",
+                    "link": true,
+                    "version": "4.17.21",
+                    "integrity": "sha512-bbbb"
+                }
+            }
+        }"#;
+
+        let err = compute_lockfile_delta(base, head).expect_err(
+            "the delta must not compute at all: a swap hidden as a link reaches ci as \
+             an unevaluated `removed` entry",
+        );
+        assert!(
+            format!("{err}").contains("node_modules/lodash"),
+            "the refusal must name the entry it refused: {err}"
+        );
+    }
+
+    /// The same shape as the link skip, one branch further down: `node_modules/`
+    /// yields no package name, and `if name.is_empty() { continue; }` dropped the
+    /// entry from the graph, so the delta reported nothing where the entry used
+    /// to be. Skipping it made the lockfile read as fully reviewed.
+    #[test]
+    fn an_entry_with_no_readable_name_is_refused() {
+        let base = r#"{
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "app", "version": "1.0.0" },
+                "node_modules/lodash": {
+                    "version": "4.17.20",
+                    "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.20.tgz",
+                    "integrity": "sha512-aaaa"
+                }
+            }
+        }"#;
+        let head = r#"{
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "app", "version": "1.0.0" },
+                "node_modules/": { "version": "1.0.0" }
+            }
+        }"#;
+
+        let err = compute_lockfile_delta(base, head).expect_err(
+            "an entry whose path names no package must be refused, not dropped: dropping \
+             it is what made the delta report nothing",
+        );
+        assert!(
+            format!("{err}").contains("node_modules/"),
+            "the refusal must name the entry it refused: {err}"
         );
     }
 

