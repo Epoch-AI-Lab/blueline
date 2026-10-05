@@ -78,6 +78,9 @@ pub fn compute_delta(
             match (base_iter.peek(), target_iter.peek()) {
                 (Some(&(b_path, _)), Some(&(t_path, _))) => match b_path.cmp(t_path) {
                     std::cmp::Ordering::Less => {
+                        // peek() returned Some above and nothing advanced this
+                        // iterator since; None here is a logic bug, not input.
+                        #[allow(clippy::unwrap_used)]
                         let (rel_path, base_meta) = base_iter.next().unwrap();
                         let base_full = base_base.join(rel_path);
                         let change = diff_single_file(Some(&base_full), None, rel_path, base_meta)?;
@@ -85,6 +88,9 @@ pub fn compute_delta(
                         files_removed.push(change);
                     }
                     std::cmp::Ordering::Greater => {
+                        // peek() returned Some above and nothing advanced this
+                        // iterator since; None here is a logic bug, not input.
+                        #[allow(clippy::unwrap_used)]
                         let (rel_path, target_meta) = target_iter.next().unwrap();
                         let target_full = target_base.join(rel_path);
                         let change =
@@ -103,7 +109,11 @@ pub fn compute_delta(
                         files_added.push(change);
                     }
                     std::cmp::Ordering::Equal => {
+                        // Both iterators peeked Some above and neither has been
+                        // advanced since; None here is a logic bug, not input.
+                        #[allow(clippy::unwrap_used)]
                         let (rel_path, base_meta) = base_iter.next().unwrap();
+                        #[allow(clippy::unwrap_used)]
                         let (_, target_meta) = target_iter.next().unwrap();
 
                         if base_meta.hash != target_meta.hash {
@@ -137,6 +147,9 @@ pub fn compute_delta(
                     }
                 },
                 (Some(_), None) => {
+                    // peek() returned Some above and nothing advanced this
+                    // iterator since; None here is a logic bug, not input.
+                    #[allow(clippy::unwrap_used)]
                     let (rel_path, base_meta) = base_iter.next().unwrap();
                     let base_full = base_base.join(rel_path);
                     let change = diff_single_file(Some(&base_full), None, rel_path, base_meta)?;
@@ -144,6 +157,9 @@ pub fn compute_delta(
                     files_removed.push(change);
                 }
                 (None, Some(_)) => {
+                    // peek() returned Some above and nothing advanced this
+                    // iterator since; None here is a logic bug, not input.
+                    #[allow(clippy::unwrap_used)]
                     let (rel_path, target_meta) = target_iter.next().unwrap();
                     let target_full = target_base.join(rel_path);
                     let change = diff_single_file(None, Some(&target_full), rel_path, target_meta)?;

@@ -1,0 +1,32 @@
+# Clippy restriction-lint configuration. Mirrors the guardrails in AGENTS.md.
+
+# `disallowed-methods` is the switch that activates `clippy::unwrap_used`,
+# denied crate-wide in `src/lib.rs` and `src/main.rs`.
+#
+# Form matters, and all three of these were measured against clippy 1.97/1.98:
+#
+#   ["unwrap"]                          parses; lints. But warns
+#                                      "`unwrap` does not refer to a reachable
+#                                      function" on every run — `unwrap` is a
+#                                      method name, not a function path.
+#   [{ path = "unwrap", msg = "..." }]  HARD FAIL: "error reading Clippy's
+#                                      configuration file: data did not match
+#                                      any variant of untagged enum
+#                                      DisallowedPathEnum". The `msg` key is
+#                                      what breaks it, not the table form.
+#   [{ path = "unwrap", allow-invalid = true }]   <- this file. Parses, lints,
+#                                      no warning. `allow-invalid` is the
+#                                      supported way to name a method.
+#
+# `expect` is deliberately absent. `allow-unwrap-in-tests` below exempts
+# `unwrap()` inside `#[test]` fns but does NOT exempt `expect_used`, so
+# denying `expect_used` crate-wide fires on ~15 pre-existing
+# `expect()`/`expect_err()` calls in `#[cfg(test)]` modules (agent, recall,
+# recursive, review, shim). If `expect_used` is ever wanted, add
+# `#[allow(clippy::expect_used)]` per `#[cfg(test)]` module — never a
+# crate-level deny.
+disallowed-methods = [{ path = "unwrap", allow-invalid = true }]
+
+# `unwrap()` inside a `#[test]` fn is test scaffolding, not a production
+# panic path on untrusted input.
+allow-unwrap-in-tests = true

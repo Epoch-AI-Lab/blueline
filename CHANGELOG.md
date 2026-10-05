@@ -1182,6 +1182,107 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
   preserves the source build for unreleased code, and this repo's dogfood
   job pins it.
 
+### Changed
+
+- **Policy keys that govern nothing are now refused at load.** `blocklist.maintainers`,
+  `allowlist.packages[].max_risk`, and `allowlist.packages[].integrity` were
+  `serde` fields that parsed cleanly and were then ignored. A user who
+  blocklisted a malicious maintainer, or pinned a package's integrity, got a
+  config that read as active protection and was not. In a fail-closed tool that
+  is fail-open, and it was silent. `Policy::reject_unimplemented_keys` now
+  returns an error naming the offending rule and the check that does apply, for
+  example pointing `maintainers` at `R10_MAINTAINER_TRANSITION` and
+  `integrity` at the registry's `dist.integrity` check.
+
+  **Breaking.** A config that sets any of the three now fails to load instead of
+  loading inert. An empty `maintainers = []` still parses, since it claims
+  nothing. There is no `deny_unknown_fields` anywhere, so deleting the struct
+  fields would have kept the behavior identical and the trap just as silent. The
+  fields stay precisely so the key is still visible at the point of refusal.
+
+- `Policy::is_maintainer_blocked` is deleted. With a populated list refused at
+  load, no accepted config can reach it.
+- The score-to-band rule has one implementation. The weight table and the
+  threshold pass were copy-pasted between `heuristic::evaluate_with_trust` and
+  `heuristic::apply_extra_findings`, with a third divergent copy of the
+  threshold pass sitting dead in `policy.rs` as `Policy::calculate_band`. That
+  dead copy was the function the threshold test exercised, so editing a
+  threshold failed that test while live behavior stayed governed by the other
+  two copies. The table is now `heuristic::score_findings` and the threshold
+  pass is `Policy::escalate_band`, each with one copy and its own tests.
+  Behavior is unchanged; 576 lib tests and the 22 attack scenarios pass before
+  and after.
+- `Policy::escalate_band` never downgrades a band a finding already earned. The
+  old `calculate_band` ignored the incoming band entirely and computed from
+  score alone, which is why its tests could not express the rule production
+  actually follows. It is written as `current.max(from_score)` rather than a
+  chain of `current < Band` guards, because those guards generate `<` to `<=`
+  mutants that are unkillable by construction.
+
+### Added
+
+- **`scripts/check-references.sh` + a `Feature map citations` CI job.** The
+  feature map in `references/` is prose, so no Rust gate could see it rot. The
+  script resolves every source citation in `references/` against `git ls-files`
+  and fails when a cited path no longer exists, a cited line falls past the end
+  of its file, a lane file is unreachable from the index, or the index links a
+  lane file that is gone. It runs as a stage in `./scripts/verify.sh` and as its
+  own CI job. Globs (`src/registry/*.rs`) and brace forms
+  (`src/registry/{mod,http_util}.rs`) are accepted so prose citations are not
+  read as broken. Currently 36 path citations, 5 line citations, and 28 lane
+  files.
+- `heuristic.rs` gained its first direct tests for `apply_extra_findings`, which
+  previously had none. They pin that it re-scores *all* findings rather than just
+  the extras, the `R06_FIRST_SIGHTING` weight, the cap at 100, and the
+  no-downgrade guard.
+- **Feature map** (`references/`) — materialized memory for agents. A scannable
+  index plus one file per lane, each with sub-features, user-POV invocation, the
+  CLI commands that drive it, and a Gotchas section. Replaces the need to read
+  the full source or the research docs to learn what a lane does.
+- **Attack-scenario harness** (`tests/support/`, `tests/scenarios.rs`) — 22
+  named scenarios that stand up a known-bad release over loopback and assert the
+  band or refusal: postinstall injection, tar absolute-path / parent-traversal /
+  symlink-escape / hardlink-escape entries, GNU longname and longlink and pax
+  absolute-path overrides, gzip bomb over the per-entry cap, entry-count over
+  the cap, sha512 integrity mismatch refused before any verdict, release
+  published without integrity, install-time dependency reach reviewed as a child
+  verdict, PKGBUILD curl-pipe-to-shell, recall backward-sequence replay refused
+  without writing, and the shim failing closed when its binary is missing.
+  `scenario_harness_never_opens_a_non_loopback_socket` keeps the suite hermetic
+  by test rather than by convention. Run one with
+  `scripts/scenarios/run.sh <name>`.
+- `scripts/verify.sh` — the single source of truth for "did I pass". Runs the
+  exact command lines `.github/workflows/ci.yml` runs, flags included. `--fast`
+  (default), `--mutants`, `--all`.
+- `clippy.toml` + `#![deny(clippy::unwrap_used)]` — the AGENTS.md rule against
+  `unwrap()` on untrusted input is now a compile error rather than a convention.
+  Tests are exempt via `allow-unwrap-in-tests`; the six invariant sites in
+  `src/diff.rs` carry a per-site `#[allow]` and a stated reason.
+- `references/drift.md` — twelve cited places where the shipped code and the
+  project's own docs disagree, four of them fail-open paths. Evidence, not fixes.
+
+### Changed
+
+- Mutation testing in CI derives its file list from
+  `git ls-files 'src/*.rs' 'src/registry/*.rs'` via one shared `env:` skip list,
+  replacing a 21-file list duplicated across two jobs. Coverage goes 21 → 32
+  files: `heuristic.rs` (the risk-band rule engine) and the registry adapters,
+  `diff.rs`, `advisory.rs`, `provenance.rs` and `verdict.rs` are now mutated too.
+- `AGENTS.md` no longer claims the three bare cargo commands are the CI gate —
+  they are not (`cargo fmt` without `--check` rewrites files instead of failing;
+  `cargo clippy` without `--locked` may lint a different dependency graph). It
+  now points at `scripts/verify.sh`, scopes the Rust-only rule so it no longer
+  contradicts the repo's own Node shims and Python benchmark harness, and notes
+  that the `rust-toolchain.toml` pin is inert without rustup.
+- `ARCHITECTURE.md` sections renumbered (they read 1, 2, 5, 3, 4), the stale
+  "design target, not shipped code" header replaced, and resolved open risks
+  marked as resolved.
+
+### Fixed
+
+- `references/` link integrity: `error.md` and `wheel_extract.md` existed but
+  were unreachable from the map index.
+
 ## [0.3.1] - 2026-09-21
 
 ### Added

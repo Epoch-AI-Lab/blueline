@@ -182,9 +182,73 @@ impl Policy {
             )));
         }
 
+        self.reject_unimplemented_keys()?;
+
         Ok(())
     }
 
+    /// Refuse policy keys that parse but govern nothing.
+    ///
+    /// These are `serde` fields, so before this check they were accepted and
+    /// ignored: a user who blocklisted a maintainer or pinned a package's
+    /// integrity got a config that read as active protection and was not. In a
+    /// tool that fails closed, a silently-ignored security control is worse
+    /// than a rejected one, because the operator has no way to notice. Erroring
+    /// here is the only point where the key is still visible; once the field is
+    /// gone, serde would drop it without a word.
+    fn reject_unimplemented_keys(&self) -> Result<(), BluelineError> {
+        if !self.blocklist.maintainers.is_empty() {
+            return Err(BluelineError::Policy(
+                "blocklist.maintainers is not implemented and would otherwise be silently ignored. \
+                 Maintainer transitions are detected by R10_MAINTAINER_TRANSITION, which compares \
+                 registry authorship between the baseline and the target release. To stop trusting a \
+                 maintainer, blocklist the package instead."
+                    .into(),
+            ));
+        }
+
+        for (i, rule) in self.allowlist.packages.iter().enumerate() {
+            if rule.max_risk.is_some() {
+                return Err(BluelineError::Policy(format!(
+                    "allowlist.packages[{i}].max_risk (rule `{}`) is not implemented and would \
+                     otherwise be silently ignored. Risk bands come from the heuristic engine and \
+                     cannot be pinned per package. Remove the key.",
+                    rule.name
+                )));
+            }
+            if rule.integrity.is_some() {
+                return Err(BluelineError::Policy(format!(
+                    "allowlist.packages[{i}].integrity (rule `{}`) is not implemented and would \
+                     otherwise be silently ignored. Integrity is verified per release against the \
+                     registry's own dist.integrity and cannot be pinned per package. Remove the key.",
+                    rule.name
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Escalate the band a set of findings already earned when the accumulated
+    /// score crosses a policy threshold.
+    ///
+    /// Never downgrades. A band earned by a specific finding outranks the band
+    /// the score alone would imply, so a BLOCK finding stays BLOCK even when its
+    /// score lands in the HIGH range. This is the only score-to-band rule in the
+    /// engine; `heuristic::evaluate_with_trust` and
+    /// `heuristic::apply_extra_findings` both route through it.
+    pub fn escalate_band(&self, score: u32, current: VerdictBand) -> VerdictBand {
+        let from_score = if score >= self.thresholds.block_score {
+            VerdictBand::Block
+        } else if score > self.thresholds.max_medium_score {
+            VerdictBand::High
+        } else if score > self.thresholds.max_low_score {
+            VerdictBand::Medium
+        } else {
+            VerdictBand::Low
+        };
+        current.max(from_score)
+    }
     /// Check if a package name matches any blocked package pattern for the
     /// given ecosystem. Rules without an `ecosystem` field match all.
     pub fn is_package_blocked(&self, name: &str, ecosystem: Ecosystem) -> bool {
@@ -202,7 +266,6 @@ impl Policy {
             .iter()
             .any(|b| b.trim().to_lowercase() == email_trimmed)
     }
-
     /// Check if a lifecycle script is explicitly permitted for a package in
     /// the given ecosystem. Rules without an `ecosystem` field match all.
     pub fn is_script_allowed(
@@ -534,11 +597,9 @@ allow_git_dependencies = false
 [[allowlist.packages]]
 name = "esbuild"
 allowed_scripts = ["postinstall"]
-max_risk = "MEDIUM"
 
 [blocklist]
 packages = ["evil-*", "@badscope/*"]
-maintainers = ["badactor@example.com"]
 "#;
 
         let policy = Policy::from_toml_str(toml_content).unwrap();
@@ -558,9 +619,88 @@ maintainers = ["badactor@example.com"]
         );
         assert!(policy.is_package_blocked("@badscope/lib", Ecosystem::Npm));
         assert!(!policy.is_package_blocked("good-pkg", Ecosystem::Npm));
+    }
 
-        assert!(policy.is_maintainer_blocked("badactor@example.com"));
-        assert!(!policy.is_maintainer_blocked("gooddev@example.com"));
+    #[test]
+    fn accepts_an_empty_maintainers_blocklist() {
+        // Present but empty is not a claim about anything, so it still parses.
+        // Only a populated list is a security claim the tool cannot honor.
+        let policy = Policy::from_toml_str(
+            r#"
+[blocklist]
+maintainers = []
+"#,
+        )
+        .unwrap();
+        assert!(policy.blocklist.maintainers.is_empty());
+    }
+
+    #[test]
+    fn rejects_a_populated_maintainers_blocklist() {
+        let err = Policy::from_toml_str(
+            r#"
+[blocklist]
+maintainers = ["badactor@example.com"]
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("blocklist.maintainers"), "got: {err}");
+        assert!(
+            err.contains("R10_MAINTAINER_TRANSITION"),
+            "the error must name the mechanism that does govern maintainers, got: {err}"
+        );
+        assert!(
+            err.contains("blocklist the package instead"),
+            "the error must offer the route that works, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_an_allowlist_max_risk_pin() {
+        let err = Policy::from_toml_str(
+            r#"
+[[allowlist.packages]]
+name = "esbuild"
+max_risk = "MEDIUM"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("max_risk"), "got: {err}");
+        assert!(
+            err.contains("esbuild"),
+            "the error must name the rule, got: {err}"
+        );
+        assert!(
+            err.contains("heuristic engine"),
+            "the error must say why it cannot be pinned, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_an_allowlist_integrity_pin() {
+        let err = Policy::from_toml_str(
+            r#"
+[[allowlist.packages]]
+name = "esbuild"
+integrity = "sha512-deadbeef"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("integrity"), "got: {err}");
+        assert!(
+            err.contains("esbuild"),
+            "the error must name the rule, got: {err}"
+        );
+        assert!(
+            err.contains("dist.integrity"),
+            "the error must name the integrity check that does exist, got: {err}"
+        );
     }
 
     #[test]
@@ -585,6 +725,35 @@ block_score = 80
 block_score = 101
 "#;
         assert!(Policy::from_toml_str(invalid_block_over_100).is_err());
+    }
+
+    #[test]
+    fn escalates_bands_at_the_policy_threshold_boundaries() {
+        let p = Policy::default();
+        let from_low = |score| p.escalate_band(score, VerdictBand::Low);
+        assert_eq!(from_low(0), VerdictBand::Low);
+        assert_eq!(from_low(19), VerdictBand::Low);
+        assert_eq!(from_low(20), VerdictBand::Medium);
+        assert_eq!(from_low(49), VerdictBand::Medium);
+        assert_eq!(from_low(50), VerdictBand::High);
+        assert_eq!(from_low(79), VerdictBand::High);
+        assert_eq!(from_low(80), VerdictBand::Block);
+        assert_eq!(from_low(100), VerdictBand::Block);
+    }
+
+    #[test]
+    fn escalate_band_never_downgrades_a_band_a_finding_already_earned() {
+        let p = Policy::default();
+        // Score 50 alone means High, but a BLOCK finding outranks it.
+        assert_eq!(p.escalate_band(50, VerdictBand::Block), VerdictBand::Block);
+        // Score 0 must not walk a finding-earned band back down to Low.
+        assert_eq!(p.escalate_band(0, VerdictBand::Block), VerdictBand::Block);
+        assert_eq!(p.escalate_band(0, VerdictBand::High), VerdictBand::High);
+        assert_eq!(p.escalate_band(0, VerdictBand::Medium), VerdictBand::Medium);
+        // Score in the MEDIUM range must not demote an earned High.
+        assert_eq!(p.escalate_band(20, VerdictBand::High), VerdictBand::High);
+        // Escalation still applies on top of an earned band.
+        assert_eq!(p.escalate_band(80, VerdictBand::Medium), VerdictBand::Block);
     }
 
     #[test]

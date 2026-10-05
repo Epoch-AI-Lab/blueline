@@ -60,7 +60,6 @@ pub fn sanitize_for_terminal(s: &str) -> String {
         if c == '\n' || c == '\t' {
             out.push(c);
         } else if code < 0x20 || code == 0x7f || (0x80..=0x9f).contains(&code) {
-            // Strip control characters
             continue;
         } else {
             out.push(c);
@@ -76,7 +75,6 @@ pub fn sanitize_single_line(s: &str) -> String {
         if c == '\x1b' {
             if let Some(&next) = chars.peek() {
                 if next == '[' {
-                    // CSI sequence: consume until 0x40..=0x7E (final byte)
                     chars.next();
                     for csi in chars.by_ref() {
                         if (0x40..=0x7E).contains(&(csi as u32)) {
@@ -85,7 +83,6 @@ pub fn sanitize_single_line(s: &str) -> String {
                     }
                     continue;
                 } else if next == ']' || next == 'P' || next == '_' || next == '^' || next == 'X' {
-                    // OSC / DCS / APC / PM / SOS: consume until \x07 (BEL) or \x1b\ (ST)
                     chars.next();
                     let mut prev = '\0';
                     for osc in chars.by_ref() {
@@ -96,7 +93,6 @@ pub fn sanitize_single_line(s: &str) -> String {
                     }
                     continue;
                 } else {
-                    // 2-byte escape sequence (e.g. \x1bN, \x1bO)
                     chars.next();
                     continue;
                 }
@@ -434,6 +430,31 @@ mod tests {
         let two_byte = "\x1bN\x1bONormal";
         assert_eq!(sanitize_for_terminal(two_byte), "Normal");
         assert_eq!(sanitize_single_line(two_byte), "Normal");
+    }
+
+    #[test]
+    fn strips_del_and_c1_controls() {
+        // The sub-0x20 band is covered by the escape test above. DEL (0x7F) and
+        // the C1 band (0x80..=0x9F) are separate clauses of the same condition,
+        // so joining them with `&&` instead of `||` leaves all of them intact.
+        let controls: Vec<char> = (0x7fu32..=0x9f).filter_map(char::from_u32).collect();
+
+        let mut input = String::new();
+        for c in &controls {
+            input.push('|');
+            input.push(*c);
+        }
+        let expected = "|".repeat(controls.len());
+
+        assert_eq!(sanitize_for_terminal(&input), expected);
+
+        // U+0085 (NEL) is a line break, so the single-line form folds it to a
+        // space rather than dropping it. Every other control in the band goes.
+        let single_line_expected: String = controls
+            .iter()
+            .map(|c| if *c == '\u{0085}' { "| " } else { "|" })
+            .collect();
+        assert_eq!(sanitize_single_line(&input), single_line_expected);
     }
 
     #[test]

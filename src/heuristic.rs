@@ -566,7 +566,8 @@ pub fn evaluate_with_trust(
         });
     }
 
-    let (capped_score, band) = score_and_band(&findings, policy);
+    let (capped_score, earned) = score_findings(&findings);
+    let band = policy.escalate_band(capped_score, earned);
 
     Verdict {
         name: name.to_string(),
@@ -596,18 +597,15 @@ pub fn evaluate_with_trust(
     }
 }
 
-/// The one score/band ladder. Weights, `R06_FIRST_SIGHTING`'s heavier bump, and
-/// the threshold escalation are defined here so the initial evaluation and
-/// `apply_extra_findings` cannot drift apart.
+/// Accumulate the risk score and the finding-derived band from a set of
+/// findings, capped at 100. The threshold pass is separate and lives on
+/// `Policy::escalate_band`.
 ///
-/// The band is monotonic in the findings: it is raised, never lowered, so a
-/// verdict is never rated below a finding it contains. A pure score→band
-/// function is a weaker rule — one HIGH finding is 25 points, which is below
-/// `max_medium_score`, and such a function answers MEDIUM for it.
-fn score_and_band(findings: &[Finding], policy: &Policy) -> (u32, VerdictBand) {
+/// Returns the capped score and the band the findings earned on their own,
+/// before any threshold escalation.
+fn score_findings(findings: &[Finding]) -> (u32, VerdictBand) {
     let mut score: u32 = 0;
     let mut band = VerdictBand::Low;
-
     for f in findings {
         match f.severity {
             VerdictBand::Block => {
@@ -634,19 +632,7 @@ fn score_and_band(findings: &[Finding], policy: &Policy) -> (u32, VerdictBand) {
             VerdictBand::Low => {}
         }
     }
-
-    let capped_score = score.min(100);
-
-    // Escalate according to policy thresholds if accumulated score exceeds them
-    if capped_score >= policy.thresholds.block_score {
-        band = VerdictBand::Block;
-    } else if capped_score > policy.thresholds.max_medium_score && band < VerdictBand::High {
-        band = VerdictBand::High;
-    } else if capped_score > policy.thresholds.max_low_score && band < VerdictBand::Medium {
-        band = VerdictBand::Medium;
-    }
-
-    (capped_score, band)
+    (score.min(100), band)
 }
 
 /// Recompute band and score after late findings (e.g. PKGBUILD heuristics)
@@ -655,8 +641,8 @@ fn score_and_band(findings: &[Finding], policy: &Policy) -> (u32, VerdictBand) {
 /// silently.
 pub fn apply_extra_findings(verdict: &mut Verdict, extra: Vec<Finding>, policy: &Policy) {
     verdict.findings.extend(extra);
-    let (capped_score, band) = score_and_band(&verdict.findings, policy);
-    verdict.band = band;
+    let (capped_score, earned) = score_findings(&verdict.findings);
+    verdict.band = policy.escalate_band(capped_score, earned);
     verdict.risk_score = capped_score;
 }
 
@@ -4521,5 +4507,129 @@ allowed_builders = [
         assert_ne!(attested.rule_id, missing.rule_id);
         assert_eq!(attested.severity, VerdictBand::Low);
         assert_eq!(missing.severity, VerdictBand::Low);
+    }
+
+    fn pin_verdict() -> Verdict {
+        Verdict {
+            name: "pin-pkg".into(),
+            target_version: "2.0.0".into(),
+            baseline_version: Some("1.0.0".into()),
+            integrity: "sha512-pin".into(),
+            ecosystem: Ecosystem::Npm,
+            band: VerdictBand::Low,
+            risk_score: 0,
+            findings: Vec::new(),
+            diff_summary: DiffSummary {
+                files_added: 0,
+                files_removed: 0,
+                files_modified: 0,
+                lines_added: 0,
+                lines_deleted: 0,
+            },
+            trust_sources: None,
+            recursive: Vec::new(),
+        }
+    }
+
+    fn pin_finding(rule_id: &str, severity: VerdictBand) -> Finding {
+        Finding {
+            rule_id: rule_id.into(),
+            severity,
+            title: format!("pin finding {rule_id}"),
+            description: "pinned".into(),
+        }
+    }
+
+    #[test]
+    fn apply_extra_findings_scores_every_finding_not_just_the_extras() {
+        // The verdict already carried one HIGH before the extras arrived. The
+        // recompute reads `verdict.findings` in full, so the pre-existing
+        // finding still contributes to the score.
+        let mut verdict = pin_verdict();
+        verdict
+            .findings
+            .push(pin_finding("R01_PINNED_PRIOR", VerdictBand::High));
+
+        apply_extra_findings(
+            &mut verdict,
+            vec![pin_finding("R02_PINNED_EXTRA", VerdictBand::High)],
+            &Policy::default(),
+        );
+
+        assert_eq!(
+            verdict.findings.len(),
+            2,
+            "extras are appended, not replaced"
+        );
+        assert_eq!(verdict.risk_score, 50, "25 + 25 across both findings");
+    }
+
+    #[test]
+    fn apply_extra_findings_uses_the_per_rule_weight_for_first_sighting() {
+        let mut plain = pin_verdict();
+        apply_extra_findings(
+            &mut plain,
+            vec![pin_finding("R99_PLAIN", VerdictBand::Medium)],
+            &Policy::default(),
+        );
+
+        let mut first_sighting = pin_verdict();
+        apply_extra_findings(
+            &mut first_sighting,
+            vec![pin_finding("R06_FIRST_SIGHTING", VerdictBand::Medium)],
+            &Policy::default(),
+        );
+
+        assert_eq!(plain.risk_score, 10);
+        assert_eq!(first_sighting.risk_score, 15);
+    }
+
+    #[test]
+    fn apply_extra_findings_caps_the_score_at_one_hundred() {
+        let mut verdict = pin_verdict();
+        let extras = (0..4)
+            .map(|i| pin_finding(&format!("R{i}_BLOCK"), VerdictBand::Block))
+            .collect();
+
+        apply_extra_findings(&mut verdict, extras, &Policy::default());
+
+        assert_eq!(verdict.risk_score, 100, "4 x 50 raw saturates to the cap");
+        assert_eq!(verdict.band, VerdictBand::Block);
+    }
+
+    #[test]
+    fn apply_extra_findings_escalates_on_thresholds_without_downgrading() {
+        // Defaults are max_low_score 19, max_medium_score 49, block_score 80.
+        // Five HIGHs score 125 -> capped 100 -> Block by threshold.
+        let mut verdict = pin_verdict();
+        let extras = (0..5)
+            .map(|i| pin_finding(&format!("H{i}"), VerdictBand::High))
+            .collect();
+
+        apply_extra_findings(&mut verdict, extras, &Policy::default());
+
+        assert_eq!(verdict.risk_score, 100);
+        assert_eq!(
+            verdict.band,
+            VerdictBand::Block,
+            "a Block earned by score must not be demoted back to High"
+        );
+    }
+
+    #[test]
+    fn apply_extra_findings_keeps_a_block_finding_block_when_score_alone_means_high() {
+        // A BLOCK-severity finding sets the band directly in the accumulation
+        // loop. Score 50 clears max_medium_score (49), so the threshold pass
+        // would pick High on its own. The no-downgrade guard keeps the Block
+        // the finding already earned.
+        let mut verdict = pin_verdict();
+        apply_extra_findings(
+            &mut verdict,
+            vec![pin_finding("R02_NEW_INSTALL_SCRIPT", VerdictBand::Block)],
+            &Policy::default(),
+        );
+
+        assert_eq!(verdict.risk_score, 50);
+        assert_eq!(verdict.band, VerdictBand::Block);
     }
 }

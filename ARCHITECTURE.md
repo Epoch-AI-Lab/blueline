@@ -15,6 +15,21 @@ and any `postinstall`/`preinstall` script is surfaced for a *separate* human dec
 > agent enforcement, local-first recall, dogfood & distribution) are shipped.
 > See `ROADMAP.md`, `TODO.md`, and `CHANGELOG.md` for the per-release record.
 
+> Note: the engine is **shipped code**, not a design target. At v0.3.1
+> `src/` is 34 tracked Rust files across 27 modules (plus a `registry/`
+> directory module) with ~650 tests, all hermetic — the test suite runs
+> against loopback registries and makes no real network calls. Every box in
+> the overview below is implemented: the diff engine, the verdict/card
+> rendering, the `ci` lockfile lane, the MCP server, the agent lane, the
+> recall index, and the eleven-manager shim.
+>
+> `./scripts/verify.sh` is the gate (see `AGENTS.md`). `references/README.md`
+> maps each feature to the code and tests that implement it.
+
+For the module-level view — which file owns which decision, and where a
+change should land — see the Feature Map at
+[`references/README.md`](references/README.md).
+
 ---
 
 ## 1. System Overview
@@ -272,6 +287,9 @@ Known bypasses stay documented in the README.
 | `allowlist.packages` | exact `name` (+optional `ecosystem`), `allowed_scripts`, `allow_unreviewed_baseline` |
 | `blocklist` | glob `packages` (+optional `ecosystem`) — every lane; `maintainers` — **AUR only** (see below) |
 | `ci` | `fail_on`, `max_evaluations`, `include_dev`, `allow_requirements_options` |
+
+| `blocklist` | glob `packages` (+optional `ecosystem`). `maintainers` parses but is refused when populated. |
+| `ci` | `fail_on`, `max_evaluations`, `include_dev` |
 | `recursion` | `max_depth` (3, cap 16), `max_child_reviews` (8, cap 256), `child_block_band` (HIGH) |
 | `recall` | `max_age_hours` (48), `block_on_stale` |
 
@@ -366,3 +384,49 @@ Two consequences worth stating because they are easy to get wrong:
   the check on that: a surviving mutant is a gap in the suite, not a flake.
   Re-introduce the mutation, watch the test catch it, then restore.
 
+## 5. Risks
+
+### Resolved
+
+These were listed here as open risks while the engine was being built. Each
+is now implemented; they are kept because the reasoning behind the final
+answer is not obvious from the code alone.
+
+- **First-sighting bootstrap — resolved, and stricter than planned.**
+  Originally the intent was a *neutral* verdict when no known-clean baseline
+  exists. Shipped behaviour is `BaselineResolution::FirstSighting`
+  (`src/baseline.rs`) plus an `R06_FIRST_SIGHTING` finding
+  (`src/heuristic.rs`) that is deliberately **elevated to MEDIUM** — it
+  scores +15 where an ordinary MEDIUM finding scores +10
+  (`first_sighting_elevated_to_medium`). A package nobody has reviewed
+  before does not get the benefit of the doubt. `allows_unreviewed_baseline`
+  in `blueline.toml` is the opt-out, and it is exact-name only: a pattern
+  like `@scope/*` grants nothing.
+- **`scripts` false positives — resolved.** Legitimate postinstall packages
+  (esbuild, core-js) are handled by `allowlist.packages[].allowed_scripts`
+  (`Policy::is_script_allowed`, `src/policy.rs`), and the "review once,
+  remember" half by the SQLite `known_clean` table in `src/store.rs`, which
+  persists approvals across runs.
+- **Lockfile vs manifest — resolved.** `blueline ci` is shipped, not Phase 3:
+  `src/ci.rs` (~2k lines) diffs a whole lockfile via `src/lockfile.rs`
+  (`compute_lockfile_delta`), and `is_cargo_lockfile` dispatches npm and
+  Cargo lockfile shapes. It is dogfooded in CI — the `dogfood-cargo` job
+  runs blueline against this repository's own `Cargo.lock` on every PR that
+  touches it.
+
+### Still open
+
+- **`review` and `ci` are two code paths** over similar input. They share
+  `src/diff.rs` and the verdict schema, but the lockfile lane has its own
+  scoring path. A rule added to one does not automatically apply to the
+  other; this is exactly what `cargo mutants` over both `ci.rs` and
+  `diff.rs` is there to catch.
+- **Mutation coverage is derived from the repo, so it grows silently.** The
+  CI target list comes from `git ls-files`, which means a newly added module
+  is mutation-tested with no edit to any workflow. That is the intent, but
+  it also means total mutant count grows with the codebase and the 15-minute
+  per-shard timeout is the thing that will break first.
+- **Bypass paths are documented, not closed.** The shim lane routes eleven
+  managers through `agent gate`, but the README still lists the known
+  bypasses. The enforcement is opt-in; a user who does not install the shim
+  gets no gate.

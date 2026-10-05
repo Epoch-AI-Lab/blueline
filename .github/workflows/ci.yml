@@ -15,6 +15,18 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Mutation-testing target list, defined ONCE and derived from the repo by
+  # both mutation jobs below (`git ls-files 'src/*.rs' 'src/registry/*.rs'`
+  # minus this skip list). Do not hand-maintain a --file list in a job body:
+  # that is how the two jobs drifted apart before.
+  #
+  # Only files with no mutable expressions are skipped. Both are pure
+  # declarations — `lib.rs` is `pub mod` lines, `error.rs` is an enum of
+  # thiserror derives. Everything else is in scope, including the
+  # heuristic.rs rule engine and the registry adapters.
+  BLUELINE_MUTANTS_SKIP: |
+    src/lib.rs
+    src/error.rs
 
 jobs:
   # GitHub compiles a workflow before it runs a single step, and a compile
@@ -35,6 +47,14 @@ jobs:
           # run blocks; whether a shell is tidy is not what takes a workflow
           # down, and folding that cleanup in here would gate every PR on it.
           args: -shellcheck= -pyflakes=
+
+  references:
+    name: Feature map citations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve every citation in references/
+        run: ./scripts/check-references.sh
 
   fmt:
     name: Formatting
@@ -368,6 +388,16 @@ jobs:
           cargo mutants --in-diff pr.diff --shard ${{ matrix.shard }}/32 \
             --file 'src/**/*.rs' \
             --in-place --baseline=skip --timeout 300
+
+          set -euo pipefail
+          mapfile -t files < <(git ls-files 'src/*.rs' 'src/registry/*.rs' \
+            | grep -vxFf <(printf '%s' "$BLUELINE_MUTANTS_SKIP"))
+          test "${#files[@]}" -gt 0 || { echo "no mutation targets resolved" >&2; exit 1; }
+          args=(); for f in "${files[@]}"; do args+=(--file "$f"); done
+          echo "mutating ${#files[@]} files (shard ${{ matrix.shard }}/16)"
+          cargo mutants --in-diff pr.diff --shard ${{ matrix.shard }}/16 \
+            "${args[@]}" \
+            --in-place --baseline=skip --timeout 30
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -429,6 +459,16 @@ jobs:
           cargo mutants --in-diff push.diff --shard ${{ matrix.shard }}/32 \
             --file 'src/**/*.rs' \
             --in-place --baseline=skip --timeout 300
+
+          set -euo pipefail
+          mapfile -t files < <(git ls-files 'src/*.rs' 'src/registry/*.rs' \
+            | grep -vxFf <(printf '%s' "$BLUELINE_MUTANTS_SKIP"))
+          test "${#files[@]}" -gt 0 || { echo "no mutation targets resolved" >&2; exit 1; }
+          args=(); for f in "${files[@]}"; do args+=(--file "$f"); done
+          echo "mutating ${#files[@]} files (shard ${{ matrix.shard }}/16)"
+          cargo mutants --in-diff push.diff --shard ${{ matrix.shard }}/16 \
+            "${args[@]}" \
+            --in-place --baseline=skip --timeout 30
       - uses: actions/upload-artifact@v4
         if: always()
         with:
