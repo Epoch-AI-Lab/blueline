@@ -429,6 +429,31 @@ mod tests {
     }
 
     #[test]
+    fn strips_del_and_c1_controls() {
+        // The sub-0x20 band is covered by the escape test above. DEL (0x7F) and
+        // the C1 band (0x80..=0x9F) are separate clauses of the same condition,
+        // so joining them with `&&` instead of `||` leaves all of them intact.
+        let controls: Vec<char> = (0x7fu32..=0x9f).filter_map(char::from_u32).collect();
+
+        let mut input = String::new();
+        for c in &controls {
+            input.push('|');
+            input.push(*c);
+        }
+        let expected = "|".repeat(controls.len());
+
+        assert_eq!(sanitize_for_terminal(&input), expected);
+
+        // U+0085 (NEL) is a line break, so the single-line form folds it to a
+        // space rather than dropping it. Every other control in the band goes.
+        let single_line_expected: String = controls
+            .iter()
+            .map(|c| if *c == '\u{0085}' { "| " } else { "|" })
+            .collect();
+        assert_eq!(sanitize_single_line(&input), single_line_expected);
+    }
+
+    #[test]
     fn preserves_newlines_tabs_and_normal_text() {
         let normal = "Normal Title: 1.0.0\nLine 2\tTabbed";
         let clean = sanitize_for_terminal(normal);
