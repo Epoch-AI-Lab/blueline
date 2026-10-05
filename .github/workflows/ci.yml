@@ -384,9 +384,32 @@ jobs:
       # rather than by arithmetic a mutant can invert. The step below stays a
       # plain invocation, so a mutant that exhausts memory is loud again.
       - name: Mutate the changed lines
+        env:
+          # Two mutation genres cannot compile against this tree, so cargo-mutants
+          # reports them `Unviable` and the shard exits non-zero. Neither is a
+          # surviving mutant; both are the harness failing to build its own edit.
+          #
+          # `replace <return type> with Default::default()` needs the return type
+          # to implement `Default`, and several deliberately do not.
+          # `ProvenanceReport` is the clearest case: its whole point is that a
+          # report which cannot be verified says so rather than defaulting to
+          # something that reads as verified. `PypiCoreMetadata` is the same
+          # shape. Deriving `Default` to satisfy a mutation tool would hand the
+          # tool exactly the synthesized-identity behaviour the rules refuse, so
+          # the genre is excluded instead.
+          #
+          # `replace && with ||` inside a `let` chain is not valid Rust at all
+          # (`||` operators are not supported in let chain conditions), so it is
+          # rejected before it can be killed. Same reasoning: the edit never
+          # becomes a tree, so it never had a chance to survive.
+          #
+          # Every other genre still runs, and a mutant that fails to compile for
+          # any other reason is still reported rather than hidden.
+          BLUELINE_MUTANTS_EXCLUDE: 'with .*Default::default\(\)|replace && with \|\| in .*'
         run: |
           cargo mutants --in-diff pr.diff --shard ${{ matrix.shard }}/32 \
             --file 'src/**/*.rs' \
+            --exclude-re "$BLUELINE_MUTANTS_EXCLUDE" \
             --in-place --baseline=skip --timeout 300
 
           set -euo pipefail
@@ -394,9 +417,17 @@ jobs:
             | grep -vxFf <(printf '%s' "$BLUELINE_MUTANTS_SKIP"))
           test "${#files[@]}" -gt 0 || { echo "no mutation targets resolved" >&2; exit 1; }
           args=(); for f in "${files[@]}"; do args+=(--file "$f"); done
-          echo "mutating ${#files[@]} files (shard ${{ matrix.shard }}/16)"
-          cargo mutants --in-diff pr.diff --shard ${{ matrix.shard }}/16 \
+          # This matrix is 32 shards, so the per-file pass below has to shard
+          # 32 ways too. It was hardcoded `/16`, which cargo-mutants rejects for
+          # any k >= n: `invalid value '26/16' for '--shard <SHARD>': shard k
+          # must be less than n`. Shards 16-31 therefore ran the 32-way pass,
+          # saw every mutant caught, and then died on this line with exit 1. The
+          # 32-way pass above had already reported its verdict, so the failure
+          # was pure noise from a stale shard count.
+          echo "mutating ${#files[@]} files (shard ${{ matrix.shard }}/32)"
+          cargo mutants --in-diff pr.diff --shard ${{ matrix.shard }}/32 \
             "${args[@]}" \
+            --exclude-re "$BLUELINE_MUTANTS_EXCLUDE" \
             --in-place --baseline=skip --timeout 30
       - uses: actions/upload-artifact@v4
         if: always()
@@ -444,6 +475,11 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUSTFLAGS: ""
+      # Same two unbuildable mutation genres as mutants-pr, and the same reason:
+      # `replace <return type> with Default::default()` needs a `Default` impl
+      # several security types deliberately lack, and `||` is not valid inside a
+      # `let` chain, so neither edit ever becomes a tree that could be killed.
+      BLUELINE_MUTANTS_EXCLUDE: 'with .*Default::default\(\)|replace && with \|\| in .*'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -458,6 +494,7 @@ jobs:
         run: |
           cargo mutants --in-diff push.diff --shard ${{ matrix.shard }}/32 \
             --file 'src/**/*.rs' \
+            --exclude-re "$BLUELINE_MUTANTS_EXCLUDE" \
             --in-place --baseline=skip --timeout 300
 
           set -euo pipefail
@@ -465,9 +502,10 @@ jobs:
             | grep -vxFf <(printf '%s' "$BLUELINE_MUTANTS_SKIP"))
           test "${#files[@]}" -gt 0 || { echo "no mutation targets resolved" >&2; exit 1; }
           args=(); for f in "${files[@]}"; do args+=(--file "$f"); done
-          echo "mutating ${#files[@]} files (shard ${{ matrix.shard }}/16)"
-          cargo mutants --in-diff push.diff --shard ${{ matrix.shard }}/16 \
+          echo "mutating ${#files[@]} files (shard ${{ matrix.shard }}/32)"
+          cargo mutants --in-diff push.diff --shard ${{ matrix.shard }}/32 \
             "${args[@]}" \
+            --exclude-re "$BLUELINE_MUTANTS_EXCLUDE" \
             --in-place --baseline=skip --timeout 30
       - uses: actions/upload-artifact@v4
         if: always()
