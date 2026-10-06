@@ -86,10 +86,9 @@ not in `registry/mod.rs`.** Npm → `NpmRegistry::new(base)`, Cargo →
 the gate and the recursive reviewer can never disagree about where a
 `cargo install` or `yay -S` lands."*
 
-**`registry/mod.rs` doc comments are stale.** L12-13 says "npm is fully wired;
-cargo, PyPI, and AUR adapters build on these seams in later PRs" and L198 says
-"npm is the only full impl for now". All four are implemented. Do not trust
-those two comments.
+**All four adapters implement `Registry`.** The seam is no longer
+npm-only: `impl Registry for` resolves to `NpmRegistry`, `CratesIoRegistry`,
+`PyPIRegistry`, and `AurRegistry`, plus the test doubles.
 
 ## npm
 
