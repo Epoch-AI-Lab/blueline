@@ -9,8 +9,6 @@ pub mod http_util;
 pub mod npm;
 pub mod pypi;
 
-/// The package ecosystems blueline knows about. npm is fully wired; cargo,
-/// PyPI, and AUR adapters build on these seams in later PRs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Ecosystem {
@@ -195,7 +193,6 @@ pub struct Release {
     pub publish_time: Option<i64>,
 }
 
-/// Seam for future registries (PyPI, cargo). npm is the only full impl for now.
 pub trait Registry {
     /// Which ecosystem this registry serves.
     fn ecosystem(&self) -> Ecosystem;
