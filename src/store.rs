@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
@@ -135,6 +137,140 @@ const MIGRATIONS: &[&str] = &[
     ",
 ];
 
+/// Every table and column `BaselineStore` depends on. `PRAGMA user_version`
+/// records how many migrations ran, not that they produced this schema: a file
+/// carrying the right counter with nothing behind it otherwise opens happily
+/// and fails much later, mid-review, complaining about a missing column. The
+/// store is the trust anchor, so opening checks the thing itself.
+const EXPECTED_SCHEMA: &[(&str, &str)] = &[
+    ("known_clean", "ecosystem"),
+    ("known_clean", "name"),
+    ("known_clean", "version"),
+    ("known_clean", "integrity"),
+    ("known_clean", "clean"),
+    ("known_clean", "reviewed_at"),
+    ("advisory_cache", "ecosystem"),
+    ("advisory_cache", "package"),
+    ("advisory_cache", "version"),
+    ("advisory_cache", "advisories_json"),
+    ("advisory_cache", "hit_count"),
+    ("advisory_cache", "has_blocking_advisory"),
+    ("advisory_cache", "fetched_at"),
+    ("advisory_cache", "expires_at"),
+    ("provenance_cache", "ecosystem"),
+    ("provenance_cache", "package"),
+    ("provenance_cache", "version"),
+    ("provenance_cache", "builder_id"),
+    ("provenance_cache", "source_repo"),
+    ("provenance_cache", "commit_sha"),
+    ("provenance_cache", "workflow_path"),
+    ("provenance_cache", "slsa_level"),
+    ("provenance_cache", "signature_valid"),
+    ("provenance_cache", "verified_at"),
+    ("audit_log", "id"),
+    ("audit_log", "package"),
+    ("audit_log", "version"),
+    ("audit_log", "integrity"),
+    ("audit_log", "action"),
+    ("audit_log", "score"),
+    ("audit_log", "verdict"),
+    ("audit_log", "decided_by"),
+    ("audit_log", "notes"),
+    ("audit_log", "decided_at"),
+    ("audit_log", "ecosystem"),
+];
+
+/// Columns whose *default* decides trust, with the type they must declare.
+/// `signature_valid` is here for the same reason as `clean`: it feeds
+/// `registry_signature_present`, which `require_signatures` gates on. The
+/// other flags are not included because nothing reads them, or because their
+/// default is an expression that no exact-match check should pin.
+const TRUST_BEARING_COLUMNS: &[(&str, &str, &str)] = &[
+    ("known_clean", "clean", "INTEGER"),
+    ("provenance_cache", "signature_valid", "INTEGER"),
+];
+
+/// Refuse to open a database whose tables do not carry every column the store
+/// queries. Names the file and the first thing missing, so a user staring at
+/// this knows which file to move aside rather than what went wrong internally.
+fn verify_schema(conn: &rusqlite::Connection, path: &Path) -> Result<(), BluelineError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT m.name, p.name, p.type, p.[notnull], p.dflt_value
+             FROM sqlite_master m, pragma_table_info(m.name) p
+             WHERE m.type = 'table'",
+        )
+        .map_err(|e| BluelineError::Store(format!("inspecting schema: {e}")))?;
+    let shapes: HashMap<(String, String), ColumnShape> = stmt
+        .query_map([], |row| {
+            Ok((
+                (row.get(0)?, row.get(1)?),
+                ColumnShape {
+                    ty: row.get(2)?,
+                    notnull: row.get::<_, i64>(3)? != 0,
+                    default: row.get(4)?,
+                },
+            ))
+        })
+        .map_err(|e| BluelineError::Store(format!("reading schema: {e}")))?
+        .collect::<Result<HashMap<_, _>, _>>()
+        .map_err(|e| BluelineError::Store(format!("reading schema: {e}")))?;
+    let present: HashSet<(String, String)> = shapes.keys().cloned().collect();
+
+    let missing: Vec<String> = EXPECTED_SCHEMA
+        .iter()
+        .filter(|(table, column)| !present.contains(&((*table).to_string(), (*column).to_string())))
+        .map(|(table, column)| format!("{table}.{column}"))
+        .collect();
+    if !missing.is_empty() {
+        return Err(BluelineError::Store(format!(
+            "{} is not a usable blueline store: {} missing (expected {}); move the file aside to start a new one",
+            path.display(),
+            missing.join(", "),
+            EXPECTED_SCHEMA.len()
+        )));
+    }
+
+    // Names alone are not enough. A column whose default decides trust is
+    // checked as well: `record_verified` never supplies `clean`, so a
+    // `DEFAULT 1` there means a package nobody approved is written straight
+    // into the set `list_clean_versions` treats as approved baselines.
+    for (table, column, want_type) in TRUST_BEARING_COLUMNS {
+        let key = ((*table).to_string(), (*column).to_string());
+        let shape = shapes.get(&key).ok_or_else(|| {
+            BluelineError::Store(format!(
+                "{} is not a usable blueline store: {table}.{column} is missing",
+                path.display()
+            ))
+        })?;
+        // Parsed rather than string-compared, so '', 'yes', NULL and a
+        // parenthesised (0) are all rejected along with a literal 1.
+        let default = shape
+            .default
+            .as_deref()
+            .and_then(|d| d.trim().parse::<i64>().ok());
+        if !shape.ty.eq_ignore_ascii_case(want_type) || !shape.notnull || default != Some(0) {
+            return Err(BluelineError::Store(format!(
+                "{} is not a usable blueline store: {table}.{column} is {} {} default {:?}, \
+                 expected {want_type} NOT NULL DEFAULT 0; a store that blesses by default \
+                 would approve releases nobody reviewed; move the file aside to start a new one",
+                path.display(),
+                shape.ty,
+                if shape.notnull { "NOT NULL" } else { "NULL" },
+                shape.default,
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// One column's declared shape, as `pragma_table_info` reports it.
+struct ColumnShape {
+    ty: String,
+    notnull: bool,
+    default: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedAdvisories {
     pub advisories_json: String,
@@ -162,6 +298,29 @@ pub struct CachedProvenance {
 /// blesses a release.
 pub struct BaselineStore {
     conn: rusqlite::Connection,
+}
+
+/// How many times the journal-mode change is retried before giving up.
+const WAL_RETRY_ATTEMPTS: u32 = 40;
+
+/// Whether the journal-mode retry loop should stop on this error.
+///
+/// Split out so the decision can be tested without provoking a real
+/// `SQLITE_BUSY`: the loop is bounded and sleeps 50ms between tries, so the only
+/// way to observe a wrong bound through `open_at` is to measure how long a
+/// failure takes, which is exactly the kind of assertion that stops being one
+/// on a loaded machine.
+///
+/// Two shapes are retryable and the rest are not. The `||` matters because
+/// SQLite words the same condition two ways depending on which object is locked,
+/// so a store contended on a *table* and not on the database would otherwise
+/// give up immediately — turning a creation race that resolves in milliseconds
+/// into a refused review. The attempt bound matters because a message that is
+/// retryable on attempt 0 is still retryable on attempt 39, and a loop that
+/// stopped early would convert contention into a hard failure.
+fn should_give_up_enabling_wal(msg: &str, attempt: u32) -> bool {
+    let retryable = msg.contains("database is locked") || msg.contains("database table is locked");
+    !retryable || attempt + 1 >= WAL_RETRY_ATTEMPTS
 }
 
 impl BaselineStore {
@@ -245,13 +404,50 @@ impl BaselineStore {
             }
         }
 
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|e| BluelineError::Store(format!("enabling WAL: {e}")))?;
+        // SQLite does not consult the busy handler for a journal-mode change while
+        // other connections are attached, so this one statement can return
+        // SQLITE_BUSY immediately instead of waiting out `busy_timeout` -- and it
+        // does exactly that when two processes open a never-before-used data
+        // directory at the same time, which is the creation race the migration
+        // handling below is built for. A concurrent opener sets the same mode, so
+        // retrying is safe, and the alternative is refusing a review over a
+        // journal setting another process is in the middle of applying.
+        let mut wal_error = None;
+        for attempt in 0..WAL_RETRY_ATTEMPTS {
+            match conn.pragma_update(None, "journal_mode", "WAL") {
+                Ok(_) => {
+                    wal_error = None;
+                    break;
+                }
+                Err(e) => {
+                    if should_give_up_enabling_wal(&e.to_string(), attempt) {
+                        wal_error = Some(e);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        }
+        if let Some(e) = wal_error {
+            return Err(BluelineError::Store(format!("enabling WAL: {e}")));
+        }
 
         let migrations = Migrations::new(MIGRATIONS.iter().map(|sql| M::up(sql)).collect());
-        migrations
-            .to_latest(&mut conn)
-            .map_err(|e| BluelineError::Store(format!("applying migrations: {e}")))?;
+        // A lost creation race is the expected cause of a migration failure:
+        // each migration runs in its own deferred transaction, so two processes
+        // opening a fresh store can both read the pre-migration version and
+        // then collide on CREATE TABLE. Whether the store is usable is decided
+        // by the schema itself, not by the version counter, so the migration
+        // error text is only surfaced when the schema check also fails.
+        let migration_error = migrations.to_latest(&mut conn).err();
+        if let Err(schema_error) = verify_schema(&conn, path) {
+            return Err(match migration_error {
+                Some(e) => {
+                    BluelineError::Store(format!("applying migrations: {e}; {schema_error}"))
+                }
+                None => schema_error,
+            });
+        }
 
         Ok(Self { conn })
     }
@@ -270,53 +466,55 @@ impl BaselineStore {
         version: &str,
         checksum: &Checksum,
     ) -> Result<(), BluelineError> {
-        let stored = self.stored_integrity(ecosystem, name, version)?;
-        match stored {
-            Some(existing) => {
-                let existing = Checksum::parse(&existing).map_err(|_| {
-                    BluelineError::Store(format!(
-                        "integrity changed for {name}@{version}: the stored record no longer matches this \
-                         tarball; refusing to overwrite it"
-                    ))
-                })?;
-                if existing != *checksum {
-                    return Err(BluelineError::Store(format!(
-                        "integrity changed for {name}@{version}: the stored record no longer matches this \
-                         tarball; refusing to overwrite it"
-                    )));
-                }
-                self.conn
-                    .prepare_cached(
-                        "UPDATE known_clean
-                         SET reviewed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-                         WHERE ecosystem = ?1 AND name = ?2 AND version = ?3",
-                    )
-                    .map_err(|e| BluelineError::Store(format!("preparing refresh: {e}")))?
-                    .execute(rusqlite::params![ecosystem.key(), name, version])
-                    .map_err(|e| {
-                        BluelineError::Store(format!("recording {name}@{version}: {e}"))
-                    })?;
-                Ok(())
-            }
-            None => {
-                self.conn
-                    .prepare_cached(
-                        "INSERT INTO known_clean (ecosystem, name, version, integrity)
-                         VALUES (?1, ?2, ?3, ?4)",
-                    )
-                    .map_err(|e| BluelineError::Store(format!("preparing upsert: {e}")))?
-                    .execute(rusqlite::params![
-                        ecosystem.key(),
-                        name,
-                        version,
-                        checksum.to_display()
-                    ])
-                    .map_err(|e| {
-                        BluelineError::Store(format!("recording {name}@{version}: {e}"))
-                    })?;
-                Ok(())
-            }
+        // Insert-if-absent is atomic, so two processes recording the same
+        // package cannot collide on the primary key. The row is then read back
+        // and checked unconditionally: a row already present must carry the
+        // same digest, so losing the insert race ends on exactly the same
+        // fail-closed answer as any other mismatched record.
+        self.conn
+            .prepare_cached(
+                "INSERT INTO known_clean (ecosystem, name, version, integrity)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(ecosystem, name, version) DO NOTHING",
+            )
+            .map_err(|e| BluelineError::Store(format!("preparing upsert: {e}")))?
+            .execute(rusqlite::params![
+                ecosystem.key(),
+                name,
+                version,
+                checksum.to_display()
+            ])
+            .map_err(|e| BluelineError::Store(format!("recording {name}@{version}: {e}")))?;
+
+        let existing = self
+            .stored_integrity(ecosystem, name, version)?
+            .ok_or_else(|| {
+                BluelineError::Store(format!(
+                    "recording {name}@{version}: the row vanished between insert and read"
+                ))
+            })?;
+        let existing = Checksum::parse(&existing).map_err(|_| {
+            BluelineError::Store(format!(
+                "integrity changed for {name}@{version}: the stored record no longer matches this \
+                 tarball; refusing to overwrite it"
+            ))
+        })?;
+        if existing != *checksum {
+            return Err(BluelineError::Store(format!(
+                "integrity changed for {name}@{version}: the stored record no longer matches this \
+                 tarball; refusing to overwrite it"
+            )));
         }
+        self.conn
+            .prepare_cached(
+                "UPDATE known_clean
+                 SET reviewed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                 WHERE ecosystem = ?1 AND name = ?2 AND version = ?3",
+            )
+            .map_err(|e| BluelineError::Store(format!("preparing refresh: {e}")))?
+            .execute(rusqlite::params![ecosystem.key(), name, version])
+            .map_err(|e| BluelineError::Store(format!("recording {name}@{version}: {e}")))?;
+        Ok(())
     }
 
     fn stored_integrity(
@@ -884,6 +1082,244 @@ mod tests {
         );
     }
 
+    fn err_of(result: &Result<BaselineStore, BluelineError>) -> String {
+        match result {
+            Ok(_) => "ok".into(),
+            Err(e) => format!("{e}"),
+        }
+    }
+
+    /// A real race. Two sequential opens in one process contend with nothing,
+    /// so this runs every opener as its own thread, released onto the same
+    /// never-before-used data directory at once by a barrier: the directory
+    /// creation, the journal-mode switch and the migrations all happen under
+    /// contention, which is the only condition under which the WAL retry and
+    /// the migration-error handling do anything at all.
+    #[test]
+    fn concurrent_open_of_a_fresh_store_all_succeed() {
+        const OPENERS: usize = 8;
+        const ROUNDS: usize = 6;
+
+        for round in 0..ROUNDS {
+            let dir = tempfile::tempdir().unwrap();
+            // Never created before: the opener creates the data directory and
+            // the database inside it, so those creations are part of the race.
+            let data_dir = dir.path().join(format!("round-{round}"));
+            let db_path = data_dir.join("baseline.db");
+
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(OPENERS));
+            let handles: Vec<_> = (0..OPENERS)
+                .map(|opener| {
+                    let db_path = db_path.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        match BaselineStore::open_at(&db_path) {
+                            Ok(store) => {
+                                // A store that opened but cannot be queried is
+                                // not a store a review can use.
+                                store
+                                    .list_clean_versions::<semver::Version>(Ecosystem::Npm, "racer")
+                                    .map(|_| ())
+                                    .map_err(|e| format!("opener {opener}: query failed: {e:#}"))
+                            }
+                            Err(e) => Err(format!("opener {opener}: {e:#}")),
+                        }
+                    })
+                })
+                .collect();
+
+            let mut failures = Vec::new();
+            for handle in handles {
+                match handle.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => failures.push(e),
+                    Err(_) => failures.push(format!("round {round}: an opener panicked")),
+                }
+            }
+            assert!(
+                failures.is_empty(),
+                "every opener of a fresh store must succeed in round {round}: {failures:?}"
+            );
+
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let applied: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                applied,
+                MIGRATIONS.len() as i64,
+                "round {round} left a schema below the target version"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_opens_of_a_fresh_store_leave_one_usable_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("repeat.db");
+        for i in 0..5 {
+            let store = BaselineStore::open_at(&db_path);
+            assert!(store.is_ok(), "open {i} failed: {}", err_of(&store));
+        }
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let applied: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(applied, MIGRATIONS.len() as i64);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM known_clean", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn open_fails_closed_when_migrations_cannot_reach_the_target_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("blocked.db");
+        // A pre-existing table of the right name but the wrong shape makes the
+        // first migration fail. The user_version guard exists to absorb a lost
+        // creation race, not to excuse a schema that never reached the target,
+        // so this must still error.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch("CREATE TABLE known_clean (wrong_column TEXT)")
+                .unwrap();
+        }
+        let result = BaselineStore::open_at(&db_path);
+        assert!(
+            result.is_err(),
+            "a schema stuck below the target must not be waved through"
+        );
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let applied: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_ne!(
+            applied,
+            MIGRATIONS.len() as i64,
+            "the refused schema must not claim the target version"
+        );
+    }
+
+    #[test]
+    fn open_refuses_a_tampered_trust_bearing_default() {
+        // `record_verified` never supplies `clean`, so a column defaulting to
+        // 1 would write a never-approved package straight into the set
+        // `list_clean_versions` hands back as an approved baseline. Names alone
+        // do not catch it: every column is present.
+        for (table, column, from, to) in [
+            (
+                "known_clean",
+                "clean",
+                "clean       INTEGER NOT NULL DEFAULT 0",
+                "clean       INTEGER NOT NULL DEFAULT 1",
+            ),
+            (
+                "provenance_cache",
+                "signature_valid",
+                "signature_valid  INTEGER NOT NULL DEFAULT 0",
+                "signature_valid  INTEGER NOT NULL DEFAULT 1",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join(format!("{column}.db"));
+            {
+                let mut conn = rusqlite::Connection::open(&db_path).unwrap();
+                Migrations::new(MIGRATIONS.iter().map(|s| M::up(s)).collect())
+                    .to_latest(&mut conn)
+                    .unwrap();
+                conn.pragma_update(None, "writable_schema", true).unwrap();
+                conn.execute(
+                    "UPDATE sqlite_master SET sql = replace(sql, ?1, ?2) WHERE name = ?3",
+                    rusqlite::params![from, to, table],
+                )
+                .unwrap();
+            }
+            let err = BaselineStore::open_at(&db_path)
+                .map(|_| ())
+                .expect_err(&format!(
+                    "a tampered {table}.{column} default must be refused"
+                ));
+            assert!(
+                err.to_string().contains(&format!("{table}.{column}")),
+                "the refusal must name the column: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn open_refuses_a_version_counter_that_contradicts_the_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("liar.db");
+        // A database whose user_version claims the target while carrying none
+        // of its tables. Trusting the counter opens this happily and then
+        // fails mid-review on a missing column.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.pragma_update(None, "user_version", MIGRATIONS.len() as i64)
+                .unwrap();
+        }
+        let err = BaselineStore::open_at(&db_path)
+            .map(|_| ())
+            .expect_err("a lying version counter must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("known_clean.ecosystem"),
+            "the error must name what is missing: {message}"
+        );
+        assert!(
+            message.contains(&db_path.display().to_string()),
+            "the error must name the file to move aside: {message}"
+        );
+    }
+
+    #[test]
+    fn open_refuses_a_table_that_exists_with_the_wrong_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wrongshape.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            // Right name, wrong shape: the v1 two-column table.
+            conn.execute_batch(
+                "CREATE TABLE known_clean (name TEXT, version TEXT);
+                 CREATE TABLE audit_log (id INTEGER PRIMARY KEY);
+                 CREATE TABLE advisory_cache (package TEXT);
+                 CREATE TABLE provenance_cache (package TEXT);",
+            )
+            .unwrap();
+        }
+        let err = BaselineStore::open_at(&db_path)
+            .map(|_| ())
+            .expect_err("a wrong-shaped table must be refused");
+        assert!(
+            err.to_string().contains("integrity"),
+            "the error must name the missing column: {err}"
+        );
+    }
+
+    #[test]
+    fn open_accepts_every_legacy_schema_it_can_migrate() {
+        // Each intermediate version must still open, since the store is
+        // expected to migrate forward rather than refuse.
+        for take in 1..MIGRATIONS.len() {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join(format!("v{take}.db"));
+            {
+                let mut conn = rusqlite::Connection::open(&db_path).unwrap();
+                Migrations::new(MIGRATIONS.iter().take(take).map(|s| M::up(s)).collect())
+                    .to_latest(&mut conn)
+                    .unwrap();
+            }
+            assert!(
+                BaselineStore::open_at(&db_path).is_ok(),
+                "schema v{take} must migrate forward and open"
+            );
+        }
+    }
+
     #[test]
     fn migration_v2_to_v3_scopes_old_rows_to_npm() {
         let dir = tempfile::tempdir().unwrap();
@@ -1336,5 +1772,281 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The journal-mode retry decision, on every shape that matters.
+    ///
+    /// The loop this governs sleeps 50ms between attempts and runs up to 40
+    /// times, so the only way to observe a wrong decision through `open_at` is
+    /// to time a failure — which stops being a test on a loaded machine. The two
+    /// conditions are therefore pinned directly:
+    ///
+    /// * SQLite words the same contention two ways, and both are retryable. A
+    ///   store locked on a *table* must not give up immediately; that is the
+    ///   creation race the whole retry exists for, and giving up turns one that
+    ///   resolves in milliseconds into a refused review.
+    /// * A retryable message stays retryable on the last attempt, so the bound
+    ///   stops the loop rather than the classification stopping it early.
+    #[test]
+    fn the_journal_mode_retry_decision_is_per_shape() {
+        for locked in ["database is locked", "database table is locked: some_table"] {
+            assert!(
+                !should_give_up_enabling_wal(locked, 0),
+                "`{locked}` is contention and must be retried, not given up on"
+            );
+            // Retried right up to the last try in the budget: the bound stops
+            // the loop, it does not reclassify the error as permanent early.
+            assert!(
+                !should_give_up_enabling_wal(locked, WAL_RETRY_ATTEMPTS - 2),
+                "`{locked}` is still contention two tries before the end"
+            );
+            // And the last try reports rather than sleeping on into a loop that
+            // has nowhere left to go.
+            assert!(
+                should_give_up_enabling_wal(locked, WAL_RETRY_ATTEMPTS - 1),
+                "the final attempt must give up and report"
+            );
+        }
+
+        for fatal in [
+            "no such table: main.migrations",
+            "attempt to write a readonly database",
+            "disk I/O error",
+            "malformed database schema",
+            "",
+        ] {
+            assert!(
+                should_give_up_enabling_wal(fatal, 0),
+                "`{fatal}` is permanent and must be reported at once"
+            );
+            assert!(
+                should_give_up_enabling_wal(fatal, WAL_RETRY_ATTEMPTS - 1),
+                "`{fatal}` is permanent at every attempt"
+            );
+        }
+
+        assert_eq!(WAL_RETRY_ATTEMPTS, 40, "the attempt budget is pinned");
+    }
+
+    /// A trust-bearing column that is wrong in exactly one way.
+    ///
+    /// `verify_schema` checks three things about `known_clean.clean` — the type,
+    /// `NOT NULL`, and that the default is `0` — and combines them with `||`,
+    /// because any one of them is independently disqualifying. The existing
+    /// fixture breaks all three at once by declaring a table with the wrong
+    /// columns entirely, which cannot tell an `||` from an `&&`: a store wrong
+    /// in one respect only has to be refused too.
+    ///
+    /// This is the case that matters. `record_verified` never supplies `clean`,
+    /// so a `DEFAULT 1` there writes a package nobody approved straight into the
+    /// set `list_clean_versions` treats as approved baselines — and the store
+    /// still opens, still migrates, still answers every query, with nothing to
+    /// distinguish it from a clean one except this comparison.
+    #[test]
+    fn a_trust_bearing_column_wrong_in_one_respect_alone_is_still_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("defaulted.db");
+        {
+            let _store = BaselineStore::open_at(&db_path).expect("a fresh store opens");
+        }
+        // Rebuild `known_clean` with the right columns, the right types, and
+        // `NOT NULL` intact -- and only the default changed.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let ddl: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='known_clean'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                ddl.contains("clean       INTEGER NOT NULL DEFAULT 0"),
+                "the fixture's starting shape changed: {ddl}"
+            );
+            conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+            conn.execute_batch("ALTER TABLE known_clean RENAME TO known_clean_orig")
+                .unwrap();
+            let poisoned = ddl.replacen("DEFAULT 0", "DEFAULT 1", 1);
+            assert_ne!(poisoned, ddl, "the default must have been replaced");
+            conn.execute_batch(&poisoned).unwrap();
+            conn.execute_batch("DROP TABLE known_clean_orig").unwrap();
+        }
+
+        let err = BaselineStore::open_at(&db_path)
+            .map(|_| ())
+            .expect_err("a trust-bearing column with the wrong default must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("known_clean.clean") && msg.contains("default"),
+            "the refusal must name the column and the reason: {msg}"
+        );
+
+        // The one-respect-only claim, made explicit: the other two properties
+        // really are intact in that fixture, so the refusal cannot be attributed
+        // to a missing column or a wrong type.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let (ty, notnull, default): (String, i64, String) = conn
+            .query_row(
+                "SELECT type, \"notnull\", dflt_value FROM pragma_table_info('known_clean') \
+                 WHERE name = 'clean'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(ty, "INTEGER", "the type is intact");
+        assert_eq!(notnull, 1, "NOT NULL is intact");
+        assert_eq!(default, "1", "only the default was changed");
+    }
+
+    /// The other two arms of the same `||`, one fixture each.
+    ///
+    /// `a_trust_bearing_column_wrong_in_one_respect_alone_is_still_refused`
+    /// poisons the default and leaves the type and `NOT NULL` intact, so it pins
+    /// the third arm alone. Mutating the comparison at `store.rs:252` to `&&`
+    /// instead of `||` survives that test: with the default wrong and the other
+    /// two right, both `||` and `&&` refuse. These two close that gap by breaking
+    /// one of the other arms and leaving the rest intact, which is the only shape
+    /// that tells the operators apart.
+    ///
+    /// Both matter for the same reason as the default: `clean` is what
+    /// `list_clean_versions` reads to decide a release is an approved baseline.
+    /// A NULL there and a `TEXT` there are both ways for that read to stop
+    /// meaning what the code assumes.
+    fn refuse_trust_bearing_column_whose_ddl_is(from: &str, to: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("poisoned.db");
+        {
+            let _store = BaselineStore::open_at(&db_path).expect("a fresh store opens");
+        }
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let ddl: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='known_clean'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let poisoned = ddl.replacen(from, to, 1);
+            assert_ne!(
+                poisoned, ddl,
+                "`{from}` must occur in the fixture DDL: {ddl}"
+            );
+            conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+            conn.execute_batch("ALTER TABLE known_clean RENAME TO known_clean_orig")
+                .unwrap();
+            conn.execute_batch(&poisoned).unwrap();
+            conn.execute_batch("DROP TABLE known_clean_orig").unwrap();
+        }
+
+        let err = BaselineStore::open_at(&db_path)
+            .map(|_| ())
+            .expect_err("a trust-bearing column wrong in one respect alone must be refused");
+        err.to_string()
+    }
+
+    /// A NULLABLE `clean` is refused even though its type and default are right.
+    ///
+    /// The fixture is `clean INTEGER DEFAULT 0`: correct type, correct default,
+    /// and no `NOT NULL`. Every check except nullability passes, so only the
+    /// `!shape.notnull` arm can refuse it.
+    #[test]
+    fn a_nullable_trust_bearing_column_is_refused_even_with_a_correct_default() {
+        let msg = refuse_trust_bearing_column_whose_ddl_is(
+            "clean       INTEGER NOT NULL DEFAULT 0",
+            "clean       INTEGER DEFAULT 0",
+        );
+        assert!(
+            msg.contains("known_clean.clean") && msg.contains("NULL"),
+            "the refusal must name the column and that it is NULL: {msg}"
+        );
+        // The type and default really are right in that fixture, so the refusal
+        // cannot be attributed to either of them. The message names the found
+        // shape on every path, so this asserts what it reports, not that the
+        // default went unmentioned.
+        assert!(
+            msg.contains("is INTEGER NULL default Some(\"0\")"),
+            "the type and default must be reported as correct, with NULL the \
+             only thing wrong: {msg}"
+        );
+    }
+
+    /// A wrongly-typed `clean` is refused even though it is `NOT NULL DEFAULT 0`.
+    ///
+    /// The fixture is `clean TEXT NOT NULL DEFAULT 0`: nullability and default
+    /// are right, only the declared type is wrong. Without this test, replacing
+    /// the type comparison at `store.rs:252` with a constant true would survive.
+    #[test]
+    fn a_mistyped_trust_bearing_column_is_refused_even_when_not_null_with_the_right_default() {
+        let msg = refuse_trust_bearing_column_whose_ddl_is(
+            "clean       INTEGER NOT NULL DEFAULT 0",
+            "clean       TEXT NOT NULL DEFAULT 0",
+        );
+        assert!(
+            msg.contains("known_clean.clean") && msg.contains("TEXT"),
+            "the refusal must name the column and the type it found: {msg}"
+        );
+        assert!(
+            msg.contains("expected INTEGER NOT NULL DEFAULT 0"),
+            "the refusal must say what was required: {msg}"
+        );
+        assert!(
+            !msg.contains("is NULL NOT NULL"),
+            "nullability was intact, so it is not what was refused: {msg}"
+        );
+    }
+
+    /// `EXPECTED_SCHEMA` and `MIGRATIONS` are two hand-written lists of the same
+    /// schema, so they can drift apart silently: a column added to a migration and
+    /// forgotten in `EXPECTED_SCHEMA` is never checked at open, and a column listed
+    /// in `EXPECTED_SCHEMA` that no migration creates makes a fresh store
+    /// unopenable. Neither shows up as a test failure on its own.
+    ///
+    /// So this compares the two directly: every column the migrations actually
+    /// produce is in `EXPECTED_SCHEMA`, and nothing is listed that is absent.
+    #[test]
+    fn expected_schema_agrees_with_the_migrations() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("fresh.db");
+        {
+            let _store = BaselineStore::open_at(&db_path).expect("a fresh store opens");
+        }
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT m.name, p.name FROM sqlite_master m, pragma_table_info(m.name) p \
+                 WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%'",
+            )
+            .unwrap();
+        let migrated: HashSet<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        // A fresh store is opened by `verify_schema` on the way in, so reaching
+        // this line at all proves `EXPECTED_SCHEMA` is not over-claiming: a listed
+        // column the migrations never create would have refused the open above.
+        // What is left to catch is the other direction.
+        let listed: HashSet<(String, String)> = EXPECTED_SCHEMA
+            .iter()
+            .map(|(t, c)| ((*t).to_string(), (*c).to_string()))
+            .collect();
+        let unlisted: Vec<String> = migrated
+            .difference(&listed)
+            .map(|(t, c)| format!("{t}.{c}"))
+            .collect();
+        assert!(
+            unlisted.is_empty(),
+            "the migrations create columns EXPECTED_SCHEMA does not check, so an \
+             open would never notice them missing: {}",
+            unlisted.join(", ")
+        );
+        assert_eq!(
+            listed.len(),
+            EXPECTED_SCHEMA.len(),
+            "EXPECTED_SCHEMA lists a duplicate, which makes the count misleading"
+        );
     }
 }

@@ -21,9 +21,21 @@ fn default_dir() -> anyhow::Result<PathBuf> {
     Ok(base.join("blueline").join("shims"))
 }
 
+/// Resolve a real package manager, excluding this project's own shim
+/// directory. Shared with the install path so a shim can never delegate to
+/// itself there either.
+pub(crate) fn resolve_package_manager(name: &str) -> anyhow::Result<PathBuf> {
+    let dir = default_dir();
+    find_on_path(
+        name,
+        dir.as_deref()
+            .unwrap_or(std::path::Path::new("/nonexistent")),
+    )
+}
+
 /// Locate the real package-manager binary on PATH, skipping the shim
 /// directory so a shim never delegates to another shim (or to itself).
-fn find_on_path(name: &str, exclude_dir: &Path) -> anyhow::Result<PathBuf> {
+pub(crate) fn find_on_path(name: &str, exclude_dir: &Path) -> anyhow::Result<PathBuf> {
     let path = std::env::var_os("PATH").ok_or_else(|| anyhow::anyhow!("PATH is not set"))?;
     for dir in std::env::split_paths(&path) {
         if dir == exclude_dir {

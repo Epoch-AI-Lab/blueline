@@ -22,6 +22,51 @@ The three underlying commands are:
 - Format: `cargo fmt --all -- --check`
 - Lint:   `cargo clippy --all-targets --locked -- -D warnings`
 - Test:   `cargo test --all-targets --locked`
+- Workflows: `actionlint -shellcheck= -pyflakes=` (run it after touching
+  `.github/`; see the Guardrails section)
+
+The first three are the Rust gate (`.github/workflows/ci.yml`), and if a change
+passes them it passes CI's Rust jobs. They are no longer *exactly* the gate: the
+same workflow also runs `actionlint` over the workflows, a supply-chain audit,
+and two dogfood jobs that run the built binary against this repository's own
+`Cargo.lock` and `package-lock.json`. Mutant scope is `src/**/*.rs`, so a change
+to a module outside `src/` is not mutation-tested at all. The toolchain is
+pinned in `rust-toolchain.toml` — do not run a different one.
+
+Two of those cannot be reproduced by the three commands above. A green local
+run is necessary, not sufficient.
+
+## Delegating
+Review agents grade an answer. They do not derive one, and they inherit the
+premise you hand them.
+
+- Never hand a reviewer your own conclusion and ask it to check. A finding
+  that says "there is a hole here" gets investigated by someone who has not
+  seen your fixture, your reading of the dependency, or your test output.
+  Verification that starts from your answer cannot escape your answer.
+- When a finding contradicts you, treat your own reproduction as the suspect.
+  A hand-built fixture proves only that the code does what the fixture
+  exercises. Check that the fixture reaches the path its comment claims before
+  you use it to close a finding: an extract.rs fixture that omitted the ustar
+  version field let tar-rs yield the header instead of consuming it, and the
+  resulting "false positive" shipped a 256 MiB allocation hole for a day.
+- For a problem with an open answer and an expensive failure, draft several
+  solutions in parallel and have a second group review the candidates. One
+  candidate graded by one reviewer is a single point of failure wearing two
+  hats. Comparing candidates also surfaces the combination nobody would have
+  proposed alone.
+- Confirm a mutation actually applied. Roughly one in three revert-and-test
+  cycles in this repo silently changed nothing: a string replace that did not
+  match, a stale `/tmp` backup restored over newer work, a `--lib` run against
+  a `blueline` binary cargo had not rebuilt. Each one read as "verified".
+- Treat a hand-picked revert as a floor, not evidence. It tests the one change
+  you thought of. CI's `cargo mutants` enumerates the rest, and it found a
+  survivor in the CVSS v2 scoring that six review passes and every manual check
+  had cleared, because all six reference vectors used `AV:N` and its weight is
+  1.0, so multiplying and dividing by it agree. Vary a fixture's constant
+  before trusting it to pin the expression around it.
+- Skip the fan-out for one-line changes. Deleting dead code does not need four
+  agents. The bar is an open answer space and an expensive miss.
 
 Both extra flags matter and are easy to drop. `cargo fmt --all` *without*
 `--check` rewrites your files instead of failing, so it reports success on
@@ -49,6 +94,15 @@ in that file. Neither is installed by default, so `--mutants` and `--all` exit
 ## Guardrails
 
 **Always**
+- Run the three commands above before finishing any work.
+- Lint workflows with `actionlint` after touching `.github/`. GitHub compiles a
+  workflow before running any step, so one bad expression yields a run with zero
+  jobs that cannot be retried, and a message that does not name the line. It
+  also expands expressions inside a `run:` block even when they sit in a shell
+  comment, so writing `${{ }}` out literally in a comment takes the whole
+  workflow down. That happened, and it failed every check in the repo for a day
+  while a YAML parser reported the file as valid.
+
 - Run `./scripts/verify.sh` before finishing any work.
 - Run `./scripts/verify.sh --mutants` for security-critical work — anything
   touching extraction, integrity, policy, or the heuristic rule engine.
@@ -62,6 +116,12 @@ in that file. Neither is installed by default, so `--mutants` and `--all` exit
 - Read `ARCHITECTURE.md` before touching module boundaries.
 - After each merged PR, add an entry to `CHANGELOG.md` under `[Unreleased]`
   in the same branch.
+- Fix a bug you found, even when it predates the current branch. "Pre-existing",
+  "out of scope", "unrelated to this diff", and "would widen the PR" are not
+  reasons to leave a defect live in a fail-closed tool. Age is a fact about when
+  a bug arrived, not an argument for keeping it. If a fix genuinely belongs in
+  its own change, say so and open that change in the same session — do not
+  report the finding and stop.
 
 **Ask first**
 - Adding a dependency — propose it and wait for a decision.
@@ -78,6 +138,8 @@ in that file. Neither is installed by default, so `--mutants` and `--all` exit
   widen an `#[allow]` to a whole function — that removes the guardrail for
   every future line in it.
 - Skipping the CI gate. If CI breaks, fix it in the same branch.
+- Shipping a fix you could not verify. A patch with no test that fails without
+  it is a guess. Re-introduce the bug, watch the test catch it, then restore.
 
 ## Conventions
 - The engine is Rust. `src/` is the security-critical path and is written

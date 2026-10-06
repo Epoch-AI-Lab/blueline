@@ -187,9 +187,19 @@ fn shim_installs_gates_and_uninstalls() {
 
     let policy_dir = tempfile::tempdir().unwrap();
     let policy_path = policy_dir.path().join("blueline.toml");
+    // `check_advisories = false` keeps this test hermetic and keeps it about the
+    // shim. Advisory coverage needs api.osv.dev, which a fixture registry cannot
+    // provide; a lookup that cannot complete is disclosed as an unknown-coverage
+    // finding, and that finding is MEDIUM, which is above the band this shim
+    // gates on. So without this line the "clean install must pass" case below is
+    // really asserting that an offline advisory host blocks every install --
+    // which is the documented behaviour, and not what this test is for. The
+    // disclosure itself is pinned by
+    // `advisory::tests::only_an_unverified_report_with_advisories_enabled_is_unknown_coverage`.
     std::fs::write(
         &policy_path,
-        "[[allowlist.packages]]\nname = \"ok\"\nallow_unreviewed_baseline = true\n",
+        "[[allowlist.packages]]\nname = \"ok\"\nallow_unreviewed_baseline = true\n\
+         [policy]\ncheck_advisories = false\n",
     )
     .unwrap();
 

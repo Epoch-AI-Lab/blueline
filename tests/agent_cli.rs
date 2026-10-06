@@ -171,7 +171,22 @@ fn agent(args: &[&str]) -> (i32, String, String) {
     let policy_path = policy_dir.path().join("blueline.toml");
     std::fs::write(
         &policy_path,
-        "[[allowlist.packages]]\nname = \"ok\"\nallow_unreviewed_baseline = true\n",
+        // `check_advisories = false` so these tests stop depending on
+        // `api.osv.dev` answering. Nothing here asserts on advisory coverage;
+        // every case is about the gate's exit codes and its decision shapes.
+        //
+        // Without it, a lookup that cannot complete is disclosed as
+        // `R09_ADVISORY_UNVERIFIED` at MEDIUM, and MEDIUM is above LOW, which
+        // `agent` gates on. So a package these tests had just marked clean came
+        // back BLOCK and `agent_gate_uses_exit_codes_and_native_decision_shapes`
+        // failed on `left: 2, right: 0`. Measured here at roughly 1 run in 4,
+        // varying with the third party's latency rather than with anything in
+        // this repo. The disclosure itself stays pinned by
+        // `advisory::tests::only_an_unverified_report_with_advisories_enabled_is_unknown_coverage`
+        // and `the_aur_never_claims_clean_advisory_coverage`, neither of which
+        // needs a network.
+        "[[allowlist.packages]]\nname = \"ok\"\nallow_unreviewed_baseline = true\n\
+         \n[policy]\ncheck_advisories = false\n",
     )
     .unwrap();
     let output = Command::cargo_bin("blueline")
@@ -310,5 +325,84 @@ fn agent_gate_uses_exit_codes_and_native_decision_shapes() {
         Some(2),
         "hook stdin must reach the gate: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn gate_refuses_a_registry_override_without_touching_the_registry() {
+    // A registry the gate cannot reach stands in for any side effect of
+    // resolving the operand. If the shape denial short-circuits, the refusal
+    // is still the shape reason rather than a network failure, and the store
+    // gains no evidence row for a command that never ran.
+    let data_dir = tempfile::tempdir().unwrap();
+    let dead_registry = "http://127.0.0.1:1";
+    let output = Command::cargo_bin("blueline")
+        .unwrap()
+        .args([
+            "agent",
+            "gate",
+            "--command",
+            "npm install risky@1.0.0 --registry=http://elsewhere.test",
+            "--registry",
+            dead_registry,
+        ])
+        .env("BLUELINE_DATA_DIR", data_dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unreviewable invocation shape"),
+        "must refuse on shape alone, not on a failed lookup: {stderr}"
+    );
+    assert!(
+        !stderr.contains("registry lookup failed"),
+        "the operand must not be resolved at all: {stderr}"
+    );
+
+    let conn = rusqlite::Connection::open(data_dir.path().join("baseline.db")).unwrap();
+    let known: i64 = conn
+        .query_row("SELECT count(*) FROM known_clean", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(known, 0, "a refused command must not record evidence");
+}
+
+#[cfg(unix)]
+#[test]
+fn gate_denies_rather_than_panicking_on_a_non_unicode_environment() {
+    use std::os::unix::ffi::OsStrExt;
+
+    // A genuinely invalid UTF-8 byte, not a replacement char, so this actually
+    // reaches the code path `env::vars()` panics on. At a hook boundary a
+    // panic is exit 101, and Claude Code and Cursor treat any exit other than
+    // 2 as non-blocking, so one odd variable would let the install proceed
+    // ungated. The gate must answer with its documented code instead.
+    let data_dir = tempfile::tempdir().unwrap();
+    let output = Command::cargo_bin("blueline")
+        .unwrap()
+        .args([
+            "agent",
+            "gate",
+            "--command",
+            "npm install risky@1.0.0",
+            "--registry",
+            "http://127.0.0.1:1",
+        ])
+        .env("BLUELINE_DATA_DIR", data_dir.path())
+        .env(
+            "BLUELINE_TEST_NONUNICODE",
+            std::ffi::OsStr::from_bytes(b"\xff\xfe"),
+        )
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_ne!(
+        output.status.code(),
+        Some(101),
+        "the gate must not panic on a hostile environment: {stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "no panic may reach the hook host: {stderr}"
     );
 }

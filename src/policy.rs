@@ -131,6 +131,15 @@ impl Policy {
 
     /// Validate internal policy consistency and invariants.
     pub fn validate(&self) -> Result<(), BluelineError> {
+        // A typo here used to fall back to HIGH, so `fail_on = "blockk"`
+        // quietly weakened a gate instead of refusing the policy. The CLI flag
+        // already refused the same typo; the policy key did not.
+        if crate::verdict::VerdictBand::parse(&self.ci.fail_on).is_none() {
+            return Err(BluelineError::Policy(format!(
+                "invalid ci policy: fail_on ({}) is not one of low, medium, high, block",
+                self.ci.fail_on
+            )));
+        }
         if self.thresholds.max_low_score > self.thresholds.max_medium_score {
             return Err(BluelineError::Policy(format!(
                 "invalid thresholds: max_low_score ({}) cannot exceed max_medium_score ({})",
@@ -188,16 +197,14 @@ impl Policy {
     /// here is the only point where the key is still visible; once the field is
     /// gone, serde would drop it without a word.
     fn reject_unimplemented_keys(&self) -> Result<(), BluelineError> {
-        if !self.blocklist.maintainers.is_empty() {
-            return Err(BluelineError::Policy(
-                "blocklist.maintainers is not implemented and would otherwise be silently ignored. \
-                 Maintainer transitions are detected by R10_MAINTAINER_TRANSITION, which compares \
-                 registry authorship between the baseline and the target release. To stop trusting a \
-                 maintainer, blocklist the package instead."
-                    .into(),
-            ));
-        }
-
+        // `blocklist.maintainers` is deliberately absent from this check. It
+        // used to be refused here because nothing read it, which was true
+        // before `P04_MAINTAINER_BLOCKED` existed and is false now: AUR
+        // resolves a per-release commit author and the rule consumes it. Where
+        // a registry supplies no identity the rule cannot be applied, and that
+        // is reported per review as `P04_MAINTAINER_UNEVALUABLE` rather than
+        // turned into a load-time error, because the policy is loaded without
+        // ecosystem context and the answer differs per lane.
         for (i, rule) in self.allowlist.packages.iter().enumerate() {
             if rule.max_risk.is_some() {
                 return Err(BluelineError::Policy(format!(
@@ -240,7 +247,6 @@ impl Policy {
         };
         current.max(from_score)
     }
-
     /// Check if a package name matches any blocked package pattern for the
     /// given ecosystem. Rules without an `ecosystem` field match all.
     pub fn is_package_blocked(&self, name: &str, ecosystem: Ecosystem) -> bool {
@@ -250,6 +256,14 @@ impl Policy {
         })
     }
 
+    /// Check if a maintainer email is on the blocklist.
+    pub fn is_maintainer_blocked(&self, email: &str) -> bool {
+        let email_trimmed = email.trim().to_lowercase();
+        self.blocklist
+            .maintainers
+            .iter()
+            .any(|b| b.trim().to_lowercase() == email_trimmed)
+    }
     /// Check if a lifecycle script is explicitly permitted for a package in
     /// the given ecosystem. Rules without an `ecosystem` field match all.
     pub fn is_script_allowed(
@@ -305,10 +319,18 @@ impl Default for ThresholdsConfig {
 #[serde(default)]
 pub struct GeneralPolicyConfig {
     /// Require valid Sigstore/SLSA build attestations (default false).
+    ///
+    /// Reported, not enforced as a blanket block. A release with no published
+    /// provenance is disclosed and its verdict held; a release whose published
+    /// provenance cannot be verified is refused. Nothing short of a signature
+    /// check is presented as satisfying this key, so the report never overstates
+    /// what was proven.
     pub require_provenance: bool,
     /// Block on newly added lifecycle scripts when no baseline approval exists (default true).
     pub block_unreviewed_scripts: bool,
-    /// Allow non-registry git/http dependencies without blocking (default false).
+    /// Lower the band of non-registry (git/http/ssh/`npm:`/`file:`/`link:`)
+    /// dependency findings from HIGH to MEDIUM. The findings stay visible; they
+    /// are never suppressed (default false).
     pub allow_git_dependencies: bool,
     /// Query and check OSV vulnerability advisories (default true).
     pub check_advisories: bool,
@@ -363,6 +385,9 @@ impl AdvisoriesPolicyConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProvenancePolicyConfig {
+    /// Same rule as `GeneralPolicyConfig::require_provenance`, and honoured
+    /// identically: either key turns the requirement on. Named here as well so a
+    /// policy can group it with the other provenance keys.
     pub require_provenance: bool,
     pub require_signatures: bool,
     pub allowed_builders: Vec<String>,
@@ -379,6 +404,12 @@ pub struct CiPolicyConfig {
     pub max_evaluations: usize,
     /// Whether to evaluate devDependencies (default: true).
     pub include_dev: bool,
+    /// Permit requirements.txt options that redirect pip away from the
+    /// reviewed graph (`--index-url`, `-r`, `-c`, ...). Off by default,
+    /// because blueline models only pinned `name==version` lines and cannot
+    /// follow an alternative index, an extra requirements file, or a
+    /// constraints file. On, they are disclosed rather than refused.
+    pub allow_requirements_options: bool,
 }
 
 impl Default for CiPolicyConfig {
@@ -387,6 +418,7 @@ impl Default for CiPolicyConfig {
             fail_on: "high".to_string(),
             max_evaluations: 100,
             include_dev: true,
+            allow_requirements_options: false,
         }
     }
 }
@@ -601,25 +633,39 @@ maintainers = []
         assert!(policy.blocklist.maintainers.is_empty());
     }
 
+    /// A populated maintainer blocklist loads rather than being refused.
+    ///
+    /// This test used to assert the opposite, and the reason it changed is the
+    /// whole point: the key was refused because nothing read it, which was true
+    /// while `is_maintainer_blocked` had no caller and false once
+    /// `P04_MAINTAINER_BLOCKED` started calling it. AUR resolves a per-release
+    /// commit author and that identity reaches the rule, so refusing the key
+    /// would forbid a protection that works.
+    ///
+    /// The lane where it cannot work is not expressible here, because a policy
+    /// is loaded without ecosystem context. That case is reported per review as
+    /// `P04_MAINTAINER_UNEVALUABLE` in `heuristic.rs`.
     #[test]
-    fn rejects_a_populated_maintainers_blocklist() {
-        let err = Policy::from_toml_str(
+    fn accepts_a_populated_maintainers_blocklist() {
+        let policy = Policy::from_toml_str(
             r#"
 [blocklist]
 maintainers = ["badactor@example.com"]
 "#,
         )
-        .unwrap_err()
-        .to_string();
+        .expect(
+            "the key is enforced by P04 wherever the registry supplies an identity, so \
+             refusing it at load would forbid a protection that works",
+        );
 
-        assert!(err.contains("blocklist.maintainers"), "got: {err}");
-        assert!(
-            err.contains("R10_MAINTAINER_TRANSITION"),
-            "the error must name the mechanism that does govern maintainers, got: {err}"
+        assert_eq!(
+            policy.blocklist.maintainers,
+            vec!["badactor@example.com".to_string()],
+            "the list must survive the load intact or the rule has nothing to match"
         );
         assert!(
-            err.contains("blocklist the package instead"),
-            "the error must offer the route that works, got: {err}"
+            policy.is_maintainer_blocked("badactor@example.com"),
+            "a loaded entry must actually be matchable, or the key is decorative again"
         );
     }
 
@@ -733,6 +779,28 @@ block_score = 101
         assert!(glob_match("*middle*", "some-middle-name"));
         assert!(glob_match("exact", "exact"));
         assert!(!glob_match("exact", "exact-not"));
+    }
+
+    #[test]
+    fn rejects_an_unparseable_ci_fail_on() {
+        for bad in ["blockk", "", "medium-high", "  "] {
+            let toml = format!("[ci]\nfail_on = \"{bad}\"\n");
+            assert!(
+                Policy::from_toml_str(&toml).is_err(),
+                "fail_on = {bad:?} must be refused rather than silently weakened"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_ci_fail_on_case_and_whitespace_insensitively() {
+        for good in ["low", "HIGH", "  Block  ", "Medium"] {
+            let toml = format!("[ci]\nfail_on = \"{good}\"\n");
+            assert!(
+                Policy::from_toml_str(&toml).is_ok(),
+                "fail_on = {good:?} must stay valid"
+            );
+        }
     }
 
     #[test]

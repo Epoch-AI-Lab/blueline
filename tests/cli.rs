@@ -79,20 +79,30 @@ fn make_tarball() -> Vec<u8> {
 }
 
 fn make_tarball_with(code: &[u8]) -> Vec<u8> {
+    make_tarball_named("express", "4.21.2", code)
+}
+
+/// The archive declares its own name, and a review refuses when that name is
+/// not the one the registry resolved, so a fixture has to be built for the
+/// package under test rather than reusing one canned tarball.
+fn make_tarball_named(name: &str, version: &str, code: &[u8]) -> Vec<u8> {
     let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     let mut builder = tar::Builder::new(encoder);
-    let pkg_json = br#"{
-        "name": "express",
-        "version": "4.21.2",
-        "scripts": { "preinstall": "echo hi", "postinstall": "node install.js" },
-        "dependencies": { "cookie": "0.7.1" }
-    }"#;
+    let pkg_json = format!(
+        r#"{{
+        "name": "{name}",
+        "version": "{version}",
+        "scripts": {{ "preinstall": "echo hi", "postinstall": "node install.js" }},
+        "dependencies": {{ "cookie": "0.7.1" }}
+    }}"#
+    );
+    let pkg_json = pkg_json.as_bytes();
     let mut h = tar::Header::new_gnu();
     h.set_size(pkg_json.len() as u64);
     h.set_mode(0o644);
     h.set_cksum();
     builder
-        .append_data(&mut h, "package/package.json", &pkg_json[..])
+        .append_data(&mut h, "package/package.json", pkg_json)
         .unwrap();
 
     let mut h2 = tar::Header::new_gnu();
@@ -132,8 +142,37 @@ fn packument(base: &str, version: &str, integrity: &str) -> String {
     .to_string()
 }
 
+/// A policy file that switches advisory lookups off, pointed at by
+/// `BLUELINE_POLICY` below.
+///
+/// Advisory checking needs `api.osv.dev`, and a fixture registry on 127.0.0.1
+/// cannot provide it. When the lookup cannot complete the review discloses it
+/// as `R09_ADVISORY_UNVERIFIED` at MEDIUM, which is above LOW, so six of these
+/// tests asserted against a third party's availability rather than against
+/// blueline: `review_yes_auto_approves_low_risk_and_fails_closed_on_high_risk`
+/// failed with `Cannot auto-approve safe-yes-pkg@1.0.0: risk verdict is
+/// MEDIUM` on a 3s timeout reading a response OSV never refused to send. A
+/// runner with egress passes it, so the flakiness was invisible in CI.
+///
+/// Nothing in this file asserts on advisory coverage, so disabling the lookup
+/// removes the network dependency without weakening an assertion. The
+/// disclosure itself is pinned by
+/// `advisory::tests::only_an_unverified_report_with_advisories_enabled_is_unknown_coverage`
+/// and by `the_aur_never_claims_clean_advisory_coverage`, neither of which
+/// needs a network.
+const NO_ADVISORIES_POLICY: &str = "[policy]\ncheck_advisories = false\n";
+
 fn blueline() -> Command {
-    Command::cargo_bin("blueline").unwrap()
+    let policy_dir = tempfile::tempdir().expect("policy tempdir");
+    let policy_path = policy_dir.path().join("blueline.toml");
+    std::fs::write(&policy_path, NO_ADVISORIES_POLICY).expect("write policy");
+    // The file must outlive this function, since the child process runs after
+    // it returns. Leaking the directory is the cost of a hermetic child; the
+    // alternative is the third-party network dependency described above.
+    std::mem::forget(policy_dir);
+    let mut cmd = Command::cargo_bin("blueline").unwrap();
+    cmd.env("BLUELINE_POLICY", &policy_path);
+    cmd
 }
 
 #[test]
@@ -460,7 +499,10 @@ fn reviews_delta_against_predecessor_baseline() {
 fn install_delegates_to_npm_with_ignore_scripts() {
     let temp_dir = tempfile::tempdir().unwrap();
     let log_file = temp_dir.path().join("npm_args.log");
-    let mock_npm = temp_dir.path().join("mock-npm.sh");
+    // The real npm is found on PATH under its own name.
+    let bin_dir = temp_dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let mock_npm = bin_dir.join("npm");
     std::fs::write(
         &mock_npm,
         format!(
@@ -469,10 +511,24 @@ fn install_delegates_to_npm_with_ignore_scripts() {
         ),
     )
     .unwrap();
+    // npm_execpath points somewhere else entirely. It is environment-supplied
+    // and must never decide which program runs.
+    let hostile = temp_dir.path().join("hostile.sh");
+    let hostile_marker = temp_dir.path().join("hostile_ran");
+    std::fs::write(
+        &hostile,
+        format!(
+            "#!/bin/sh\ntouch \"{}\"\nexit 0\n",
+            hostile_marker.display()
+        ),
+    )
+    .unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&mock_npm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for p in [&mock_npm, &hostile] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
 
     let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -550,9 +606,22 @@ fn install_delegates_to_npm_with_ignore_scripts() {
             "--save-dev",
         ])
         .env("BLUELINE_DATA_DIR", data_dir.path())
-        .env("npm_execpath", mock_npm.to_str().unwrap())
+        .env("npm_execpath", hostile.to_str().unwrap())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin_dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
         .assert()
         .success();
+
+    assert!(
+        !hostile_marker.exists(),
+        "npm_execpath must never choose the program that runs"
+    );
 
     let logged_args = std::fs::read_to_string(&log_file).unwrap();
     assert!(
@@ -828,7 +897,7 @@ fn regression_large_file_opaque_detection() {
 
 #[test]
 fn regression_unreviewed_predecessor_baseline_warning() {
-    let tarball = make_tarball_with(b"module.exports = { clean: true };");
+    let tarball = make_tarball_named("pred-pkg", "1.1.0", b"module.exports = { clean: true };");
     let integrity = sha512_b64(&tarball);
 
     let fixture = spawn_fixture(
@@ -953,7 +1022,7 @@ fn regression_terminal_sanitization() {
 
 #[test]
 fn regression_non_interactive_review_fail_closed_and_success() {
-    let safe_tarball = make_tarball_with(b"module.exports = {};");
+    let safe_tarball = make_tarball_named("safe-pass-pkg", "0.9.0", b"module.exports = {};");
     let safe_integrity = sha512_b64(&safe_tarball);
     let fixture_safe = spawn_fixture(
         move |base| {
@@ -1326,7 +1395,7 @@ fn mcp_stdio_handles_initialize_and_tools_list() {
 
 #[test]
 fn review_yes_auto_approves_low_risk_and_fails_closed_on_high_risk() {
-    let safe_tarball = make_tarball_with(b"module.exports = {};");
+    let safe_tarball = make_tarball_named("safe-yes-pkg", "1.0.0", b"module.exports = {};");
     let safe_integrity = sha512_b64(&safe_tarball);
     let fixture_safe = spawn_fixture(
         move |base| {
@@ -1416,7 +1485,7 @@ fn review_yes_auto_approves_low_risk_and_fails_closed_on_high_risk() {
 
 #[test]
 fn regression_pure_json_output_with_yes_and_clean_exit() {
-    let safe_tarball = make_tarball_with(b"module.exports = {};");
+    let safe_tarball = make_tarball_named("pure-json-pkg", "1.0.0", b"module.exports = {};");
     let safe_integrity = sha512_b64(&safe_tarball);
     let fixture_integrity = safe_integrity.clone();
 
@@ -1496,7 +1565,7 @@ fn regression_pure_json_output_with_yes_and_clean_exit() {
 
 #[test]
 fn regression_non_interactive_emits_diagnostic_stderr_on_exit() {
-    let safe_tarball = make_tarball_with(b"module.exports = {};");
+    let safe_tarball = make_tarball_named("unapproved-pkg", "1.0.0", b"module.exports = {};");
     let safe_integrity = sha512_b64(&safe_tarball);
 
     let fixture = spawn_fixture(
@@ -1834,7 +1903,7 @@ fn ci_rejects_flag_like_base_refs() {
 
 #[test]
 fn regression_refusal_hints_name_the_bootstrap_command() {
-    let tarball = make_tarball_with(b"module.exports = { clean: true };");
+    let tarball = make_tarball_named("hint-pkg", "1.1.0", b"module.exports = { clean: true };");
     let integrity = sha512_b64(&tarball);
 
     let fixture = spawn_fixture(
@@ -1881,7 +1950,8 @@ fn regression_refusal_hints_name_the_bootstrap_command() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains("hint: baseline `hint-pkg@1.0.0`"))
-        .stderr(predicate::str::contains("blueline review hint-pkg@1.0.0"));
+        .stderr(predicate::str::contains("blueline review hint-pkg@1.0.0"))
+        .stderr(predicate::str::contains("allow_unreviewed_baseline = true"));
 }
 
 #[test]
@@ -1932,10 +2002,18 @@ fn policy_allow_unreviewed_baseline_enables_scripted_onboarding() {
     let temp_policy = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(
         temp_policy.path(),
+        // `check_advisories = false` for the reason on `NO_ADVISORIES_POLICY`:
+        // this case is about the baseline allowlist, and an unreachable advisory
+        // host would add a MEDIUM disclosure to a verdict this test asserts is
+        // LOW. It cannot inherit the file `blueline()` writes, because an
+        // explicit `--policy` outranks `BLUELINE_POLICY`.
         r#"
 [[allowlist.packages]]
 name = "onboard-pkg"
 allow_unreviewed_baseline = true
+
+[policy]
+check_advisories = false
 "#,
     )
     .unwrap();

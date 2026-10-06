@@ -44,19 +44,7 @@ pub struct Delta {
     pub modified_lifecycle_scripts: Vec<String>,
     pub new_dependencies: Vec<(String, String)>,
     pub modified_dependencies: Vec<(String, String, String)>,
-    #[allow(dead_code)]
-    pub removed_dependencies: Vec<String>,
-    #[allow(dead_code)]
     pub binding_gyp_added: bool,
-}
-
-impl Delta {
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.files_added.is_empty()
-            && self.files_removed.is_empty()
-            && self.files_modified.is_empty()
-    }
 }
 
 pub fn compute_delta(
@@ -107,13 +95,15 @@ pub fn compute_delta(
                         let target_full = target_base.join(rel_path);
                         let change =
                             diff_single_file(None, Some(&target_full), rel_path, target_meta)?;
-                        if change.is_executable || is_executable_extension(rel_path) {
-                            new_executables.push(rel_path.clone());
+                        if change.is_executable
+                            || is_executable_extension(&rel_path.to_string_lossy())
+                        {
+                            new_executables.push(rel_display_at(rel_path));
                         }
                         if change.kind == FileKind::Binary
                             || change.kind == FileKind::OpaqueTooLarge
                         {
-                            new_binaries.push(rel_path.clone());
+                            new_binaries.push(rel_display_at(rel_path));
                         }
                         total_lines_added += change.lines_added;
                         files_added.push(change);
@@ -136,19 +126,19 @@ pub fn compute_delta(
                                 target_meta,
                             )?;
                             if !base_meta.is_executable && target_meta.is_executable {
-                                new_executables.push(rel_path.clone());
+                                new_executables.push(rel_display_at(rel_path));
                             }
                             if base_meta.kind == FileKind::Binary
                                 && target_meta.kind == FileKind::Binary
                             {
-                                modified_binaries.push(rel_path.clone());
+                                modified_binaries.push(rel_display_at(rel_path));
                             }
                             if (base_meta.kind != FileKind::Binary
                                 && target_meta.kind == FileKind::Binary)
                                 || (base_meta.kind != FileKind::OpaqueTooLarge
                                     && target_meta.kind == FileKind::OpaqueTooLarge)
                             {
-                                new_binaries.push(rel_path.clone());
+                                new_binaries.push(rel_display_at(rel_path));
                             }
                             total_lines_added += change.lines_added;
                             total_lines_deleted += change.lines_deleted;
@@ -173,11 +163,12 @@ pub fn compute_delta(
                     let (rel_path, target_meta) = target_iter.next().unwrap();
                     let target_full = target_base.join(rel_path);
                     let change = diff_single_file(None, Some(&target_full), rel_path, target_meta)?;
-                    if change.is_executable || is_executable_extension(rel_path) {
-                        new_executables.push(rel_path.clone());
+                    if change.is_executable || is_executable_extension(&rel_path.to_string_lossy())
+                    {
+                        new_executables.push(rel_display_at(rel_path));
                     }
                     if change.kind == FileKind::Binary || change.kind == FileKind::OpaqueTooLarge {
-                        new_binaries.push(rel_path.clone());
+                        new_binaries.push(rel_display_at(rel_path));
                     }
                     total_lines_added += change.lines_added;
                     files_added.push(change);
@@ -188,13 +179,14 @@ pub fn compute_delta(
     } else {
         // First sighting: all target files are added
         for (rel_path, target_meta) in target_files {
+            let display = rel_display_at(&rel_path);
             let target_full = target_base.join(&rel_path);
             let change = diff_single_file(None, Some(&target_full), &rel_path, &target_meta)?;
-            if change.is_executable || is_executable_extension(&rel_path) {
-                new_executables.push(rel_path.clone());
+            if change.is_executable || is_executable_extension(&rel_path.to_string_lossy()) {
+                new_executables.push(display.clone());
             }
             if change.kind == FileKind::Binary || change.kind == FileKind::OpaqueTooLarge {
-                new_binaries.push(rel_path.clone());
+                new_binaries.push(display);
             }
             total_lines_added += change.lines_added;
             files_added.push(change);
@@ -225,7 +217,6 @@ pub fn compute_delta(
 
     let mut new_dependencies = Vec::new();
     let mut modified_dependencies = Vec::new();
-    let mut removed_dependencies = Vec::new();
 
     let target_deps = collect_all_dependencies(target_manifest);
     if let Some(base_m) = baseline_manifest {
@@ -237,11 +228,6 @@ pub fn compute_delta(
                 }
             } else {
                 new_dependencies.push((dep.clone(), ver.clone()));
-            }
-        }
-        for dep in base_deps.keys() {
-            if !target_deps.contains_key(dep) {
-                removed_dependencies.push(dep.clone());
             }
         }
     } else {
@@ -274,7 +260,6 @@ pub fn compute_delta(
         modified_lifecycle_scripts,
         new_dependencies,
         modified_dependencies,
-        removed_dependencies,
         binding_gyp_added,
     })
 }
@@ -295,14 +280,16 @@ fn collect_all_dependencies(manifest: &PackageJson) -> BTreeMap<String, String> 
 
 #[derive(Debug, Clone)]
 struct DiskFileMeta {
-    #[allow(dead_code)]
-    size: u64,
     hash: [u8; 32],
     kind: FileKind,
     is_executable: bool,
 }
 
-fn scan_tree(root: &Path) -> Result<BTreeMap<String, DiskFileMeta>, BluelineError> {
+/// Keyed by `PathBuf`, not a lossy string. Two entries differing only in
+/// invalid UTF-8 bytes collapse to the same replacement character, and the
+/// merged string was then joined back onto the root to read the file, so a
+/// non-UTF-8 name aborted the whole review with "No such file or directory".
+fn scan_tree(root: &Path) -> Result<BTreeMap<PathBuf, DiskFileMeta>, BluelineError> {
     let mut files = BTreeMap::new();
     for entry in WalkDir::new(root).follow_links(false) {
         let entry = entry.map_err(|e| BluelineError::Extraction(format!("scanning tree: {e}")))?;
@@ -311,8 +298,7 @@ fn scan_tree(root: &Path) -> Result<BTreeMap<String, DiskFileMeta>, BluelineErro
             let rel = path
                 .strip_prefix(root)
                 .map_err(|e| BluelineError::Extraction(format!("path strip error: {e}")))?
-                .to_string_lossy()
-                .to_string();
+                .to_path_buf();
 
             let bytes = fs::read(path).map_err(|e| {
                 BluelineError::Extraction(format!("reading {}: {e}", path.display()))
@@ -327,7 +313,6 @@ fn scan_tree(root: &Path) -> Result<BTreeMap<String, DiskFileMeta>, BluelineErro
             files.insert(
                 rel,
                 DiskFileMeta {
-                    size: bytes.len() as u64,
                     hash,
                     kind,
                     is_executable,
@@ -351,12 +336,19 @@ fn classify_bytes(bytes: &[u8]) -> FileKind {
     FileKind::Text
 }
 
+/// Display form of a relative path, for the string-typed report fields.
+fn rel_display_at(p: &Path) -> String {
+    p.to_string_lossy().into_owned()
+}
+
 fn diff_single_file(
     old_path: Option<&Path>,
     new_path: Option<&Path>,
-    rel_path: &str,
+    rel_path: &Path,
     target_meta: &DiskFileMeta,
 ) -> Result<FileChange, BluelineError> {
+    let rel_display = rel_path.to_string_lossy().into_owned();
+    let rel_path = rel_display.as_str();
     let kind = target_meta.kind.clone();
     if kind != FileKind::Text {
         return Ok(FileChange {
@@ -603,6 +595,29 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn non_utf8_filename_is_reviewed_rather_than_fatal() {
+        use std::os::unix::ffi::OsStrExt;
+        let base = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        // A name that is not valid UTF-8. validate_entry_path only rejects NUL,
+        // so this reaches the diff layer through normal extraction.
+        let odd = std::ffi::OsStr::from_bytes(b"p\xffayload.sh");
+        std::fs::write(target.path().join(odd), b"console.log(1)\n").unwrap();
+        let empty = PackageJson::default();
+        let delta = compute_delta(
+            Some(base.path()),
+            None,
+            None,
+            target.path(),
+            &empty,
+            "1.0.0",
+        )
+        .expect("a non-UTF-8 filename must not abort the review");
+        assert_eq!(delta.files_added.len(), 1);
+    }
+
+    #[test]
     fn detects_binding_gyp_addition() {
         let new_dir = tempfile::tempdir().unwrap();
         fs::write(new_dir.path().join("binding.gyp"), "{}").unwrap();
@@ -650,5 +665,191 @@ mod tests {
 
         fs::write(dir.path().join("extra.txt"), "hello").unwrap();
         assert_eq!(find_package_prefix(dir.path()), dir.path());
+    }
+
+    /// The executable and binary classification, on the *merge* path.
+    ///
+    /// `compute_delta` has two independent implementations of this
+    /// classification: a sorted merge when a baseline tree is supplied, and a
+    /// one-sided walk when it is not. `detects_binary_files` passes
+    /// `baseline_root: None`, so it only ever reached the second — which is why
+    /// every mutant in the merge arm survived while its twin in the one-sided
+    /// arm was already covered.
+    ///
+    /// Each assertion below is the one input that separates a mutation from the
+    /// code as written:
+    ///
+    /// * `added-exec-mode` is executable by mode with an unremarkable name, so
+    ///   it is in `new_executables` only while the test is an `||`. Under `&&`
+    ///   it needs both signals and drops out.
+    /// * `hook.sh` is the other half: an exec extension with no exec bit.
+    /// * `both-exec` is executable in the baseline *and* the target, so it is a
+    ///   modified file that gained nothing and must not be reported as a new
+    ///   executable. Deleting the `!` on the baseline's `is_executable` turns
+    ///   the guard into "executable in both" and reports it.
+    /// * `text-to-big` crosses into `OpaqueTooLarge` by growing past 2 MiB, so
+    ///   it is neither binary before nor binary after, and only the
+    ///   "became opaque" arm can put it in `new_binaries`.
+    /// * `bin-to-bin` is binary on both sides, which is the only way into
+    ///   `modified_binaries`.
+    #[test]
+    fn the_merge_path_classifies_executables_and_binaries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn manifest(version: &str) -> PackageJson {
+            PackageJson {
+                name: "test".into(),
+                version: version.into(),
+                gypfile: None,
+                scripts: BTreeMap::new(),
+                dependencies: BTreeMap::new(),
+                optional_dependencies: BTreeMap::new(),
+                peer_dependencies: BTreeMap::new(),
+            }
+        }
+
+        fn set_mode(dir: &std::path::Path, name: &str, mode: u32) {
+            fs::set_permissions(dir.join(name), fs::Permissions::from_mode(mode)).unwrap();
+        }
+
+        let old_dir = tempfile::tempdir().unwrap();
+        let new_dir = tempfile::tempdir().unwrap();
+
+        // Modified files.
+        fs::write(old_dir.path().join("both-exec"), "old\n").unwrap();
+        set_mode(old_dir.path(), "both-exec", 0o755);
+        fs::write(new_dir.path().join("both-exec"), "new\n").unwrap();
+        set_mode(new_dir.path(), "both-exec", 0o755);
+
+        fs::write(old_dir.path().join("gains-exec"), "old\n").unwrap();
+        set_mode(old_dir.path(), "gains-exec", 0o644);
+        fs::write(new_dir.path().join("gains-exec"), "new\n").unwrap();
+        set_mode(new_dir.path(), "gains-exec", 0o755);
+
+        // Binary on both sides: the only route into `modified_binaries`.
+        fs::write(old_dir.path().join("bin-to-bin"), [1u8, 0, 2, 3]).unwrap();
+        fs::write(new_dir.path().join("bin-to-bin"), [9u8, 0, 8, 7]).unwrap();
+
+        // Grows past MAX_DIFF_FILE_BYTES, so it is opaque rather than binary.
+        let big = "a".repeat((MAX_DIFF_FILE_BYTES + 1024) as usize);
+        fs::write(old_dir.path().join("text-to-big"), "small\n").unwrap();
+        fs::write(new_dir.path().join("text-to-big"), &big).unwrap();
+
+        // Added files, one signal each.
+        fs::write(new_dir.path().join("added-exec-mode"), "hi\n").unwrap();
+        set_mode(new_dir.path(), "added-exec-mode", 0o755);
+        fs::write(new_dir.path().join("hook.sh"), "hi\n").unwrap();
+        set_mode(new_dir.path(), "hook.sh", 0o644);
+
+        // Added, and opaque rather than binary. This is the only shape that
+        // separates the two arms of the `new_binaries` test in the `(None,
+        // Some(_))` merge arm, and that arm is reachable only with a baseline --
+        // the one-sided walk has its own copy of the check further down.
+        fs::write(new_dir.path().join("added-opaque"), &big).unwrap();
+
+        // Added, opaque, and named so it sorts *after* every baseline entry.
+        // That is what routes it through the `(None, Some(_))` arm rather than
+        // the `Greater` one: the merge compares the two sorted streams, so a
+        // file that sorts before the next baseline entry is classified as
+        // `Greater` and one that sorts after all of them is classified only once
+        // the baseline iterator is exhausted. The two arms carry their own copy
+        // of the check, so an added file only reaches one of them by name.
+        fs::write(new_dir.path().join("zzz-opaque"), &big).unwrap();
+
+        // Added, executable, and named so it sorts after every baseline entry,
+        // for the executable check in the same `(None, Some(_))` arm.
+        fs::write(new_dir.path().join("zzz-exec"), "hi\n").unwrap();
+        set_mode(new_dir.path(), "zzz-exec", 0o755);
+
+        // Added and genuinely *binary* -- a NUL byte, which is what makes
+        // `classify_bytes` call it Binary rather than OpaqueTooLarge. The
+        // opaque file above covers the other arm of the `||`; only a real
+        // binary tells a `==` from a `!=` here, because an opaque file satisfies
+        // "kind is not Binary" as readily as "kind is Binary".
+        fs::write(new_dir.path().join("zzz-binary"), [1u8, 0, 2, 3]).unwrap();
+
+        // Removed.
+        fs::write(old_dir.path().join("gone"), "bye\n").unwrap();
+
+        let base_m = manifest("1.0.0");
+        let target_m = manifest("1.1.0");
+        let delta = compute_delta(
+            Some(old_dir.path()),
+            Some(&base_m),
+            Some("1.0.0"),
+            new_dir.path(),
+            &target_m,
+            "1.1.0",
+        )
+        .unwrap();
+
+        for want in ["gains-exec", "added-exec-mode", "hook.sh", "zzz-exec"] {
+            assert!(
+                delta.new_executables.iter().any(|p| p == want),
+                "`{want}` must be reported as a new executable, got {:?}",
+                delta.new_executables
+            );
+        }
+        assert!(
+            !delta.new_executables.iter().any(|p| p == "both-exec"),
+            "a file executable in both trees gained nothing: {:?}",
+            delta.new_executables
+        );
+
+        assert!(
+            delta.modified_binaries.iter().any(|p| p == "bin-to-bin"),
+            "binary before and after is a modified binary, got {:?}",
+            delta.modified_binaries
+        );
+        assert!(
+            delta.new_binaries.iter().any(|p| p == "text-to-big"),
+            "a file that becomes opaque is a new binary, got {:?}",
+            delta.new_binaries
+        );
+        for want in ["added-opaque", "zzz-opaque", "zzz-binary"] {
+            assert!(
+                delta.new_binaries.iter().any(|p| p == want),
+                "an added non-text file is a new binary: `{want}`, got {:?}",
+                delta.new_binaries
+            );
+        }
+        assert!(
+            delta
+                .files_removed
+                .iter()
+                .any(|c| c.relative_path == "gone"),
+            "the removed file must still be reported"
+        );
+    }
+
+    /// An added file that is opaque rather than binary. `classify_bytes` tests
+    /// the size cap *before* the NUL scan, so a file over 2 MiB is
+    /// `OpaqueTooLarge` and never `Binary` — which is the only way to tell the
+    /// two arms of the `new_binaries` test apart. `detects_binary_files` adds a
+    /// 4-byte `.node` file, where both sides of the `||` are false, so it passes
+    /// whether the operator is `||` or `&&`.
+    #[test]
+    fn an_added_opaque_file_counts_as_a_new_binary() {
+        let new_dir = tempfile::tempdir().unwrap();
+        let big = "a".repeat((MAX_DIFF_FILE_BYTES + 1024) as usize);
+        fs::write(new_dir.path().join("huge.txt"), &big).unwrap();
+
+        let m = PackageJson {
+            name: "test".into(),
+            version: "1.0.0".into(),
+            gypfile: None,
+            scripts: BTreeMap::new(),
+            dependencies: BTreeMap::new(),
+            optional_dependencies: BTreeMap::new(),
+            peer_dependencies: BTreeMap::new(),
+        };
+        let delta = compute_delta(None, None, None, new_dir.path(), &m, "1.0.0").unwrap();
+
+        assert_eq!(delta.files_added[0].kind, FileKind::OpaqueTooLarge);
+        assert!(
+            delta.new_binaries.contains(&"huge.txt".to_string()),
+            "an opaque file is not scannable, so it counts as a new binary: {:?}",
+            delta.new_binaries
+        );
     }
 }

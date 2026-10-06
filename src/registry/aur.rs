@@ -59,7 +59,6 @@ pub struct AurInfo {
 #[derive(Debug, Deserialize)]
 struct AurRpcResponse {
     #[serde(rename = "version")]
-    #[allow(dead_code)]
     version: u8,
     #[serde(rename = "type")]
     result_type: String,
@@ -115,11 +114,7 @@ impl AurRpc {
     }
 
     pub fn with_limits(base: &str, limits: RegistryLimits) -> Self {
-        let agent = ureq::AgentBuilder::new()
-            .timeout(std::time::Duration::from_secs(90))
-            .user_agent(USER_AGENT)
-            .redirects(0)
-            .build();
+        let agent = super::http_util::registry_agent(USER_AGENT, base);
         Self {
             agent,
             base: base.trim_end_matches('/').to_string(),
@@ -808,6 +803,41 @@ impl AurRegistry {
     }
 }
 
+impl AurRegistry {
+    /// The commit author email of the pinned commit (self-declared AUR
+    /// identity). Failures degrade to `None` = "unknown" by design.
+    fn commit_author(&self, pkg: &Package) -> Option<String> {
+        let (clone_url, commit) = parse_git_tarball_url(&pkg.tarball_url).ok()?;
+        self.pin_clone_url(&clone_url).ok()?;
+        let repo_path = self.cached_repo(&clone_url).ok()?;
+        verify_commit_exists(&repo_path, &commit).ok()?;
+        let text = git_text(
+            Some(&repo_path),
+            &["log", "-1", "--format=%ae", &commit],
+            MAX_GIT_SMALL_OUTPUT_BYTES,
+        )
+        .ok()?;
+        usable_author_email(&text)
+    }
+}
+
+/// The email an author field yields, or `None` when it is not usable.
+///
+/// The commit author and the RPC-declared maintainer are different strings from
+/// different sources — `git log --format=%ae` and a JSON field the AUR serves —
+/// and either can be empty or carry a control character, so the check lives
+/// here rather than being written twice. A maintainer string is written into an
+/// audit row, so a control character in it is a report-injection vector rather
+/// than a cosmetic problem.
+fn usable_author_email(text: &str) -> Option<String> {
+    let email = text.trim();
+    if email.is_empty() || email.chars().any(char::is_control) {
+        None
+    } else {
+        Some(email.to_string())
+    }
+}
+
 impl Registry for AurRegistry {
     fn ecosystem(&self) -> Ecosystem {
         Ecosystem::Aur
@@ -851,25 +881,19 @@ impl Registry for AurRegistry {
         Ok(self.list_releases(name)?.last().map(|r| r.version.clone()))
     }
 
-    /// The commit author email of the pinned commit (self-declared AUR
-    /// identity). Failures degrade to `None` = "unknown" by design.
+    /// The publishing identity of a release, preferring the per-release commit
+    /// author and falling back to the maintainer the RPC declares.
+    ///
+    /// Both channels existed and only one was read. The RPC `Maintainer` field
+    /// is registry-asserted, is present even when git history is unavailable,
+    /// and is the identity `[blocklist] maintainers` is written against, so a
+    /// package whose clone cannot be pinned was invisible to the blocklist.
     fn release_author(&self, pkg: &Package) -> Option<String> {
-        let (clone_url, commit) = parse_git_tarball_url(&pkg.tarball_url).ok()?;
-        self.pin_clone_url(&clone_url).ok()?;
-        let repo_path = self.cached_repo(&clone_url).ok()?;
-        verify_commit_exists(&repo_path, &commit).ok()?;
-        let text = git_text(
-            Some(&repo_path),
-            &["log", "-1", "--format=%ae", &commit],
-            MAX_GIT_SMALL_OUTPUT_BYTES,
-        )
-        .ok()?;
-        let email = text.trim();
-        if email.is_empty() || email.chars().any(char::is_control) {
-            None
-        } else {
-            Some(email.to_string())
+        if let Some(email) = self.commit_author(pkg) {
+            return Some(email);
         }
+        let declared = self.rpc.info(&pkg.name).ok()?.maintainer?;
+        usable_author_email(&declared)
     }
 }
 
@@ -1186,10 +1210,20 @@ mod tests {
     }
 
     impl AurGitFixture {
+        /// A file:// URL, not a bare path. Git ignores `--depth` on a local
+        /// clone and falls back to copying loose objects one at a time, which
+        /// is the path that intermittently fails on a repo with a few hundred
+        /// commits. Over a real transport git honours the depth and fetches a
+        /// packfile, which is both faster and what the adapter does against
+        /// the AUR itself.
+        fn git_base(&self) -> String {
+            format!("file://{}", self.fixtures.display())
+        }
+
         fn registry(&self) -> AurRegistry {
             AurRegistry::with_bases(
                 &self.server.base,
-                self.fixtures.to_str().unwrap(),
+                &self.git_base(),
                 RegistryLimits::default(),
             )
         }
@@ -1834,11 +1868,14 @@ mod tests {
             integrity: Some(integrity.clone()),
         };
 
+        let base = fx.git_base();
         for url in [
             format!("git+https://evil.example/yay.git#{hash}"),
             format!("git+/tmp/evil/yay.git#{hash}"),
-            format!("git+{}/yay#{}", fx.fixtures.display(), hash),
-            format!("git+{}/../evil.git#{}", fx.fixtures.display(), hash),
+            format!("git+{base}/yay#{hash}"),
+            format!("git+{base}/../evil.git#{hash}"),
+            // A sibling base that merely shares a prefix must not pass the pin.
+            format!("git+{base}-evil/yay.git#{hash}"),
         ] {
             let err = reg
                 .fetch_verified(&pkg(url.clone()))
@@ -1852,8 +1889,53 @@ mod tests {
 
         // Under the base the pin passes; with no such repo the failure is
         // the clone itself, not the pin.
-        let url = format!("git+{}/nosuchpkg.git#{}", fx.fixtures.display(), hash);
+        let url = format!("git+{base}/nosuchpkg.git#{hash}");
         let err = reg.fetch_verified(&pkg(url)).unwrap_err().to_string();
         assert!(err.contains("git clone failed"), "unexpected error: {err}");
+    }
+
+    /// An author email must be present *and* free of control characters.
+    ///
+    /// Both conditions are needed and they are checked with `||`, which means
+    /// the two failure shapes are independent: an empty string, and a non-empty
+    /// string carrying a control character. The empty case is the one a test has
+    /// to include, because it is the only input where the two operands disagree
+    /// — a well-formed email satisfies neither, so asserting the happy path
+    /// leaves an `&&` in place of the `||` completely undetected.
+    ///
+    /// A control character matters because this string is written into an audit
+    /// row. The AUR's RPC `Maintainer` field is registry-asserted, so whatever
+    /// the AUR serves reaches the log.
+    #[test]
+    fn an_author_email_must_be_present_and_free_of_control_characters() {
+        // The ordinary case, with the surrounding whitespace git and the RPC
+        // both add.
+        assert_eq!(
+            usable_author_email(" maintainer@example.org \n").as_deref(),
+            Some("maintainer@example.org")
+        );
+
+        // Present but empty: the discriminating case.
+        assert_eq!(usable_author_email(""), None, "an empty author is unknown");
+        assert_eq!(
+            usable_author_email("   \n\t  "),
+            None,
+            "whitespace is empty"
+        );
+
+        // Non-empty but carrying a control character: a report-injection vector
+        // in a value that lands in the audit log.
+        for bad in [
+            "bad\u{0}name@example.org",
+            "bad\nname@example.org",
+            "bad\tname@example.org",
+            "na\rme@example.org",
+        ] {
+            assert_eq!(
+                usable_author_email(bad),
+                None,
+                "a control character must disqualify `{bad:?}`"
+            );
+        }
     }
 }

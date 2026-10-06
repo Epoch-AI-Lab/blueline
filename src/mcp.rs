@@ -1,3 +1,6 @@
+const MAX_REQUEST_LINE_BYTES: usize = 64 * 1024;
+const JSONRPC_VERSION: &str = "2.0";
+
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 
@@ -11,7 +14,6 @@ use crate::store::BaselineStore;
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
-    #[allow(dead_code)]
     jsonrpc: Option<String>,
     id: Option<serde_json::Value>,
     method: String,
@@ -75,7 +77,7 @@ pub fn run_stdio(
     policy_path: Option<&Path>,
 ) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
-    let reader = BufReader::new(stdin.lock());
+    let mut reader = BufReader::new(stdin.lock());
     let mut stdout = std::io::stdout();
 
     let policy = Policy::load_or_default(policy_path)?;
@@ -83,63 +85,232 @@ pub fn run_stdio(
 
     eprintln!("blueline-mcp: starting stdio server loop (ready for JSON-RPC 2.0)");
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("blueline-mcp: error reading stdin: {e}");
-                break;
-            }
+    loop {
+        let line = match next_request_line(&mut reader) {
+            Ok(Some(l)) => l,
+            // A clean end of stream is a normal shutdown.
+            Ok(None) => break,
+            // A stream error is fatal, unlike a decode error. Falling through
+            // to a clean exit told the host the gate succeeded while an
+            // in-flight request went unanswered.
+            Err(e) => return Err(anyhow::anyhow!("reading MCP stdin: {e}")),
         };
-
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let request: JsonRpcRequest = match serde_json::from_str(trimmed) {
-            Ok(req) => req,
-            Err(e) => {
-                let err_resp = JsonRpcResponse {
-                    jsonrpc: "2.0",
-                    id: serde_json::Value::Null,
-                    result: None,
-                    error: Some(JsonRpcError::parse_error(format!("Parse error: {e}"))),
-                };
-                let resp_str = serde_json::to_string(&err_resp)?;
-                writeln!(stdout, "{resp_str}")?;
-                stdout.flush()?;
+        match line {
+            RequestLine::Skip => continue,
+            RequestLine::Oversize => {
+                write_error(
+                    &mut stdout,
+                    &format!("request exceeds {MAX_REQUEST_LINE_BYTES} bytes; refusing"),
+                )?;
+                // Framing is newline-delimited, so an oversized line cannot be
+                // resynchronised. A host must treat a dead blueline-mcp as a
+                // denial; see the same reasoning in agent.rs.
+                return Err(anyhow::anyhow!(
+                    "MCP request exceeds {MAX_REQUEST_LINE_BYTES} bytes; refusing"
+                ));
+            }
+            RequestLine::InvalidUtf8 => {
+                // One bad request must not kill the server.
+                write_error(&mut stdout, "request is not valid UTF-8")?;
                 continue;
             }
-        };
-
-        // Notifications don't require responses
-        if request.id.is_none() {
-            continue;
+            RequestLine::Text(t) => {
+                serve_request_line(&t, &mut stdout, bases, &store, &policy)?;
+            }
         }
-
-        let id = request.id.unwrap_or(serde_json::Value::Null);
-        let resp = match handle_request(&request.method, request.params, bases, &store, &policy) {
-            Ok(result) => JsonRpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(result),
-                error: None,
-            },
-            Err(err) => JsonRpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: None,
-                error: Some(err),
-            },
-        };
-
-        let resp_str = serde_json::to_string(&resp)?;
-        writeln!(stdout, "{resp_str}")?;
-        stdout.flush()?;
     }
 
     eprintln!("blueline-mcp: shutting down stdio server loop");
+    Ok(())
+}
+
+/// Answer one framed request line. A request this server refuses to act on
+/// (unparseable, wrong `jsonrpc` member) draws the same error shape and does
+/// not stop the loop: one bad request must not kill the server.
+fn serve_request_line<W: Write>(
+    line: &str,
+    out: &mut W,
+    bases: &crate::cli::RegistryBases,
+    store: &BaselineStore,
+    policy: &Policy,
+) -> anyhow::Result<()> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+
+    let request: JsonRpcRequest = match serde_json::from_str(trimmed) {
+        Ok(req) => req,
+        Err(e) => {
+            let err_resp = JsonRpcResponse {
+                jsonrpc: JSONRPC_VERSION,
+                id: serde_json::Value::Null,
+                result: None,
+                error: Some(JsonRpcError::parse_error(format!("Parse error: {e}"))),
+            };
+            let resp_str = serde_json::to_string(&err_resp)?;
+            writeln!(out, "{resp_str}")?;
+            out.flush()?;
+            return Ok(());
+        }
+    };
+
+    if let Err(err) = check_protocol_version(&request) {
+        write_error(out, &err.message)?;
+        return Ok(());
+    }
+    // Notifications don't require responses
+    if request.id.is_none() {
+        return Ok(());
+    }
+
+    let id = request.id.unwrap_or(serde_json::Value::Null);
+    let resp = match handle_request(&request.method, request.params, bases, store, policy) {
+        Ok(result) => JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION,
+            id,
+            result: Some(result),
+            error: None,
+        },
+        Err(err) => JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION,
+            id,
+            result: None,
+            error: Some(err),
+        },
+    };
+
+    let resp_str = serde_json::to_string(&resp)?;
+    writeln!(out, "{resp_str}")?;
+    out.flush()?;
+    Ok(())
+}
+
+/// JSON-RPC 2.0 requires the `jsonrpc` member to be exactly `"2.0"`. It used to
+/// be deserialized and dropped, so a `"1.0"` request — and a request with no
+/// `jsonrpc` member at all — was dispatched as a 2.0 call.
+fn check_protocol_version(req: &JsonRpcRequest) -> Result<(), JsonRpcError> {
+    match req.jsonrpc.as_deref() {
+        Some(JSONRPC_VERSION) => Ok(()),
+        Some(other) => Err(JsonRpcError::parse_error(format!(
+            "Invalid request: `jsonrpc` member must be \"{JSONRPC_VERSION}\", got `{other}`"
+        ))),
+        None => Err(JsonRpcError::parse_error(format!(
+            "Invalid request: missing `jsonrpc` member; JSON-RPC requires \"{JSONRPC_VERSION}\""
+        ))),
+    }
+}
+
+/// One framed line off the MCP stdin stream, decoded. `Oversize` means the
+/// cap was passed before a newline arrived, not that a longer line was read
+/// and then measured.
+#[derive(Debug)]
+enum RequestLine {
+    Skip,
+    Text(String),
+    Oversize,
+    InvalidUtf8,
+}
+
+enum FrameStep {
+    Eof,
+    /// Bytes to hand back to the reader, and whether they ended the line.
+    Take {
+        len: usize,
+        newline: bool,
+    },
+}
+
+fn next_request_line<R: BufRead>(reader: &mut R) -> std::io::Result<Option<RequestLine>> {
+    let mut raw: Vec<u8> = Vec::new();
+    let mut any = false;
+    loop {
+        let step = {
+            let available = match reader.fill_buf() {
+                Ok(available) => available,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            if available.is_empty() {
+                FrameStep::Eof
+            } else {
+                match available.iter().position(|&b| b == b'\n') {
+                    Some(nl) => {
+                        push_bounded(&mut raw, &available[..nl]);
+                        FrameStep::Take {
+                            len: nl + 1,
+                            newline: true,
+                        }
+                    }
+                    None => {
+                        push_bounded(&mut raw, available);
+                        FrameStep::Take {
+                            len: available.len(),
+                            newline: false,
+                        }
+                    }
+                }
+            }
+        };
+        match step {
+            FrameStep::Eof => {
+                // `any` alone decides this. `raw` only ever grows inside the
+                // `Take` arm, and reaching that arm sets `any` before it can
+                // return, so `any` is false exactly when `raw` is empty -- the
+                // `|| !raw.is_empty()` this replaces could never be the true one
+                // on its own. It read as a second safety net and was in fact a
+                // second opinion that could not disagree, which is how it
+                // survived every attempt to pin it with a test.
+                return Ok(if any { Some(classify(raw)) } else { None });
+            }
+            FrameStep::Take { len, newline } => {
+                reader.consume(len);
+                any = true;
+                // Refuse the moment the cap is passed rather than at the
+                // newline: the line is already unreviewable, and the caller
+                // treats `Oversize` as fatal, so there is nothing to resync.
+                if raw.len() > MAX_REQUEST_LINE_BYTES {
+                    return Ok(Some(RequestLine::Oversize));
+                }
+                if newline {
+                    return Ok(Some(classify(raw)));
+                }
+            }
+        }
+    }
+}
+
+/// Copy at most what is still needed to prove the cap is passed, so the
+/// resident bytes never exceed `MAX_REQUEST_LINE_BYTES + 1` no matter how much
+/// the peer sends. `BufRead::read_until` (and therefore `split`) copies the
+/// whole line first and bounds nothing; `agent.rs` has the same shape bounded
+/// with `Read::take`.
+fn push_bounded(buf: &mut Vec<u8>, chunk: &[u8]) {
+    let room = MAX_REQUEST_LINE_BYTES + 1 - buf.len();
+    buf.extend_from_slice(&chunk[..chunk.len().min(room)]);
+}
+
+fn classify(raw: Vec<u8>) -> RequestLine {
+    if raw.len() > MAX_REQUEST_LINE_BYTES {
+        return RequestLine::Oversize;
+    }
+    match String::from_utf8(raw) {
+        Ok(text) if text.trim().is_empty() => RequestLine::Skip,
+        Ok(text) => RequestLine::Text(text),
+        Err(_) => RequestLine::InvalidUtf8,
+    }
+}
+
+fn write_error<W: Write>(out: &mut W, message: &str) -> anyhow::Result<()> {
+    let resp = JsonRpcResponse {
+        jsonrpc: JSONRPC_VERSION,
+        id: serde_json::Value::Null,
+        result: None,
+        error: Some(JsonRpcError::parse_error(message.to_string())),
+    };
+    let text = serde_json::to_string(&resp)?;
+    writeln!(out, "{text}")?;
+    out.flush()?;
     Ok(())
 }
 
@@ -753,10 +924,302 @@ mod tests {
     }
 
     #[test]
+    fn a_line_at_the_cap_is_read_and_one_byte_over_is_refused() {
+        let mut at_cap = vec![b'a'; MAX_REQUEST_LINE_BYTES];
+        at_cap.push(b'\n');
+        let mut reader = BufReader::new(&at_cap[..]);
+        assert!(matches!(
+            next_request_line(&mut reader).unwrap(),
+            Some(RequestLine::Text(_))
+        ));
+        // A consumed line leaves the reader at a clean end of stream.
+        assert!(next_request_line(&mut reader).unwrap().is_none());
+
+        let mut over = vec![b'a'; MAX_REQUEST_LINE_BYTES + 1];
+        over.push(b'\n');
+        let mut reader = BufReader::new(&over[..]);
+        assert!(matches!(
+            next_request_line(&mut reader).unwrap(),
+            Some(RequestLine::Oversize)
+        ));
+    }
+
+    /// The cap has to bound the read, not just the check. The old loop used
+    /// `lines()`, which reads a whole line into an unbounded `String` before
+    /// anything looks at its length, so a peer that never sends a newline made
+    /// the server buffer as much as it cared to send. The strongest observable
+    /// proxy for "the buffer never grew to the size of what was sent" is the
+    /// byte count the source was drained by: a bounded read stops within a few
+    /// buffer-fills of the cap, an unbounded one drains the stream to EOF.
+    #[test]
+    fn newline_free_stream_is_refused_at_the_cap_without_reading_the_stream() {
+        // Sized down so the accounting is tight rather than dominated by the
+        // reader's own buffer.
+        const CHUNK: usize = 64;
+        const STREAM: usize = 8 * 1024 * 1024;
+
+        struct Counting {
+            remaining: usize,
+            served: usize,
+        }
+        impl std::io::Read for Counting {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = buf.len().min(CHUNK).min(self.remaining);
+                for b in &mut buf[..n] {
+                    *b = b'a';
+                }
+                self.remaining -= n;
+                self.served += n;
+                Ok(n)
+            }
+        }
+
+        let mut src = Counting {
+            remaining: STREAM,
+            served: 0,
+        };
+        let mut reader = BufReader::with_capacity(CHUNK, &mut src);
+
+        assert!(matches!(
+            next_request_line(&mut reader).unwrap(),
+            Some(RequestLine::Oversize)
+        ));
+        assert!(
+            src.served <= MAX_REQUEST_LINE_BYTES + 64 * CHUNK,
+            "the refusal must land within a few reads of the cap, not after the stream: \
+             served {} bytes of {STREAM}",
+            src.served
+        );
+        assert!(
+            src.remaining > STREAM / 2,
+            "most of the stream must never be read: served {} of {STREAM}",
+            src.served
+        );
+    }
+
+    #[test]
+    fn consecutive_requests_keep_their_framing() {
+        let stream = concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}"
+        );
+        let mut reader = BufReader::new(stream.as_bytes());
+        for id in ["1", "2"] {
+            match next_request_line(&mut reader).unwrap() {
+                Some(RequestLine::Text(text)) => {
+                    assert!(text.contains(&format!("\"id\":{id}")), "{text}")
+                }
+                other => panic!("request {id} did not frame: {other:?}"),
+            }
+        }
+        assert!(next_request_line(&mut reader).unwrap().is_none());
+    }
+
+    #[test]
+    fn non_utf8_line_is_flagged_and_a_blank_one_skipped() {
+        let mut reader = BufReader::new(&b"{ \xff\xfe\n"[..]);
+        assert!(matches!(
+            next_request_line(&mut reader).unwrap(),
+            Some(RequestLine::InvalidUtf8)
+        ));
+        let mut reader = BufReader::new(&b"   \n"[..]);
+        assert!(matches!(
+            next_request_line(&mut reader).unwrap(),
+            Some(RequestLine::Skip)
+        ));
+        // An empty stream is a clean shutdown, not an empty request.
+        let mut reader = BufReader::new(&b""[..]);
+        assert!(next_request_line(&mut reader).unwrap().is_none());
+    }
+
+    #[test]
     fn jsonrpc_error_constructors_have_spec_codes() {
         assert_eq!(JsonRpcError::parse_error("bad json").code, -32700);
         assert_eq!(JsonRpcError::method_not_found("unknown").code, -32601);
         assert_eq!(JsonRpcError::invalid_params("bad param").code, -32602);
         assert_eq!(JsonRpcError::internal_error("fail").code, -32603);
+    }
+
+    /// JSON-RPC 2.0 requires `"jsonrpc":"2.0"`. The member was deserialized and
+    /// never read, so a `"1.0"` request and a request without the member were
+    /// both answered as ordinary 2.0 calls.
+    #[test]
+    fn rejects_wrong_or_absent_jsonrpc_member() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&temp.path().join("store.db")).unwrap();
+        let policy = Policy::default();
+        let bases = test_bases();
+
+        for (body, needle) in [
+            (
+                r#"{"jsonrpc":"1.0","id":1,"method":"ping"}"#,
+                "must be \"2.0\"",
+            ),
+            (r#"{"id":1,"method":"ping"}"#, "missing `jsonrpc` member"),
+        ] {
+            let mut out: Vec<u8> = Vec::new();
+            serve_request_line(body, &mut out, &bases, &store, &policy).unwrap();
+            let resp: serde_json::Value =
+                serde_json::from_str(String::from_utf8(out).unwrap().trim()).unwrap();
+            assert_eq!(resp["jsonrpc"], "2.0", "{body}");
+            assert_eq!(resp["id"], serde_json::Value::Null, "{body}");
+            assert_eq!(resp["error"]["code"], -32700, "{body}");
+            assert!(
+                resp["error"]["message"].as_str().unwrap().contains(needle),
+                "{body}: {resp}"
+            );
+            assert!(
+                resp.get("result").is_none(),
+                "a refused request must carry no result: {body}: {resp}"
+            );
+        }
+
+        // The declared version is answered normally, so the check is not a
+        // blanket refusal.
+        let mut out: Vec<u8> = Vec::new();
+        serve_request_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+            &mut out,
+            &bases,
+            &store,
+            &policy,
+        )
+        .unwrap();
+        let resp: serde_json::Value =
+            serde_json::from_str(String::from_utf8(out).unwrap().trim()).unwrap();
+        assert_eq!(resp["id"], 1);
+        assert_eq!(resp["result"], json!({}));
+        assert!(resp.get("error").is_none(), "{resp}");
+    }
+
+    /// The cap's own value. Every framing test builds its fixture *from* this
+    /// constant, so a constant that stopped meaning 64 KiB would resize every
+    /// case and none of them would notice.
+    #[test]
+    fn the_request_line_cap_is_sixty_four_kibibytes() {
+        assert_eq!(MAX_REQUEST_LINE_BYTES, 64 * 1024);
+        assert_eq!(MAX_REQUEST_LINE_BYTES, 65_536);
+    }
+
+    /// The cap has to bound the *resident bytes*, not just the verdict.
+    ///
+    /// The framing tests all check the outcome, and the outcome is identical
+    /// either way: an over-cap line is refused whether the buffer stopped
+    /// growing at `MAX + 1` or swallowed the whole peer stream. What the cap is
+    /// for is the second one — a peer that never sends a newline must not be able
+    /// to make blueline hold its payload — so the invariant is asserted directly
+    /// against the helper, over far more input than the cap.
+    #[test]
+    fn the_resident_bytes_never_exceed_the_cap_plus_one() {
+        let mut buf: Vec<u8> = Vec::new();
+        let chunk = vec![b'x'; 4096];
+        let rounds = MAX_REQUEST_LINE_BYTES / chunk.len() + 16;
+        for _ in 0..rounds {
+            push_bounded(&mut buf, &chunk);
+        }
+        assert_eq!(
+            buf.len(),
+            MAX_REQUEST_LINE_BYTES + 1,
+            "a peer sending {rounds} chunks with no newline must not be able to \
+             grow the buffer past the cap plus the one byte that proves it"
+        );
+
+        // A partial final chunk lands exactly on the same bound.
+        let mut buf: Vec<u8> = Vec::new();
+        push_bounded(&mut buf, &chunk);
+        assert_eq!(buf.len(), chunk.len());
+        let headroom = MAX_REQUEST_LINE_BYTES + 1 - buf.len();
+        push_bounded(&mut buf, &vec![b'y'; headroom + 5_000]);
+        assert_eq!(buf.len(), MAX_REQUEST_LINE_BYTES + 1);
+    }
+
+    /// A reader that fails with `Interrupted` first, then works.
+    ///
+    /// `Interrupted` is the one I/O error that means "try again" rather than
+    /// "this stream is broken", and a signal arriving mid-read is the ordinary
+    /// way to get it. Treating it as fatal would drop a request for no reason;
+    /// treating every error as retryable would spin on a stream that is never
+    /// going to recover. Both directions need a test, and they need different
+    /// fixtures, because each is invisible to the other.
+    struct FlakyReader {
+        remaining_faults: Vec<std::io::ErrorKind>,
+        inner: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl std::io::Read for FlakyReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.remaining_faults.is_empty() {
+                let kind = self.remaining_faults.remove(0);
+                return Err(std::io::Error::from(kind));
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    fn framed(faults: Vec<std::io::ErrorKind>, body: &str) -> std::io::Result<Option<RequestLine>> {
+        let mut reader = std::io::BufReader::new(FlakyReader {
+            remaining_faults: faults,
+            inner: std::io::Cursor::new(body.as_bytes().to_vec()),
+        });
+        next_request_line(&mut reader)
+    }
+
+    #[test]
+    fn an_interrupted_read_is_retried_rather_than_fatal() {
+        let line = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+        for faults in [
+            vec![std::io::ErrorKind::Interrupted],
+            vec![
+                std::io::ErrorKind::Interrupted,
+                std::io::ErrorKind::Interrupted,
+            ],
+            vec![
+                std::io::ErrorKind::Interrupted,
+                std::io::ErrorKind::Interrupted,
+                std::io::ErrorKind::Interrupted,
+            ],
+        ] {
+            let got = framed(faults, &format!("{line}\n"))
+                .expect("an interrupted read must be retried, not fatal");
+            match got {
+                Some(RequestLine::Text(text)) => assert_eq!(text, line),
+                other => panic!("the request was lost across the retry: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_error_that_is_not_interrupted_is_propagated() {
+        // The fault fires once and the stream would recover, so retrying
+        // everything would return a request instead of the error -- which is
+        // what makes this a test rather than a hang.
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::InvalidData,
+        ] {
+            let err = framed(vec![kind], "{\"a\":1}\n").expect_err(
+                "an error that is not `Interrupted` must reach the caller, or the \
+                 read spins on a stream that will never recover",
+            );
+            assert_eq!(err.kind(), kind, "the original error kind must survive");
+        }
+    }
+
+    /// A bare newline carries no request, but it *is* input: the peer spoke and
+    /// then closed. Reporting a clean shutdown would tell the caller the stream
+    /// ended having said nothing, which is a different statement from "said
+    /// something empty". The two are separated here because `raw` is empty and
+    /// only the "did we see anything" flag distinguishes them.
+    #[test]
+    fn a_bare_newline_is_an_empty_request_not_a_clean_shutdown() {
+        let mut reader = BufReader::new(&b"\n"[..]);
+        assert!(
+            matches!(
+                next_request_line(&mut reader).unwrap(),
+                Some(RequestLine::Skip)
+            ),
+            "a blank line must be skipped, not reported as end of stream"
+        );
     }
 }

