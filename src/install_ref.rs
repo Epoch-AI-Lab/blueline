@@ -630,6 +630,7 @@ fn plausible_spec(manager: RefManager, token: &str) -> bool {
     let name = split_spec(manager, token).map(|(n, _)| n).unwrap_or(token);
     match manager {
         RefManager::Pip => valid_py_name(name),
+        RefManager::Yay | RefManager::Paru => valid_aur_name(name),
         _ => valid_npm_name(name),
     }
 }
@@ -2007,6 +2008,53 @@ mod tests {
         assert_eq!(
             scan_line("yay pkg -S foo=1.0"),
             vec![(RefManager::Yay, "foo=1.0".to_string())]
+        );
+    }
+
+    /// A pkgbase the AUR grammar accepts must be captured, or R24 discloses
+    /// nothing for a `yay -S` line the resolver would otherwise review.
+    #[test]
+    fn scan_line_captures_aur_names_npm_grammar_rejects() {
+        for spec in ["foo+bar", "x@y", "foo-1.2_3+x"] {
+            assert_eq!(
+                scan_line(&format!("yay -S {spec}")),
+                vec![(RefManager::Yay, spec.to_string())],
+                "yay dropped an AUR-valid pkgbase: {spec}"
+            );
+            assert_eq!(
+                scan_line(&format!("paru -S {spec}")),
+                vec![(RefManager::Paru, spec.to_string())],
+                "paru dropped an AUR-valid pkgbase: {spec}"
+            );
+            assert!(
+                command_ref(RefManager::Yay, spec, true)
+                    .registry_spec()
+                    .is_some(),
+                "{spec} must stay resolvable for recursive review"
+            );
+        }
+    }
+
+    /// Widening the AUR arm to alpm's grammar must not let a path segment
+    /// through, and must leave the existing non-registry capture alone:
+    /// `../escape` is still surfaced as an unresolvable reference, never as
+    /// a registry pkgbase.
+    #[test]
+    fn scan_line_aur_gate_rejects_paths_and_keeps_non_registry_capture() {
+        for line in ["yay -S foo/bar", "yay -S foo+bar/bar", "paru -S scope/pkg"] {
+            assert!(
+                scan_line(line).is_empty(),
+                "{line} must not resolve to an AUR pkgbase"
+            );
+        }
+
+        let escape = scan_line("yay -S ../escape");
+        assert_eq!(escape, vec![(RefManager::Yay, "../escape".to_string())]);
+        assert!(
+            raw_ref(RefOrigin::CommandLine, RefManager::Yay, "../escape")
+                .registry_spec()
+                .is_none(),
+            "a path must never resolve to a registry pkgbase"
         );
     }
 

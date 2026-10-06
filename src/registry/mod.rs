@@ -12,8 +12,6 @@ pub mod http_util;
 pub mod npm;
 pub mod pypi;
 
-/// The package ecosystems blueline knows about. npm is fully wired; cargo,
-/// PyPI, and AUR adapters build on these seams in later PRs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Ecosystem {
@@ -260,7 +258,6 @@ pub fn releases_with_reasons(
     Ok((releases, reasons))
 }
 
-/// Seam for future registries (PyPI, cargo). npm is the only full impl for now.
 ///
 /// `Any` is a supertrait so a caller holding a `&dyn Registry` can recover the
 /// concrete adapter when one of them publishes something the seam cannot
