@@ -68,5 +68,5 @@ Rule wiring: `R06_FIRST_SIGHTING` when `baseline_version.is_none()`,
 - **A predecessor with no registry integrity yields `UnreviewedBaseline::None`**
   and therefore no `[y/N]` prompt at all. The prompt is gated on
   `pkg.integrity.is_some()`, not on the resolution alone.
-- `BaselineResolution::display_summary()` is `#[allow(dead_code)]` with three
-  exact strings pinned by a test only. Nothing renders it.
+- `BaselineResolution::display_summary()` is deleted. `impl BaselineResolution`
+  carries only `package()`; nothing else is attached to the enum.

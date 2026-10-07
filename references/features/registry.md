@@ -28,8 +28,9 @@ Loopback registry bases are permitted — see the SSRF carve-out below.
 
 **npm signature verification and `dist.shasum` are NOT implemented.** Only
 `dist.integrity` with algorithm `sha512` is checked. `Dist` has no `shasum`
-field; grep `shasum` in `src/` returns nothing; there is no `signatures`/`pgp`
-handling under `src/registry/`. ARCHITECTURE.md §1 claims both. See
+field; grep `shasum` in `src/` returns nothing. The signature *block* is read
+(`Dist::signatures`, `release_signatures`) but only its presence and first key
+id are used, so `require_signatures` passes on a block nobody verified. See
 [extract](extract.md).
 
 **A non-sha512 `dist.integrity` is a hard refusal**, not a downgrade:
@@ -37,11 +38,13 @@ handling under `src/registry/`. ARCHITECTURE.md §1 claims both. See
 sha512"`. And a *missing* integrity is also fatal:
 `"registry provided no dist.integrity; refusing to trust unverifiable bytes"`.
 
-**The harness is fail-open on DNS failure.** `is_private_or_local_host`
-resolves the hostname — *"to prevent DNS rebinding"* — with **port 443
-hard-coded regardless of the URL's actual port**, and wraps it in `if let Ok(..)`,
-so a resolution failure is treated as *allowed*. That contradicts the
-function's own stated purpose. `ambiguous` whether it is deliberate.
+**The SSRF guard is `ValidatingResolver`, and the pre-flight check is not.**
+`is_private_or_local_host` still resolves a name as an early-out, but every
+agent is built by `registry_agent_with_timeout` with `.redirects(0)` and
+`.resolver(validating_resolver_for(base))`, so the check that binds is
+`ValidatingResolver::resolve`, which runs where a name becomes an address: an
+empty answer is `NotFound`, any private answer is `PermissionDenied`. Only the
+configured base host is exempt.
 
 **A private/local download host is allowed only if its host string equals the
 registry base host.** `if is_private_or_local_host(&download_host) &&
