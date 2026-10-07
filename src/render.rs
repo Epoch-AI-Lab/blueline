@@ -16,38 +16,42 @@ fn is_dangerous_unicode(c: char) -> bool {
     )
 }
 
+/// Consumes the rest of one escape sequence, the ESC already taken.
+///
+/// Both sanitizers need this, and it was inlined in each: a guard added to
+/// one copy silently did nothing for the other.
+fn skip_escape_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    let Some(&next) = chars.peek() else { return };
+    if next == '[' {
+        // CSI sequence: consume until 0x40..=0x7E (final byte)
+        chars.next();
+        for csi in chars.by_ref() {
+            if (0x40..=0x7E).contains(&(csi as u32)) {
+                break;
+            }
+        }
+    } else if next == ']' || next == 'P' || next == '_' || next == '^' || next == 'X' {
+        // OSC / DCS / APC / PM / SOS: consume until \x07 (BEL) or \x1b\ (ST)
+        chars.next();
+        let mut prev = '\0';
+        for osc in chars.by_ref() {
+            if osc == '\x07' || (prev == '\x1b' && osc == '\\') {
+                break;
+            }
+            prev = osc;
+        }
+    } else {
+        // 2-byte escape sequence (e.g. \x1bN, \x1bO)
+        chars.next();
+    }
+}
+
 pub fn sanitize_for_terminal(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\x1b' {
-            if let Some(&next) = chars.peek() {
-                if next == '[' {
-                    // CSI sequence: consume until 0x40..=0x7E (final byte)
-                    chars.next();
-                    for csi in chars.by_ref() {
-                        if (0x40..=0x7E).contains(&(csi as u32)) {
-                            break;
-                        }
-                    }
-                    continue;
-                } else if next == ']' || next == 'P' || next == '_' || next == '^' || next == 'X' {
-                    // OSC / DCS / APC / PM / SOS: consume until \x07 (BEL) or \x1b\ (ST)
-                    chars.next();
-                    let mut prev = '\0';
-                    for osc in chars.by_ref() {
-                        if osc == '\x07' || (prev == '\x1b' && osc == '\\') {
-                            break;
-                        }
-                        prev = osc;
-                    }
-                    continue;
-                } else {
-                    // 2-byte escape sequence (e.g. \x1bN, \x1bO)
-                    chars.next();
-                    continue;
-                }
-            }
+            skip_escape_sequence(&mut chars);
             continue;
         }
 
@@ -73,30 +77,7 @@ pub fn sanitize_single_line(s: &str) -> String {
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\x1b' {
-            if let Some(&next) = chars.peek() {
-                if next == '[' {
-                    chars.next();
-                    for csi in chars.by_ref() {
-                        if (0x40..=0x7E).contains(&(csi as u32)) {
-                            break;
-                        }
-                    }
-                    continue;
-                } else if next == ']' || next == 'P' || next == '_' || next == '^' || next == 'X' {
-                    chars.next();
-                    let mut prev = '\0';
-                    for osc in chars.by_ref() {
-                        if osc == '\x07' || (prev == '\x1b' && osc == '\\') {
-                            break;
-                        }
-                        prev = osc;
-                    }
-                    continue;
-                } else {
-                    chars.next();
-                    continue;
-                }
-            }
+            skip_escape_sequence(&mut chars);
             continue;
         }
 
