@@ -8,8 +8,10 @@ Start with [../AGENTS.md](../AGENTS.md) (guardrails + CI gate) and
 R24–R28). This map is the *how*, not the *why*.
 
 Also read **[drift.md](drift.md)** — where the shipped code and the project's own
-docs disagree, with evidence. Four of those entries are fail-open paths in a
-tool whose premise is failing closed.
+docs disagree, with evidence. Two live entries are guarantees `ARCHITECTURE.md`
+claims and `src/` does not implement; the rest are judgement calls about how a
+working path fails. Entries already fixed are struck through, with the commit's
+shape, so the list is history rather than a to-do.
 
 Every command below was run against the built binary; every limit is the
 literal in `src/`. If a number here disagrees with the code, the code wins —

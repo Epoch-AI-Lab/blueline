@@ -130,14 +130,21 @@ keeps anything with verdict `BLOCK` or `HIGH`.
 `"{name}@{version}: registry provided no content checksum; refusing to trust
 unverifiable bytes"`.
 
-**PyPI `METADATA` is parsed inline here, not in [manifest](manifest.md), and it
-fails OPEN.** `review.rs:491-511`: `if let Ok(raw) = fs::read_to_string(root.join("METADATA"))`
-— an unreadable or missing METADATA yields an **empty dependency set and no
-error**. Exact-prefix match on `Requires-Dist:` (case-sensitive, no RFC-822
-continuations, no `Provides-Dist`/`Obsoletes-Dist`); the `;` marker is stripped
-and the full marker-stripped string becomes the map value keyed by its first
-whitespace token. Only a root-level `METADATA` is read — no `.dist-info/`
-search. Worth an issue; `ambiguous` whether the fail-open is intended.
+**PyPI core metadata is read from every legal location and anything but one is a
+refusal.** `pypi_metadata_candidates` returns `METADATA`/`PKG-INFO` at the root
+and one level down (a wheel's `.dist-info`, an sdist's single top-level
+directory), and `prepare_extracted_root` requires exactly one. The refusals are:
+no candidate at all; more than one, naming each path; unreadable or non-UTF-8
+content; no declared name; no declared version; a declared version that
+disagrees with the version the registry resolved. Tests
+`a_pypi_archive_whose_metadata_cannot_be_read_is_refused` and the two-metadata
+case alongside it.
+
+`parse_pypi_core_metadata` is exact-prefix and case-sensitive on
+`Requires-Dist:`, with no RFC-822 continuations and no
+`Provides-Dist`/`Obsoletes-Dist`; the `;` marker is stripped and the
+marker-stripped string becomes the map value keyed by its first whitespace
+token.
 
 **Cargo archives must unpack to exactly one `{canonical-name}-{version}`
 directory.** `cratesio::verify_single_root` refuses anything else, *before* the

@@ -13,10 +13,10 @@ Severity is this file's own judgement, not the project's.
 
 | # | Drift | Severity |
 |---|---|---|
-| 1 | No decompress-ratio monitor, FD cap, Landlock/seccomp, or `cap-std` — all claimed in `ARCHITECTURE.md` §1 | **High** — the caps that *do* exist are per-entry size and entry count only |
-| 2 | `dist.shasum` unparsed, npm registry signature unverified — both claimed in `ARCHITECTURE.md` §1; only `dist.integrity` sha512 is checked | **High** — a signature mismatch is currently invisible |
-| 8 | SSRF guard fails **open** on DNS resolution failure, port hard-coded 443 | **High** — see below |
-| 11 | PyPI `METADATA` parse fails **open** — an unreadable file yields an empty dependency set | **High** — fail-open in a fail-closed tool |
+| 1 | No Landlock/seccomp/`cap-std` sandbox — `ARCHITECTURE.md` D4 still claims it, though §1 now labels it planned | **High** — the bounds that do exist are per-entry size, entry count and the inflated-stream budget |
+| 2 | npm registry signature is checked for *presence* only, never verified; `dist.shasum` unparsed | **High** — `require_signatures` passes on an unverified block |
+| 8 | ~~SSRF guard fails **open** on DNS failure, port 443 hard-coded~~ **resolved** — `ValidatingResolver` is the guard now, not the pre-flight check | High — see below |
+| 11 | ~~PyPI `METADATA` parse fails **open**~~ **resolved** — every unreadable or undetermined-metadata case is a refusal | High — see below |
 | 3 | Integrity mismatch surfaces as `Err` + exit 1, not `Verdict::Block` | Medium — a consumer keying on band never sees BLOCK |
 | 4 | No cargo `-`/`_` name canonicalization, contrary to `CHANGELOG` 0.3.0 | Medium — `serde_json` and `serde-json` are distinct crates |
 | 10 | `diff_single_file` coerces invalid UTF-8 to `""`, so a real change reads as all-add or all-delete | Medium — undocumented, silently mis-scores |
@@ -24,7 +24,7 @@ Severity is this file's own judgement, not the project's.
 | 9 | `hex_to_bytes` uses `.unwrap_or(0)`, mapping invalid hex to byte `0` | Low — fails toward "valid-looking" |
 | 5 | ~~`registry/mod.rs` doc comments are stale~~ **resolved** — both were deleted; the four adapters are all real. See below | Low |
 | 6 | Manager count is six in `CHANGELOG` 0.3.1, eleven in `ARCHITECTURE.md` §5; `--help` says eleven | Low — `--help` is authoritative |
-| 7 | ~~Dead code: `Policy::is_maintainer_blocked`, `blocklist.maintainers`, `allowlist.packages[].max_risk` / `.integrity`~~ **resolved** — the three policy keys are now refused at load. Still dead: `BaselineStore::clear_advisory_cache`, `BaselineResolution::display_summary` | Low — the two remaining are test-only helpers, both `#[allow(dead_code)]` |
+| 7 | ~~Dead code: `Policy::is_maintainer_blocked`, `blocklist.maintainers`, `allowlist.packages[].max_risk` / `.integrity`~~ **resolved** — the three policy keys are now refused at load. Still dead: `BaselineStore::clear_advisory_cache` | Low — test-only helper, `#[allow(dead_code)]` |
 
 ## Lane verification basis
 
@@ -56,12 +56,17 @@ the prose docs.
 
 Each finding is cited in its lane file with the exact source location.
 
-1. **No decompress-ratio bomb guard, no FD cap, no Landlock/seccomp/capability
-   drop, no `cap-std`, no non-writable temp dir.** ARCHITECTURE.md §1 claims all
-   of them. See [extract](features/extract.md).
-2. **`dist.shasum` is not parsed and the npm registry signature is not
-   verified.** ARCHITECTURE.md §1 claims both. Only `dist.integrity` sha512 is
-   checked. See [registry](features/registry.md).
+1. **No Landlock/seccomp/capability-drop sandbox and no `cap-std`.** D4 still
+   reads as shipping; §1 now says "planned, not implemented" and names the
+   parser-level budget as the real bound. `decompressed_stream_cap` is that
+   budget and it exists, so the absence of a decompress-ratio monitor is a
+   deliberate choice, not drift. See [extract](features/extract.md).
+2. **The npm registry signature is read for presence and never verified.**
+   `release_signatures` returns the block as raw JSON and nothing checks the
+   bytes against it; `require_signatures` gates on
+   `registry_signature_present` alone, so a forged block satisfies the policy.
+   `dist.shasum` is likewise unparsed; `dist.integrity` sha512 is the only
+   check. See [registry](features/registry.md).
 3. **Integrity mismatch produces an `Err`, not `Verdict::Block`.** A CI report
    contains an error and exit 1, not a BLOCK verdict. See
    [extract](features/extract.md).
@@ -78,9 +83,12 @@ Each finding is cited in its lane file with the exact source location.
    eleven** (`npm npx pnpm yarn bun bunx pip pip3 cargo yay paru`) while the
    0.3.1 entry lists six. Both counts appear in the project's own docs; the
    `--help` text is authoritative and says eleven.
-7. **`BaselineStore::clear_advisory_cache` and `BaselineResolution::display_summary`
-   are dead.** Both are `#[allow(dead_code)]` with test-only callers, so the
-   marker is deliberate rather than rot. See [store](features/store.md).
+7. **~~`BaselineStore::clear_advisory_cache` and
+   `BaselineResolution::display_summary` are dead~~ — `display_summary` is
+   deleted; `impl BaselineResolution` carries only `package()`. The one that
+   remains is `clear_advisory_cache`, `#[allow(dead_code)]` with one test
+   caller, so the marker is deliberate rather than rot. See
+   [store](features/store.md).
 
    This item originally also listed `Policy::is_maintainer_blocked`,
    `blocklist.maintainers`, and `allowlist.packages[].max_risk` / `.integrity`.
@@ -98,15 +106,26 @@ Each finding is cited in its lane file with the exact source location.
    the only executable spec of the thresholds. Resolved — the weight table is now
    `heuristic::score_findings` and the threshold pass is
    `Policy::escalate_band`, each with one copy and its own tests.
-8. **The SSRF guard is fail-open on DNS resolution failure**, with port 443
-   hard-coded regardless of the actual URL port — contradicting its own
-   "prevent DNS rebinding" comment. See [registry](features/registry.md).
+8. **~~The SSRF guard is fail-open on DNS resolution failure~~ — resolved.**
+   `is_private_or_local_host` is now the early-out and not the guard, which is
+   what its own comment says. `registry_agent_with_timeout` builds the agent
+   with `.resolver(validating_resolver_for(base))`, and
+   `ValidatingResolver::resolve` runs where a name becomes an address: an
+   empty answer is `NotFound` and any private answer is `PermissionDenied`, so
+   a name that resolved publicly for the check and privately for the
+   connection no longer gets through. Only the configured base is exempt.
+   See [registry](features/registry.md).
 9. **`registry/mod.rs::hex_to_bytes` uses `.unwrap_or(0)`**, silently mapping
    invalid hex to byte `0`.
 10. **`diff_single_file` silently converts invalid UTF-8 to `""`**, so a real
     change reads as all-add or all-delete. `ambiguous`, not documented. See
     [diff](features/diff.md).
-11. **PyPI `METADATA` parsing fails OPEN** — `if let Ok(raw) = read_to_string(..)`
-    swallows an unreadable file into an empty dependency set with no error. See
+11. **~~PyPI `METADATA` parsing fails OPEN~~ — resolved.** The old
+    `if let Ok(raw) = read_to_string(root.join("METADATA"))` is gone. A PyPI
+    archive is now refused unless it carries exactly one core-metadata file
+    at a location pip could install from, the file reads as UTF-8, and it
+    declares a name and a version that agree with the resolved release. The
+    refusals name which of those failed. Test
+    `a_pypi_archive_whose_metadata_cannot_be_read_is_refused`. See
     [review](features/review.md).
 12. **`store.rs` silently discards the `0o600` pre-create error** (`let _ =`).
