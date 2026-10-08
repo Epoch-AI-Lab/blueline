@@ -13,8 +13,8 @@ Severity is this file's own judgement, not the project's.
 
 | # | Drift | Severity |
 |---|---|---|
-| 1 | No Landlock/seccomp/`cap-std` sandbox — `ARCHITECTURE.md` D4 still claims it, though §1 now labels it planned | **High** — the bounds that do exist are per-entry size, entry count and the inflated-stream budget |
-| 2 | npm registry signature is checked for *presence* only, never verified; `dist.shasum` unparsed | **High** — `require_signatures` passes on an unverified block |
+| 1 | No Landlock/seccomp/`cap-std` sandbox — the parser-level bounds are real, and every claim of an OS-level one is now removed from `README.md`, D4, the §1 diagram and the §1 header rule | **High, unfixed** — this is a real missing capability, and the fix is code, not wording |
+| 2 | ~~npm registry signature checked for *presence* only~~ — **the key that read it as verification is refused at load; verification itself is still absent** | **High, unchanged in severity** — see below |
 | 8 | ~~SSRF guard fails **open** on DNS failure, port 443 hard-coded~~ **resolved** — `ValidatingResolver` is the guard now, not the pre-flight check | High — see below |
 | 11 | ~~PyPI `METADATA` parse fails **open**~~ **resolved** — every unreadable or undetermined-metadata case is a refusal | High — see below |
 | 3 | Integrity mismatch surfaces as `Err` + exit 1, not `Verdict::Block` | Medium — a consumer keying on band never sees BLOCK |
@@ -56,17 +56,42 @@ the prose docs.
 
 Each finding is cited in its lane file with the exact source location.
 
-1. **No Landlock/seccomp/capability-drop sandbox and no `cap-std`.** D4 still
-   reads as shipping; §1 now says "planned, not implemented" and names the
-   parser-level budget as the real bound. `decompressed_stream_cap` is that
-   budget and it exists, so the absence of a decompress-ratio monitor is a
-   deliberate choice, not drift. See [extract](features/extract.md).
-2. **The npm registry signature is read for presence and never verified.**
-   `release_signatures` returns the block as raw JSON and nothing checks the
-   bytes against it; `require_signatures` gates on
-   `registry_signature_present` alone, so a forged block satisfies the policy.
-   `dist.shasum` is likewise unparsed; `dist.integrity` sha512 is the only
-   check. See [registry](features/registry.md).
+1. **No Landlock/seccomp/capability-drop sandbox and no `cap-std`. Still
+   unfixed, and this entry stays live.** §1 has said "planned, not implemented"
+   and named the parser-level budget as the real bound, but `README.md` still
+   called the temp dir "an isolated sandbox", D4 still read "Read-only sandbox
+   extraction", and the §1 header rule and §1 diagram both said "sandbox". Those
+   are now corrected, so the *documentation* no longer claims a capability the
+   code lacks — which is the half of this that prose could fix.
+
+   The half prose could not fix is the missing capability itself, and it is the
+   half that matters. What bounds a hostile archive today is
+   `decompressed_stream_cap` plus the three `ExtractionLimits` fields, enforced
+   on the declared size *and* on the inflated stream. There is no OS-level
+   confinement behind that, so the guarantee a reader takes from the word
+   "sandbox" does not exist. Closing this means adding a confinement mechanism
+   (Landlock on Linux, `cap-std`, or seccomp), which is a dependency decision
+   and therefore not something to do silently. See [extract](features/extract.md)
+   for what the bounds actually are.
+2. **The npm registry signature is read for presence and never verified. Partly
+   resolved; the verification gap itself is untouched.** `release_signatures`
+   still returns the block as raw JSON, nothing compares the bytes to it, and
+   `dist.shasum` is still unparsed (`dist.integrity` sha512 is the only check
+   that runs). What changed is the consequence: `[provenance]
+   require_signatures = true` is now **refused at load** by
+   `Policy::reject_unimplemented_keys`, with an error naming what the flag
+   actually checked and pointing at `dist.integrity`. Before, the key was
+   accepted and any non-empty `dist.signatures` array satisfied it, so an
+   operator who wrote it got a config that read as signature *verification* and
+   was checked against nothing. A key that cannot fail closed is refused rather
+   than honoured; the finding is disclosed at MEDIUM rather than struck through
+   because a Sigstore verification path needs a dependency this project has not
+   approved, and until one lands nothing verifies a registry signature.
+
+   The engine keeps `P03_SIGNATURE_REQUIRED_MISSING` (BLOCK) for a caller that
+   sets the flag directly, so an unsigned release is still refused. The
+   direction it cannot close is the present case. See
+   [registry](features/registry.md) and [policy](features/policy.md).
 3. **Integrity mismatch produces an `Err`, not `Verdict::Block`.** A CI report
    contains an error and exit 1, not a BLOCK verdict. See
    [extract](features/extract.md).

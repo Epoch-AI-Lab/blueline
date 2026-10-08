@@ -40,7 +40,12 @@ Rule wiring (`heuristic.rs`):
   `[policy] require_provenance || [provenance] require_provenance` **and**
   `status != Verified`.
 - `P03_SIGNATURE_REQUIRED_MISSING` → `Block`, when
-  `[provenance] require_signatures && !registry_signature_present`.
+  `provenance.require_signatures && !registry_signature_present`. **Unreachable
+  from a policy file**: the key is refused at load, because
+  `registry_signature_present` is *presence* of a `dist.signatures` block and
+  never a verification, so `require_signatures = true` would read as
+  "signatures are checked" while a forged block satisfied it. The rule is kept so
+  a direct caller still gets the fail-closed direction on an unsigned release.
 
 ## Gotchas
 - **Exactly one thing is verified: the subject digest.** There is **no DSSE

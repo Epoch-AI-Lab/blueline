@@ -83,6 +83,30 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
   refused and still exits 2 — that is an integrity failure, not a missing
   document.
 
+- **`[provenance] require_signatures = true` is now refused instead of honoured.**
+  The flag gated on `registry_signature_present`, which is built from whether the
+  packument's `dist.signatures` is a non-empty array. Nothing compares the
+  tarball against that block, and `dist.shasum` — the sha1 the npm registry
+  signature actually signs — is not parsed at all, so any forged block satisfied
+  the key exactly as a genuine one did. An operator who wrote
+  `require_signatures = true` got a config that read as signature *verification*
+  and was checked against nothing, which is the same shape of harm as the
+  dead-policy-key entries below: a security control that looks active and is not.
+
+  Setting it is now a load-time error that names what the flag actually checked,
+  points at `dist.integrity` (sha512) as the check that does run before
+  extraction, and says to remove the key.
+
+  **What did not change.** blueline still verifies no registry signature, and
+  this release does not add that. Verified signatures need a Sigstore
+  verification path, which is a dependency this project has not approved, so the
+  honest outcome today is to refuse a key that cannot fail closed rather than
+  ship a green check on a forged block. The report field and the review card are
+  unchanged: a release that publishes a block still says so, and still says it
+  was not verified. `P03_SIGNATURE_REQUIRED_MISSING` stays in the engine (BLOCK)
+  so a caller that sets the flag by another route still gets the fail-closed
+  direction on an unsigned release; what it cannot close is the present case.
+
 ### Fixed
 
 - **A maintainer blocklist that cannot be applied is now disclosed instead of
@@ -102,10 +126,18 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
   `maintainers = []` discloses nothing, since nothing was configured.
 
   This is a deliberate reversal of refusing the key at load, which the 0.4.0 entry
-  below describes. That refusal was correct while nothing read the key and wrong
+  above describes. That refusal was correct while nothing read the key and wrong
   once the rule existed, and a load-time refusal cannot be ecosystem-scoped
   because the policy is loaded without ecosystem context. Per-review disclosure
   can be, and is.
+
+  `require_signatures` is the opposite case and is refused for the opposite
+  reason: the key is read, the rule exists, and there is no lane to disclose on,
+  because no lane can verify a signature. `P04_MAINTAINER_UNEVALUABLE` exists
+  because a maintainer identity *is* resolvable on one lane and absent on three.
+  There is no lane here where "verify the registry signature" is possible, so a
+  per-review disclosure would be the same sentence on every ecosystem: it would
+  read as a partial answer to a question with no answer.
 
 - **`"link": true` in an npm lockfile can no longer hide a version or an
   integrity swap.** The skip added for workspace links keyed on the `link` field
