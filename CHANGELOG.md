@@ -109,6 +109,23 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
 
 ### Fixed
 
+- **The extraction temp dir is no longer world-accessible.** `tempfile::tempdir()`
+  asks the OS for `0o777 & ~umask`, which measures `0o755` at the common umask
+  022 and `0o777` at umask 000. Every review unpacks the target and baseline
+  releases into such a directory, so the unpacked bytes of an *unreviewed*
+  release were readable by any local user, and writable by any local user on a
+  host with a permissive umask. In a tool whose whole purpose is deciding
+  whether unreviewed bytes are safe, that is the wrong default.
+
+  Extraction now uses `extract::private_temp_dir()`, which sets `0o700`
+  explicitly rather than inheriting the ambient umask. Windows has no unix mode
+  bits and no equivalent umask, so nothing changes there.
+
+  This is a pre-existing defect, and not one Landlock would have fixed: an
+  OS-level confinement on the extraction directory bounds what a *confined*
+  process may write, and says nothing about who else may read that directory
+  afterwards.
+
 - **A maintainer blocklist that cannot be applied is now disclosed instead of
   silently passing.** `P04_MAINTAINER_BLOCKED` blocked a release whose publishing
   identity was on `[blocklist] maintainers`, but the rule had one exit: a

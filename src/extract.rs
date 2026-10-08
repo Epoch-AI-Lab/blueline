@@ -60,6 +60,32 @@ fn decompressed_stream_cap(tarball_len: usize, limits: &ExtractionLimits) -> u64
         .max(tarball_len as u64)
 }
 
+/// A temp dir only the current user can reach, for holding extracted bytes.
+///
+/// `tempfile::tempdir()` asks the OS for `0o777 & ~umask`, which at the common
+/// umask 022 is `0o755`: the target and baseline trees of every review sit in a
+/// directory any local user can list and read, and at umask 000 in one they can
+/// write. That is a disclosure vector for the one thing this tool holds, the
+/// unpacked bytes of an unreviewed release, so the mode is set explicitly
+/// instead of inherited. The child process that a future sandbox adds re-derives
+/// its own handle to this directory, so a permissive mode would widen the write
+/// grant it asks the kernel for.
+///
+/// Windows has no unix mode bits and no equivalent umask, so there is nothing
+/// to tighten there and the OS default is used unchanged.
+#[cfg(unix)]
+pub fn private_temp_dir() -> std::io::Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+    tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+}
+
+#[cfg(not(unix))]
+pub fn private_temp_dir() -> std::io::Result<tempfile::TempDir> {
+    tempfile::Builder::new().tempdir()
+}
+
 /// A `Read` that refuses once more than `remaining` bytes have been handed out.
 struct Budgeted<R> {
     inner: R,
@@ -566,6 +592,46 @@ fn set_dir_perm(_path: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The extracted bytes of an unreviewed release must not be readable, let
+    /// alone writable, by another local user.
+    ///
+    /// `tempfile::tempdir()` asks for `0o777 & ~umask`, which measures 0755 at
+    /// umask 022 and 0777 at umask 000. This pins the mode we actually hand the
+    /// kernel, and the test process runs under whatever umask it was started
+    /// with, which is the point: the fix must not depend on the ambient umask.
+    #[cfg(unix)]
+    /// The directory mode is the control that matters. A file inside it gets
+    /// its mode from the archive header, and `safe_extract` does not currently
+    /// clamp that, so the defence here is that no other user can traverse the
+    /// directory to reach the file at all.
+    #[cfg(unix)]
+    #[test]
+    fn the_extraction_temp_dir_is_not_world_accessible() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = private_temp_dir().expect("temp dir");
+        let mode = fs::metadata(dir.path()).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            mode, 0o700,
+            "extraction temp dir must be 0700 regardless of umask, got {mode:#o}"
+        );
+    }
+
+    #[test]
+    fn a_private_temp_dir_holds_what_was_written_to_it() {
+        let dir = private_temp_dir().expect("temp dir");
+        let stats = safe_extract(
+            &make_tarball(&[("package/package.json", br#"{"name":"package"}"#)]),
+            dir.path(),
+            &ExtractionLimits::default(),
+        )
+        .expect("extraction into a private temp dir");
+        assert_eq!(stats.files, 1);
+        assert!(
+            dir.path().join("package/package.json").exists(),
+            "the parent still reads the tree after the dir is handed back"
+        );
+    }
 
     fn make_tarball(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());

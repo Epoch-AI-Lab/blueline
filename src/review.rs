@@ -135,7 +135,8 @@ fn evaluate_with_registry<V: VersionInfo>(
         )
     })?;
 
-    let target_temp = tempfile::tempdir().map_err(|e| anyhow::anyhow!("creating temp dir: {e}"))?;
+    let target_temp = crate::extract::private_temp_dir()
+        .map_err(|e| anyhow::anyhow!("creating temp dir: {e}"))?;
     extract_for_ecosystem(
         &target_tarball,
         target_temp.path(),
@@ -172,8 +173,8 @@ fn evaluate_with_registry<V: VersionInfo>(
 
     let (delta, base_pkgbuild) = if let Some(base_pkg) = baseline_res.resolution.package() {
         let base_tarball = ctx.fetch_tarball(registry, base_pkg)?;
-        let base_temp =
-            tempfile::tempdir().map_err(|e| anyhow::anyhow!("creating temp dir: {e}"))?;
+        let base_temp = crate::extract::private_temp_dir()
+            .map_err(|e| anyhow::anyhow!("creating temp dir: {e}"))?;
         extract_for_ecosystem(
             &base_tarball,
             base_temp.path(),
