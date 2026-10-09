@@ -140,6 +140,46 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
 
 ### Fixed
 
+- **A confinement failure that already narrowed something is no longer reported
+  as an unavailable kernel.** The Landlock ladder returned one "try a lower
+  tier" answer for every error, including a `restrict_self` that failed after
+  `no_new_privs` was set, and including a destination directory that could not
+  even be opened for the ruleset. Both reached the parent as
+  `UNAVAILABLE` (exit 4), which is the *fall back in-process* signal: the parent
+  re-ran the extraction itself with no confinement at all and attached a LOW
+  disclosure about a kernel gap that did not exist. A hardened container blocking
+  `prctl`, and a destination path that cannot be opened, both produced a
+  completely unconfined extraction while the review reported only that the
+  sandbox was unavailable.
+
+  Only errors that occur *before* the domain is touched are a fallback
+  candidate: an over-ABI `handle_access`, a `create` on a kernel with no
+  Landlock, or a rejected `add_rule`. Anything at or after `restrict_self` is a
+  new `UNUSABLE` reply (exit 5) carrying the child's own diagnosis, and the
+  parent refuses. `a_child_that_cannot_confine_never_reports_unavailable` drives
+  the built binary against a destination that does not exist and pins exit 5.
+
+- **The child confines itself before it reads the archive, and non-Linux hosts
+  no longer spawn one at all.** Confinement used to run *after* the whole
+  tarball had been streamed down a pipe, so on a platform with no Landlock every
+  review paid a process spawn and a full copy of the archive to be told what the
+  parent could already have answered. Off Linux `spawn_child` now returns the
+  same disclosure without spawning. On Linux the ordering costs nothing, since
+  a pipe needs no filesystem grant.
+
+- **The Landlock ladder has a middle rung.** It went straight from V5 to V1. V3
+  is the newest tier that adds `Truncate` without also demanding `IoctlDev`, so
+  a kernel too old for V5 keeps `O_TRUNC` containment instead of silently
+  dropping to V1, which does not handle it at all.
+
+- **The child's reply framing is checked for an off-by-one.** `read_reply`
+  sliced the body from `nl + 1`, and `serde_json` skips leading whitespace, so a
+  framing error that leaked the header newline into the body parsed fine and no
+  test could tell. It now splits the header off at the newline. The parent's raw
+  stdout is also bounded before parsing, and a child whose exit code is
+  `UNUSABLE` is believed for its own diagnosis instead of being relabelled as an
+  exit code.
+
 - **The extraction temp dir is no longer world-accessible.** `tempfile::tempdir()`
   asks the OS for `0o777 & ~umask`, which measures `0o755` at the common umask
   022 and `0o777` at umask 000. Every review unpacks the target and baseline

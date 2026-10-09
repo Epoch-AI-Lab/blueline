@@ -37,15 +37,28 @@ use crate::verdict::{Finding, VerdictBand};
 
 /// Marker environment variable. The parent sets it; `child_entrypoint` keys on
 /// it.
-pub(crate) const CHILD_ENV: &str = "BLUELINE_SANDBOX_CHILD";
+///
+/// `#[doc(hidden)] pub` for the same reason as `may_spawn_child`: the test that
+/// pins the marker's effect lives outside the harness, and it must set the real
+/// name rather than a copy of it that can drift.
+#[doc(hidden)]
+pub const CHILD_ENV: &str = "BLUELINE_SANDBOX_CHILD";
 /// Canonical absolute path of the directory the child may write.
 pub(crate) const DEST_ENV: &str = "BLUELINE_SANDBOX_DEST";
 /// Which extractor the child runs.
 pub(crate) const KIND_ENV: &str = "BLUELINE_SANDBOX_KIND";
 
-/// Ceiling on the child's reply, so a child that streams nonsense cannot make
-/// the parent allocate without bound. The reply is three numbers or a short
-/// reason, so this is generous.
+/// Ceiling on the child's *declared* reply length.
+///
+/// Checked in two places: the child replaces an oversized reply before writing
+/// it (a reply larger than the pipe buffer would deadlock the parent in
+/// `wait_with_timeout`), and the parent refuses a reply that declares more
+/// than this. It does not bound what the parent allocates overall:
+/// `wait_with_output` collects the child's whole stdout before `read_reply`
+/// runs, so a hostile stdout past the framing is already in memory by the time
+/// the ceiling is checked. That is accepted because the child is our own
+/// binary, not an attacker-controlled peer. The reply itself is three numbers
+/// or a short reason, so this is generous.
 const MAX_REPLY_BYTES: usize = 64 * 1024;
 
 /// Which archive reader the child runs. Resolved by the parent, which already
@@ -167,7 +180,7 @@ impl SandboxLedger {
             severity: VerdictBand::Low,
             title: "Extraction sandbox was not available".into(),
             description: format!(
-                "this release's archive was unpacked without OS-level Landlock confinement \
+                "an archive in this review was unpacked without OS-level Landlock confinement \
                  ({skip}). The path grammar, the entry-type rejection and the byte and entry \
                  caps all still applied, so the extraction was bounded exactly as before; what \
                  was missing is the kernel refusing a write, a read or an exec outside the \
@@ -210,6 +223,13 @@ enum Reply {
     Unavailable {
         reason: String,
     },
+    /// Confinement was attempted and failed after narrowing something (or the
+    /// destination could not even be opened for the ruleset). Never a fallback:
+    /// `dest` may hold a partial tree. Distinct from `Unavailable`, which means
+    /// nothing was applied and the parent may retry in-process.
+    Unusable {
+        reason: String,
+    },
 }
 
 /// Map a child `Reply::Refused` back to the variant the extractor produced.
@@ -230,6 +250,19 @@ fn rebuild_error(variant: &str, message: String) -> BluelineError {
         _ => BluelineError::Sandbox(format!(
             "child reported an unrecognised refusal variant `{variant}`: {message}"
         )),
+    }
+}
+
+/// The refusal name the child sends for an extractor error.
+///
+/// A separate function so the mapping is pinned by unit tests: the extractor
+/// grows variants over time, and a new arm that falls through to the wrong
+/// name either downgrades a limit breach or breaks the parent's rebuild.
+fn refusal_variant(e: &BluelineError) -> &'static str {
+    match e {
+        BluelineError::ExtractionLimit(_) => "extraction_limit",
+        BluelineError::Extraction(_) => "extraction",
+        _ => "extraction",
     }
 }
 
@@ -294,11 +327,27 @@ fn write_reply(reply: &Reply) {
 
 /// Read the framed reply, refusing a truncated or oversized one.
 fn read_reply(stdout: &[u8]) -> Result<Reply, BluelineError> {
+    // Bound the raw stdout before parsing anything out of it.
+    // `wait_with_output` already collected all of it, so a child that streams
+    // megabytes would otherwise have the parent parse megabytes. The only
+    // thing a well-behaved child writes is one framed reply: a body at the
+    // ceiling plus its short count header (see the margin test below).
+    if stdout.len() > MAX_REPLY_BYTES + 32 {
+        return Err(BluelineError::Sandbox(format!(
+            "child stdout was {} bytes, over the {MAX_REPLY_BYTES} reply ceiling",
+            stdout.len()
+        )));
+    }
     let nl = stdout
         .iter()
         .position(|&b| b == b'\n')
         .ok_or_else(|| BluelineError::Sandbox("child reply had no length prefix".into()))?;
-    let count: usize = std::str::from_utf8(&stdout[..nl])
+    // Split off the header rather than slicing from `nl`: every formulation
+    // with `nl + 1` in it silently tolerates the header newline leaking into
+    // the body (`serde_json` skips leading whitespace), so an off-by-one in
+    // the framing would parse and no test could tell.
+    let (header, rest) = stdout.split_at(nl);
+    let count: usize = std::str::from_utf8(header)
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .ok_or_else(|| BluelineError::Sandbox("child reply had an unreadable length".into()))?;
@@ -307,8 +356,8 @@ fn read_reply(stdout: &[u8]) -> Result<Reply, BluelineError> {
             "child reply declared {count} bytes, over the {MAX_REPLY_BYTES} ceiling"
         )));
     }
-    let body = stdout
-        .get(nl + 1..nl + 1 + count)
+    let body = rest
+        .get(1..count + 1)
         .ok_or_else(|| BluelineError::Sandbox("child reply was truncated".into()))?;
     serde_json::from_slice(body)
         .map_err(|e| BluelineError::Sandbox(format!("child reply did not parse: {e}")))
@@ -358,6 +407,27 @@ fn run_child() -> i32 {
         }
     };
 
+    // Confine before reading a byte of the archive. The archive arrives over a
+    // pipe, which needs no filesystem grant, so restricting first costs
+    // nothing on Linux and saves the whole round-trip where there is nothing
+    // to confine with: without this order every extraction off Linux spawns a
+    // process, copies the entire tarball through a pipe, then discards it.
+    match confine(&dest) {
+        Ok(_) => {}
+        // Nothing was applied, so the parent may retry in-process.
+        Err(ConfineError::Unsupported(detail)) => {
+            write_reply(&Reply::Unavailable { reason: detail });
+            return exit::UNAVAILABLE;
+        }
+        // Something narrowed, or the destination could not even be opened for
+        // the ruleset. The parent must not retry in-process: `dest` may hold
+        // a partial tree, or the failure itself is the signal.
+        Err(ConfineError::Failed(detail)) => {
+            write_reply(&Reply::Unusable { reason: detail });
+            return exit::UNUSABLE;
+        }
+    }
+
     // Read to the end of stdin rather than framing the archive on the way in.
     // A pipe carries no file path, so the child needs no filesystem grant to
     // receive the bytes and the archive never lands on disk twice.
@@ -365,21 +435,6 @@ fn run_child() -> i32 {
     if let Err(e) = std::io::stdin().lock().read_to_end(&mut bytes) {
         eprintln!("error: reading archive from stdin: {e}");
         return exit::UNUSABLE;
-    }
-
-    // Confine before touching a byte of the archive. On failure the layer was
-    // never applied, so the parent may retry in-process.
-    #[cfg(target_os = "linux")]
-    let confined = confined::confine(&dest);
-    #[cfg(not(target_os = "linux"))]
-    let confined: Result<&'static str, String> =
-        Err("Landlock is Linux-only, so there is nothing to confine".into());
-
-    if let Err(e) = confined {
-        write_reply(&Reply::Unavailable {
-            reason: e.to_string(),
-        });
-        return exit::UNAVAILABLE;
     }
 
     match extract_local(kind, &bytes, &dest) {
@@ -392,11 +447,7 @@ fn run_child() -> i32 {
             exit::OK
         }
         Err(e) => {
-            let variant = match &e {
-                BluelineError::ExtractionLimit(_) => "extraction_limit",
-                BluelineError::Extraction(_) => "extraction",
-                _ => "extraction",
-            };
+            let variant = refusal_variant(&e);
             write_reply(&Reply::Refused {
                 variant: variant.into(),
                 message: e.to_string(),
@@ -404,6 +455,43 @@ fn run_child() -> i32 {
             exit::REFUSED
         }
     }
+}
+
+/// Why confinement did not happen, split so the caller can tell "nothing was
+/// applied, retry in-process" from "something narrowed, refuse".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfineError {
+    /// Nothing was restricted. Safe to fall back.
+    Unsupported(String),
+    /// The domain is partly applied, or the attempt failed after narrowing
+    /// something. Never a fallback.
+    Failed(String),
+}
+
+impl std::fmt::Display for ConfineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfineError::Unsupported(d) | ConfineError::Failed(d) => f.write_str(d),
+        }
+    }
+}
+
+/// The tier names `confine` can report on success. Pinned by
+/// `confinement_reports_a_known_tier_or_an_honest_gap`, because a tier string
+/// the ladder never named is a protocol break, not confinement.
+pub const TIER_NAMES: [&str; 3] = ["V5", "V3", "V1"];
+
+/// Dispatch to the Linux Landlock implementation, or report the platform gap.
+#[cfg(target_os = "linux")]
+fn confine(dest: &Path) -> Result<&'static str, ConfineError> {
+    confined::confine(dest)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn confine(_dest: &Path) -> Result<&'static str, ConfineError> {
+    Err(ConfineError::Unsupported(
+        "Landlock is Linux-only, so there is nothing to confine".into(),
+    ))
 }
 
 /// Confinement, and the reason it is shaped the way it is.
@@ -430,27 +518,18 @@ mod confined {
     /// V9 is deliberately not requested: its only filesystem addition is
     /// `ResolveUnix`, about abstract unix sockets rather than files, and the
     /// crate's own doc warns against requesting rights you have not vetted.
-    const TIERS: [(&str, landlock::ABI); 2] =
-        [("V5", landlock::ABI::V5), ("V1", landlock::ABI::V1)];
+    ///
+    /// The ladder is V5, V3, V1 rather than just the ceiling and the floor. V3
+    /// is the newest tier that adds a filesystem right (`Truncate`) without
+    /// also demanding `IoctlDev`, so a kernel too old for V5 still keeps the
+    /// `O_TRUNC` containment above instead of silently dropping to V1, which
+    /// does not handle `Truncate` at all.
+    const TIERS: [(&str, landlock::ABI); 3] = [
+        ("V5", landlock::ABI::V5),
+        ("V3", landlock::ABI::V3),
+        ("V1", landlock::ABI::V1),
+    ];
 
-    pub enum ConfineError {
-        /// Nothing was restricted. Safe to fall back.
-        Unsupported(String),
-        /// The domain is partly applied, or the attempt failed after narrowing
-        /// something. Never a fallback.
-        Failed(String),
-    }
-
-    impl std::fmt::Display for ConfineError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                ConfineError::Unsupported(d) | ConfineError::Failed(d) => f.write_str(d),
-            }
-        }
-    }
-
-    /// Grant every filesystem right under `dest` and nothing anywhere else, then
-    /// make it permanent for this process.
     pub fn confine(dest: &Path) -> Result<&'static str, ConfineError> {
         let mut last = TIERS[TIERS.len() - 1].0;
         for (name, abi) in TIERS {
@@ -468,10 +547,8 @@ mod confined {
                          unconfined from a partly applied domain"
                     )));
                 }
-                // Nothing was restricted. `create`, `add_rule` and
-                // `restrict_self` all returned `Err`, and only
-                // `restrict_self` narrows anything, so the next tier is still
-                // safe to try.
+                // Nothing was restricted: only `restrict_self` narrows anything,
+                // and it never ran, so the next tier is still safe to try.
                 Err(RestrictError::Unsupported) => last = name,
                 Err(RestrictError::Failed(detail)) => {
                     return Err(ConfineError::Failed(detail));
@@ -496,38 +573,38 @@ mod confined {
         let dest_fd = PathFd::new(dest)
             .map_err(|e| RestrictError::Failed(format!("opening {dest:?} for the ruleset: {e}")))?;
 
-        let out = Ruleset::default()
+        // Staged, not chained: only the last stage narrows anything. An
+        // over-ABI `handle_access`, a no-Landlock `create`, or a rejected
+        // `add_rule` all happen before `restrict_self` runs, so nothing was
+        // applied and the next tier is safe to try. A `restrict_self` failure
+        // is different: it runs after `no_new_privs` handling inside the
+        // crate, so a hardened container that blocks `prctl` fails here, and
+        // diagnosing that as "the kernel has no Landlock" would silently
+        // downgrade a real restriction failure into an unconfined extraction.
+        let ruleset = Ruleset::default()
             .set_compatibility(CompatLevel::HardRequirement)
             .handle_access(access)
-            .and_then(Ruleset::create)
-            .and_then(|created| created.add_rule(PathBeneath::new(dest_fd, access)))
-            .and_then(|created| {
-                // `HardRequirement` is the load-bearing part. The crate defaults
-                // to `BestEffort`, under which an access right the kernel does
-                // not implement is dropped and `restrict_self()` still returns
-                // `Ok`, reporting `PartiallyEnforced`. A caller checking only
-                // `is_ok()` would read a kernel without Landlock as a sandbox.
-                // Measured on a V7 kernel: `ABI::V9` under `BestEffort` gives
-                // `Ok(PartiallyEnforced)`, under `HardRequirement` an `Err`.
-                created
-                    .set_compatibility(CompatLevel::HardRequirement)
-                    .restrict_self()
-            });
+            .map_err(|_| RestrictError::Unsupported)?;
+        let created = ruleset.create().map_err(|_| RestrictError::Unsupported)?;
+        let with_rule = created
+            .add_rule(PathBeneath::new(dest_fd, access))
+            .map_err(|_| RestrictError::Unsupported)?;
+        let status = with_rule
+            // `HardRequirement` is the load-bearing part. The crate defaults
+            // to `BestEffort`, under which an access right the kernel does
+            // not implement is dropped and `restrict_self()` still returns
+            // `Ok`, reporting `PartiallyEnforced`. A caller checking only
+            // `is_ok()` would read a kernel without Landlock as a sandbox.
+            // Measured on a V7 kernel: `ABI::V9` under `BestEffort` gives
+            // `Ok(PartiallyEnforced)`, under `HardRequirement` an `Err`.
+            .set_compatibility(CompatLevel::HardRequirement)
+            .restrict_self()
+            .map_err(|e| {
+                RestrictError::Failed(format!("restricting to {dest:?} at this tier: {e}"))
+            })?;
 
-        match out {
-            Ok(status) => Ok(status.ruleset),
-            // `HardRequirement` reports an over-ABI request as a hard error from
-            // `handle_access`, and a kernel with no Landlock as a
-            // `CreateRulesetError` from `create`. Both mean "try the next tier",
-            // because neither reached `restrict_self`.
-            Err(_) => Err(RestrictError::Unsupported),
-        }
+        Ok(status.ruleset)
     }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn confine(_dest: &Path) -> Result<&'static str, String> {
-    Err("Landlock is Linux-only".into())
 }
 
 /// Extract one archive under OS-level confinement, or disclose there was none.
@@ -574,6 +651,7 @@ pub fn extract(
     }
 }
 
+#[derive(Debug)]
 enum ChildFailure {
     /// The layer was not established. Fall back and disclose.
     Skip(SandboxSkip),
@@ -584,6 +662,28 @@ enum ChildFailure {
     /// than as a sandbox failure. Distinct from `Unusable` because a refusal is
     /// a clean answer rather than a broken handshake.
     Refused(BluelineError),
+}
+
+/// The child's reason for reporting it could not confine itself.
+///
+/// A separate function so the preference is pinned: the child's own framed
+/// reason first, stderr only when the reply is missing or says something else,
+/// "no reason" last. Without the first arm every confinement failure would
+/// read as a bare exit with no diagnosis.
+fn unavailable_reason(stdout: &[u8], stderr: &str) -> String {
+    read_reply(stdout)
+        .ok()
+        .and_then(|r| match r {
+            Reply::Unavailable { reason } => Some(reason),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            if stderr.is_empty() {
+                "the child gave no reason".to_string()
+            } else {
+                stderr.to_string()
+            }
+        })
 }
 
 /// Whether this process may exec an extraction child.
@@ -603,7 +703,13 @@ enum ChildFailure {
 /// The marker condition stops the same recursion from a child of any build: a
 /// process holding `CHILD_ENV` is (or leaked out of) an extraction child, and
 /// production never needs it because `run_child` extracts in-process.
-fn may_spawn_child() -> bool {
+///
+/// `pub` (and `#[doc(hidden)]`) so an integration test can pin the production
+/// case: under `cfg(test)` this always returns `false`, so no unit test can
+/// tell the guard from a hardcoded `false`. `tests/sandbox_spawns.rs` asserts
+/// the `true` case from outside the harness, where the lib is built normally.
+#[doc(hidden)]
+pub fn may_spawn_child() -> bool {
     if cfg!(test) {
         return false;
     }
@@ -611,9 +717,6 @@ fn may_spawn_child() -> bool {
 }
 
 fn spawn_child(kind: ArchiveKind, bytes: &[u8], dest: &Path) -> Result<ExtractStats, ChildFailure> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-
     // See `may_spawn_child`: exec from the test harness (or from a child)
     // re-runs tests instead of the extractor and can fork-bomb the machine.
     if !may_spawn_child() {
@@ -621,6 +724,29 @@ fn spawn_child(kind: ArchiveKind, bytes: &[u8], dest: &Path) -> Result<ExtractSt
             detail: "refusing to re-exec the test harness or an extraction child".into(),
         }));
     }
+
+    // Off Linux there is nothing to confine with, and the child would say so
+    // only after a full spawn plus a copy of the archive through a pipe. Skip
+    // before either cost, with the same disclosure the child would report.
+    #[cfg(target_os = "linux")]
+    return spawn_child_on_linux(kind, bytes, dest);
+
+    #[cfg(not(target_os = "linux"))]
+    Err(ChildFailure::Skip(SandboxSkip::UnsupportedPlatform))
+}
+
+/// The Linux half of `spawn_child`: everything from resolving `current_exe`
+/// onwards. Split out so the non-Linux arm above is a plain expression rather
+/// than an early `return`, which would leave the rest of the function as
+/// unreachable code that `-D warnings` rejects on macOS and Windows.
+#[cfg(target_os = "linux")]
+fn spawn_child_on_linux(
+    kind: ArchiveKind,
+    bytes: &[u8],
+    dest: &Path,
+) -> Result<ExtractStats, ChildFailure> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
 
     let exe = match std::env::current_exe() {
         Ok(p) => p,
@@ -692,6 +818,42 @@ fn spawn_child(kind: ArchiveKind, bytes: &[u8], dest: &Path) -> Result<ExtractSt
     };
     let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
 
+    map_child_result(status.code(), &out.stdout, &stderr, dest)
+}
+
+/// The child's reason for a failed confinement.
+///
+/// Same shape as `unavailable_reason`, kept separate so each exit code pins
+/// which replies it trusts: a confessed failure is believed from either
+/// failure reply, anything else falls back to stderr.
+fn unusable_reason(stdout: &[u8], stderr: &str) -> String {
+    read_reply(stdout)
+        .ok()
+        .and_then(|r| match r {
+            Reply::Unusable { reason } | Reply::Unavailable { reason } => Some(reason),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            if stderr.is_empty() {
+                "the child gave no reason".to_string()
+            } else {
+                stderr.to_string()
+            }
+        })
+}
+
+/// Map a finished child's exit code and output to a result, without spawning.
+///
+/// Pure so the exit-code mapping is pinned by unit tests: no test can spawn a
+/// real child from the harness (`may_spawn_child` forbids it), and the
+/// distinction between "retry in-process" (`Skip`) and "refuse" (`Unusable`)
+/// is the fail-closed core of this module. Every arm below has a test.
+fn map_child_result(
+    code: Option<i32>,
+    stdout: &[u8],
+    stderr: &str,
+    dest: &Path,
+) -> Result<ExtractStats, ChildFailure> {
     let died = |why: String| {
         ChildFailure::Unusable(BluelineError::Sandbox(format!(
             "the extraction child died ({why}); {} may hold a partial tree, so the review \
@@ -700,29 +862,21 @@ fn spawn_child(kind: ArchiveKind, bytes: &[u8], dest: &Path) -> Result<ExtractSt
         )))
     };
 
-    match status.code() {
-        Some(exit::OK) => {}
-        Some(exit::REFUSED) => {}
+    match code {
+        Some(exit::OK) | Some(exit::REFUSED) => {}
         Some(exit::UNAVAILABLE) => {
-            let reason = read_reply(&out.stdout)
-                .ok()
-                .and_then(|r| match r {
-                    Reply::Unavailable { reason } => Some(reason),
-                    _ => None,
-                })
-                .unwrap_or_else(|| {
-                    if stderr.is_empty() {
-                        "the child gave no reason".to_string()
-                    } else {
-                        stderr.clone()
-                    }
-                });
             return Err(ChildFailure::Skip(SandboxSkip::Unavailable {
-                detail: reason,
+                detail: unavailable_reason(stdout, stderr),
             }));
         }
-        // A child that exits 0 having written nothing, or exits with a signal,
-        // or exits with a code we do not define, is never a fallback.
+        // Confinement was attempted and failed. `dest` may hold a partial
+        // tree, so this is an error and never a fallback. The reply carries
+        // the child's own diagnosis when it survived; stderr otherwise.
+        Some(exit::UNUSABLE) => {
+            return Err(died(unusable_reason(stdout, stderr)));
+        }
+        // A child that exits with a code we do not define, or dies on a
+        // signal, is never a fallback either.
         Some(code) => {
             return Err(died(format!(
                 "exit code {code}{}",
@@ -745,7 +899,7 @@ fn spawn_child(kind: ArchiveKind, bytes: &[u8], dest: &Path) -> Result<ExtractSt
         }
     }
 
-    match read_reply(&out.stdout) {
+    match read_reply(stdout) {
         Err(e) => Err(died(e.to_string())),
         Ok(Reply::Ok {
             files,
@@ -762,6 +916,9 @@ fn spawn_child(kind: ArchiveKind, bytes: &[u8], dest: &Path) -> Result<ExtractSt
         Ok(Reply::Unavailable { reason }) => Err(ChildFailure::Skip(SandboxSkip::Unavailable {
             detail: reason,
         })),
+        // The child confessed it failed confinement but exited as if the
+        // extraction ran. Trust the confession: `dest` may be partial.
+        Ok(Reply::Unusable { reason }) => Err(died(reason)),
     }
 }
 
@@ -872,6 +1029,257 @@ mod tests {
         );
     }
 
+    /// Every extractor error maps to a refusal name the parent can rebuild.
+    /// Deleting an arm either downgrades a limit breach to a plain failure or
+    /// turns a refusal into a protocol break.
+    #[test]
+    fn refusal_variant_names_every_extractor_error() {
+        assert_eq!(
+            refusal_variant(&BluelineError::ExtractionLimit("cap".into())),
+            "extraction_limit"
+        );
+        assert_eq!(
+            refusal_variant(&BluelineError::Extraction("traversal".into())),
+            "extraction"
+        );
+        assert_eq!(
+            refusal_variant(&BluelineError::Sandbox("other".into())),
+            "extraction"
+        );
+    }
+
+    fn framed(reason: &str) -> Vec<u8> {
+        let body = serde_json::to_vec(&Reply::Unavailable {
+            reason: reason.into(),
+        })
+        .unwrap();
+        let mut out = format!("{}\n", body.len()).into_bytes();
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// The child's own framed reason wins over stderr. Without this arm every
+    /// confinement failure would read as a bare exit with no diagnosis.
+    #[test]
+    fn unavailable_reason_prefers_the_childs_own_words() {
+        assert_eq!(
+            unavailable_reason(&framed("no Landlock ABI tier"), "some stderr"),
+            "no Landlock ABI tier"
+        );
+    }
+
+    #[test]
+    fn unavailable_reason_falls_back_to_stderr_then_to_no_reason() {
+        assert_eq!(
+            unavailable_reason(b"garbage", "child stderr words"),
+            "child stderr words"
+        );
+        assert_eq!(
+            unavailable_reason(b"garbage", ""),
+            "the child gave no reason"
+        );
+        // A reply of the wrong variant is a protocol mismatch, not a reason.
+        let ok = serde_json::to_vec(&Reply::Ok {
+            files: 1,
+            dirs: 0,
+            unpacked_bytes: 1,
+        })
+        .unwrap();
+        let mut out = format!("{}\n", ok.len()).into_bytes();
+        out.extend_from_slice(&ok);
+        assert_eq!(unavailable_reason(&out, "stderr wins"), "stderr wins");
+    }
+
+    fn framed_unusable(reason: &str) -> Vec<u8> {
+        let body = serde_json::to_vec(&Reply::Unusable {
+            reason: reason.into(),
+        })
+        .unwrap();
+        let mut out = format!("{}\n", body.len()).into_bytes();
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// A confessed failure is believed from either failure reply; anything
+    /// else falls back to stderr. Without the reply arms the child's own
+    /// diagnosis would be discarded exactly when it matters.
+    #[test]
+    fn unusable_reason_believes_a_confessed_failure() {
+        assert_eq!(
+            unusable_reason(&framed_unusable("prctl blocked"), "stderr"),
+            "prctl blocked"
+        );
+        assert_eq!(unusable_reason(&framed("abi gone"), "stderr"), "abi gone");
+        assert_eq!(unusable_reason(b"garbage", "stderr words"), "stderr words");
+        assert_eq!(unusable_reason(b"garbage", ""), "the child gave no reason");
+    }
+
+    fn framed_ok() -> Vec<u8> {
+        let body = serde_json::to_vec(&Reply::Ok {
+            files: 2,
+            dirs: 1,
+            unpacked_bytes: 20,
+        })
+        .unwrap();
+        let mut out = format!("{}\n", body.len()).into_bytes();
+        out.extend_from_slice(&body);
+        out
+    }
+
+    fn framed_refused() -> Vec<u8> {
+        let body = serde_json::to_vec(&Reply::Refused {
+            variant: "extraction".into(),
+            message: "traversal".into(),
+        })
+        .unwrap();
+        let mut out = format!("{}\n", body.len()).into_bytes();
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn a_clean_child_maps_to_its_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        for code in [exit::OK, exit::REFUSED] {
+            let stats = map_child_result(code.into(), &framed_ok(), "", dir.path())
+                .expect("a clean reply maps to stats");
+            assert_eq!((stats.files, stats.dirs, stats.unpacked_bytes), (2, 1, 20));
+        }
+    }
+
+    #[test]
+    fn a_refusing_child_maps_to_the_extractor_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let Err(ChildFailure::Refused(e)) =
+            map_child_result(Some(exit::REFUSED), &framed_refused(), "", dir.path())
+        else {
+            panic!("a refusal must surface as the extractor's error");
+        };
+        assert!(matches!(e, BluelineError::Extraction(_)), "{e:?}");
+    }
+
+    #[test]
+    fn an_unavailable_child_is_a_skip_with_its_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let Err(ChildFailure::Skip(skip)) = map_child_result(
+            Some(exit::UNAVAILABLE),
+            &framed("no tier"),
+            "stderr",
+            dir.path(),
+        ) else {
+            panic!("an unavailable child must fall back with a disclosure");
+        };
+        assert_eq!(
+            skip,
+            SandboxSkip::Unavailable {
+                detail: "no tier".into()
+            }
+        );
+    }
+
+    /// Exit 5 with a confessed failure must refuse with the child's diagnosis,
+    /// not fall back and not relabel. Deleting the UNUSABLE arm would answer
+    /// "exit code 5" here instead.
+    #[test]
+    fn an_unusable_child_is_never_a_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        for stdout in [framed_unusable("prctl blocked"), framed("abi gone")] {
+            let Err(failure) =
+                map_child_result(Some(exit::UNUSABLE), &stdout, "stderr", dir.path())
+            else {
+                panic!("a failed confinement must refuse, never fall back");
+            };
+            let ChildFailure::Unusable(e) = failure else {
+                panic!("exit 5 must be unusable, got: {failure:?}");
+            };
+            assert!(
+                e.to_string().contains("partial tree"),
+                "the refusal must warn dest may be partial, got: {e}"
+            );
+        }
+        // The child's own words survive in the refusal.
+        let Err(ChildFailure::Unusable(e)) = map_child_result(
+            Some(exit::UNUSABLE),
+            &framed_unusable("prctl blocked"),
+            "",
+            dir.path(),
+        ) else {
+            panic!("unreachable");
+        };
+        assert!(e.to_string().contains("prctl blocked"), "got: {e}");
+    }
+
+    #[test]
+    fn an_unknown_code_or_signal_is_never_a_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        for code in [Some(99), None] {
+            let Err(failure) = map_child_result(code, &framed_ok(), "boom", dir.path()) else {
+                panic!("code {code:?} must refuse, never fall back");
+            };
+            assert!(
+                matches!(failure, ChildFailure::Unusable(_)),
+                "code {code:?} must be unusable, got: {failure:?}"
+            );
+        }
+    }
+
+    /// A clean exit carrying a failure reply is a protocol mismatch, handled
+    /// by what the reply confesses, not by the exit code.
+    #[test]
+    fn a_mismatched_reply_is_handled_by_what_it_confesses() {
+        let dir = tempfile::tempdir().unwrap();
+        let Err(ChildFailure::Skip(skip)) =
+            map_child_result(Some(exit::OK), &framed("late gap"), "", dir.path())
+        else {
+            panic!("an Unavailable reply must disclose even on exit 0");
+        };
+        assert!(matches!(skip, SandboxSkip::Unavailable { .. }));
+        let Err(failure) = map_child_result(
+            Some(exit::OK),
+            &framed_unusable("late failure"),
+            "",
+            dir.path(),
+        ) else {
+            panic!("an Unusable reply must refuse even on exit 0");
+        };
+        assert!(matches!(failure, ChildFailure::Unusable(_)));
+        let Err(failure) = map_child_result(Some(exit::OK), b"garbage", "", dir.path()) else {
+            panic!("garbage on a clean exit must refuse, never fall back");
+        };
+        assert!(matches!(failure, ChildFailure::Unusable(_)));
+    }
+
+    /// `require_sandbox` refuses the review instead of falling back. Runs
+    /// entirely in-harness: spawning is forbidden here, so the guard returns a
+    /// skip and the policy turns it into a refusal before any extraction.
+    #[test]
+    fn require_sandbox_refuses_instead_of_falling_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = SandboxLedger::default();
+        let mut policy = Policy::default();
+        policy.policy.require_sandbox = true;
+        let err = extract(
+            ArchiveKind::Tar,
+            b"never-read",
+            dir.path(),
+            &mut ledger,
+            &policy,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("require_sandbox"),
+            "the refusal must name the key, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("re-exec the test harness"),
+            "the refusal must carry the skip detail, got: {err}"
+        );
+        assert!(
+            ledger.skip().is_none(),
+            "a refused review records no disclosure"
+        );
+    }
+
     /// The child writes its whole reply to a pipe the parent does not read until
     /// after `wait_with_timeout` returns. A reply larger than the pipe buffer
     /// therefore blocks the child in `write_all` and the parent waits out the
@@ -925,6 +1333,103 @@ mod tests {
             err.to_string().contains("truncated"),
             "a short body must be a truncation, got: {err}"
         );
+    }
+
+    /// The ceiling is 64 KiB, not 64 + 1024 and not anything else. A wrong
+    /// constant here silently moves every bound in both directions.
+    #[test]
+    fn the_reply_ceiling_is_64_kib() {
+        assert_eq!(MAX_REPLY_BYTES, 64 * 1024);
+    }
+
+    /// Pad a refusal until its serialised body is exactly the ceiling, so the
+    /// boundary tests below prove something about `>` rather than `>=`.
+    fn reply_at_exactly_the_ceiling() -> (Reply, Vec<u8>) {
+        let base = serde_json::to_vec(&Reply::Refused {
+            variant: "extraction".into(),
+            message: String::new(),
+        })
+        .unwrap()
+        .len();
+        let reply = Reply::Refused {
+            variant: "extraction".into(),
+            message: "x".repeat(MAX_REPLY_BYTES - base),
+        };
+        let body = serde_json::to_vec(&reply).unwrap();
+        assert_eq!(
+            body.len(),
+            MAX_REPLY_BYTES,
+            "the fixture must sit exactly on the boundary, or these tests prove nothing"
+        );
+        (reply, body)
+    }
+
+    /// `body.len() > MAX` passes an exactly-MAX body through. With `>=` this
+    /// fails, and every normal-sized refusal near the ceiling would lose its
+    /// message to the deadlock guard.
+    #[test]
+    fn a_reply_at_exactly_the_ceiling_passes_through() {
+        let (reply, body) = reply_at_exactly_the_ceiling();
+        assert_eq!(framed_reply_bytes(&reply), body);
+    }
+
+    /// `count > MAX` parses a declared count of exactly MAX. With `>=` the
+    /// largest legal reply would be refused.
+    #[test]
+    fn a_declared_count_at_exactly_the_ceiling_parses() {
+        let (reply, body) = reply_at_exactly_the_ceiling();
+        let mut framed = format!("{}\n", body.len()).into_bytes();
+        framed.extend_from_slice(&body);
+        assert_eq!(
+            read_reply(&framed).expect("ceiling-sized reply parses"),
+            reply
+        );
+    }
+
+    /// The framing slices exactly `count` bytes, so trailing garbage after a
+    /// complete reply must not move the parse. A framing off-by-one in either
+    /// direction reads the wrong bytes and fails here.
+    #[test]
+    fn trailing_bytes_after_a_reply_do_not_move_the_parse() {
+        let reply = Reply::Ok {
+            files: 1,
+            dirs: 0,
+            unpacked_bytes: 7,
+        };
+        let body = serde_json::to_vec(&reply).unwrap();
+        let mut framed = format!("{}\n", body.len()).into_bytes();
+        framed.extend_from_slice(&body);
+        framed.extend_from_slice(b"TRAILING");
+        assert_eq!(
+            read_reply(&framed).expect("trailing bytes are ignored"),
+            reply
+        );
+    }
+
+    /// The raw stdout guard fires far past the framing, and names the ceiling.
+    /// Without the message assertion a mutant that never fires would still
+    /// refuse (via "no length prefix") and read as covered.
+    #[test]
+    fn an_oversized_stdout_is_refused_without_parsing() {
+        let stdout = vec![b'9'; MAX_REPLY_BYTES + 33];
+        let err = read_reply(&stdout).unwrap_err();
+        assert!(
+            err.to_string().contains("reply ceiling"),
+            "a megabyte stdout must hit the ceiling guard, got: {err}"
+        );
+    }
+
+    /// The guard allows the framing overhead: a ceiling-sized body plus its
+    /// short count header is a legal stdout, not an attack.
+    #[test]
+    fn a_stdout_at_exactly_the_margin_parses() {
+        let (reply, body) = reply_at_exactly_the_ceiling();
+        let mut framed = format!("{}\n", body.len()).into_bytes();
+        let header_len = framed.len();
+        framed.extend_from_slice(&body);
+        framed.extend_from_slice(vec![b't'; 32 - header_len].as_slice());
+        assert_eq!(framed.len(), MAX_REPLY_BYTES + 32);
+        assert_eq!(read_reply(&framed).expect("marginal stdout parses"), reply);
     }
 
     #[test]
@@ -1030,6 +1535,138 @@ mod tests {
         );
     }
 
+    /// Build a gzipped tarball in memory. The `tar` builder writes honest
+    /// archives; malicious ones need hand-rolled headers (see below).
+    fn child_tarball(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        for (path, data) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, path, *data).unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    /// A tarball whose entry escapes the destination. Hand-rolled because the
+    /// builder writes the path it is given and the extractor must refuse it.
+    fn child_traversal_tarball() -> Vec<u8> {
+        use std::io::Write;
+        let mut header = [0u8; 512];
+        header[..8].copy_from_slice(b"../evil\x00");
+        header[100..108].copy_from_slice(b"0000644\x00");
+        header[124..136].copy_from_slice(format!("{:011o}\x00", 2).as_bytes());
+        header[156] = b'0';
+        let mut sum: u32 = header.iter().map(|&b| b as u32).sum();
+        sum += 8 * (b' ' as u32);
+        header[148..156].copy_from_slice(format!("{sum:06o}\x00 ").as_bytes());
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&header);
+        raw.extend_from_slice(b"hi");
+        raw.extend_from_slice(&vec![0u8; 510]);
+        raw.extend_from_slice(&[0u8; 1024]);
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&raw).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// Drive the built binary as an extraction child. This is the one place
+    /// that may exec: the target is the compiled binary, never this harness
+    /// (`may_spawn_child` forbids re-exec here for exactly that reason).
+    fn run_child_binary(kind: &str, dest: &Path, tarball: &[u8]) -> std::process::Output {
+        assert_cmd::Command::cargo_bin("blueline")
+            .unwrap()
+            .env(CHILD_ENV, "1")
+            .env(DEST_ENV, dest)
+            .env(KIND_ENV, kind)
+            .write_stdin(tarball.to_vec())
+            .output()
+            .unwrap()
+    }
+
+    fn stdout_reply(out: &std::process::Output) -> Reply {
+        read_reply(&out.stdout).expect("a finished child leaves a parseable reply on stdout")
+    }
+
+    /// The confined happy path, end to end: a real child confines itself,
+    /// extracts, and reports its stats in a framed reply.
+    #[test]
+    fn a_real_child_extracts_and_reports_its_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let tarball = child_tarball(&[
+            ("package/package.json", b"{}"),
+            ("package/lib/index.js", b"module.exports = 1;"),
+        ]);
+        let out = run_child_binary("tar", dir.path(), &tarball);
+        assert_eq!(
+            out.status.code(),
+            Some(exit::OK),
+            "a clean archive extracts confined, stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        match stdout_reply(&out) {
+            Reply::Ok {
+                files,
+                unpacked_bytes,
+                ..
+            } => {
+                assert_eq!(files, 2);
+                assert_eq!(unpacked_bytes, 21);
+            }
+            other => panic!("a clean archive reports Ok, got: {other:?}"),
+        }
+        assert!(dir.path().join("package/lib/index.js").exists());
+    }
+
+    /// A traversal archive is refused by the extractor in the child, and the
+    /// refusal crosses the protocol as the extractor's own error, not as a
+    /// sandbox failure.
+    #[test]
+    fn a_real_child_refuses_a_traversal_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = run_child_binary("tar", dir.path(), &child_traversal_tarball());
+        assert_eq!(
+            out.status.code(),
+            Some(exit::REFUSED),
+            "a traversal archive is refused, stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        match stdout_reply(&out) {
+            Reply::Refused { variant, .. } => assert_eq!(variant, "extraction"),
+            other => panic!("a refused archive reports Refused, got: {other:?}"),
+        }
+    }
+
+    /// B1 regression: when confinement fails after narrowing started (here the
+    /// destination cannot even be opened for the ruleset), the child exits
+    /// UNUSABLE with a confessed failure, never UNAVAILABLE. An UNAVAILABLE
+    /// here would read to the parent as "retry in-process", unconfined.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_child_that_cannot_confine_never_reports_unavailable() {
+        let missing = std::env::temp_dir().join("blueline-sandbox-never-exists-9f3c");
+        assert!(
+            !missing.exists(),
+            "the fixture needs a destination that is not there"
+        );
+        let out = run_child_binary("tar", &missing, b"never-read");
+        assert_eq!(
+            out.status.code(),
+            Some(exit::UNUSABLE),
+            "a failed confinement is unusable, never a fallback, stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        match stdout_reply(&out) {
+            Reply::Unusable { reason } => assert!(
+                !reason.is_empty(),
+                "the confession must diagnose the failure"
+            ),
+            other => panic!("a failed confinement confesses Unusable, got: {other:?}"),
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn confine_reports_whether_the_kernel_actually_enforced() {
@@ -1041,11 +1678,25 @@ mod tests {
         let dir = crate::extract::private_temp_dir().expect("temp dir");
         match confined::confine(dir.path()) {
             Ok(tier) => assert!(
-                !tier.is_empty(),
-                "a confined result names the tier that was established"
+                TIER_NAMES.contains(&tier),
+                "a confined result names the tier that was established, got `{tier}`"
             ),
-            Err(confined::ConfineError::Unsupported(_))
-            | Err(confined::ConfineError::Failed(_)) => {}
+            Err(ConfineError::Unsupported(_)) | Err(ConfineError::Failed(_)) => {}
+        }
+    }
+
+    /// The dispatch reports a tier from the same ladder, whatever the platform:
+    /// on Linux it delegates, elsewhere it reports the gap. A result that
+    /// names no known tier is a protocol break, not confinement.
+    #[test]
+    fn confinement_reports_a_known_tier_or_an_honest_gap() {
+        let dir = crate::extract::private_temp_dir().expect("temp dir");
+        match confine(dir.path()) {
+            Ok(tier) => assert!(
+                cfg!(target_os = "linux") && TIER_NAMES.contains(&tier),
+                "a confined result names a tier from the ladder, got `{tier}`"
+            ),
+            Err(ConfineError::Unsupported(_)) | Err(ConfineError::Failed(_)) => {}
         }
     }
 
