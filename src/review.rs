@@ -3,7 +3,6 @@ use std::io::{IsTerminal, Write};
 use crate::baseline::{BaselineSelection, resolve_baseline};
 use crate::cli::{Output, OutputFormat, RegistryBases};
 use crate::diff::compute_delta;
-use crate::extract::{ExtractionLimits, safe_extract};
 use crate::heuristic::evaluate_with_trust;
 use crate::install_ref::InstallRef;
 use crate::manifest::{read_aur_srcinfo, read_package_json, read_packed_cargo_toml};
@@ -142,6 +141,8 @@ fn evaluate_with_registry<V: VersionInfo>(
         target_temp.path(),
         ecosystem,
         &target_pkg.tarball_url,
+        &mut ctx.sandbox,
+        policy,
     )
     .map_err(|e| {
         anyhow::anyhow!(
@@ -180,6 +181,8 @@ fn evaluate_with_registry<V: VersionInfo>(
             base_temp.path(),
             ecosystem,
             &base_pkg.tarball_url,
+            &mut ctx.sandbox,
+            policy,
         )
         .map_err(|e| {
             anyhow::anyhow!(
@@ -347,6 +350,17 @@ fn evaluate_with_registry<V: VersionInfo>(
         Some(&advisories),
         provenance.as_ref(),
     );
+
+    // An unconfined extraction is disclosed per review, never silently absorbed.
+    // Pushed rather than routed through `apply_extra_findings`, on purpose: that
+    // helper recomputes the band from the accumulated score, and this finding
+    // must not touch the band at all. A direct push cannot, by construction, so
+    // the invariant does not depend on a severity a future edit could change.
+    // `ci.rs` already pushes `R10_LOCKFILE_HASH_MISMATCH` the same way, so this
+    // is an existing idiom rather than a new one.
+    if let Some(disclosure) = ctx.sandbox.disclosure() {
+        verdict.findings.push(disclosure);
+    }
 
     if ecosystem == Ecosystem::Aur {
         if matches!(base_pkgbuild.as_deref(), Some("")) {
@@ -568,20 +582,27 @@ fn parse_pypi_core_metadata(raw: &str) -> PypiCoreMetadata {
     parsed
 }
 
+/// Extract one archive under the OS-level sandbox, or disclose there was none.
+///
+/// The routing decision stays here, where the ecosystem and the tarball URL are
+/// already known, so the child never re-derives a decision from bytes it would
+/// otherwise have to parse. `ExtractionLimits::default()` is applied inside
+/// `sandbox`, so the confined child and the in-process fallback cannot drift
+/// apart on how much an archive is allowed to cost.
 fn extract_for_ecosystem(
     tarball: &[u8],
     dest: &std::path::Path,
     ecosystem: Ecosystem,
     tarball_url: &str,
+    ledger: &mut crate::sandbox::SandboxLedger,
+    policy: &Policy,
 ) -> Result<crate::extract::ExtractStats, crate::error::BluelineError> {
-    if ecosystem == Ecosystem::PyPi && tarball_url.ends_with(".whl") {
-        return crate::wheel_extract::safe_extract_wheel(
-            tarball,
-            dest,
-            &ExtractionLimits::default(),
-        );
-    }
-    safe_extract(tarball, dest, &ExtractionLimits::default())
+    let kind = if ecosystem == Ecosystem::PyPi && tarball_url.ends_with(".whl") {
+        crate::sandbox::ArchiveKind::Wheel
+    } else {
+        crate::sandbox::ArchiveKind::Tar
+    };
+    crate::sandbox::extract(kind, tarball, dest, ledger, policy)
 }
 
 /// Locate and parse the package manifest inside an extracted release tree.
@@ -1605,11 +1626,14 @@ mod tests {
             tar.finish().unwrap();
         }
         let tarball_bytes = enc.finish().unwrap();
+        let mut ledger = crate::sandbox::SandboxLedger::default();
         let res = extract_for_ecosystem(
             &tarball_bytes,
             dir.path(),
             Ecosystem::PyPi,
             "https://example.com/pkg-1.0.0.tar.gz",
+            &mut ledger,
+            &Policy::default(),
         );
         assert!(res.is_ok());
     }

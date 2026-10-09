@@ -347,6 +347,15 @@ pub struct GeneralPolicyConfig {
     pub require_provenance: bool,
     /// Block on newly added lifecycle scripts when no baseline approval exists (default true).
     pub block_unreviewed_scripts: bool,
+    /// Refuse a review whose extraction could not be confined by the kernel,
+    /// instead of disclosing it and continuing.
+    ///
+    /// Off by default, and that default is the honest one. Unavailability is
+    /// the normal case on macOS, Windows and any kernel without Landlock, so
+    /// refusing by default would make the tool unusable on four of six shipped
+    /// platforms for a check the operator never asked for. Turning it on is how
+    /// an operator says "refuse rather than tell me".
+    pub require_sandbox: bool,
     /// Lower the band of non-registry (git/http/ssh/`npm:`/`file:`/`link:`)
     /// dependency findings from HIGH to MEDIUM. The findings stay visible; they
     /// are never suppressed (default false).
@@ -362,6 +371,7 @@ impl Default for GeneralPolicyConfig {
         Self {
             require_provenance: false,
             block_unreviewed_scripts: true,
+            require_sandbox: false,
             allow_git_dependencies: false,
             check_advisories: true,
             fail_closed_network: false,

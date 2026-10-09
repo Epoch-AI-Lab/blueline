@@ -107,6 +107,30 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
   so a caller that sets the flag by another route still gets the fail-closed
   direction on an unsigned release; what it cannot close is the present case.
 
+- **Extraction runs in a Landlock-confined child process, and says so when it
+  cannot.** Unpacking an unreviewed release ran in the review process itself, so
+  a parser bug in the extraction path executed with the full privileges of
+  whatever invoked blueline. Extraction now happens in a child re-exec'd from
+  `current_exe()` with a Landlock ruleset restricting it to the destination
+  directory.
+
+  Where the kernel cannot confine the child (macOS, Windows, any kernel without
+  Landlock) the extraction is **not** silently downgraded. Each review that could
+  not be confined carries `P05_SANDBOX_UNAVAILABLE` at LOW, so the gap is on the
+  review card instead of being invisible. `P05` deliberately does not touch the
+  verdict band; it is pushed directly rather than routed through
+  `apply_extra_findings`, which recomputes the band from the accumulated score.
+
+  **New policy key `[general] require_sandbox`, default `false`.** Off by default
+  because unavailability is the normal case off Linux, and refusing by default
+  would make the tool unusable on four of six shipped platforms for a check the
+  operator never asked for. Setting it to `true` refuses a review whose
+  extraction could not be confined, instead of disclosing it and continuing.
+
+  A child that dies or breaks its protocol is a hard error
+  (`extraction sandbox child failed`), never a fallback to in-process extraction:
+  a retry in-process would read whatever the dead child managed to write.
+
 ### Fixed
 
 - **The extraction temp dir is no longer world-accessible.** `tempfile::tempdir()`
