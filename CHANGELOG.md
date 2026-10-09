@@ -121,6 +121,17 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
   explicitly rather than inheriting the ambient umask. Windows has no unix mode
   bits and no equivalent umask, so nothing changes there.
 
+- **The AUR clone directory is no longer world-accessible either.** `AurRegistry::temp_repo`
+  still called bare `tempfile::tempdir()`, so the same 0o755 exposure remained on
+  the AUR lane. That lane is arguably the worse of the two: `fetch_verified` runs
+  `git archive` against the clone directory, so at a permissive umask any local
+  user could write into an attacker-chosen repository's clone between the clone
+  and the read. A swap window, not just a disclosure. Both `cached_repo` and
+  `fetch_verified` go through `temp_repo`, so the one-line fix covers both.
+
+  Pinned by `the_aur_clone_dir_is_not_world_accessible`, which was confirmed to
+  fail against the previous code.
+
   This is a pre-existing defect, and not one Landlock would have fixed: an
   OS-level confinement on the extraction directory bounds what a *confined*
   process may write, and says nothing about who else may read that directory
