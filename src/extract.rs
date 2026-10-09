@@ -600,7 +600,7 @@ mod tests {
     /// umask 022 and 0777 at umask 000. This pins the mode we actually hand the
     /// kernel, and the test process runs under whatever umask it was started
     /// with, which is the point: the fix must not depend on the ambient umask.
-    #[cfg(unix)]
+    ///
     /// The directory mode is the control that matters. A file inside it gets
     /// its mode from the archive header, and `safe_extract` does not currently
     /// clamp that, so the defence here is that no other user can traverse the

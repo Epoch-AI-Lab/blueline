@@ -93,9 +93,11 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
   and was checked against nothing, which is the same shape of harm as the
   dead-policy-key entries below: a security control that looks active and is not.
 
-  Setting it is now a load-time error that names what the flag actually checked,
-  points at `dist.integrity` (sha512) as the check that does run before
-  extraction, and says to remove the key.
+  Setting it is now a load-time error that names what the flag actually checked
+  and names the per-lane registry checksum that does run before extraction
+  instead (sha512 for npm, sha256 for cargo, pypi and aur), and says to remove
+  the key. The message cannot name one algorithm for every lane: policy loads
+  without lane context.
 
   **What did not change.** blueline still verifies no registry signature, and
   this release does not add that. Verified signatures need a Sigstore
