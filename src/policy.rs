@@ -731,6 +731,27 @@ require_signatures = true
         );
     }
 
+    /// `require_sandbox` sits in `GeneralPolicyConfig`, but the TOML table is
+    /// named after the *field* (`policy`), not the struct. `Policy` has no
+    /// `deny_unknown_fields`, so `[general]` loads cleanly and leaves the flag at
+    /// its default. An operator who wrote it expecting fail-closed refusals got
+    /// an unconfined extraction and a LOW disclosure instead.
+    #[test]
+    fn require_sandbox_lives_under_the_policy_table() {
+        let right = Policy::from_toml_str("[policy]\nrequire_sandbox = true\n").expect("loads");
+        assert!(
+            right.policy.require_sandbox,
+            "`[policy] require_sandbox = true` must set the flag"
+        );
+
+        let wrong = Policy::from_toml_str("[general]\nrequire_sandbox = true\n").expect("loads");
+        assert!(
+            !wrong.policy.require_sandbox,
+            "`[general]` must not be what an operator writes; if this ever passes, the \
+             documented table name is wrong again"
+        );
+    }
+
     /// `require_provenance` sits in the same table and is honoured per status,
     /// so refusing the sibling key must not refuse this one.
     #[test]

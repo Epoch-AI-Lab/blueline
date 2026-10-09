@@ -121,11 +121,18 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
   verdict band; it is pushed directly rather than routed through
   `apply_extra_findings`, which recomputes the band from the accumulated score.
 
-  **New policy key `[general] require_sandbox`, default `false`.** Off by default
+  **New policy key `[policy] require_sandbox`, default `false`.** Off by default
   because unavailability is the normal case off Linux, and refusing by default
   would make the tool unusable on four of six shipped platforms for a check the
   operator never asked for. Setting it to `true` refuses a review whose
   extraction could not be confined, instead of disclosing it and continuing.
+
+  The key lives under `[policy]`, not `[general]`, even though the Rust struct is
+  named `GeneralPolicyConfig`. `Policy` does not use `deny_unknown_fields`, so a
+  misspelled table is silently ignored rather than refused: writing `[general]`
+  loads cleanly and leaves `require_sandbox` at its default, which is the
+  fail-open this entry's own first draft created. `require_sandbox_lives_under
+  the_policy_table` pins the spelling.
 
   A child that dies or breaks its protocol is a hard error
   (`extraction sandbox child failed`), never a fallback to in-process extraction:

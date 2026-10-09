@@ -195,7 +195,7 @@ pub mod exit {
 
 /// The framed reply. The byte-count prefix exists because a bare read-to-end
 /// cannot distinguish a complete reply from one the child died halfway through.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 enum Reply {
     Ok {
@@ -221,8 +221,12 @@ enum Reply {
 fn rebuild_error(variant: &str, message: String) -> BluelineError {
     match variant {
         "extraction_limit" => BluelineError::ExtractionLimit(message),
-        // Only these two variants are reachable today, so an unknown name is a
-        // protocol break rather than a new extractor error.
+        // The common case. Without this arm every ordinary extractor refusal,
+        // which is the thing an attacker triggers most easily, came back to the
+        // operator as "the sandbox protocol broke" when the sandbox worked
+        // exactly as intended.
+        "extraction" => BluelineError::Extraction(message),
+        // An unknown name is a protocol break rather than a new extractor error.
         _ => BluelineError::Sandbox(format!(
             "child reported an unrecognised refusal variant `{variant}`: {message}"
         )),
@@ -244,8 +248,17 @@ fn extract_local(
     }
 }
 
-fn write_reply(reply: &Reply) {
-    use std::io::Write;
+/// Serialise a reply, guaranteeing it fits a pipe buffer.
+///
+/// The parent calls `wait_with_timeout` before it reads stdout, so a reply
+/// larger than the pipe blocks the child in `write_all` and the parent blocks
+/// waiting for an exit that cannot come: the full `CHILD_TIMEOUT`, once per
+/// extraction, twice when there is a baseline. Refusal messages embed archive
+/// entry paths, so the size is attacker-controlled.
+///
+/// An oversized reply is replaced rather than written. The detail is lost, which
+/// is the lesser evil against a hang the operator cannot interrupt.
+fn framed_reply_bytes(reply: &Reply) -> Vec<u8> {
     let body = serde_json::to_vec(reply).unwrap_or_else(|_| {
         // Serialising our own two-variant enum cannot fail, but a fallback that
         // still speaks the protocol beats a panic: an unserialisable reply
@@ -255,6 +268,22 @@ fn write_reply(reply: &Reply) {
         };
         serde_json::to_vec(&fallback).unwrap_or_default()
     });
+    if body.len() > MAX_REPLY_BYTES {
+        let short = Reply::Unavailable {
+            reason: format!(
+                "the child's reply was {} bytes, over the {MAX_REPLY_BYTES} ceiling, and was \
+                 discarded rather than written (writing it would deadlock the parent)",
+                body.len()
+            ),
+        };
+        return serde_json::to_vec(&short).unwrap_or_default();
+    }
+    body
+}
+
+fn write_reply(reply: &Reply) {
+    use std::io::Write;
+    let body = framed_reply_bytes(reply);
     let mut out = std::io::stdout().lock();
     // `writeln!` rather than `write!` with a trailing newline: the latter is a
     // clippy error, and the prefix is the framing, not decoration.
@@ -824,6 +853,68 @@ mod tests {
         assert!(
             matches!(unknown, BluelineError::Sandbox(_)),
             "an unknown variant must refuse, not relabel: {unknown:?}"
+        );
+    }
+
+    /// `"extraction"` is what the child emits for every ordinary extractor
+    /// refusal, which is the variant an attacker triggers most easily. It used
+    /// to fall through to the unknown-variant arm, so a correct refusal reached
+    /// the operator as "the sandbox protocol broke".
+    #[test]
+    fn an_ordinary_extraction_refusal_is_not_reported_as_a_protocol_break() {
+        let rebuilt = rebuild_error(
+            "extraction",
+            "parent traversal in entry path rejected".into(),
+        );
+        assert!(
+            matches!(rebuilt, BluelineError::Extraction(_)),
+            "an ordinary refusal must not be relabelled as a sandbox failure: {rebuilt:?}"
+        );
+    }
+
+    /// The child writes its whole reply to a pipe the parent does not read until
+    /// after `wait_with_timeout` returns. A reply larger than the pipe buffer
+    /// therefore blocks the child in `write_all` and the parent waits out the
+    /// full timeout. Refusal messages embed archive entry paths, so the size is
+    /// attacker-controlled: this was a 300s hang per extraction, reachable from
+    /// one malicious tarball.
+    #[test]
+    fn an_oversized_reply_is_never_written() {
+        let huge = Reply::Refused {
+            variant: "extraction".into(),
+            message: "x".repeat(MAX_REPLY_BYTES * 4),
+        };
+        assert!(
+            serde_json::to_vec(&huge).unwrap().len() > MAX_REPLY_BYTES,
+            "the fixture must actually be oversized, or this test proves nothing"
+        );
+        // Same bound `write_reply` applies before touching stdout.
+        let written = framed_reply_bytes(&huge);
+        assert!(
+            written.len() <= MAX_REPLY_BYTES,
+            "what is written must fit a pipe buffer, got {}",
+            written.len()
+        );
+        let parsed: Reply = serde_json::from_slice(&written).expect("still valid JSON");
+        assert!(
+            matches!(parsed, Reply::Unavailable { .. }),
+            "an oversized reply must be replaced, not truncated into something unparseable: \
+             {parsed:?}"
+        );
+    }
+
+    /// The ordinary case must survive the bound untouched, or this fix has
+    /// silently cost every normal refusal its message.
+    #[test]
+    fn a_normal_reply_passes_the_bound_unchanged() {
+        let reply = Reply::Refused {
+            variant: "extraction_limit".into(),
+            message: "entry count over cap".into(),
+        };
+        let written = framed_reply_bytes(&reply);
+        assert_eq!(
+            serde_json::from_slice::<Reply>(&written).expect("round-trips"),
+            reply
         );
     }
 
