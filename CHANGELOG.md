@@ -180,6 +180,14 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
   `UNUSABLE` is believed for its own diagnosis instead of being relabelled as an
   exit code.
 
+- **The `confine` dispatch no longer hides the non-Linux path from mutation
+  testing.** Written as two `#[cfg]`-gated functions, the non-Linux `confine`
+  did not exist in a Linux build, so `cargo mutants` could offer a
+  function-level mutation of it that no test on CI could ever kill. It is now
+  one function whose body is `#[cfg]`-gated in two blocks, so the symbol is
+  present on every host and
+  `confinement_reports_a_known_tier_or_an_honest_gap` can observe the mutation.
+
 - **The extraction temp dir is no longer world-accessible.** `tempfile::tempdir()`
   asks the OS for `0o777 & ~umask`, which measures `0o755` at the common umask
   022 and `0o777` at umask 000. Every review unpacks the target and baseline

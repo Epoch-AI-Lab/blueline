@@ -261,7 +261,6 @@ fn rebuild_error(variant: &str, message: String) -> BluelineError {
 fn refusal_variant(e: &BluelineError) -> &'static str {
     match e {
         BluelineError::ExtractionLimit(_) => "extraction_limit",
-        BluelineError::Extraction(_) => "extraction",
         _ => "extraction",
     }
 }
@@ -482,16 +481,28 @@ impl std::fmt::Display for ConfineError {
 pub const TIER_NAMES: [&str; 3] = ["V5", "V3", "V1"];
 
 /// Dispatch to the Linux Landlock implementation, or report the platform gap.
-#[cfg(target_os = "linux")]
+///
+/// **One `confine` for every platform, not a `#[cfg]` twin per platform.**
+///
+/// Two `#[cfg]`-gated functions mean the non-Linux one does not exist in a
+/// Linux build, so `cargo mutants` offers a function-level mutation of it that
+/// no test can ever kill: the mutant compiles, runs, and is unobservable
+/// because nothing on Linux calls it. That is exactly what CI reported against
+/// this file. Two blocks in one signature keep the symbol present on every
+/// host, so the tier assertion in `confinement_reports_a_known_tier_or_an_honest_gap`
+/// can see the mutation.
 fn confine(dest: &Path) -> Result<&'static str, ConfineError> {
-    confined::confine(dest)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn confine(_dest: &Path) -> Result<&'static str, ConfineError> {
-    Err(ConfineError::Unsupported(
-        "Landlock is Linux-only, so there is nothing to confine".into(),
-    ))
+    #[cfg(target_os = "linux")]
+    {
+        confined::confine(dest)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = dest;
+        Err(ConfineError::Unsupported(
+            "Landlock is Linux-only, so there is nothing to confine".into(),
+        ))
+    }
 }
 
 /// Confinement, and the reason it is shaped the way it is.
@@ -1030,8 +1041,13 @@ mod tests {
     }
 
     /// Every extractor error maps to a refusal name the parent can rebuild.
-    /// Deleting an arm either downgrades a limit breach to a plain failure or
-    /// turns a refusal into a protocol break.
+    /// Deleting the limit arm downgrades a limit breach to a plain failure.
+    ///
+    /// `Extraction` is pinned here rather than by naming its own match arm: an
+    /// explicit `BluelineError::Extraction(_) => "extraction"` sits directly
+    /// above the `_` arm that produces the same string, so no test can tell the
+    /// two apart and `cargo mutants` correctly reports deleting it as a
+    /// survivor. One arm, one behaviour.
     #[test]
     fn refusal_variant_names_every_extractor_error() {
         assert_eq!(
