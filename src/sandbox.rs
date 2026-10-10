@@ -474,7 +474,16 @@ fn run_child() -> i32 {
     // to confine with: without this order every extraction off Linux spawns a
     // process, copies the entire tarball through a pipe, then discards it.
     match confine(&dest) {
-        Ok(_) => {}
+        Ok(tier) => {
+            // Diagnostics only, and only on the success path. Nothing reads it
+            // in production: `unavailable_reason` consults stderr only when the
+            // reply is missing, and a confined child always writes one. It
+            // exists so a test can drive the built binary and read which ABI
+            // tier the kernel actually granted, which is the one confinement
+            // fact that cannot be observed from inside the harness without
+            // narrowing the harness.
+            eprintln!("confined at tier {tier}");
+        }
         // Nothing was applied, so the parent may retry in-process.
         Err(ConfineError::Unsupported(detail)) => {
             write_reply(&Reply::Unavailable { reason: detail });
@@ -613,7 +622,7 @@ mod confined {
                 // never be widened. A non-`FullyEnforced` status is therefore
                 // `Failed`, not `Unsupported`, and the caller refuses rather
                 // than extracting from a half-applied domain.
-                Ok(RulesetStatus::FullyEnforced) => return Ok(name),
+                Ok(status) if is_fully_enforced(&status) => return Ok(name),
                 Ok(got) => {
                     return Err(ConfineError::Failed(format!(
                         "Landlock reported {got:?} at tier {name}; refusing to extract \
@@ -636,6 +645,25 @@ mod confined {
     enum RestrictError {
         Unsupported,
         Failed(String),
+    }
+
+    /// Whether a finished ruleset is the one status that means confined.
+    ///
+    /// A function of its own so the decision between "confined" and "refuse" is
+    /// pinned without applying a ruleset to the process running the test.
+    /// `restrict_self` is irreversible and thread-inheriting, so a test that
+    /// called `confine` directly narrowed every thread libtest spawned for the
+    /// rest of the run; the only safe way to observe real confinement is
+    /// `run_child_binary` driving the built binary. The comparison is pure and
+    /// carries the whole fail-closed argument, so it gets its own unit tests.
+    ///
+    /// `NotEnforced` and `PartiallyEnforced` are both "something was requested
+    /// and the kernel did not deliver it", and both must read as a refusal. The
+    /// distinction matters because `restrict_self` returns `Ok` under all three
+    /// on a kernel that swallowed the request, so an `is_ok()` check would call
+    /// a no-op sandbox a sandbox.
+    fn is_fully_enforced(status: &RulesetStatus) -> bool {
+        matches!(status, RulesetStatus::FullyEnforced)
     }
 
     fn restrict_once(dest: &Path, abi: landlock::ABI) -> Result<RulesetStatus, RestrictError> {
@@ -677,6 +705,31 @@ mod confined {
             })?;
 
         Ok(status.ruleset)
+    }
+
+    /// The status comparison, without applying anything.
+    ///
+    /// `Ok` under every status is what `restrict_self` returns on a kernel that
+    /// swallowed the request, so this is the line between "the kernel enforced
+    /// the ruleset" and "the child extracted unconfined while reporting a
+    /// tier". It lives here rather than in the outer `tests` module because it
+    /// names `RulesetStatus`, which the crate does not otherwise re-export.
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn only_fully_enforced_reads_as_confined() {
+            assert!(is_fully_enforced(&RulesetStatus::FullyEnforced));
+            assert!(
+                !is_fully_enforced(&RulesetStatus::PartiallyEnforced),
+                "a partly enforced ruleset confined something and left the rest open"
+            );
+            assert!(
+                !is_fully_enforced(&RulesetStatus::NotEnforced),
+                "a not-enforced ruleset is the kernel without Landlock"
+            );
+        }
     }
 }
 
@@ -2116,37 +2169,32 @@ mod tests {
         }
     }
 
+    /// The child reports the tier the kernel granted, and it is one the ladder
+    /// names.
+    ///
+    /// Drives the built binary, which is the only safe place to observe
+    /// confinement: the harness must never call `restrict_self` itself. This is
+    /// what pins `TIER_NAMES` against a tier string nothing produces, and what
+    /// makes a `confine` that stopped confining observable at all, since a
+    /// child that cannot confine exits `UNAVAILABLE` instead of `OK`.
     #[cfg(target_os = "linux")]
     #[test]
-    fn confine_reports_whether_the_kernel_actually_enforced() {
-        // Not a unit test of the ruleset's effect, which needs a child to be
-        // safe. It pins that the status is *read* and compared against
-        // `FullyEnforced`, because `restrict_self()` returns `Ok` on a kernel
-        // with no Landlock and a caller checking only `is_ok()` would report a
-        // sandbox that does not exist.
-        let dir = crate::extract::private_temp_dir().expect("temp dir");
-        match confined::confine(dir.path()) {
-            Ok(tier) => assert!(
-                TIER_NAMES.contains(&tier),
-                "a confined result names the tier that was established, got `{tier}`"
-            ),
-            Err(ConfineError::Unsupported(_)) | Err(ConfineError::Failed(_)) => {}
-        }
-    }
-
-    /// The dispatch reports a tier from the same ladder, whatever the platform:
-    /// on Linux it delegates, elsewhere it reports the gap. A result that
-    /// names no known tier is a protocol break, not confinement.
-    #[test]
-    fn confinement_reports_a_known_tier_or_an_honest_gap() {
-        let dir = crate::extract::private_temp_dir().expect("temp dir");
-        match confine(dir.path()) {
-            Ok(tier) => assert!(
-                cfg!(target_os = "linux") && TIER_NAMES.contains(&tier),
-                "a confined result names a tier from the ladder, got `{tier}`"
-            ),
-            Err(ConfineError::Unsupported(_)) | Err(ConfineError::Failed(_)) => {}
-        }
+    fn a_confined_child_names_the_tier_it_established() {
+        let dir = tempfile::tempdir().unwrap();
+        let tarball = child_tarball(&[("package/package.json", b"{}")]);
+        let out = run_child_binary("tar", dir.path(), &tarball);
+        assert_eq!(
+            out.status.code(),
+            Some(exit::OK),
+            "the child must extract confined, stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let named = TIER_NAMES.iter().any(|tier| stderr.contains(tier));
+        assert!(
+            named,
+            "a confined child names one of {TIER_NAMES:?} on stderr, got: {stderr}"
+        );
     }
 
     #[test]
