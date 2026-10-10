@@ -132,7 +132,11 @@ Every tarball and registry response is fully untrusted. The `extract` stage enfo
   and a kernel without Landlock get the parser-level bounds above plus a
   `P05_SANDBOX_UNAVAILABLE` disclosure — or a refusal, when
   `[policy] require_sandbox = true`. seccomp and `cap-std` are still absent;
-  Landlock is the confinement layer that ships.
+  Landlock is the confinement layer that ships. It covers the extraction step
+  only: AUR review bytes are assembled by `git clone` and `git archive` in the
+  review process, which no Landlock domain can reach (no network control, and a
+  clone writes its own tree), so that lane refuses rather than discloses under
+  the same key.
 - **Treat extracted bytes as hostile:** the extracted `package.json` (`scripts`,
   `dependencies`) is diffed/flagged as attack surface, not trusted.
 

@@ -34,9 +34,26 @@ require_sandbox = true   # refuse the review instead of disclosing a fallback
 
 and the disclosure itself — `P05_SANDBOX_UNAVAILABLE` at **Low**, score-neutral,
 when a review fell back to the in-process path. The key lives under `[policy]`,
-not `[general]`: `Policy` has no `deny_unknown_fields`, so a `[general]` copy
-loads cleanly and silently does nothing
-(`require_sandbox_lives_under_the_policy_table` pins the right table).
+not `[general]`: `Policy` derives `deny_unknown_fields`, so a `[general]` copy is
+refused at load rather than silently doing nothing
+(`require_sandbox_lives_under_the_policy_table` pins both).
+
+## What this lane does not cover
+
+**The AUR fetch.** `registry/aur.rs` builds the review bytes with `git clone`
+and `git archive`, and both run as ordinary subprocesses of the review process.
+Landlock cannot fix that: it has no say over the network, which is most of what
+`clone` does, and a clone writes to its own working tree by design. The archive
+that comes out of `git archive` is then confined on its way into the extractor,
+like every other lane, but the git process that assembled it parsed the
+attacker-chosen git objects with the full privileges of whatever invoked
+blueline. That is the larger parser of the two.
+
+What closes it is the refusal, not a ruleset: with `require_sandbox = true` an
+AUR review stops before the first registry call
+(`require_sandbox_refuses_an_aur_review_before_any_registry_call`), because a
+confined extraction there would keep a promise the key cannot make. With the key
+off, the default, the AUR lane reviews exactly as before.
 
 ## Driving it
 - **Tiers** (`TIER_NAMES` is `["V5", "V3", "V1"]`): V5 is the ceiling that adds
@@ -79,7 +96,19 @@ loads cleanly and silently does nothing
   `a_child_that_cannot_confine_never_reports_unavailable` drive the built
   binary with the child marker; the first two need Landlock and are
   `#[cfg(target_os = "linux")]`-gated for it. Everywhere else the protocol half
-  is pinned by `map_child_result`'s unit tests.
+  is pinned by `map_child_result`'s unit tests. `cargo test --lib sandbox::`
+  runs against whatever binary is already in `target/debug` and does not
+  rebuild it, so a filtered run of these can fail on a stale binary.
+- **No test calls `restrict_self` on the harness.** Two unit tests used to call
+  `confine` directly; Landlock is irreversible and thread-inheriting, so every
+  thread libtest spawned afterwards stayed narrowed for the rest of the run and
+  an unrelated temp-dir test could fail with `EPERM` for no visible reason. The
+  status comparison survives as a pure `is_fully_enforced`
+  (`only_fully_enforced_reads_as_confined`) and the tier-or-refusal decision as
+  a pure `tier_or_refusal`
+  (`a_partly_enforced_ruleset_is_a_refusal_and_not_a_tier`), both pinned against
+  all three `RulesetStatus` values. The tier the kernel granted is read back off
+  the child's stderr (`a_confined_child_names_the_tier_it_established`).
 - **`SandboxSkip` has three variants and all three fire in production.**
   `UnsupportedPlatform` (compile-time), `Unavailable` (the child's own words),
   `SelfExecUnavailable` (exec failed). A dead child or a failed confinement is

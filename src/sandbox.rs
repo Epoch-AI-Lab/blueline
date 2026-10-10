@@ -27,6 +27,17 @@
 //! unsafe rather than merely wasteful: Landlock rulesets are cumulative, so a
 //! long-lived child accumulates a write grant per destination and ends up able
 //! to write to all of them at once.
+//!
+//! **What this does not buy, part two: the bytes entering it.** The AUR lane
+//! builds its review bytes by running `git clone` and `git archive` as ordinary
+//! subprocesses of the review process, and neither can be confined here.
+//! Landlock has no say over the network, which is most of what a clone does,
+//! and a clone writes to its own working tree by design. So the git process
+//! that assembles an AUR archive parses attacker-chosen git objects with the
+//! full privileges of the caller, and only the archive it produces gets the
+//! domain described above. `[policy] require_sandbox` refuses an AUR review
+//! rather than let a confined extraction stand in for a promise this module
+//! cannot keep on that lane.
 
 use std::path::Path;
 
@@ -547,7 +558,7 @@ impl std::fmt::Display for ConfineError {
 }
 
 /// The tier names `confine` can report on success. Pinned by
-/// `confinement_reports_a_known_tier_or_an_honest_gap`, because a tier string
+/// `a_confined_child_names_the_tier_it_established`, because a tier string
 /// the ladder never named is a protocol break, not confinement.
 pub const TIER_NAMES: [&str; 3] = ["V5", "V3", "V1"];
 
@@ -560,8 +571,9 @@ pub const TIER_NAMES: [&str; 3] = ["V5", "V3", "V1"];
 /// no test can ever kill: the mutant compiles, runs, and is unobservable
 /// because nothing on Linux calls it. That is exactly what CI reported against
 /// this file. Two blocks in one signature keep the symbol present on every
-/// host, so the tier assertion in `confinement_reports_a_known_tier_or_an_honest_gap`
-/// can see the mutation.
+/// host, so a confined child that reports `UNAVAILABLE` instead of `OK` — which
+/// is what a `confine` that stopped confining produces — turns the shard red
+/// from `a_real_child_extracts_and_reports_its_stats`.
 fn confine(dest: &Path) -> Result<&'static str, ConfineError> {
     #[cfg(target_os = "linux")]
     {
@@ -622,13 +634,7 @@ mod confined {
                 // never be widened. A non-`FullyEnforced` status is therefore
                 // `Failed`, not `Unsupported`, and the caller refuses rather
                 // than extracting from a half-applied domain.
-                Ok(status) if is_fully_enforced(&status) => return Ok(name),
-                Ok(got) => {
-                    return Err(ConfineError::Failed(format!(
-                        "Landlock reported {got:?} at tier {name}; refusing to extract \
-                         unconfined from a partly applied domain"
-                    )));
-                }
+                Ok(status) => return tier_or_refusal(name, &status),
                 // Nothing was restricted: only `restrict_self` narrows anything,
                 // and it never ran, so the next tier is still safe to try.
                 Err(RestrictError::Unsupported) => last = name,
@@ -645,6 +651,29 @@ mod confined {
     enum RestrictError {
         Unsupported,
         Failed(String),
+    }
+
+    /// What a finished `restrict_self` means for the review.
+    ///
+    /// Pure, and taking the tier name and the status rather than reading either,
+    /// so the fail-closed decision is pinned for every status a kernel can
+    /// report. It has to be, because `restrict_self` returns `Ok` under all
+    /// three: in Rust, "the kernel enforced the ruleset" and "the kernel
+    /// swallowed the request" are the same type, and this branch is the only
+    /// thing that separates them. A CI runner fully enforces, so no test that
+    /// drives the real child can reach the refusing half; a unit test that
+    /// hands it `PartiallyEnforced` can.
+    fn tier_or_refusal(
+        name: &'static str,
+        status: &RulesetStatus,
+    ) -> Result<&'static str, ConfineError> {
+        if is_fully_enforced(status) {
+            return Ok(name);
+        }
+        Err(ConfineError::Failed(format!(
+            "Landlock reported {status:?} at tier {name}; refusing to extract \
+             unconfined from a partly applied domain"
+        )))
     }
 
     /// Whether a finished ruleset is the one status that means confined.
@@ -729,6 +758,30 @@ mod confined {
                 !is_fully_enforced(&RulesetStatus::NotEnforced),
                 "a not-enforced ruleset is the kernel without Landlock"
             );
+        }
+
+        /// The decision that sits between a finished ruleset and the review's
+        /// answer, for every status the kernel can report.
+        ///
+        /// This is the pin that the exit code cannot provide. On a runner where
+        /// Landlock fully enforces, a child always reports `FullyEnforced`, so
+        /// no end-to-end test reaches the refusing half and a mutant that reads
+        /// every status as confined would survive the whole shard.
+        #[test]
+        fn a_partly_enforced_ruleset_is_a_refusal_and_not_a_tier() {
+            assert_eq!(
+                tier_or_refusal("V5", &RulesetStatus::FullyEnforced),
+                Ok("V5")
+            );
+            for status in [RulesetStatus::PartiallyEnforced, RulesetStatus::NotEnforced] {
+                let err = tier_or_refusal("V3", &status)
+                    .expect_err("a ruleset the kernel did not fully enforce is never a tier")
+                    .to_string();
+                assert!(
+                    err.contains("V3") && err.contains(&format!("{status:?}")),
+                    "the refusal names the tier and the status the kernel reported, got: {err}"
+                );
+            }
         }
     }
 }
@@ -2177,6 +2230,11 @@ mod tests {
     /// what pins `TIER_NAMES` against a tier string nothing produces, and what
     /// makes a `confine` that stopped confining observable at all, since a
     /// child that cannot confine exits `UNAVAILABLE` instead of `OK`.
+    ///
+    /// `cargo test --lib sandbox::` runs against whatever binary is already in
+    /// `target/debug`, and this test reads the child's stderr, so a filtered
+    /// run can fail on a stale binary that predates the tier line. Run the
+    /// whole suite, or `cargo build` first.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_confined_child_names_the_tier_it_established() {

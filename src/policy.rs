@@ -356,6 +356,12 @@ pub struct GeneralPolicyConfig {
     /// refusing by default would make the tool unusable on four of six shipped
     /// platforms for a check the operator never asked for. Turning it on is how
     /// an operator says "refuse rather than tell me".
+    ///
+    /// **The AUR lane refuses under this key.** Its review bytes are built by
+    /// `git clone` and `git archive` running outside the Landlock domain by
+    /// construction, so confining only the extraction would leave the larger
+    /// parser of the two unconfined while reporting otherwise. Refusing the
+    /// lane keeps the key's promise exact.
     pub require_sandbox: bool,
     /// Lower the band of non-registry (git/http/ssh/`npm:`/`file:`/`link:`)
     /// dependency findings from HIGH to MEDIUM. The findings stay visible; they

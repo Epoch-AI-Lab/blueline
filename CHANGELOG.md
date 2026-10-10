@@ -130,15 +130,51 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
   extraction could not be confined, instead of disclosing it and continuing.
 
   The key lives under `[policy]`, not `[general]`, even though the Rust struct is
-  named `GeneralPolicyConfig`. `Policy` does not use `deny_unknown_fields`, so a
-  misspelled table is silently ignored rather than refused: writing `[general]`
-  loads cleanly and leaves `require_sandbox` at its default, which is the
-  fail-open this entry's own first draft created. `require_sandbox_lives_under
-  the_policy_table` pins the spelling.
+  named `GeneralPolicyConfig`. The misspelled table used to load cleanly and
+  leave `require_sandbox` at its default, which is the fail-open this entry's own
+  first draft created. `Policy` now derives `deny_unknown_fields`, so `[general]`,
+  a misspelled key, and an unknown table are all refused at load.
+  `require_sandbox_lives_under_the_policy_table` pins both the right table and
+  the refusal.
+
+  On the AUR lane the key also refuses a review it cannot honour: those bytes are
+  built by `git clone` and `git archive` running outside the Landlock domain by
+  construction, so a confined extraction there would still read as a promise the
+  key does not keep. The refusal is named in the key's own doc comment.
 
   A child that dies or breaks its protocol is a hard error
   (`extraction sandbox child failed`), never a fallback to in-process extraction:
   a retry in-process would read whatever the dead child managed to write.
+
+- **A policy key that cannot be honoured is refused instead of silently
+  defaulted.** `Policy` and every config struct now derive
+  `deny_unknown_fields`, so `[general] require_sandbox = true`, a misspelled key,
+  and an unknown table are all errors naming the offending key. Before this, an
+  operator who wrote the key under the wrong table got an unconfined extraction
+  plus a LOW disclosure and no way to tell the difference from a confined review.
+  Omitting a table entirely still loads, because `#[serde(default)]` fills it in.
+
+- **The AUR lane refuses rather than promises under `require_sandbox`.**
+  `registry/aur.rs` builds the review bytes with `git clone` and `git archive`,
+  and neither can be confined by Landlock: the network is outside its reach,
+  and a clone writes to its own working tree by design. The archive those
+  processes produce is confined on its way into the extractor like every other
+  lane, but the git process that assembled it parsed attacker-chosen git objects
+  with the caller's full privileges, and it is the larger parser of the two. An
+  AUR review now stops before the first registry call when the key is set,
+  instead of reporting a confinement the lane cannot deliver. With the key off
+  (the default) the lane is unchanged.
+
+- **No test narrows the process running the suite.** Two unit tests called
+  `confine` directly, and `restrict_self` is irreversible and thread-inheriting:
+  every thread libtest spawned after them stayed narrowed for the rest of the
+  run, so an unrelated temp-dir test could fail with `EPERM` for no visible
+  reason. The status comparison survives as a pure `is_fully_enforced`
+  (`only_fully_enforced_reads_as_confined`), the tier-or-refusal decision as a
+  pure `tier_or_refusal` pinned against all three statuses
+  (`a_partly_enforced_ruleset_is_a_refusal_and_not_a_tier`), and the tier the
+  kernel granted is read back off the built binary's stderr, which is the one
+  place confinement can be observed without applying it to the observer.
 
 ### Fixed
 
@@ -228,8 +264,9 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
   did not exist in a Linux build, so `cargo mutants` could offer a
   function-level mutation of it that no test on CI could ever kill. It is now
   one function whose body is `#[cfg]`-gated in two blocks, so the symbol is
-  present on every host and
-  `confinement_reports_a_known_tier_or_an_honest_gap` can observe the mutation.
+  present on every host and a `confine` that stopped confining is observable:
+  the child would exit `UNAVAILABLE` instead of `OK`, which
+  `a_real_child_extracts_and_reports_its_stats` refuses.
 
 - **The extraction temp dir is no longer world-accessible.** `tempfile::tempdir()`
   asks the OS for `0o777 & ~umask`, which measures `0o755` at the common umask

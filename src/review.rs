@@ -121,6 +121,26 @@ fn evaluate_with_registry<V: VersionInfo>(
         .map_err(|e| anyhow::anyhow!("invalid version for `{version_str}`: {e}"))?;
 
     let ecosystem = registry.ecosystem();
+    // AUR review bytes are built by `git clone` and `git archive` running as
+    // ordinary subprocesses of this process, and neither can be confined:
+    // Landlock has no say over the network, and a clone writes to its own
+    // working tree by design. The extraction step that follows is still
+    // confined by `src/sandbox.rs`, but the parent's own `git` parses the
+    // attacker-chosen objects first and is the larger of the two parsers. An
+    // operator who set `require_sandbox` asked for a refusal rather than a
+    // disclosure, so that is what the AUR lane gets: a key that cannot deliver
+    // what it promises, silently, is the same fail-open as a key in a table
+    // nothing reads.
+    if ecosystem == Ecosystem::Aur && policy.policy.require_sandbox {
+        return Err(anyhow::anyhow!(
+            "AUR@{}@{}: `[policy] require_sandbox = true` cannot be honoured, because the \
+             review bytes are produced by `git clone` and `git archive` outside the \
+             Landlock domain by construction. Unset the key to review this package with a \
+             disclosed gap instead of a refusal.",
+            name,
+            version_str
+        ));
+    }
     let registry_base = ctx.bases.for_ecosystem(ecosystem).to_string();
     let target_pkg = registry.resolve(name, version_str)?;
 
@@ -2277,6 +2297,118 @@ mod recursive_tests {
         let (verdict, _, _, _) =
             evaluate_package(name, version, Ecosystem::Npm, &store, policy, &mut ctx).unwrap();
         verdict
+    }
+
+    /// An AUR adapter that must never be asked for anything.
+    ///
+    /// Both failure strings are tokens, so a test that reaches them is a test
+    /// that found the gate in the wrong place: the refusal has to happen before
+    /// the first registry call, because a refusal reached after the fetch is a
+    /// disclosure wearing an error's clothes.
+    struct FakeAurGated;
+
+    impl Registry for FakeAurGated {
+        fn ecosystem(&self) -> Ecosystem {
+            Ecosystem::Aur
+        }
+        fn resolve(
+            &self,
+            _name: &str,
+            _version: &str,
+        ) -> Result<Package, crate::error::BluelineError> {
+            Err(crate::error::BluelineError::NotFound(
+                "resolve-must-not-run".to_string(),
+            ))
+        }
+        fn fetch_tarball(&self, _pkg: &Package) -> Result<Vec<u8>, crate::error::BluelineError> {
+            Err(crate::error::BluelineError::NotFound(
+                "fetch-must-not-run".to_string(),
+            ))
+        }
+        fn list_versions(
+            &self,
+            _name: &str,
+        ) -> Result<Vec<semver::Version>, crate::error::BluelineError> {
+            Err(crate::error::BluelineError::NotFound(
+                "list-versions-must-not-run".to_string(),
+            ))
+        }
+        fn list_releases(&self, _name: &str) -> Result<Vec<Release>, crate::error::BluelineError> {
+            Err(crate::error::BluelineError::NotFound(
+                "list-releases-must-not-run".to_string(),
+            ))
+        }
+        fn default_version(
+            &self,
+            _name: &str,
+        ) -> Result<Option<String>, crate::error::BluelineError> {
+            Err(crate::error::BluelineError::NotFound(
+                "default-version-must-not-run".to_string(),
+            ))
+        }
+    }
+
+    /// `require_sandbox` on the AUR lane refuses instead of promising.
+    ///
+    /// The key means "refuse a review the kernel could not confine". The AUR
+    /// bytes come from `git clone` plus `git archive`, which no Landlock domain
+    /// can cover, so honouring the key there would mean reporting a confinement
+    /// that never existed for the bytes that matter most. The refusal is what
+    /// `src/sandbox.rs::extract` already does for its own fallback; this closes
+    /// the second half of the same promise.
+    #[test]
+    fn require_sandbox_refuses_an_aur_review_before_any_registry_call() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&store_dir.path().join("t.db")).unwrap();
+        let mut policy = no_advisory_policy();
+        policy.policy.require_sandbox = true;
+        let mut ctx = ReviewContext::new(&policy, fixture_bases());
+        ctx.inject_registry(Ecosystem::Aur, std::rc::Rc::new(FakeAurGated));
+
+        let err = evaluate_package("yay", "1.0.0", Ecosystem::Aur, &store, &policy, &mut ctx)
+            .expect_err("require_sandbox must refuse an AUR review rather than promise it")
+            .to_string();
+        assert!(
+            err.contains("git clone"),
+            "the refusal must name the step that cannot be confined, got: {err}"
+        );
+        assert!(
+            err.contains("require_sandbox"),
+            "the refusal must name the key the operator set, got: {err}"
+        );
+        for token in [
+            "resolve-must-not-run",
+            "fetch-must-not-run",
+            "list-versions-must-not-run",
+            "list-releases-must-not-run",
+            "default-version-must-not-run",
+        ] {
+            assert!(
+                !err.contains(token),
+                "the gate ran too late: the review already touched the registry ({token})"
+            );
+        }
+    }
+
+    /// The same lane reviews fine with the key off, which is the default. This
+    /// is the pair that keeps the refusal above from reading as "AUR is
+    /// unsupported": without the key the review reaches the registry and fails
+    /// on the fixture's own absence, which is the ordinary path.
+    #[test]
+    fn an_aur_review_proceeds_when_the_key_is_unset() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&store_dir.path().join("t.db")).unwrap();
+        let policy = no_advisory_policy();
+        let mut ctx = ReviewContext::new(&policy, fixture_bases());
+        ctx.inject_registry(Ecosystem::Aur, std::rc::Rc::new(FakeAurGated));
+
+        let err = evaluate_package("yay", "1.0.0", Ecosystem::Aur, &store, &policy, &mut ctx)
+            .expect_err("the fixture has no package, so the review fails on that")
+            .to_string();
+        assert!(
+            err.contains("resolve-must-not-run"),
+            "with the key off the review must reach the registry, got: {err}"
+        );
     }
 
     /// Serves a PEP 691 Simple index for one package plus the artifact bytes
