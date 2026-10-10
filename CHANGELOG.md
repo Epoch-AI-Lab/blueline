@@ -174,6 +174,47 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
   a kernel too old for V5 keeps `O_TRUNC` containment instead of silently
   dropping to V1, which does not handle it at all.
 
+- **An oversized refusal is truncated, not relabelled as a fallback.** When the
+  child's reply was too large for the pipe it was replaced wholesale with
+  `Unavailable`, which the parent reads as "nothing was confined, retry
+  in-process". For a refusal that was the wrong direction: the child had
+  already written part of the tree into `dest` before it stopped, so the
+  in-process retry re-ran the extraction **unconfined over a destination that
+  was no longer empty** — the exact outcome the child exists to prevent. The
+  trigger was attacker-controlled, because refusal messages embed archive entry
+  paths and one long GNU long-name was enough.
+
+  What gets cut now is the free text, never the outcome: the message is
+  truncated with a `[message truncated to fit the reply frame]` marker and the
+  parent rebuilds the extractor's own error from the surviving variant.
+  `an_oversized_refusal_stays_a_refusal_and_never_becomes_a_fallback` drives
+  the whole path through `map_child_result`, since the bug was in the mapping
+  and not in the serialiser.
+
+- **The child's reply body and the parent's read ceiling are now separate
+  numbers.** Both were `MAX_REPLY_BYTES`, and the writer prefixes the body with
+  its decimal length and a newline. A body at exactly the ceiling was 65542
+  bytes on the wire against a 64 KiB pipe, and the parent does not read stdout
+  until the child has exited, so the child blocked in `write_all` and the parent
+  waited out the full `CHILD_TIMEOUT`. That is the same bug the writer-side
+  guard was added for, narrowed from unbounded to six bytes rather than closed,
+  and a test was pinning the deadlock-prone size as the intended maximum.
+
+  The writer is now bounded by `MAX_REPLY_BODY_BYTES`, which reserves room for
+  the prefix; the reader keeps the larger ceiling, because its job is refusing a
+  hostile peer rather than fitting a pipe. Both are pinned separately, and the
+  cut walks back to a character boundary so a multi-byte character at the cut
+  point cannot panic the child into reading as a dead one.
+
+- **The `may_spawn_child` guard no longer needs `unsafe` to be tested.** The
+  integration test reached the marker branch by calling
+  `std::env::set_var`, `unsafe` since edition 2024, with a safety argument that
+  held only because it was the single test in its binary. The decision is now
+  `may_spawn_child_given(marker_set: bool)`, a pure function, with
+  `may_spawn_child` reading the environment and delegating. Both arms are
+  covered by ordinary parallel-safe tests, so a second test in that file is now
+  free.
+
 - **The child's reply framing is checked for an off-by-one.** `read_reply`
   sliced the body from `nl + 1`, and `serde_json` skips leading whitespace, so a
   framing error that leaked the header newline into the body parsed fine and no

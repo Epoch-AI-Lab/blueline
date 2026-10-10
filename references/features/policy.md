@@ -26,6 +26,7 @@ max_low_score = 19; max_medium_score = 49; block_score = 80
 [policy]
 require_provenance = false; block_unreviewed_scripts = true
 allow_git_dependencies = false; check_advisories = true; fail_closed_network = false
+require_sandbox = false   # true REFUSES a review the sandbox could not cover
 [advisories]
 block_on_malware = true; block_on_critical_cve = true
 cache_ttl_hours_clean = 12; cache_ttl_hours_vulnerable = 1
@@ -125,6 +126,14 @@ otherwise exact `==` (**case-sensitive**). No `?`, no `[...]`, no escaping.
 - **`glob_match("**")` is `true`** (`contains("")`), and `a*b*c` degrades to an
   `a*` prefix match. Replacing this with `globset`/`glob` silently changes
   blocking semantics.
+- **`require_sandbox` lives under `[policy]`, and `[general]` silently does
+  nothing.** `Policy` has no `deny_unknown_fields`, so a `[general]` copy of
+  the key loads cleanly, is dropped, and leaves the flag false — an operator
+  who set it expecting fail-closed refusals got an unconfined extraction with
+  only a LOW disclosure. `require_sandbox_lives_under_the_policy_table` pins
+  both tables. When the flag is true and `sandbox::extract` would fall back,
+  the review stops with an error naming the skip reason instead. See
+  [sandbox](sandbox.md).
 - **An env-probing test must re-exec the test binary.** `std::env::set_var` is
   `unsafe` and forbidden in edition 2024, so
   `env_policy_present_reads_process_environment` spawns itself with

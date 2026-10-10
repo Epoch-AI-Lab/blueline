@@ -38,28 +38,37 @@ use crate::verdict::{Finding, VerdictBand};
 /// Marker environment variable. The parent sets it; `child_entrypoint` keys on
 /// it.
 ///
-/// `#[doc(hidden)] pub` for the same reason as `may_spawn_child`: the test that
-/// pins the marker's effect lives outside the harness, and it must set the real
-/// name rather than a copy of it that can drift.
-#[doc(hidden)]
-pub const CHILD_ENV: &str = "BLUELINE_SANDBOX_CHILD";
+/// `pub(crate)` now: the integration test that pinned the marker's effect
+/// reaches the decision through `may_spawn_child_given` instead of writing the
+/// real environment, so nothing outside the crate needs the name.
+pub(crate) const CHILD_ENV: &str = "BLUELINE_SANDBOX_CHILD";
 /// Canonical absolute path of the directory the child may write.
 pub(crate) const DEST_ENV: &str = "BLUELINE_SANDBOX_DEST";
 /// Which extractor the child runs.
 pub(crate) const KIND_ENV: &str = "BLUELINE_SANDBOX_KIND";
 
-/// Ceiling on the child's *declared* reply length.
+/// Ceiling on the reply the parent will *read*.
 ///
-/// Checked in two places: the child replaces an oversized reply before writing
-/// it (a reply larger than the pipe buffer would deadlock the parent in
-/// `wait_with_timeout`), and the parent refuses a reply that declares more
-/// than this. It does not bound what the parent allocates overall:
-/// `wait_with_output` collects the child's whole stdout before `read_reply`
-/// runs, so a hostile stdout past the framing is already in memory by the time
-/// the ceiling is checked. That is accepted because the child is our own
-/// binary, not an attacker-controlled peer. The reply itself is three numbers
-/// or a short reason, so this is generous.
+/// Checked in one place, on the parent's side: a reply that declares more than
+/// this is refused rather than parsed. It does not bound what the parent
+/// allocates overall: `wait_with_output` collects the child's whole stdout
+/// before `read_reply` runs, so a hostile stdout past the framing is already in
+/// memory by the time the ceiling is checked. That is accepted because the
+/// child is our own binary, not an attacker-controlled peer. The reply itself
+/// is three numbers or a short reason, so this is generous.
 const MAX_REPLY_BYTES: usize = 64 * 1024;
+
+/// Ceiling on the reply *body* the child writes, which is the smaller number.
+///
+/// `write_reply` prefixes the body with its decimal length and a newline, and
+/// the parent does not read stdout until the child has exited, so a body at
+/// `MAX_REPLY_BYTES` is still six bytes past a 64 KiB pipe: the child blocks in
+/// `write_all` and the parent waits out the full `CHILD_TIMEOUT`. The reader's
+/// job is refusing a hostile peer, the writer's is fitting a pipe, and sharing
+/// one constant between them is how a six-byte window survived a fix for the
+/// unbounded version of the same bug. The reserve is pinned by a test so it
+/// cannot be quietly removed.
+const MAX_REPLY_BODY_BYTES: usize = MAX_REPLY_BYTES - 32;
 
 /// Which archive reader the child runs. Resolved by the parent, which already
 /// has the ecosystem and the tarball URL, so the child never re-derives a
@@ -91,21 +100,23 @@ impl ArchiveKind {
 
 /// The reason the kernel-level layer is not active.
 ///
-/// Every variant except the last means nothing was attempted or nothing was
-/// applied, so the destination is untouched and the in-process fallback is
-/// safe. `ChildDied` is the exception and is never a fallback: the child may
-/// have written a partial tree.
+/// Every variant means nothing was attempted or nothing was applied, so the
+/// destination is untouched and the in-process fallback is safe. A child that
+/// died or failed its confinement never becomes a `SandboxSkip`: it is
+/// `ChildFailure::Unusable`, an error the review stops on.
+///
+/// Three variants, and all three are reachable in production.
+/// `KernelWithoutLandlock`, `AbiUnavailable` and `ChildDied` used to advertise
+/// a taxonomy nothing built: the "no Landlock" and "no ABI tier" answers both
+/// arrive as the child's own `Unavailable` reason text, and a dead child is
+/// the `Unusable` error above. Both review rounds flagged the dead members,
+/// because a caller who matches on a variant that can never fire has built a
+/// decision on nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SandboxSkip {
     /// Not Linux. Landlock is a Linux LSM and the `landlock` crate does not
     /// build elsewhere, so this is fixed at compile time.
     UnsupportedPlatform,
-    /// Linux, kernel has no Landlock: `CONFIG_SECURITY_LANDLOCK` off or
-    /// `landlock` absent from `CONFIG_LSM`.
-    KernelWithoutLandlock,
-    /// Landlock exists but no tier could be established under
-    /// `CompatLevel::HardRequirement`. `last_tried` is the floor reached.
-    AbiUnavailable { last_tried: &'static str },
     /// The child ran and reported that it could not confine itself. The child's
     /// own words, because the child is the only place the ruleset was built.
     Unavailable { detail: String },
@@ -113,9 +124,6 @@ pub enum SandboxSkip {
     /// process table, not a kernel feature, and an operator reading this
     /// disclosure should look for a different problem.
     SelfExecUnavailable { detail: String },
-    /// The child died, panicked, or broke the protocol. `dest` may hold a
-    /// partial tree, so this is an error and never a fallback.
-    ChildDied { status: String, stderr: String },
 }
 
 impl std::fmt::Display for SandboxSkip {
@@ -124,21 +132,11 @@ impl std::fmt::Display for SandboxSkip {
             SandboxSkip::UnsupportedPlatform => {
                 write!(f, "this platform has no Landlock, which is Linux-only")
             }
-            SandboxSkip::KernelWithoutLandlock => {
-                write!(f, "this kernel has no Landlock")
-            }
-            SandboxSkip::AbiUnavailable { last_tried } => write!(
-                f,
-                "no Landlock ABI tier could be established, down to tier {last_tried}"
-            ),
             SandboxSkip::Unavailable { detail } => {
                 write!(f, "the extraction child could not confine itself: {detail}")
             }
             SandboxSkip::SelfExecUnavailable { detail } => {
                 write!(f, "the extraction child could not be started: {detail}")
-            }
-            SandboxSkip::ChildDied { status, .. } => {
-                write!(f, "the extraction child died ({status})")
             }
         }
     }
@@ -208,7 +206,7 @@ pub mod exit {
 
 /// The framed reply. The byte-count prefix exists because a bare read-to-end
 /// cannot distinguish a complete reply from one the child died halfway through.
-#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 enum Reply {
     Ok {
@@ -288,29 +286,96 @@ fn extract_local(
 /// extraction, twice when there is a baseline. Refusal messages embed archive
 /// entry paths, so the size is attacker-controlled.
 ///
-/// An oversized reply is replaced rather than written. The detail is lost, which
-/// is the lesser evil against a hang the operator cannot interrupt.
+/// What gets cut to fit is the free text, never the outcome. An oversized reply
+/// used to be replaced wholesale with `Unavailable`, which the parent reads as
+/// "nothing was confined, retry in-process", and for a `Refused` that re-ran
+/// the extraction unconfined over a `dest` the child had already partly
+/// written: the outcome this module exists to prevent.
 fn framed_reply_bytes(reply: &Reply) -> Vec<u8> {
-    let body = serde_json::to_vec(reply).unwrap_or_else(|_| {
-        // Serialising our own two-variant enum cannot fail, but a fallback that
+    serialise(&fit_to_frame(reply.clone()))
+}
+
+/// Marker left behind when a message was cut to fit the frame.
+const TRUNCATION_NOTE: &str = " [message truncated to fit the reply frame]";
+
+fn serialise(reply: &Reply) -> Vec<u8> {
+    serde_json::to_vec(reply).unwrap_or_else(|_| {
+        // Serialising our own four-variant enum cannot fail, but a fallback that
         // still speaks the protocol beats a panic: an unserialisable reply
         // would otherwise read to the parent as a child that died.
         let fallback = Reply::Unavailable {
             reason: "reply could not be serialised".into(),
         };
         serde_json::to_vec(&fallback).unwrap_or_default()
-    });
-    if body.len() > MAX_REPLY_BYTES {
-        let short = Reply::Unavailable {
-            reason: format!(
-                "the child's reply was {} bytes, over the {MAX_REPLY_BYTES} ceiling, and was \
-                 discarded rather than written (writing it would deadlock the parent)",
-                body.len()
-            ),
+    })
+}
+
+/// Cut a reply's free text until its body fits `MAX_REPLY_BODY_BYTES`.
+///
+/// One round is not always enough: the body is the *escaped* form, so cutting N
+/// bytes off a message can leave the serialised length unchanged when the cut
+/// lands in a run of quotes or backslashes. Each round that shortens the text
+/// ends up shortening the body by at least what the reply was over, so the loop
+/// converges; the progress guard catches the one case that would not (a text
+/// already too short to cut, which cannot be reached but must not spin).
+fn fit_to_frame(reply: Reply) -> Reply {
+    let mut reply = reply;
+    loop {
+        let len = serialise(&reply).len();
+        if len <= MAX_REPLY_BODY_BYTES {
+            return reply;
+        }
+        let Some(text) = free_text_mut(&mut reply) else {
+            // `Ok` carries three integers and is never the oversized reply.
+            break;
         };
-        return serde_json::to_vec(&short).unwrap_or_default();
+        let before = text.len();
+        let keep = text
+            .len()
+            .saturating_sub((len - MAX_REPLY_BODY_BYTES).saturating_add(TRUNCATION_NOTE.len()));
+        let kept = cut_to(text, keep).to_string();
+        *text = format!("{kept}{TRUNCATION_NOTE}");
+        if text.len() >= before {
+            break;
+        }
     }
-    body
+    // Shortest reply that still carries the outcome. Unreachable in practice:
+    // the empty reply is a few dozen bytes of punctuation against a 64 KiB
+    // ceiling. If it somehow is not, the parent refuses the declared count and
+    // stops, which is the direction this whole path fails in.
+    empty_free_text(&mut reply);
+    reply
+}
+
+/// The free-text field of a reply, or `None` for `Ok`.
+fn free_text_mut(reply: &mut Reply) -> Option<&mut String> {
+    match reply {
+        Reply::Refused { message, .. } => Some(message),
+        Reply::Unavailable { reason } | Reply::Unusable { reason } => Some(reason),
+        Reply::Ok { .. } => None,
+    }
+}
+
+fn empty_free_text(reply: &mut Reply) {
+    if let Some(text) = free_text_mut(reply) {
+        text.clear();
+    }
+}
+
+/// Cut `text` to at most `max` bytes, never mid-character.
+///
+/// A byte offset landing inside a multi-byte character makes `&text[..end]`
+/// panic, and a panic in the child reads to the parent as a child that died:
+/// a worse answer than a truncated message.
+fn cut_to(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 fn write_reply(reply: &Reply) {
@@ -721,10 +786,21 @@ fn unavailable_reason(stdout: &[u8], stderr: &str) -> String {
 /// the `true` case from outside the harness, where the lib is built normally.
 #[doc(hidden)]
 pub fn may_spawn_child() -> bool {
-    if cfg!(test) {
-        return false;
-    }
-    std::env::var_os(CHILD_ENV).is_none()
+    may_spawn_child_given(std::env::var_os(CHILD_ENV).is_some())
+}
+
+/// The guard's decision as a pure function of its two inputs.
+///
+/// Split out so both arms are reachable from a test. Under `cfg(test)` the
+/// marker branch is dead, so `may_spawn_child` alone can only ever be observed
+/// returning `false`, and the honest way to reach the other arm is to set the
+/// marker: `set_var` is `unsafe` from edition 2024 because another test thread
+/// may read the environment mid-write, so a test that did it was safe only for
+/// as long as nothing else lived in its binary. Taking the inputs as arguments
+/// removes both problems. `tests/sandbox_spawns.rs` pins the real answers.
+#[doc(hidden)]
+pub fn may_spawn_child_given(marker_set: bool) -> bool {
+    !cfg!(test) && !marker_set
 }
 
 fn spawn_child(kind: ArchiveKind, bytes: &[u8], dest: &Path) -> Result<ExtractStats, ChildFailure> {
@@ -1001,11 +1077,18 @@ mod tests {
     #[test]
     fn the_first_skip_reason_wins() {
         let mut ledger = SandboxLedger::default();
-        ledger.record_skip(SandboxSkip::KernelWithoutLandlock);
+        ledger.record_skip(SandboxSkip::Unavailable {
+            detail: "no Landlock ABI tier could be established".into(),
+        });
         ledger.record_skip(SandboxSkip::SelfExecUnavailable {
             detail: "later".into(),
         });
-        assert_eq!(ledger.skip(), Some(&SandboxSkip::KernelWithoutLandlock));
+        assert_eq!(
+            ledger.skip(),
+            Some(&SandboxSkip::Unavailable {
+                detail: "no Landlock ABI tier could be established".into(),
+            })
+        );
     }
 
     /// An unrecognised refusal variant must not be relabelled as a plain
@@ -1321,9 +1404,18 @@ mod tests {
         );
         let parsed: Reply = serde_json::from_slice(&written).expect("still valid JSON");
         assert!(
-            matches!(parsed, Reply::Unavailable { .. }),
-            "an oversized reply must be replaced, not truncated into something unparseable: \
-             {parsed:?}"
+            matches!(parsed, Reply::Refused { .. }),
+            "an oversized reply keeps its outcome: rewriting it to `Unavailable` would \
+             hand the parent a fallback over a dest the child already partly wrote, \
+             got {parsed:?}"
+        );
+        let Reply::Refused { message, .. } = parsed else {
+            unreachable!("just asserted")
+        };
+        assert!(
+            message.ends_with(TRUNCATION_NOTE),
+            "the operator is told the message was cut, got a message ending in {:?}",
+            message.chars().rev().take(8).collect::<String>()
         );
     }
 
@@ -1358,8 +1450,23 @@ mod tests {
         assert_eq!(MAX_REPLY_BYTES, 64 * 1024);
     }
 
-    /// Pad a refusal until its serialised body is exactly the ceiling, so the
-    /// boundary tests below prove something about `>` rather than `>=`.
+    /// The body ceiling has to leave room for the length prefix and its
+    /// newline, or the child deadlocks the parent again. The prefix is the
+    /// decimal body length plus `\n`: 6 bytes at this size, so 32 is the reserve
+    /// and it must not be spent.
+    #[test]
+    fn the_body_ceiling_leaves_room_for_the_length_prefix() {
+        assert_eq!(MAX_REPLY_BODY_BYTES, MAX_REPLY_BYTES - 32);
+        let prefix = format!("{}\n", MAX_REPLY_BODY_BYTES).len();
+        assert!(
+            MAX_REPLY_BYTES - MAX_REPLY_BODY_BYTES > prefix,
+            "the reserve must exceed the longest length prefix, or a body at \
+             the ceiling overruns the pipe it has to fit"
+        );
+    }
+
+    /// Pad a refusal until its serialised body is exactly the *body* ceiling,
+    /// so the boundary tests below prove something about `>` rather than `>=`.
     fn reply_at_exactly_the_ceiling() -> (Reply, Vec<u8>) {
         let base = serde_json::to_vec(&Reply::Refused {
             variant: "extraction".into(),
@@ -1369,15 +1476,30 @@ mod tests {
         .len();
         let reply = Reply::Refused {
             variant: "extraction".into(),
-            message: "x".repeat(MAX_REPLY_BYTES - base),
+            message: "x".repeat(MAX_REPLY_BODY_BYTES - base),
         };
         let body = serde_json::to_vec(&reply).unwrap();
         assert_eq!(
             body.len(),
-            MAX_REPLY_BYTES,
+            MAX_REPLY_BODY_BYTES,
             "the fixture must sit exactly on the boundary, or these tests prove nothing"
         );
         (reply, body)
+    }
+
+    /// The whole point of the split: a body at the writer's ceiling still has to
+    /// fit the pipe once the prefix is added. `write_reply` emits the decimal
+    /// body length, a newline, then the body, so that sum is the length the
+    /// parent actually has to drain from a 64 KiB pipe it does not read until
+    /// the child has exited.
+    #[test]
+    fn a_framed_body_at_the_ceiling_still_fits_the_pipe() {
+        let (_, body) = reply_at_exactly_the_ceiling();
+        let on_wire = format!("{}\n", body.len()).len() + body.len();
+        assert!(
+            on_wire <= MAX_REPLY_BYTES,
+            "a ceiling-sized reply wrote {on_wire} bytes, past the {MAX_REPLY_BYTES} pipe"
+        );
     }
 
     /// `body.len() > MAX` passes an exactly-MAX body through. With `>=` this
@@ -1435,15 +1557,17 @@ mod tests {
         );
     }
 
-    /// The guard allows the framing overhead: a ceiling-sized body plus its
-    /// short count header is a legal stdout, not an attack.
+    /// The guard allows the framing overhead: the largest legal body plus its
+    /// short count header is a legal stdout, not an attack. The padding is
+    /// computed rather than assumed, because the body sits on the *body*
+    /// ceiling now, so the header is slack rather than the whole 32 bytes.
     #[test]
     fn a_stdout_at_exactly_the_margin_parses() {
         let (reply, body) = reply_at_exactly_the_ceiling();
         let mut framed = format!("{}\n", body.len()).into_bytes();
-        let header_len = framed.len();
         framed.extend_from_slice(&body);
-        framed.extend_from_slice(vec![b't'; 32 - header_len].as_slice());
+        let slack = MAX_REPLY_BYTES + 32 - framed.len();
+        framed.extend(std::iter::repeat_n(b't', slack));
         assert_eq!(framed.len(), MAX_REPLY_BYTES + 32);
         assert_eq!(read_reply(&framed).expect("marginal stdout parses"), reply);
     }
@@ -1453,6 +1577,112 @@ mod tests {
         let header = format!("{}\n", MAX_REPLY_BYTES + 1);
         let err = read_reply(header.as_bytes()).unwrap_err();
         assert!(err.to_string().contains("ceiling"), "got: {err}");
+    }
+
+    /// The bug the reviewer found: an oversized refusal used to be replaced by
+    /// `Unavailable`, which the parent reads as "nothing was confined, retry
+    /// in-process". That re-ran the extraction unconfined over a `dest` the
+    /// child had already partly written. This drives the whole path, not just
+    /// the serialiser, because the damage was in the mapping.
+    #[test]
+    fn an_oversized_refusal_stays_a_refusal_and_never_becomes_a_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let reply = Reply::Refused {
+            variant: "extraction".into(),
+            message: "entry ../../etc/passwd escapes the destination ".repeat(4_000),
+        };
+        let body = framed_reply_bytes(&reply);
+        assert!(
+            body.len() <= MAX_REPLY_BODY_BYTES,
+            "the framed reply must fit the pipe, got {}",
+            body.len()
+        );
+
+        let mut framed = format!("{}\n", body.len()).into_bytes();
+        framed.extend_from_slice(&body);
+        let Err(ChildFailure::Refused(e)) =
+            map_child_result(Some(exit::REFUSED), &framed, "", dir.path())
+        else {
+            panic!(
+                "an oversized refusal must stay a Refused; a Skip here is the \
+                 unconfined in-process retry over a partial tree"
+            );
+        };
+        assert!(
+            matches!(e, BluelineError::Extraction(_)),
+            "the extractor's own variant must survive, got {e:?}"
+        );
+        assert!(
+            e.to_string().contains(TRUNCATION_NOTE),
+            "the operator must be told the message was cut, got: {e}"
+        );
+    }
+
+    /// Same leak on the other branch that carries free text. `Unusable` means
+    /// confinement failed and `dest` may be partial, so downgrading it to
+    /// `Unavailable` invites the same retry.
+    #[test]
+    fn an_oversized_unusable_stays_unusable() {
+        let dir = tempfile::tempdir().unwrap();
+        let reply = Reply::Unusable {
+            reason: "no Landlock ABI tier could be established: ".repeat(4_000),
+        };
+        let body = framed_reply_bytes(&reply);
+        let mut framed = format!("{}\n", body.len()).into_bytes();
+        framed.extend_from_slice(&body);
+        let Err(ChildFailure::Unusable(_)) =
+            map_child_result(Some(exit::UNUSABLE), &framed, "", dir.path())
+        else {
+            panic!("an oversized Unusable must not become a Skip");
+        };
+    }
+
+    /// The cut lands wherever the byte budget runs out, which for a multi-byte
+    /// character is inside it. `cut_to` walks back to a boundary; without that
+    /// the child panics and the parent reads a live refusal as a dead child.
+    #[test]
+    fn a_cut_never_splits_a_multi_byte_character() {
+        let text = "é".repeat(64); // 128 bytes, 64 two-byte characters
+        for max in 0..=text.len() + 8 {
+            let cut = cut_to(&text, max);
+            assert!(
+                cut.len() <= max,
+                "cut of {max} bytes was {} bytes",
+                cut.len()
+            );
+            assert!(
+                text.starts_with(cut),
+                "the cut must be a prefix, so the message keeps its head"
+            );
+            // The invariant that actually matters: this must not panic.
+            let _ = serde_json::to_vec(&cut);
+        }
+    }
+
+    /// A reply one byte over the body ceiling is still written, still framed,
+    /// and still parses. The truncation path is not a refusal path.
+    #[test]
+    fn a_reply_one_byte_over_the_body_ceiling_is_truncated_not_dropped() {
+        let base = serde_json::to_vec(&Reply::Refused {
+            variant: "extraction".into(),
+            message: String::new(),
+        })
+        .unwrap()
+        .len();
+        let reply = Reply::Refused {
+            variant: "extraction".into(),
+            message: "x".repeat(MAX_REPLY_BODY_BYTES - base + 1),
+        };
+        let body = framed_reply_bytes(&reply);
+        assert!(body.len() <= MAX_REPLY_BODY_BYTES);
+        let mut framed = format!("{}\n", body.len()).into_bytes();
+        framed.extend_from_slice(&body);
+        let parsed = read_reply(&framed).expect("a truncated refusal still parses");
+        let Reply::Refused { message, .. } = parsed else {
+            panic!("the variant must survive truncation, got {parsed:?}");
+        };
+        assert!(message.ends_with(TRUNCATION_NOTE), "got: {message:?}");
+        assert!(message.contains("entry") || message.starts_with('x'));
     }
 
     #[test]
@@ -1608,6 +1838,13 @@ mod tests {
 
     /// The confined happy path, end to end: a real child confines itself,
     /// extracts, and reports its stats in a framed reply.
+    ///
+    /// Gated on Linux because the assertion *is* the confinement: off Linux
+    /// `run_child` never spawns and the child would exit `UNAVAILABLE`, and a
+    /// Linux kernel without Landlock in `CONFIG_LSM` fails the same way. The
+    /// protocol half is pinned everywhere by `map_child_result`'s unit tests;
+    /// this one exists to prove the ruleset on a kernel that has it.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_real_child_extracts_and_reports_its_stats() {
         let dir = tempfile::tempdir().unwrap();
@@ -1639,6 +1876,13 @@ mod tests {
     /// A traversal archive is refused by the extractor in the child, and the
     /// refusal crosses the protocol as the extractor's own error, not as a
     /// sandbox failure.
+    ///
+    /// The message assertion is load-bearing. A broken hand-rolled checksum
+    /// would make tar-rs fail to parse the header, and both that error and
+    /// `validate_entry_path`'s rejection exit `REFUSED` with the `extraction`
+    /// variant, so without naming the traversal itself this test would pass on
+    /// an archive the extractor never even looked at.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_real_child_refuses_a_traversal_archive() {
         let dir = tempfile::tempdir().unwrap();
@@ -1650,7 +1894,14 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         match stdout_reply(&out) {
-            Reply::Refused { variant, .. } => assert_eq!(variant, "extraction"),
+            Reply::Refused { variant, message } => {
+                assert_eq!(variant, "extraction");
+                assert!(
+                    message.contains("parent traversal") && message.contains("../evil"),
+                    "the refusal must be the path grammar naming the entry, not a parse \
+                     error on the fixture's header, got: {message}"
+                );
+            }
             other => panic!("a refused archive reports Refused, got: {other:?}"),
         }
     }
