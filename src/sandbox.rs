@@ -298,6 +298,10 @@ fn framed_reply_bytes(reply: &Reply) -> Vec<u8> {
 /// Marker left behind when a message was cut to fit the frame.
 const TRUNCATION_NOTE: &str = " [message truncated to fit the reply frame]";
 
+/// Bytes a character-boundary walk-back can give back when the cut point
+/// lands inside a multi-byte character. A 4-byte character loses at most 3.
+const BOUNDARY_SLACK: usize = 3;
+
 fn serialise(reply: &Reply) -> Vec<u8> {
     serde_json::to_vec(reply).unwrap_or_else(|_| {
         // Serialising our own four-variant enum cannot fail, but a fallback that
@@ -312,12 +316,13 @@ fn serialise(reply: &Reply) -> Vec<u8> {
 
 /// Cut a reply's free text until its body fits `MAX_REPLY_BODY_BYTES`.
 ///
-/// One round is not always enough: the body is the *escaped* form, so cutting N
-/// bytes off a message can leave the serialised length unchanged when the cut
-/// lands in a run of quotes or backslashes. Each round that shortens the text
-/// ends up shortening the body by at least what the reply was over, so the loop
-/// converges; the progress guard catches the one case that would not (a text
-/// already too short to cut, which cannot be reached but must not spin).
+/// One round is enough, and the loop is the backstop rather than the
+/// mechanism. JSON escaping only ever expands, so cutting `over +
+/// marker + slack` raw bytes removes at least `over + marker` escaped bytes
+/// and the body lands at or under the ceiling: cutting N raw bytes always
+/// removes at least N escaped bytes, because escaping is per-character and
+/// additive. The slack pays for the character boundary `cut_to` walks back
+/// to when the cut point lands inside a multi-byte character.
 fn fit_to_frame(reply: Reply) -> Reply {
     let mut reply = reply;
     loop {
@@ -327,24 +332,21 @@ fn fit_to_frame(reply: Reply) -> Reply {
         }
         let Some(text) = free_text_mut(&mut reply) else {
             // `Ok` carries three integers and is never the oversized reply.
-            break;
+            return reply;
         };
-        let before = text.len();
+        let over = len - MAX_REPLY_BODY_BYTES;
         let keep = text
             .len()
-            .saturating_sub((len - MAX_REPLY_BODY_BYTES).saturating_add(TRUNCATION_NOTE.len()));
-        let kept = cut_to(text, keep).to_string();
-        *text = format!("{kept}{TRUNCATION_NOTE}");
-        if text.len() >= before {
-            break;
+            .saturating_sub(over + TRUNCATION_NOTE.len() + BOUNDARY_SLACK);
+        if keep == 0 {
+            // Shorter than the marker it would have to carry. The outcome
+            // alone is the answer: an empty text serialises to a few dozen
+            // bytes of punctuation against a 64 KiB ceiling.
+            text.clear();
+            return reply;
         }
+        *text = format!("{}{TRUNCATION_NOTE}", cut_to(text, keep));
     }
-    // Shortest reply that still carries the outcome. Unreachable in practice:
-    // the empty reply is a few dozen bytes of punctuation against a 64 KiB
-    // ceiling. If it somehow is not, the parent refuses the declared count and
-    // stops, which is the direction this whole path fails in.
-    empty_free_text(&mut reply);
-    reply
 }
 
 /// The free-text field of a reply, or `None` for `Ok`.
@@ -356,25 +358,19 @@ fn free_text_mut(reply: &mut Reply) -> Option<&mut String> {
     }
 }
 
-fn empty_free_text(reply: &mut Reply) {
-    if let Some(text) = free_text_mut(reply) {
-        text.clear();
-    }
-}
-
 /// Cut `text` to at most `max` bytes, never mid-character.
 ///
 /// A byte offset landing inside a multi-byte character makes `&text[..end]`
 /// panic, and a panic in the child reads to the parent as a child that died:
-/// a worse answer than a truncated message.
+/// a worse answer than a truncated message. The cut is the start of the first
+/// character whose end passes `max`, so it is always a boundary, always a
+/// prefix of `text`, and never longer than `max`. Past the end of the string
+/// there is no such character, and the whole text is the answer.
 fn cut_to(text: &str, max: usize) -> &str {
-    if text.len() <= max {
-        return text;
-    }
-    let mut end = max;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = text
+        .char_indices()
+        .find_map(|(i, c)| (i + c.len_utf8() > max).then_some(i))
+        .unwrap_or(text.len());
     &text[..end]
 }
 
@@ -1640,6 +1636,9 @@ mod tests {
     /// The cut lands wherever the byte budget runs out, which for a multi-byte
     /// character is inside it. `cut_to` walks back to a boundary; without that
     /// the child panics and the parent reads a live refusal as a dead child.
+    /// The maximality assertion is what pins the walk-back arithmetic: a cut
+    /// that stops one character early is still a safe prefix, so "never
+    /// mid-character" alone cannot tell a tight cut from a timid one.
     #[test]
     fn a_cut_never_splits_a_multi_byte_character() {
         let text = "é".repeat(64); // 128 bytes, 64 two-byte characters
@@ -1653,6 +1652,11 @@ mod tests {
             assert!(
                 text.starts_with(cut),
                 "the cut must be a prefix, so the message keeps its head"
+            );
+            let next = text[cut.len()..].chars().next();
+            assert!(
+                next.is_none_or(|c| cut.len() + c.len_utf8() > max),
+                "the cut must be maximal: a whole character still fits under {max}"
             );
             // The invariant that actually matters: this must not panic.
             let _ = serde_json::to_vec(&cut);
@@ -1685,10 +1689,97 @@ mod tests {
         assert!(message.contains("entry") || message.starts_with('x'));
     }
 
+    /// The cut is the overage, not a rough guess. For a plain-ASCII message
+    /// (escaping is 1:1) the truncation removes `over + marker + slack` bytes
+    /// and not meaningfully more, which is what makes the one-round argument
+    /// checkable: a cut that keeps too little silently amputates the
+    /// operator's diagnosis, and a cut that keeps too much pushes the body
+    /// back over the ceiling it exists to fit.
+    #[test]
+    fn an_oversized_reply_is_cut_by_almost_exactly_the_overage() {
+        let original_len = MAX_REPLY_BODY_BYTES;
+        let reply = Reply::Refused {
+            variant: "extraction".into(),
+            message: "x".repeat(original_len),
+        };
+        let before = serialise(&reply).len();
+        let over = before - MAX_REPLY_BODY_BYTES;
+        let body = framed_reply_bytes(&reply);
+        assert!(body.len() <= MAX_REPLY_BODY_BYTES, "got {}", body.len());
+        let parsed: Reply = serde_json::from_slice(&body).expect("truncated reply parses");
+        let Reply::Refused { message: kept, .. } = parsed else {
+            panic!("the variant survives truncation, got {parsed:?}");
+        };
+        let removed = original_len - kept.len();
+        let exact = over + TRUNCATION_NOTE.len();
+        assert!(
+            exact <= removed && removed <= exact + BOUNDARY_SLACK + 1,
+            "the cut removed {removed} bytes; the overage plus the marker is \
+             {exact}, plus at most the {BOUNDARY_SLACK}-byte boundary slack"
+        );
+    }
+
+    /// The boundary walk-back is paid for, not swallowed: when the cut point
+    /// lands inside a 4-byte character the reply keeps exactly the walk-back
+    /// less, still under the ceiling, and the backstop loop does not run a
+    /// second round. `keep` is `MAX_REPLY_BODY_BYTES - marker - slack` whatever
+    /// the message length, so the character can be placed on the cut exactly.
+    #[test]
+    fn a_cut_inside_a_four_byte_character_costs_exactly_the_walk_back() {
+        let keep = MAX_REPLY_BODY_BYTES - TRUNCATION_NOTE.len() - BOUNDARY_SLACK;
+        let message = format!("{}🦀{}", "x".repeat(keep - 3), "x".repeat(64));
+        let original_len = message.len();
+        let reply = Reply::Refused {
+            variant: "extraction".into(),
+            message,
+        };
+        let before = serialise(&reply).len();
+        let over = before - MAX_REPLY_BODY_BYTES;
+        let body = framed_reply_bytes(&reply);
+        assert!(body.len() <= MAX_REPLY_BODY_BYTES, "got {}", body.len());
+        let parsed: Reply = serde_json::from_slice(&body).expect("truncated reply parses");
+        let Reply::Refused { message: kept, .. } = parsed else {
+            panic!("the variant survives truncation, got {parsed:?}");
+        };
+        let removed = original_len - kept.len();
+        assert_eq!(
+            removed,
+            over + TRUNCATION_NOTE.len(),
+            "the crab straddles the cut point, so exactly BOUNDARY_SLACK bytes \
+             are given back and nothing else changes"
+        );
+    }
+
     #[test]
     fn a_reply_with_no_length_prefix_is_refused() {
         let err = read_reply(b"{}").unwrap_err();
         assert!(err.to_string().contains("length prefix"), "got: {err}");
+    }
+
+    /// A reply that declares exactly the ceiling is legal; the guard refuses
+    /// only past it. Without this the declared-count boundary is pinned from
+    /// the refusing side alone, and `>` becoming `>=` would refuse the largest
+    /// reply the protocol allows and nothing would notice.
+    #[test]
+    fn a_reply_declaring_exactly_the_ceiling_parses() {
+        let base = serde_json::to_vec(&Reply::Unavailable {
+            reason: String::new(),
+        })
+        .unwrap()
+        .len();
+        let body = serde_json::to_vec(&Reply::Unavailable {
+            reason: "x".repeat(MAX_REPLY_BYTES - base),
+        })
+        .unwrap();
+        assert_eq!(
+            body.len(),
+            MAX_REPLY_BYTES,
+            "the fixture must declare exactly the ceiling, or this proves nothing"
+        );
+        let mut framed = format!("{}\n", body.len()).into_bytes();
+        framed.extend_from_slice(&body);
+        let reply = read_reply(&framed).expect("a reply declaring exactly the ceiling parses");
+        assert!(matches!(reply, Reply::Unavailable { .. }), "{reply:?}");
     }
 
     #[test]
