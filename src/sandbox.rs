@@ -316,37 +316,38 @@ fn serialise(reply: &Reply) -> Vec<u8> {
 
 /// Cut a reply's free text until its body fits `MAX_REPLY_BODY_BYTES`.
 ///
-/// One round is enough, and the loop is the backstop rather than the
-/// mechanism. JSON escaping only ever expands, so cutting `over +
-/// marker + slack` raw bytes removes at least `over + marker` escaped bytes
-/// and the body lands at or under the ceiling: cutting N raw bytes always
-/// removes at least N escaped bytes, because escaping is per-character and
-/// additive. The slack pays for the character boundary `cut_to` walks back
-/// to when the cut point lands inside a multi-byte character.
+/// One round, not a loop. JSON escaping only ever expands, so cutting
+/// `over + marker + slack` raw bytes removes at least `over + marker`
+/// escaped bytes: cutting N raw bytes always removes at least N escaped
+/// bytes, because escaping is per-character and additive. The body lands at
+/// or under the ceiling on the first cut. The slack pays for the character
+/// boundary `cut_to` walks back to when the cut point lands inside a
+/// multi-byte character; that walk-back only shortens the kept text, which
+/// only adds headroom. A loop would let an inverted overage subtraction spin
+/// forever, so there is nothing here to spin.
 fn fit_to_frame(reply: Reply) -> Reply {
     let mut reply = reply;
-    loop {
-        let len = serialise(&reply).len();
-        if len <= MAX_REPLY_BODY_BYTES {
-            return reply;
-        }
-        let Some(text) = free_text_mut(&mut reply) else {
-            // `Ok` carries three integers and is never the oversized reply.
-            return reply;
-        };
-        let over = len - MAX_REPLY_BODY_BYTES;
-        let keep = text
-            .len()
-            .saturating_sub(over + TRUNCATION_NOTE.len() + BOUNDARY_SLACK);
-        if keep == 0 {
-            // Shorter than the marker it would have to carry. The outcome
-            // alone is the answer: an empty text serialises to a few dozen
-            // bytes of punctuation against a 64 KiB ceiling.
-            text.clear();
-            return reply;
-        }
-        *text = format!("{}{TRUNCATION_NOTE}", cut_to(text, keep));
+    let len = serialise(&reply).len();
+    if len <= MAX_REPLY_BODY_BYTES {
+        return reply;
     }
+    let Some(text) = free_text_mut(&mut reply) else {
+        // `Ok` carries three integers and is never the oversized reply.
+        return reply;
+    };
+    let over = len - MAX_REPLY_BODY_BYTES;
+    let keep = text
+        .len()
+        .saturating_sub(over + TRUNCATION_NOTE.len() + BOUNDARY_SLACK);
+    if keep == 0 {
+        // Shorter than the marker it would have to carry. The outcome
+        // alone is the answer: an empty text serialises to a few dozen
+        // bytes of punctuation against a 64 KiB ceiling.
+        text.clear();
+        return reply;
+    }
+    *text = format!("{}{TRUNCATION_NOTE}", cut_to(text, keep));
+    reply
 }
 
 /// The free-text field of a reply, or `None` for `Ok`.
@@ -1690,11 +1691,13 @@ mod tests {
     }
 
     /// The cut is the overage, not a rough guess. For a plain-ASCII message
-    /// (escaping is 1:1) the truncation removes `over + marker + slack` bytes
-    /// and not meaningfully more, which is what makes the one-round argument
-    /// checkable: a cut that keeps too little silently amputates the
-    /// operator's diagnosis, and a cut that keeps too much pushes the body
-    /// back over the ceiling it exists to fit.
+    /// (escaping is 1:1) the net removal is the overage plus the boundary
+    /// slack and nothing more: the cut spares `over + marker + slack` raw
+    /// bytes, then the marker is re-appended, so the marker nets to zero and
+    /// only the slack is left. That is what makes the one-round argument
+    /// checkable. A cut that keeps too little silently amputates the
+    /// operator's diagnosis; a cut that keeps too much pushes the body back
+    /// over the ceiling it exists to fit.
     #[test]
     fn an_oversized_reply_is_cut_by_almost_exactly_the_overage() {
         let original_len = MAX_REPLY_BODY_BYTES;
@@ -1711,23 +1714,43 @@ mod tests {
             panic!("the variant survives truncation, got {parsed:?}");
         };
         let removed = original_len - kept.len();
-        let exact = over + TRUNCATION_NOTE.len();
+        assert_eq!(
+            removed,
+            over + BOUNDARY_SLACK,
+            "for an ASCII message the net removal is the overage plus the \
+             boundary slack: the marker is cut out then re-appended, so it \
+             nets to zero"
+        );
         assert!(
-            exact <= removed && removed <= exact + BOUNDARY_SLACK + 1,
-            "the cut removed {removed} bytes; the overage plus the marker is \
-             {exact}, plus at most the {BOUNDARY_SLACK}-byte boundary slack"
+            kept.ends_with(TRUNCATION_NOTE),
+            "the marker must still be appended, got tail {:?}",
+            &kept[kept.len().saturating_sub(60)..]
         );
     }
 
     /// The boundary walk-back is paid for, not swallowed: when the cut point
     /// lands inside a 4-byte character the reply keeps exactly the walk-back
-    /// less, still under the ceiling, and the backstop loop does not run a
-    /// second round. `keep` is `MAX_REPLY_BODY_BYTES - marker - slack` whatever
-    /// the message length, so the character can be placed on the cut exactly.
+    /// less and still fits. The real cut point is `MAX - wrapper - marker -
+    /// slack`, measured rather than assumed, so the crab lands on it whatever
+    /// the JSON wrapper costs. The crab starts `BOUNDARY_SLACK` bytes before
+    /// the cut and ends one past it, so `cut_to` must walk back to the crab's
+    /// start: never a mid-character slice, never the whole over-removed.
     #[test]
     fn a_cut_inside_a_four_byte_character_costs_exactly_the_walk_back() {
-        let keep = MAX_REPLY_BODY_BYTES - TRUNCATION_NOTE.len() - BOUNDARY_SLACK;
-        let message = format!("{}🦀{}", "x".repeat(keep - 3), "x".repeat(64));
+        // The real cut point, derived the same way `fit_to_frame` derives it.
+        let probe = Reply::Refused {
+            variant: "extraction".into(),
+            message: String::new(),
+        };
+        let wrapper = serialise(&probe).len();
+        let cut_point = MAX_REPLY_BODY_BYTES - wrapper - TRUNCATION_NOTE.len() - BOUNDARY_SLACK;
+        // The crab straddles the cut: it starts `BOUNDARY_SLACK` bytes early
+        // and runs one past, so its end is the first character end over it.
+        let message = format!(
+            "{}🦀{}",
+            "x".repeat(cut_point - BOUNDARY_SLACK),
+            "x".repeat(64)
+        );
         let original_len = message.len();
         let reply = Reply::Refused {
             variant: "extraction".into(),
@@ -1741,12 +1764,80 @@ mod tests {
         let Reply::Refused { message: kept, .. } = parsed else {
             panic!("the variant survives truncation, got {parsed:?}");
         };
-        let removed = original_len - kept.len();
+        // The cut landed on the crab's start byte: the crab and its tail are
+        // gone, never split, and the marker is appended.
+        let expected_keep = cut_point - BOUNDARY_SLACK;
+        assert!(
+            !kept.contains('🦀'),
+            "the cut must walk back past the crab, never split it"
+        );
+        assert!(
+            kept.ends_with(TRUNCATION_NOTE),
+            "the marker must still be appended"
+        );
         assert_eq!(
-            removed,
-            over + TRUNCATION_NOTE.len(),
-            "the crab straddles the cut point, so exactly BOUNDARY_SLACK bytes \
-             are given back and nothing else changes"
+            kept.len(),
+            expected_keep + TRUNCATION_NOTE.len(),
+            "the reply keeps exactly the walk-back less, plus the marker"
+        );
+        // Net removal is the overage, the slack, and the full walk-back.
+        assert_eq!(
+            original_len - kept.len(),
+            over + BOUNDARY_SLACK + BOUNDARY_SLACK,
+            "the crab straddles the cut, so the full {BOUNDARY_SLACK}-byte \
+             walk-back is paid on top of the overage and slack"
+        );
+    }
+
+    /// `Ok` carries three integers and no free text, so there is nothing to
+    /// cut. Pinned directly: a mutant that gave `Ok` a free-text arm, or
+    /// dropped the `None` that makes `fit_to_frame` leave it alone, would
+    /// otherwise be invisible because no oversized `Ok` exists to route
+    /// through `fit_to_frame`.
+    #[test]
+    fn ok_has_no_free_text_to_cut() {
+        let mut ok = Reply::Ok {
+            files: 1,
+            dirs: 0,
+            unpacked_bytes: 0,
+        };
+        assert!(free_text_mut(&mut ok).is_none());
+    }
+
+    /// A message made of characters that escape to two bytes each drives the
+    /// keep down to zero, and a zero keep clears the text rather than leaving
+    /// a bare marker: the outcome alone is the reply. Escaping is the only
+    /// way to reach it, because for an ASCII message `keep` is a constant
+    /// `MAX - wrapper - marker - slack` no matter how long the text is.
+    #[test]
+    fn a_reply_whose_cut_would_keep_nothing_keeps_the_outcome() {
+        let probe = Reply::Refused {
+            variant: "extraction".into(),
+            message: String::new(),
+        };
+        let wrapper = serialise(&probe).len();
+        // Newlines escape to `\n` (two bytes), so escaped length is 2T.
+        // keep = T - (over + marker + slack) and over = wrapper + 2T - MAX,
+        // so keep = MAX - wrapper - marker - slack - T; T at that value is 0.
+        let t = MAX_REPLY_BODY_BYTES - wrapper - TRUNCATION_NOTE.len() - BOUNDARY_SLACK;
+        let reply = Reply::Refused {
+            variant: "extraction".into(),
+            message: "\n".repeat(t),
+        };
+        let before = serialise(&reply).len();
+        assert!(
+            before > MAX_REPLY_BODY_BYTES,
+            "the fixture must be oversized, got {before}"
+        );
+        let body = framed_reply_bytes(&reply);
+        assert!(body.len() <= MAX_REPLY_BODY_BYTES, "got {}", body.len());
+        let parsed: Reply = serde_json::from_slice(&body).expect("truncated reply parses");
+        let Reply::Refused { message: kept, .. } = parsed else {
+            panic!("the variant survives truncation, got {parsed:?}");
+        };
+        assert!(
+            kept.is_empty(),
+            "a cut that would keep nothing clears the text, got {kept:?}"
         );
     }
 
