@@ -817,10 +817,10 @@ mod tests {
         );
     }
 
-    /// What `registry_signature_present` is built from. The npm lane used to
-    /// pass no block at all, so this was `false` on every review and
-    /// `require_signatures` could never be satisfied there; it is presence
-    /// only, and never a verification.
+    /// What `registry_signature_present` is built from, and the reason
+    /// `provenance.require_signatures` is refused at load: it is the presence of a
+    /// block, never a verification of one. Nothing in this function compares the
+    /// tarball against the signature, so any non-empty array sets it.
     #[test]
     fn a_published_signature_block_marks_the_registry_signature_present() {
         let signatures = serde_json::json!([
@@ -838,7 +838,8 @@ mod tests {
         );
         assert!(
             report.registry_signature_present,
-            "a published block is what satisfies require_signatures"
+            "a published block is what this reports, which is why the policy key that read it \
+             as verification is refused at load"
         );
         assert_eq!(
             report.registry_signature_key_id.as_deref(),
@@ -865,7 +866,7 @@ mod tests {
             );
             assert!(
                 !report.registry_signature_present,
-                "{signatures:?} must not satisfy require_signatures"
+                "{signatures:?} is not a signature list, so nothing is reported as published"
             );
         }
     }

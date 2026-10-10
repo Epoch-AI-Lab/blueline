@@ -30,8 +30,9 @@ Loopback registry bases are permitted — see the SSRF carve-out below.
 `dist.integrity` with algorithm `sha512` is checked. `Dist` has no `shasum`
 field; grep `shasum` in `src/` returns nothing. The signature *block* is read
 (`Dist::signatures`, `release_signatures`) but only its presence and first key
-id are used, so `require_signatures` passes on a block nobody verified. See
-[extract](extract.md).
+id are used, so any non-empty block satisfies the flag and nothing compares the
+tarball to it. `[provenance] require_signatures = true` is **refused at load**
+for exactly that reason. See [policy](policy.md) and [extract](extract.md).
 
 **A non-sha512 `dist.integrity` is a hard refusal**, not a downgrade:
 `"{name}@{version}: unsupported dist.integrity algorithm \`{alg}\`, expected

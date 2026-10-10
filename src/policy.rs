@@ -197,6 +197,26 @@ impl Policy {
     /// here is the only point where the key is still visible; once the field is
     /// gone, serde would drop it without a word.
     fn reject_unimplemented_keys(&self) -> Result<(), BluelineError> {
+        // `require_signatures` gates on `registry_signature_present`, which is
+        // built from whether `dist.signatures` is a non-empty array. Nothing
+        // compares the tarball against the signature, and `dist.shasum` is not
+        // even parsed, so the key is satisfied by a registry publishing *any*
+        // block. Verified registry signatures need a Sigstore verification path
+        // this project has not approved as a dependency, so rather than leave a
+        // key that reads as verification and is not, refuse it at load.
+        if self.provenance.require_signatures {
+            return Err(BluelineError::Policy(
+                "provenance.require_signatures is not implemented and would otherwise be \
+                 silently satisfied by the *presence* of a registry signature block rather \
+                 than by verifying it. blueline does not check the tarball against that \
+                 signature and does not parse dist.shasum, so a forged block satisfies this \
+                 key. Remove it; the registry checksum blueline does verify before extraction \
+                 (sha512 for npm, sha256 for cargo, pypi and aur) is the check that actually \
+                 runs."
+                    .into(),
+            ));
+        }
+
         // `blocklist.maintainers` is deliberately absent from this check. It
         // used to be refused here because nothing read it, which was true
         // before `P04_MAINTAINER_BLOCKED` existed and is false now: AUR
@@ -389,6 +409,15 @@ pub struct ProvenancePolicyConfig {
     /// identically: either key turns the requirement on. Named here as well so a
     /// policy can group it with the other provenance keys.
     pub require_provenance: bool,
+    /// Require a *verified* npm registry signature on every release.
+    ///
+    /// Refused at load. The npm lane reads `dist.signatures` for presence and
+    /// never checks the bytes against it, so this key used to read as a
+    /// verification requirement while a forged signature block satisfied it —
+    /// the operator's protection was the registry's willingness to publish a
+    /// block. A key that cannot fail closed must be refused rather than
+    /// honoured, because `require_signatures = true` in a file is a claim that
+    /// signatures are checked and nothing in this codebase can check them.
     pub require_signatures: bool,
     pub allowed_builders: Vec<String>,
     pub allowed_repositories: Vec<String>,
@@ -667,6 +696,70 @@ maintainers = ["badactor@example.com"]
             policy.is_maintainer_blocked("badactor@example.com"),
             "a loaded entry must actually be matchable, or the key is decorative again"
         );
+    }
+
+    /// The whole point of the key is that it cannot be satisfied by a forged
+    /// block, and it cannot, so it is refused.
+    #[test]
+    fn rejects_require_signatures() {
+        let err = Policy::from_toml_str(
+            r#"
+[provenance]
+require_signatures = true
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("require_signatures"), "got: {err}");
+        assert!(
+            err.contains("presence"),
+            "the error must name what the key actually checked, got: {err}"
+        );
+        assert!(
+            err.contains("sha512 for npm") && err.contains("sha256 for cargo"),
+            "the error must name the check that does run, per lane, got: {err}"
+        );
+        assert!(
+            !err.contains("dist.integrity (sha512)"),
+            "naming one algorithm for every lane is wrong: cargo, pypi and aur all verify \
+             sha256, and the refusal loads without lane context. got: {err}"
+        );
+    }
+
+    /// `require_provenance` sits in the same table and is honoured per status,
+    /// so refusing the sibling key must not refuse this one.
+    #[test]
+    fn accepts_require_provenance_alongside_a_refused_require_signatures() {
+        Policy::from_toml_str(
+            r#"
+[provenance]
+require_provenance = true
+"#,
+        )
+        .expect("require_provenance is enforced per status and is not the key being refused");
+    }
+
+    /// The default leaves the key off, so an ordinary policy still loads.
+    #[test]
+    fn accepts_a_policy_that_never_mentions_signatures() {
+        Policy::from_toml_str(
+            r#"
+[provenance]
+allowed_repositories = ["https://github.com/vercel/next.js"]
+"#,
+        )
+        .expect("the key is off by default, so this is an ordinary policy");
+    }
+
+    /// An empty `blueline.toml` on disk is the common case and must not trip
+    /// the refusal, which is why the check reads the flag rather than the
+    /// table's presence.
+    #[test]
+    fn accepts_the_repository_blueline_toml_it_ships_with() {
+        let shipped = concat!(env!("CARGO_MANIFEST_DIR"), "/blueline.toml");
+        Policy::from_file(std::path::Path::new(shipped))
+            .unwrap_or_else(|e| panic!("the shipped policy must load: {e}"));
     }
 
     #[test]

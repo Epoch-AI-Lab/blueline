@@ -6,8 +6,10 @@ Blueline is a release-diff review desk for the package install line. It renders
 every release as a proof sheet and demands sign-off before the byte runs.
 
 **Hard rule: nothing executes until judged.** Tarballs are fetched, **integrity-verified
-(sha512 SRI, fail closed)**, then extracted read-only into a sandboxed temp dir —
-never executed, diffed, and scored. The package's own code is
+against the registry's own per-lane checksum (fail closed)**, then extracted read-only into a
+private temp dir
+under hard size and entry caps — never executed, diffed, and scored. The temp dir
+is not an OS-level sandbox; see §1. The package's own code is
 never run: even on approve, install proceeds with `npm install --ignore-scripts`,
 and any `postinstall`/`preinstall` script is surfaced for a *separate* human decision.
 
@@ -49,7 +51,7 @@ change should land — see the Feature Map at
 │  registry::npm   ── fetch metadata + tarballs (read-only)     │
 │  baseline::store ── SQLite: installed/known-clean versions,   │
 │                     approval overrides, policy                │
-│  extract         ── verify hash → bounded sandbox extract    │
+│  extract         ── verify hash → bounded temp-dir extract    │
 │  diff            ── file-level + line-level (similar crate)   │
 │  install_ref     ── scan payload for referenced installs      │
 │  recursive       ── re-review referenced installs: depth caps,│
@@ -91,10 +93,13 @@ registry plugged in later without refactoring the engine.
 ### Extraction & untrusted-input safety
 Every tarball and registry response is fully untrusted. The `extract` stage enforces:
 - **Integrity first:** download the tarball under a hard byte cap, then hash the
-  buffered bytes and compare to the registry `dist.integrity` (sha512); a missing
-  or non-sha512 `dist.integrity` is refused rather than downgraded. A mismatch
-  aborts the review with a verification error *before* extraction — no verdict is
-  produced, so there is nothing to approve or override.
+  buffered bytes and compare to the registry's own checksum for that lane. The
+  field and algorithm are lane-specific and there is no cross-lane fallback:
+  npm publishes `dist.integrity` as sha512, while cargo, PyPI and AUR each
+  verify sha256. A missing checksum, or one declaring an algorithm the lane does
+  not accept, is refused rather than downgraded. A mismatch aborts the review
+  with a verification error *before* extraction — no verdict is produced, so
+  there is nothing to approve or override.
 - **Bounded extraction:** hard *absolute* caps, not multiples of the tarball
   size — entry count (100 000, checked before any write), per-entry unpacked
   size (128 MiB, checked against the header and again against the bytes actually
@@ -137,7 +142,7 @@ Every tarball and registry response is fully untrusted. The `extract` stage enfo
 | D1 | Rust core + Node shim                               | Security-critical path in a memory-safe, single-binary language; Node only for `npx` ergonomics. |
 | D2 | Local deterministic heuristic first                 | Transparent, auditable, offline. Hosted ML *refines* score when token present — never required. Keeps "the wedge stays open" honest. |
 | D3 | One registry deep, `Registry` trait seam, then four | Deepen one registry first; avoid speculative multi-registry code. npm, crates.io, PyPI, and review-only AUR now share the seam. |
-| D4 | Read-only sandbox extraction + integrity verify     | Core safety invariant. Verify sha512/signature *before* extract; bound size/entry; reject symlinks/special files; Landlock-sandbox the step (planned). Package code never runs. |
+| D4 | Read-only extraction into a temp dir + integrity verify | Core safety invariant. Verify the registry's sha512/sha256 *before* extract; bound size/entry; reject symlinks/special files; Landlock-sandbox the step (planned, not implemented — §1). Package code never runs. |
 | D5 | Baseline = last known-clean version                 | Source: locally installed version in `node_modules` → else previous version in registry list (neutral verdict on first sighting). Overrides persisted in SQLite. |
 | D6 | Revocation = OSV + GitHub Advisory cache            | Reuse the open vulnerability corpus; paid tier adds human-verified recall (hosted index). |
 | D7 | Stable `Verdict` JSON schema                        | Same struct feeds CLI card, CI comment, and MCP tool. One source of truth.|
@@ -282,7 +287,7 @@ Known bypasses stay documented in the README.
 | `thresholds` | `max_low_score` (19), `max_medium_score` (49), `block_score` (80) |
 | `policy` | `require_provenance`, `block_unreviewed_scripts`, `allow_git_dependencies`, `check_advisories`, `fail_closed_network` |
 | `advisories` | `block_on_malware`, `block_on_critical_cve`, cache TTLs |
-| `provenance` | `require_provenance`, `require_signatures`, `allowed_builders`, `allowed_repositories` (the last two enforced at Block) |
+| `provenance` | `require_provenance`, `allowed_builders`, `allowed_repositories` (the last two enforced at Block). `require_signatures` is **refused at load** — it gated on the *presence* of a `dist.signatures` block and nothing ever compared the bytes to it, so `true` is a load-time error rather than a value |
 | `provenance.require_provenance` | Either this or `policy.require_provenance` turns the requirement on; they are honoured identically. Absence of an attestation is disclosed (LOW, score-neutral, exit 0); a present-but-unverifiable attestation is refused (BLOCK, exit 2). See P03 above. |
 | `allowlist.packages` | exact `name` (+optional `ecosystem`), `allowed_scripts`, `allow_unreviewed_baseline` |
 | `blocklist` | glob `packages` (+optional `ecosystem`) — every lane; `maintainers` — **AUR only** (see below) |

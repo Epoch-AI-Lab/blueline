@@ -30,7 +30,7 @@ allow_git_dependencies = false; check_advisories = true; fail_closed_network = f
 block_on_malware = true; block_on_critical_cve = true
 cache_ttl_hours_clean = 12; cache_ttl_hours_vulnerable = 1
 [provenance]
-require_provenance = false; require_signatures = false
+require_provenance = false; require_signatures = false  # true is REFUSED at load
 allowed_builders = []; allowed_repositories = []
 [[allowlist.packages]]
 name = "demo"; ecosystem = "npm"; allowed_scripts = ["postinstall"]
@@ -77,8 +77,15 @@ otherwise exact `==` (**case-sensitive**). No `?`, no `[...]`, no escaping.
   surface that does.
 - **No `deny_unknown_fields` anywhere.** A typo'd key (`block_on_malwares`)
   is silently dropped and the default applies. For `block_on_critical_cve`,
-  `fail_closed_network`, `block_on_stale`, and `require_signatures` that
-  default is the fail-open one.
+  `fail_closed_network`, and `block_on_stale` that default is the fail-open one.
+  `require_signatures` is the exception: setting it to `true` is refused outright,
+  because the flag is satisfied by the *presence* of a `dist.signatures` block
+  and nothing compares the tarball against it. `npm.rs` never parses
+  `dist.shasum` either, so the sha1 the signature signs is not available.
+  The registry checksum that does run before extraction is the one the refusal
+  message names: sha512 for npm, sha256 for cargo, pypi and aur. The refusal is
+  ecosystem-agnostic (policy loads without lane context), so the message cannot
+  name one algorithm for every lane and does not pretend to.
 - **Malformed or unreadable always fails closed.** A `BLUELINE_POLICY` that is
   set but unreadable is `Err`, not a fallback to defaults
   (`blueline_policy_env_scopes_policy_loading_fail_closed`).
@@ -102,11 +109,17 @@ otherwise exact `==` (**case-sensitive**). No `?`, no `[...]`, no escaping.
   per-crate rules.
 - **Two `require_provenance` fields exist** (`[policy]` and `[provenance]`) and
   are OR'd in `heuristic.rs`. Setting only one is ambiguous; set both.
-- **`provenance.allowed_builders` is a dead knob.** `max_risk` and
-  `allowlist.packages[].integrity` were dead too and are now **refused at load**
-  by `Policy::reject_unimplemented_keys`, with an error naming the rule and the
-  check that does apply. `blocklist.maintainers` is likewise refused when
-  non-empty, and an empty list still parses.
+- **`provenance.allowed_builders` is a dead knob.** `max_risk`,
+  `allowlist.packages[].integrity`, and `provenance.require_signatures` are dead
+  too and are now **refused at load** by `Policy::reject_unimplemented_keys`, with
+  an error naming the rule and the check that does apply. `blocklist.maintainers`
+  is likewise refused when non-empty, and an empty list still parses.
+- **The engine keeps the signature rule even though the key is refused.**
+  `P03_SIGNATURE_REQUIRED_MISSING` (BLOCK) still fires for a caller that sets
+  `provenance.require_signatures` directly, so a release with no signature block
+  is refused rather than passing because the flag was readable. The gap it does
+  not close is the *present* case: any non-empty block satisfies it, which is the
+  whole reason the key cannot load from a file.
 - **`recursion.child_block_band` compares with `>=`**, so lowering it to
   `MEDIUM` rolls up medium children (`child_block_band_policy_lowering_rolls_up_medium_children`).
 - **`glob_match("**")` is `true`** (`contains("")`), and `a*b*c` degrades to an

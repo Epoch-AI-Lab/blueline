@@ -37,8 +37,8 @@ PyPI sdists, goes through `safe_extract`. Production passes
 `ExtractionLimits::default()` — all three fields are currently **test-only knobs**.
 
 Integrity algorithms: **npm sha512 only**, **cargo sha256 only**, **PyPI sha256
-only**. Mismatch, missing checksum, or wrong algorithm is a hard error *before*
-any byte is returned from `fetch_tarball`.
+only**, **AUR sha256 only**. Mismatch, missing checksum, or wrong algorithm is a
+hard error *before* any byte is returned from `fetch_tarball`.
 
 ## Gotchas
 - **There is no FD cap and no gzip-ratio bomb guard.** No `setrlimit`, no

@@ -2,7 +2,7 @@
 
 > Approve the change, not the download.
 
-Blueline is a review step for package installs. It extracts the release tarball in an isolated sandbox, calculates what changed against your last verified version, and prompts for approval before anything touches your machine.
+Blueline is a review step for package installs. It verifies the release tarball's integrity, unpacks it into a private temp directory under hard size and entry caps, calculates what changed against your last verified version, and prompts for approval before anything touches your machine.
 
 ## The problem
 
@@ -50,7 +50,7 @@ If a release exceeds risk thresholds, Blueline blocks the install and halts the 
 - [x] Multi-registry support: npm, crates.io (`--ecosystem cargo`), PyPI (`--ecosystem pypi`), and AUR (`--ecosystem aur`, review-only)
 - [x] Recursive review: an install reference inside a reviewed payload (npm lifecycle script, PKGBUILD `npm install` delivery, wheel `.data/scripts`) is itself reviewed — depth-capped, cycle-safe, and rolled up into the parent verdict
 - [x] Recall / revocation index: local-first and self-hostable — serve a curated revocation snapshot, sync it, and any hit blocks; staleness is disclosed (and can BLOCK by policy)
-- [x] Sandboxed archive extraction with path traversal, symlink, and decompression bomb guards
+- [x] Bounded archive extraction with path traversal, symlink, and decompression bomb guards, into a private temp directory (no OS-level sandbox yet — see [references/drift.md](references/drift.md) entry 1)
 - [x] Package manifest parsing, cryptographic integrity (SHA-256 / SHA-512), and PEP 740 / SLSA provenance
 - [x] SQLite store for verified baseline releases and audit logging
 - [x] Lockfile CI scanning (`package-lock.json`, `Cargo.lock`, `requirements.txt`)

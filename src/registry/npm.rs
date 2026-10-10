@@ -260,7 +260,12 @@ impl Registry for NpmRegistry {
     /// npm publishes the signature block on the release's own `dist`, so it
     /// is read back for the exact version under review and not for whatever
     /// `latest` points at. An unreadable packument yields `None`, which the
-    /// signature policy treats as absent.
+    /// provenance report treats as no signature published.
+    ///
+    /// Presence only. Nothing here (or anywhere else) checks the tarball against
+    /// the block, so the value reaching the report cannot support a policy that
+    /// requires a *verified* signature; `provenance.require_signatures` is refused
+    /// at load for that reason.
     fn release_signatures(&self, pkg: &Package) -> Option<serde_json::Value> {
         let packument = self.packument(&pkg.name).ok()?;
         packument
@@ -446,6 +451,11 @@ struct Dist {
     /// one. Kept as raw JSON because the provenance engine only reads
     /// presence and key id, and a stricter shape here would refuse a packument
     /// over a field the check does not use.
+    ///
+    /// There is no `shasum` field. npm's `dist.shasum` is the sha1 the registry
+    /// signature signs, and ignoring it means blueline cannot check that
+    /// signature even in principle; `dist.integrity` (sha512) is the value that
+    /// is verified, before extraction.
     signatures: Option<serde_json::Value>,
 }
 
@@ -1053,10 +1063,11 @@ mod tests {
         let _ = handle.join();
     }
 
-    /// The signature block the registry publishes next to the artifact was
-    /// never deserialized, so `[provenance] require_signatures` gated on a
-    /// value that was hard-wired absent and could never be satisfied on this
-    /// lane. It is read for the exact version under review.
+    /// The block is read for the exact version under review, and only its
+    /// *presence* is ever used: nothing compares the tarball against it, which is
+    /// why `[provenance] require_signatures` is refused at load rather than
+    /// reported as a verification. A release whose `latest` publishes a block
+    /// while the version under review does not must not inherit it.
     #[test]
     fn release_signatures_reads_the_blocks_for_the_resolved_version_only() {
         use std::io::{Read, Write};

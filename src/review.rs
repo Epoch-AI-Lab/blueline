@@ -135,7 +135,8 @@ fn evaluate_with_registry<V: VersionInfo>(
         )
     })?;
 
-    let target_temp = tempfile::tempdir().map_err(|e| anyhow::anyhow!("creating temp dir: {e}"))?;
+    let target_temp = crate::extract::private_temp_dir()
+        .map_err(|e| anyhow::anyhow!("creating temp dir: {e}"))?;
     extract_for_ecosystem(
         &target_tarball,
         target_temp.path(),
@@ -172,8 +173,8 @@ fn evaluate_with_registry<V: VersionInfo>(
 
     let (delta, base_pkgbuild) = if let Some(base_pkg) = baseline_res.resolution.package() {
         let base_tarball = ctx.fetch_tarball(registry, base_pkg)?;
-        let base_temp =
-            tempfile::tempdir().map_err(|e| anyhow::anyhow!("creating temp dir: {e}"))?;
+        let base_temp = crate::extract::private_temp_dir()
+            .map_err(|e| anyhow::anyhow!("creating temp dir: {e}"))?;
         extract_for_ecosystem(
             &base_tarball,
             base_temp.path(),
@@ -2472,14 +2473,20 @@ mod recursive_tests {
         policy
     }
 
-    /// `require_signatures` gated on `registry_signature_present`, which the
-    /// npm lane hard-wired to false: the review passed `None` for the
-    /// signatures, the packument never deserialized `dist.signatures`, and the
-    /// provenance report cached `has_sig` as false. Every npm review was
-    /// blocked by the key, and no setting could satisfy it. With the block read
-    /// off the resolved release, a published signature satisfies it.
+    /// The engine still refuses an unsigned release when the flag is set. It is
+    /// no longer reachable from a policy file -- `require_signatures` is refused
+    /// at load, because a published block is presence and not verification -- so
+    /// this constructs the policy directly. The rule is kept as the fail-closed
+    /// direction for any caller that sets the field by another route: an unsigned
+    /// release is refused rather than passing because the key looked satisfied.
+    /// This is the behaviour `require_signatures` is refused at load for, pinned
+    /// so the refusal cannot be undone by accident. With the flag set, a release
+    /// whose packument carries *any* non-empty `dist.signatures` array passes:
+    /// the bytes are never checked against the block, so a forged one satisfies
+    /// the rule exactly as a genuine one does. The flag is set here directly
+    /// because a policy file that sets it no longer loads.
     #[test]
-    fn require_signatures_is_satisfiable_when_the_registry_publishes_a_block() {
+    fn a_published_signature_block_satisfies_the_flag_without_being_verified() {
         let policy = signature_policy();
         let verdict = evaluate_with_fake(
             FakeRegistry::with_signatures(
@@ -2494,7 +2501,8 @@ mod recursive_tests {
                 .findings
                 .iter()
                 .any(|f| f.rule_id == "P03_SIGNATURE_REQUIRED_MISSING"),
-            "a published signature must satisfy the key: {:?}",
+            "this test exists to show a published block satisfies the key, which is why the \
+             key is refused at load: {:?}",
             verdict
                 .findings
                 .iter()
@@ -2502,12 +2510,24 @@ mod recursive_tests {
                 .collect::<Vec<_>>()
         );
         assert_ne!(verdict.band, crate::verdict::VerdictBand::Block);
+        let prov = verdict
+            .trust_sources
+            .as_ref()
+            .and_then(|t| t.provenance.as_ref())
+            .expect("the npm lane reports provenance");
+        assert!(
+            prov.registry_signature_present,
+            "the report must still say a block was published, and the card must still say it \
+             was not verified"
+        );
     }
 
-    /// The absent case is the fail-closed one and must be unchanged: no
-    /// published block, no satisfaction.
+    /// The absent case is the fail-closed one and is unchanged: no published block,
+    /// no satisfaction. This is the direction the engine still enforces for any
+    /// caller that sets the flag, since refusing the key at load is about the
+    /// *present* case being unverifiable, not about dropping the check.
     #[test]
-    fn require_signatures_still_blocks_when_no_block_is_published() {
+    fn an_unsigned_release_is_refused_when_the_signature_flag_is_set() {
         let policy = signature_policy();
         let verdict = evaluate_with_fake(
             FakeRegistry::new(&[("unsigned@1.0.0", r#"{"name":"unsigned","version":"1.0.0"}"#)]),
@@ -2523,11 +2543,12 @@ mod recursive_tests {
         assert_eq!(verdict.band, crate::verdict::VerdictBand::Block);
     }
 
-    /// With the key unset, a published block is disclosed rather than gating
+    /// With the flag unset, a published block is disclosed rather than gating
     /// anything: the card says a signature exists, and still says it was not
-    /// verified.
+    /// verified. This is the only shape a real review can now produce, since the
+    /// flag is refused at load.
     #[test]
-    fn a_published_signature_without_the_policy_key_is_not_a_gate() {
+    fn a_published_signature_without_the_policy_flag_is_not_a_gate() {
         let policy = no_advisory_policy();
         let verdict = evaluate_with_fake(
             FakeRegistry::with_signatures(

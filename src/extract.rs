@@ -60,6 +60,32 @@ fn decompressed_stream_cap(tarball_len: usize, limits: &ExtractionLimits) -> u64
         .max(tarball_len as u64)
 }
 
+/// A temp dir only the current user can reach, for holding extracted bytes.
+///
+/// `tempfile::tempdir()` asks the OS for `0o777 & ~umask`, which at the common
+/// umask 022 is `0o755`: the target and baseline trees of every review sit in a
+/// directory any local user can list and read, and at umask 000 in one they can
+/// write. That is a disclosure vector for the one thing this tool holds, the
+/// unpacked bytes of an unreviewed release, so the mode is set explicitly
+/// instead of inherited. The child process that a future sandbox adds re-derives
+/// its own handle to this directory, so a permissive mode would widen the write
+/// grant it asks the kernel for.
+///
+/// Windows has no unix mode bits and no equivalent umask, so there is nothing
+/// to tighten there and the OS default is used unchanged.
+#[cfg(unix)]
+pub fn private_temp_dir() -> std::io::Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+    tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+}
+
+#[cfg(not(unix))]
+pub fn private_temp_dir() -> std::io::Result<tempfile::TempDir> {
+    tempfile::Builder::new().tempdir()
+}
+
 /// A `Read` that refuses once more than `remaining` bytes have been handed out.
 struct Budgeted<R> {
     inner: R,
@@ -566,6 +592,194 @@ fn set_dir_perm(_path: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The extracted bytes of an unreviewed release must not be readable, let
+    /// alone writable, by another local user.
+    ///
+    /// `tempfile::tempdir()` asks for `0o777 & ~umask`, which measures 0755 at
+    /// umask 022 and 0777 at umask 000. This pins the mode we actually hand the
+    /// kernel, and the test process runs under whatever umask it was started
+    /// with, which is the point: the fix must not depend on the ambient umask.
+    ///
+    /// The directory mode is the control that matters. A file inside it gets
+    /// its mode from the archive header, and `safe_extract` does not currently
+    /// clamp that, so the defence here is that no other user can traverse the
+    /// directory to reach the file at all.
+    #[cfg(unix)]
+    #[test]
+    fn the_extraction_temp_dir_is_not_world_accessible() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = private_temp_dir().expect("temp dir");
+        let mode = fs::metadata(dir.path()).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            mode, 0o700,
+            "extraction temp dir must be 0700 regardless of umask, got {mode:#o}"
+        );
+    }
+
+    #[test]
+    fn a_private_temp_dir_holds_what_was_written_to_it() {
+        let dir = private_temp_dir().expect("temp dir");
+        let stats = safe_extract(
+            &make_tarball(&[("package/package.json", br#"{"name":"package"}"#)]),
+            dir.path(),
+            &ExtractionLimits::default(),
+        )
+        .expect("extraction into a private temp dir");
+        assert_eq!(stats.files, 1);
+        assert!(
+            dir.path().join("package/package.json").exists(),
+            "the parent still reads the tree after the dir is handed back"
+        );
+    }
+
+    /// `private_temp_dir` only defends the call sites that use it: the mode is
+    /// decided at creation and nothing observable later can correct it, so a
+    /// production site quietly reverted to `tempfile::tempdir()` compiles and
+    /// passes every other test here. This pins the call sites themselves by
+    /// reading the source: nothing under `src/` may name `tempfile::tempdir()`
+    /// outside `#[cfg(test)]`.
+    #[test]
+    fn production_code_never_asks_the_os_for_a_temp_dir() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut violations = Vec::new();
+        scan_rs_files(&src, &mut violations);
+        assert!(
+            violations.is_empty(),
+            "`tempfile::tempdir()` outside #[cfg(test)] hands unreviewed bytes an \
+             umask-inherited mode; call `extract::private_temp_dir()` instead:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    fn scan_rs_files(dir: &Path, violations: &mut Vec<String>) {
+        for entry in fs::read_dir(dir).expect("readable src dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                scan_rs_files(&path, violations);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                scan_file_for_tempdirs(&path, violations);
+            }
+        }
+    }
+
+    /// Carried across lines so string literals spanning them stay stripped.
+    #[derive(Default)]
+    struct LexState {
+        in_str: bool,
+        in_raw: bool,
+        raw_hashes: usize,
+    }
+
+    /// The source line with string literals and `//` comments removed, so the
+    /// brace counting in `scan_file_for_tempdirs` sees only code.
+    fn code_only(line: &str, st: &mut LexState) -> String {
+        let mut out = String::new();
+        let mut it = line.chars().peekable();
+        while let Some(c) = it.next() {
+            if st.in_raw {
+                if c == '"' {
+                    let mut hashes = 0;
+                    while it.peek() == Some(&'#') {
+                        it.next();
+                        hashes += 1;
+                    }
+                    if hashes == st.raw_hashes {
+                        st.in_raw = false;
+                    }
+                }
+                continue;
+            }
+            if st.in_str {
+                match c {
+                    '\\' => {
+                        it.next();
+                    }
+                    '"' => st.in_str = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match c {
+                '/' if it.peek() == Some(&'/') => break,
+                '"' => st.in_str = true,
+                'r' if matches!(it.peek(), Some('"') | Some('#')) => {
+                    let mut hashes = 0;
+                    while it.peek() == Some(&'#') {
+                        it.next();
+                        hashes += 1;
+                    }
+                    if it.peek() == Some(&'"') {
+                        it.next();
+                        st.in_raw = true;
+                        st.raw_hashes = hashes;
+                    } else {
+                        out.push(c);
+                    }
+                }
+                '\'' => match it.peek().copied() {
+                    Some('\\') => {
+                        it.next();
+                        while it.next().is_some_and(|e| e != '\'') {}
+                    }
+                    Some(n) => {
+                        it.next();
+                        if it.peek() == Some(&'\'') {
+                            it.next();
+                        } else {
+                            out.push(n);
+                        }
+                    }
+                    None => {}
+                },
+                _ => out.push(c),
+            }
+        }
+        out
+    }
+
+    fn scan_file_for_tempdirs(path: &Path, violations: &mut Vec<String>) {
+        let text = fs::read_to_string(path).expect("readable source file");
+        let mut st = LexState::default();
+        let mut depth: i64 = 0;
+        let mut in_test = false;
+        let mut test_depth: i64 = 0;
+        let mut pending_test = false;
+        for (num, line) in text.lines().enumerate() {
+            let code = code_only(line, &mut st);
+            if code.trim_start().contains("cfg(test)") {
+                pending_test = !in_test;
+            }
+            if !in_test && code.contains("tempfile::tempdir()") {
+                violations.push(format!("{}:{num}: {}", path.display(), line.trim()));
+            }
+            for c in code.chars() {
+                match c {
+                    '{' => {
+                        depth += 1;
+                        if pending_test {
+                            in_test = true;
+                            test_depth = depth;
+                            pending_test = false;
+                        }
+                    }
+                    '}' => {
+                        depth -= 1;
+                        if in_test && depth < test_depth {
+                            in_test = false;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(
+            depth,
+            0,
+            "scanner lost track of braces in {}",
+            path.display()
+        );
+    }
 
     fn make_tarball(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());

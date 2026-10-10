@@ -1988,13 +1988,20 @@ fn provenance_findings(
         });
     }
 
+    // Unreachable from a policy file: `provenance.require_signatures` is refused
+    // at load, because the flag is satisfied by the *presence* of a
+    // `dist.signatures` block and nothing compares the bytes against it. The rule
+    // stays as the fail-closed direction for a caller that sets the field
+    // directly, so a release with no signature block is refused rather than
+    // passing on the strength of the flag having been read.
     if policy.provenance.require_signatures && !prov_rep.registry_signature_present {
         findings.push(Finding {
             rule_id: "P03_SIGNATURE_REQUIRED_MISSING".into(),
             severity: VerdictBand::Block,
             title: "Required registry signature missing".into(),
             description:
-                "Policy requires npm registry signatures, but no valid signature was attached."
+                "A registry signature was required and the release's packument published no \
+                 signature block at all."
                     .into(),
         });
     }

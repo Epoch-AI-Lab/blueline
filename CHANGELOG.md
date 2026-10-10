@@ -83,7 +83,61 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
   refused and still exits 2 — that is an integrity failure, not a missing
   document.
 
+- **`[provenance] require_signatures = true` is now refused instead of honoured.**
+  The flag gated on `registry_signature_present`, which is built from whether the
+  packument's `dist.signatures` is a non-empty array. Nothing compares the
+  tarball against that block, and `dist.shasum` — the sha1 the npm registry
+  signature actually signs — is not parsed at all, so any forged block satisfied
+  the key exactly as a genuine one did. An operator who wrote
+  `require_signatures = true` got a config that read as signature *verification*
+  and was checked against nothing, which is the same shape of harm as the
+  dead-policy-key entries below: a security control that looks active and is not.
+
+  Setting it is now a load-time error that names what the flag actually checked
+  and names the per-lane registry checksum that does run before extraction
+  instead (sha512 for npm, sha256 for cargo, pypi and aur), and says to remove
+  the key. The message cannot name one algorithm for every lane: policy loads
+  without lane context.
+
+  **What did not change.** blueline still verifies no registry signature, and
+  this release does not add that. Verified signatures need a Sigstore
+  verification path, which is a dependency this project has not approved, so the
+  honest outcome today is to refuse a key that cannot fail closed rather than
+  ship a green check on a forged block. The report field and the review card are
+  unchanged: a release that publishes a block still says so, and still says it
+  was not verified. `P03_SIGNATURE_REQUIRED_MISSING` stays in the engine (BLOCK)
+  so a caller that sets the flag by another route still gets the fail-closed
+  direction on an unsigned release; what it cannot close is the present case.
+
 ### Fixed
+
+- **The extraction temp dir is no longer world-accessible.** `tempfile::tempdir()`
+  asks the OS for `0o777 & ~umask`, which measures `0o755` at the common umask
+  022 and `0o777` at umask 000. Every review unpacks the target and baseline
+  releases into such a directory, so the unpacked bytes of an *unreviewed*
+  release were readable by any local user, and writable by any local user on a
+  host with a permissive umask. In a tool whose whole purpose is deciding
+  whether unreviewed bytes are safe, that is the wrong default.
+
+  Extraction now uses `extract::private_temp_dir()`, which sets `0o700`
+  explicitly rather than inheriting the ambient umask. Windows has no unix mode
+  bits and no equivalent umask, so nothing changes there.
+
+- **The AUR clone directory is no longer world-accessible either.** `AurRegistry::temp_repo`
+  still called bare `tempfile::tempdir()`, so the same 0o755 exposure remained on
+  the AUR lane. That lane is arguably the worse of the two: `fetch_verified` runs
+  `git archive` against the clone directory, so at a permissive umask any local
+  user could write into an attacker-chosen repository's clone between the clone
+  and the read. A swap window, not just a disclosure. Both `cached_repo` and
+  `fetch_verified` go through `temp_repo`, so the one-line fix covers both.
+
+  Pinned by `the_aur_clone_dir_is_not_world_accessible`, which was confirmed to
+  fail against the previous code.
+
+  This is a pre-existing defect, and not one Landlock would have fixed: an
+  OS-level confinement on the extraction directory bounds what a *confined*
+  process may write, and says nothing about who else may read that directory
+  afterwards.
 
 - **A maintainer blocklist that cannot be applied is now disclosed instead of
   silently passing.** `P04_MAINTAINER_BLOCKED` blocked a release whose publishing
@@ -102,10 +156,18 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
   `maintainers = []` discloses nothing, since nothing was configured.
 
   This is a deliberate reversal of refusing the key at load, which the 0.4.0 entry
-  below describes. That refusal was correct while nothing read the key and wrong
+  above describes. That refusal was correct while nothing read the key and wrong
   once the rule existed, and a load-time refusal cannot be ecosystem-scoped
   because the policy is loaded without ecosystem context. Per-review disclosure
   can be, and is.
+
+  `require_signatures` is the opposite case and is refused for the opposite
+  reason: the key is read, the rule exists, and there is no lane to disclose on,
+  because no lane can verify a signature. `P04_MAINTAINER_UNEVALUABLE` exists
+  because a maintainer identity *is* resolvable on one lane and absent on three.
+  There is no lane here where "verify the registry signature" is possible, so a
+  per-review disclosure would be the same sentence on every ecosystem: it would
+  read as a partial answer to a question with no answer.
 
 - **`"link": true` in an npm lockfile can no longer hide a version or an
   integrity swap.** The skip added for workspace links keyed on the `link` field
