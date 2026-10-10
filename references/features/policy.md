@@ -82,7 +82,10 @@ otherwise exact `==` (**case-sensitive**). No `?`, no `[...]`, no escaping.
   because the flag is satisfied by the *presence* of a `dist.signatures` block
   and nothing compares the tarball against it. `npm.rs` never parses
   `dist.shasum` either, so the sha1 the signature signs is not available.
-  `dist.integrity` (sha512) is the check that actually runs, before extraction.
+  The registry checksum that does run before extraction is the one the refusal
+  message names: sha512 for npm, sha256 for cargo, pypi and aur. The refusal is
+  ecosystem-agnostic (policy loads without lane context), so the message cannot
+  name one algorithm for every lane and does not pretend to.
 - **Malformed or unreadable always fails closed.** A `BLUELINE_POLICY` that is
   set but unreadable is `Err`, not a fallback to defaults
   (`blueline_policy_env_scopes_policy_loading_fail_closed`).

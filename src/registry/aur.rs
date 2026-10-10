@@ -607,7 +607,12 @@ impl AurRegistry {
     }
 
     fn temp_repo(&self) -> Result<tempfile::TempDir, BluelineError> {
-        tempfile::tempdir().map_err(|e| BluelineError::Network(format!("creating temp dir: {e}")))
+        // 0o700, not the umask-inherited default: this holds a `git clone` of an
+        // attacker-chosen AUR repository, and `fetch_verified` runs `git archive`
+        // against it afterwards. A world-writable clone dir is a swap window
+        // between the clone and the read, not merely a disclosure one.
+        crate::extract::private_temp_dir()
+            .map_err(|e| BluelineError::Network(format!("creating temp dir: {e}")))
     }
 
     /// Clone `url` once and return the repo path, reusing a prior clone of
@@ -903,6 +908,23 @@ mod tests {
     use std::io::Write;
     use std::net::TcpListener;
     use std::sync::Arc;
+
+    /// A `git clone` of an attacker-chosen repository lands here, and
+    /// `fetch_verified` reads it back with `git archive`. A world-writable clone
+    /// directory is a swap window between those two steps, so the mode is pinned
+    /// rather than left to the ambient umask.
+    #[cfg(unix)]
+    #[test]
+    fn the_aur_clone_dir_is_not_world_accessible() {
+        use std::os::unix::fs::PermissionsExt;
+        let reg = AurRegistry::new("https://aur.archlinux.org");
+        let dir = reg.temp_repo().expect("clone dir");
+        let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            mode, 0o700,
+            "AUR clone dir must be 0700 regardless of umask, got {mode:#o}"
+        );
+    }
 
     fn rpc_body(info: serde_json::Value) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({

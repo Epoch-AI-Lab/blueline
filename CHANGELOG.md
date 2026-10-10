@@ -93,9 +93,11 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
   and was checked against nothing, which is the same shape of harm as the
   dead-policy-key entries below: a security control that looks active and is not.
 
-  Setting it is now a load-time error that names what the flag actually checked,
-  points at `dist.integrity` (sha512) as the check that does run before
-  extraction, and says to remove the key.
+  Setting it is now a load-time error that names what the flag actually checked
+  and names the per-lane registry checksum that does run before extraction
+  instead (sha512 for npm, sha256 for cargo, pypi and aur), and says to remove
+  the key. The message cannot name one algorithm for every lane: policy loads
+  without lane context.
 
   **What did not change.** blueline still verifies no registry signature, and
   this release does not add that. Verified signatures need a Sigstore
@@ -199,6 +201,17 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
   Extraction now uses `extract::private_temp_dir()`, which sets `0o700`
   explicitly rather than inheriting the ambient umask. Windows has no unix mode
   bits and no equivalent umask, so nothing changes there.
+
+- **The AUR clone directory is no longer world-accessible either.** `AurRegistry::temp_repo`
+  still called bare `tempfile::tempdir()`, so the same 0o755 exposure remained on
+  the AUR lane. That lane is arguably the worse of the two: `fetch_verified` runs
+  `git archive` against the clone directory, so at a permissive umask any local
+  user could write into an attacker-chosen repository's clone between the clone
+  and the read. A swap window, not just a disclosure. Both `cached_repo` and
+  `fetch_verified` go through `temp_repo`, so the one-line fix covers both.
+
+  Pinned by `the_aur_clone_dir_is_not_world_accessible`, which was confirmed to
+  fail against the previous code.
 
   This is a pre-existing defect, and not one Landlock would have fixed: an
   OS-level confinement on the extraction directory bounds what a *confined*

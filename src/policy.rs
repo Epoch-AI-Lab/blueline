@@ -210,8 +210,9 @@ impl Policy {
                  silently satisfied by the *presence* of a registry signature block rather \
                  than by verifying it. blueline does not check the tarball against that \
                  signature and does not parse dist.shasum, so a forged block satisfies this \
-                 key. Remove it; dist.integrity (sha512) is the check that actually runs \
-                 before extraction."
+                 key. Remove it; the registry checksum blueline does verify before extraction \
+                 (sha512 for npm, sha256 for cargo, pypi and aur) is the check that actually \
+                 runs."
                     .into(),
             ));
         }
@@ -726,8 +727,13 @@ require_signatures = true
             "the error must name what the key actually checked, got: {err}"
         );
         assert!(
-            err.contains("dist.integrity"),
-            "the error must name the check that does run, got: {err}"
+            err.contains("sha512 for npm") && err.contains("sha256 for cargo"),
+            "the error must name the check that does run, per lane, got: {err}"
+        );
+        assert!(
+            !err.contains("dist.integrity (sha512)"),
+            "naming one algorithm for every lane is wrong: cargo, pypi and aur all verify \
+             sha256, and the refusal loads without lane context. got: {err}"
         );
     }
 

@@ -76,16 +76,17 @@ Each finding is cited in its lane file with the exact source location.
 2. **The npm registry signature is read for presence and never verified. Partly
    resolved; the verification gap itself is untouched.** `release_signatures`
    still returns the block as raw JSON, nothing compares the bytes to it, and
-   `dist.shasum` is still unparsed (`dist.integrity` sha512 is the only check
-   that runs). What changed is the consequence: `[provenance]
-   require_signatures = true` is now **refused at load** by
-   `Policy::reject_unimplemented_keys`, with an error naming what the flag
-   actually checked and pointing at `dist.integrity`. Before, the key was
-   accepted and any non-empty `dist.signatures` array satisfied it, so an
-   operator who wrote it got a config that read as signature *verification* and
-   was checked against nothing. A key that cannot fail closed is refused rather
-   than honoured; the finding is disclosed at MEDIUM rather than struck through
-   because a Sigstore verification path needs a dependency this project has not
+   `dist.shasum` is still unparsed (the registry checksum that does run is
+   sha512 for npm and sha256 for cargo, pypi and aur). What changed is the
+   consequence: `[provenance] require_signatures = true` is now **refused at
+   load** by `Policy::reject_unimplemented_keys`, with an error naming what the
+   flag actually checked and naming the per-lane checksum that does run instead.
+   Before, the key was accepted and any non-empty `dist.signatures` array
+   satisfied it, so an operator who wrote it got a config that read as signature
+   *verification* and was checked against nothing. A key that cannot fail closed
+   is refused rather than honoured. This entry stays at **High, unchanged in
+   severity**: refusing the key removes a control that looked active and was
+   not, but a Sigstore verification path needs a dependency this project has not
    approved, and until one lands nothing verifies a registry signature.
 
    The engine keeps `P03_SIGNATURE_REQUIRED_MISSING` (BLOCK) for a caller that
