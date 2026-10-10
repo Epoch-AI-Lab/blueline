@@ -30,6 +30,13 @@ tempfile = "3"
 dirs = "6"
 toml = "0.8"
 
+# Landlock is a Linux LSM. The crate carries no `cfg(target_os)` of its own and
+# calls `libc::prctl` and `libc::SYS_landlock_*`, which `libc` defines only under
+# `linux_like`, so an untargeted dependency breaks the Darwin and Windows jobs in
+# release.yml. Target-gated for that reason alone.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"

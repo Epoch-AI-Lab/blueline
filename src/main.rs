@@ -8,6 +8,16 @@ use blueline::{agent, ci, cli, mcp, recall, review, shim};
 use clap::Parser;
 
 fn main() {
+    // The extraction child is dispatched before clap, before the policy loader,
+    // before the registry and before the store: it confines itself to one
+    // directory and then needs nothing else, and every one of those needs
+    // something outside it. It carries no arguments (see
+    // `sandbox::child_entrypoint`), so reaching here means this is an ordinary
+    // invocation.
+    if let Some(code) = blueline::sandbox::child_entrypoint() {
+        std::process::exit(code);
+    }
+
     if let Err(e) = run() {
         eprintln!("error: {e:#}");
         std::process::exit(1);

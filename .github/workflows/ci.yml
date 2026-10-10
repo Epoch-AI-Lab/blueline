@@ -403,9 +403,31 @@ jobs:
           # rejected before it can be killed. Same reasoning: the edit never
           # becomes a tree, so it never had a chance to survive.
           #
+          # The fork-bomb guard mutants are excluded because running them is the
+          # exact incident the guard exists to prevent. `delete ! in
+          # spawn_child`, `delete ! in may_spawn_child_given`, and `replace
+          # may_spawn_child[_given] -> bool with true` each let `spawn_child`
+          # reach `Command::new(current_exe())` from inside the test harness,
+          # where `current_exe` is libtest: the child re-runs the suite, every
+          # extract test spawns the next generation, and the runner is lost
+          # (2026-10-09, 529 processes, forced reboot). They cannot be killed
+          # honestly, because killing requires the suite to finish, and the
+          # suite cannot finish once the guard is gone. The guard is pinned the
+          # only way that is safe under a mutant: the fast assertion
+          # `the_test_harness_is_never_allowed_to_spawn_an_extraction_child`
+          # fails the moment `may_spawn_child` returns true, before any spawn,
+          # so a real regression to the decision still turns the shard red.
+          # What is given up is only the ability to execute the detonation.
+          #
+          # `may_spawn_child_given` holds two `!` (`!cfg!(test)` and
+          # `!marker_set`) that share one mutant name, so the exclusion covers
+          # both. Losing the `!marker_set` edit is acceptable: that branch is
+          # pinned by `tests/sandbox_spawns.rs`, which drives the true case from
+          # outside the harness where a fork cannot reach it.
+          #
           # Every other genre still runs, and a mutant that fails to compile for
           # any other reason is still reported rather than hidden.
-          BLUELINE_MUTANTS_EXCLUDE: 'with .*Default::default\(\)|replace && with \|\| in .*'
+          BLUELINE_MUTANTS_EXCLUDE: 'with .*Default::default\(\)|replace && with \|\| in .*|delete ! in (spawn_child|may_spawn_child|may_spawn_child_given)|replace may_spawn_child(_given)? -> bool with true'
         run: |
           cargo mutants --in-diff pr.diff --shard ${{ matrix.shard }}/32 \
             --file 'src/**/*.rs' \
@@ -479,7 +501,11 @@ jobs:
       # `replace <return type> with Default::default()` needs a `Default` impl
       # several security types deliberately lack, and `||` is not valid inside a
       # `let` chain, so neither edit ever becomes a tree that could be killed.
-      BLUELINE_MUTANTS_EXCLUDE: 'with .*Default::default\(\)|replace && with \|\| in .*'
+      # The fork-bomb guard mutants are excluded for the same reason as in
+      # mutants-pr: executing them re-execs the test harness and detonates the
+      # runner, so they can only be pinned by the fast `may_spawn_child`
+      # assertion, never by running the mutant to completion.
+      BLUELINE_MUTANTS_EXCLUDE: 'with .*Default::default\(\)|replace && with \|\| in .*|delete ! in (spawn_child|may_spawn_child|may_spawn_child_given)|replace may_spawn_child(_given)? -> bool with true'
     steps:
       - uses: actions/checkout@v4
         with:

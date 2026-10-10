@@ -13,7 +13,7 @@ pub const MAX_POLICY_FILE_SIZE: u64 = 64 * 1024;
 
 /// Complete policy configuration loaded from `blueline.toml` or defaults.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Policy {
     pub thresholds: ThresholdsConfig,
     pub policy: GeneralPolicyConfig,
@@ -314,7 +314,7 @@ impl Policy {
 
 /// Threshold configurations for mapping numeric risk scores to verdict bands.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ThresholdsConfig {
     /// Maximum score for VerdictBand::Low (default 19).
     pub max_low_score: u32,
@@ -336,7 +336,7 @@ impl Default for ThresholdsConfig {
 
 /// General security policy flags.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct GeneralPolicyConfig {
     /// Require valid Sigstore/SLSA build attestations (default false).
     ///
@@ -348,6 +348,21 @@ pub struct GeneralPolicyConfig {
     pub require_provenance: bool,
     /// Block on newly added lifecycle scripts when no baseline approval exists (default true).
     pub block_unreviewed_scripts: bool,
+    /// Refuse a review whose extraction could not be confined by the kernel,
+    /// instead of disclosing it and continuing.
+    ///
+    /// Off by default, and that default is the honest one. Unavailability is
+    /// the normal case on macOS, Windows and any kernel without Landlock, so
+    /// refusing by default would make the tool unusable on four of six shipped
+    /// platforms for a check the operator never asked for. Turning it on is how
+    /// an operator says "refuse rather than tell me".
+    ///
+    /// **The AUR lane refuses under this key.** Its review bytes are built by
+    /// `git clone` and `git archive` running outside the Landlock domain by
+    /// construction, so confining only the extraction would leave the larger
+    /// parser of the two unconfined while reporting otherwise. Refusing the
+    /// lane keeps the key's promise exact.
+    pub require_sandbox: bool,
     /// Lower the band of non-registry (git/http/ssh/`npm:`/`file:`/`link:`)
     /// dependency findings from HIGH to MEDIUM. The findings stay visible; they
     /// are never suppressed (default false).
@@ -363,6 +378,7 @@ impl Default for GeneralPolicyConfig {
         Self {
             require_provenance: false,
             block_unreviewed_scripts: true,
+            require_sandbox: false,
             allow_git_dependencies: false,
             check_advisories: true,
             fail_closed_network: false,
@@ -372,7 +388,7 @@ impl Default for GeneralPolicyConfig {
 
 /// Advisory policy configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AdvisoriesPolicyConfig {
     pub block_on_malware: bool,
     pub block_on_critical_cve: bool,
@@ -403,7 +419,7 @@ impl AdvisoriesPolicyConfig {
 
 /// Provenance and attestation policy configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ProvenancePolicyConfig {
     /// Same rule as `GeneralPolicyConfig::require_provenance`, and honoured
     /// identically: either key turns the requirement on. Named here as well so a
@@ -425,7 +441,7 @@ pub struct ProvenancePolicyConfig {
 
 /// CI policy configuration for pull requests and lockfile scanning.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct CiPolicyConfig {
     /// Minimum verdict band that triggers a non-zero exit code (default: "high").
     pub fail_on: String,
@@ -456,7 +472,7 @@ impl Default for CiPolicyConfig {
 /// band at which a referenced package's finding escalates the parent
 /// verdict. Ambiguity resolves to block (fail closed).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RecursionPolicyConfig {
     /// Maximum review depth for referenced installs (root review is depth
     /// 0; default 3). Exceeding the cap emits R25_RECURSION_DEPTH (HIGH).
@@ -484,7 +500,7 @@ impl Default for RecursionPolicyConfig {
 /// snapshot may drift before it is disclosed (R28), and whether that
 /// staleness escalates to BLOCK.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RecallPolicyConfig {
     pub max_age_hours: u64,
     pub block_on_stale: bool,
@@ -501,13 +517,14 @@ impl Default for RecallPolicyConfig {
 
 /// Allowlist configuration for verified packages and lifecycle scripts.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AllowlistConfig {
     pub packages: Vec<PackageAllowRule>,
 }
 
 /// Specific package allowlist rule.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PackageAllowRule {
     pub name: String,
     /// Restrict the rule to one ecosystem; absent means it applies to all.
@@ -530,6 +547,7 @@ pub struct PackageAllowRule {
 /// (`"evil-*"`, matching every ecosystem) or a table
 /// (`{ pattern = "evil-*", ecosystem = "npm" }`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PackageBlockRule {
     #[serde(alias = "name")]
     pub pattern: String,
@@ -560,7 +578,7 @@ impl From<RawBlockPackage> for PackageBlockRule {
 
 /// Blocklist configuration for banned packages and maintainers.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct BlocklistConfig {
     #[serde(deserialize_with = "deserialize_block_packages")]
     pub packages: Vec<PackageBlockRule>,
@@ -725,6 +743,60 @@ require_signatures = true
             "naming one algorithm for every lane is wrong: cargo, pypi and aur all verify \
              sha256, and the refusal loads without lane context. got: {err}"
         );
+    }
+
+    /// `require_sandbox` sits in `GeneralPolicyConfig`, but the TOML table is
+    /// named after the *field* (`policy`), not the struct. `Policy` derives
+    /// `deny_unknown_fields`, so `[general]` is refused at load instead of
+    /// loading cleanly and leaving the flag at its default. That default used
+    /// to hand an operator who wrote `[general] require_sandbox = true` an
+    /// unconfined extraction and a LOW disclosure, which is the fail-open
+    /// direction for a tool whose whole purpose is the other one.
+    #[test]
+    fn require_sandbox_lives_under_the_policy_table() {
+        let right = Policy::from_toml_str("[policy]\nrequire_sandbox = true\n").expect("loads");
+        assert!(
+            right.policy.require_sandbox,
+            "`[policy] require_sandbox = true` must set the flag"
+        );
+
+        let err = Policy::from_toml_str("[general]\nrequire_sandbox = true\n")
+            .expect_err("an unknown table is refused, not ignored")
+            .to_string();
+        assert!(
+            err.contains("general"),
+            "the error must name the table that does not exist, got: {err}"
+        );
+    }
+
+    /// A misspelled key inside a table that does exist fails the same way.
+    ///
+    /// The top-level `deny_unknown_fields` alone would not catch this: an
+    /// operator who wrote `require_sandboxx = true` under `[policy]` would
+    /// still get the default and a review that reports it was confined only
+    /// because it never checked. Every config struct carries the same derive,
+    /// so one typo anywhere is one loud error rather than a silent default.
+    #[test]
+    fn a_misspelled_key_is_refused_rather_than_defaulted() {
+        let err = Policy::from_toml_str("[policy]\nrequire_sandboxx = true\n")
+            .expect_err("a misspelled key is refused, not defaulted")
+            .to_string();
+        assert!(
+            err.contains("require_sandboxx"),
+            "the error must name the key that does not exist, got: {err}"
+        );
+    }
+
+    /// The restriction is on keys, not on absence: a policy that omits a table
+    /// entirely still loads, because `#[serde(default)]` fills it in. Without
+    /// this the flag above could be satisfied by a rule that also refuses every
+    /// ordinary minimal policy file.
+    #[test]
+    fn an_absent_table_is_not_a_refusal() {
+        let policy = Policy::from_toml_str("[ci]\nfail_on = \"medium\"\n")
+            .expect("a policy may name only the tables it wants to change");
+        assert!(!policy.policy.require_sandbox);
+        assert_eq!(policy.ci.fail_on, "medium");
     }
 
     /// `require_provenance` sits in the same table and is honoured per status,

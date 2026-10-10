@@ -109,7 +109,164 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
   so a caller that sets the flag by another route still gets the fail-closed
   direction on an unsigned release; what it cannot close is the present case.
 
+- **Extraction runs in a Landlock-confined child process, and says so when it
+  cannot.** Unpacking an unreviewed release ran in the review process itself, so
+  a parser bug in the extraction path executed with the full privileges of
+  whatever invoked blueline. Extraction now happens in a child re-exec'd from
+  `current_exe()` with a Landlock ruleset restricting it to the destination
+  directory.
+
+  Where the kernel cannot confine the child (macOS, Windows, any kernel without
+  Landlock) the extraction is **not** silently downgraded. Each review that could
+  not be confined carries `P05_SANDBOX_UNAVAILABLE` at LOW, so the gap is on the
+  review card instead of being invisible. `P05` deliberately does not touch the
+  verdict band; it is pushed directly rather than routed through
+  `apply_extra_findings`, which recomputes the band from the accumulated score.
+
+  **New policy key `[policy] require_sandbox`, default `false`.** Off by default
+  because unavailability is the normal case off Linux, and refusing by default
+  would make the tool unusable on four of six shipped platforms for a check the
+  operator never asked for. Setting it to `true` refuses a review whose
+  extraction could not be confined, instead of disclosing it and continuing.
+
+  The key lives under `[policy]`, not `[general]`, even though the Rust struct is
+  named `GeneralPolicyConfig`. The misspelled table used to load cleanly and
+  leave `require_sandbox` at its default, which is the fail-open this entry's own
+  first draft created. `Policy` now derives `deny_unknown_fields`, so `[general]`,
+  a misspelled key, and an unknown table are all refused at load.
+  `require_sandbox_lives_under_the_policy_table` pins both the right table and
+  the refusal.
+
+  On the AUR lane the key also refuses a review it cannot honour: those bytes are
+  built by `git clone` and `git archive` running outside the Landlock domain by
+  construction, so a confined extraction there would still read as a promise the
+  key does not keep. The refusal is named in the key's own doc comment.
+
+  A child that dies or breaks its protocol is a hard error
+  (`extraction sandbox child failed`), never a fallback to in-process extraction:
+  a retry in-process would read whatever the dead child managed to write.
+
+- **A policy key that cannot be honoured is refused instead of silently
+  defaulted.** `Policy` and every config struct now derive
+  `deny_unknown_fields`, so `[general] require_sandbox = true`, a misspelled key,
+  and an unknown table are all errors naming the offending key. Before this, an
+  operator who wrote the key under the wrong table got an unconfined extraction
+  plus a LOW disclosure and no way to tell the difference from a confined review.
+  Omitting a table entirely still loads, because `#[serde(default)]` fills it in.
+
+- **The AUR lane refuses rather than promises under `require_sandbox`.**
+  `registry/aur.rs` builds the review bytes with `git clone` and `git archive`,
+  and neither can be confined by Landlock: the network is outside its reach,
+  and a clone writes to its own working tree by design. The archive those
+  processes produce is confined on its way into the extractor like every other
+  lane, but the git process that assembled it parsed attacker-chosen git objects
+  with the caller's full privileges, and it is the larger parser of the two. An
+  AUR review now stops before the first registry call when the key is set,
+  instead of reporting a confinement the lane cannot deliver. With the key off
+  (the default) the lane is unchanged.
+
+- **No test narrows the process running the suite.** Two unit tests called
+  `confine` directly, and `restrict_self` is irreversible and thread-inheriting:
+  every thread libtest spawned after them stayed narrowed for the rest of the
+  run, so an unrelated temp-dir test could fail with `EPERM` for no visible
+  reason. The status comparison survives as a pure `is_fully_enforced`
+  (`only_fully_enforced_reads_as_confined`), the tier-or-refusal decision as a
+  pure `tier_or_refusal` pinned against all three statuses
+  (`a_partly_enforced_ruleset_is_a_refusal_and_not_a_tier`), and the tier the
+  kernel granted is read back off the built binary's stderr, which is the one
+  place confinement can be observed without applying it to the observer.
+
 ### Fixed
+
+- **A confinement failure that already narrowed something is no longer reported
+  as an unavailable kernel.** The Landlock ladder returned one "try a lower
+  tier" answer for every error, including a `restrict_self` that failed after
+  `no_new_privs` was set, and including a destination directory that could not
+  even be opened for the ruleset. Both reached the parent as
+  `UNAVAILABLE` (exit 4), which is the *fall back in-process* signal: the parent
+  re-ran the extraction itself with no confinement at all and attached a LOW
+  disclosure about a kernel gap that did not exist. A hardened container blocking
+  `prctl`, and a destination path that cannot be opened, both produced a
+  completely unconfined extraction while the review reported only that the
+  sandbox was unavailable.
+
+  Only errors that occur *before* the domain is touched are a fallback
+  candidate: an over-ABI `handle_access`, a `create` on a kernel with no
+  Landlock, or a rejected `add_rule`. Anything at or after `restrict_self` is a
+  new `UNUSABLE` reply (exit 5) carrying the child's own diagnosis, and the
+  parent refuses. `a_child_that_cannot_confine_never_reports_unavailable` drives
+  the built binary against a destination that does not exist and pins exit 5.
+
+- **The child confines itself before it reads the archive, and non-Linux hosts
+  no longer spawn one at all.** Confinement used to run *after* the whole
+  tarball had been streamed down a pipe, so on a platform with no Landlock every
+  review paid a process spawn and a full copy of the archive to be told what the
+  parent could already have answered. Off Linux `spawn_child` now returns the
+  same disclosure without spawning. On Linux the ordering costs nothing, since
+  a pipe needs no filesystem grant.
+
+- **The Landlock ladder has a middle rung.** It went straight from V5 to V1. V3
+  is the newest tier that adds `Truncate` without also demanding `IoctlDev`, so
+  a kernel too old for V5 keeps `O_TRUNC` containment instead of silently
+  dropping to V1, which does not handle it at all.
+
+- **An oversized refusal is truncated, not relabelled as a fallback.** When the
+  child's reply was too large for the pipe it was replaced wholesale with
+  `Unavailable`, which the parent reads as "nothing was confined, retry
+  in-process". For a refusal that was the wrong direction: the child had
+  already written part of the tree into `dest` before it stopped, so the
+  in-process retry re-ran the extraction **unconfined over a destination that
+  was no longer empty** — the exact outcome the child exists to prevent. The
+  trigger was attacker-controlled, because refusal messages embed archive entry
+  paths and one long GNU long-name was enough.
+
+  What gets cut now is the free text, never the outcome: the message is
+  truncated with a `[message truncated to fit the reply frame]` marker and the
+  parent rebuilds the extractor's own error from the surviving variant.
+  `an_oversized_refusal_stays_a_refusal_and_never_becomes_a_fallback` drives
+  the whole path through `map_child_result`, since the bug was in the mapping
+  and not in the serialiser.
+
+- **The child's reply body and the parent's read ceiling are now separate
+  numbers.** Both were `MAX_REPLY_BYTES`, and the writer prefixes the body with
+  its decimal length and a newline. A body at exactly the ceiling was 65542
+  bytes on the wire against a 64 KiB pipe, and the parent does not read stdout
+  until the child has exited, so the child blocked in `write_all` and the parent
+  waited out the full `CHILD_TIMEOUT`. That is the same bug the writer-side
+  guard was added for, narrowed from unbounded to six bytes rather than closed,
+  and a test was pinning the deadlock-prone size as the intended maximum.
+
+  The writer is now bounded by `MAX_REPLY_BODY_BYTES`, which reserves room for
+  the prefix; the reader keeps the larger ceiling, because its job is refusing a
+  hostile peer rather than fitting a pipe. Both are pinned separately, and the
+  cut walks back to a character boundary so a multi-byte character at the cut
+  point cannot panic the child into reading as a dead one.
+
+- **The `may_spawn_child` guard no longer needs `unsafe` to be tested.** The
+  integration test reached the marker branch by calling
+  `std::env::set_var`, `unsafe` since edition 2024, with a safety argument that
+  held only because it was the single test in its binary. The decision is now
+  `may_spawn_child_given(marker_set: bool)`, a pure function, with
+  `may_spawn_child` reading the environment and delegating. Both arms are
+  covered by ordinary parallel-safe tests, so a second test in that file is now
+  free.
+
+- **The child's reply framing is checked for an off-by-one.** `read_reply`
+  sliced the body from `nl + 1`, and `serde_json` skips leading whitespace, so a
+  framing error that leaked the header newline into the body parsed fine and no
+  test could tell. It now splits the header off at the newline. The parent's raw
+  stdout is also bounded before parsing, and a child whose exit code is
+  `UNUSABLE` is believed for its own diagnosis instead of being relabelled as an
+  exit code.
+
+- **The `confine` dispatch no longer hides the non-Linux path from mutation
+  testing.** Written as two `#[cfg]`-gated functions, the non-Linux `confine`
+  did not exist in a Linux build, so `cargo mutants` could offer a
+  function-level mutation of it that no test on CI could ever kill. It is now
+  one function whose body is `#[cfg]`-gated in two blocks, so the symbol is
+  present on every host and a `confine` that stopped confining is observable:
+  the child would exit `UNAVAILABLE` instead of `OK`, which
+  `a_real_child_extracts_and_reports_its_stats` refuses.
 
 - **The extraction temp dir is no longer world-accessible.** `tempfile::tempdir()`
   asks the OS for `0o777 & ~umask`, which measures `0o755` at the common umask

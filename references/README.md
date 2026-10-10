@@ -8,10 +8,11 @@ Start with [../AGENTS.md](../AGENTS.md) (guardrails + CI gate) and
 R24–R28). This map is the *how*, not the *why*.
 
 Also read **[drift.md](drift.md)** — where the shipped code and the project's own
-docs disagree, with evidence. Two live entries are guarantees `ARCHITECTURE.md`
-claims and `src/` does not implement; the rest are judgement calls about how a
-working path fails. Entries already fixed are struck through, with the commit's
-shape, so the list is history rather than a to-do.
+docs disagree, with evidence. One live entry is a guarantee `ARCHITECTURE.md`
+used to claim and `src/` did not implement (the npm signature gap); the rest
+are judgement calls about how a working path fails. Entries already fixed are
+struck through, with the commit's shape, so the list is history rather than a
+to-do.
 
 Every command below was run against the built binary; every limit is the
 literal in `src/`. If a number here disagrees with the code, the code wins —
@@ -32,6 +33,7 @@ and fix this file in the same branch.
 | [Review orchestration](features/review.md) | the one function every surface funnels through: resolve → verify → extract → diff → score → disclose | `src/review.rs` |
 | [Heuristics & scoring](features/heuristic.md) | rule engine, risk-score arithmetic, band escalation | `src/heuristic.rs` |
 | [Extraction](features/extract.md) | bounded tar/wheel unpack, entry-type rejection, path validation | `src/extract.rs` |
+| [Extraction sandbox](features/sandbox.md) | Landlock child around extraction, reply protocol, P05 disclosure, `require_sandbox` | `src/sandbox.rs` |
 | [Wheel extraction](features/wheel_extract.md) | the `.data/scripts` and `.data/data` payload split | `src/wheel_extract.rs` |
 | [Diff](features/diff.md) | file/line delta, executable + binary classification | `src/diff.rs` |
 | [Manifest parsing](features/manifest.md) | `package.json`, packed `Cargo.toml`, `.SRCINFO` | `src/manifest.rs` |
