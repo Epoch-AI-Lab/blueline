@@ -597,6 +597,106 @@ mod tests {
     use super::*;
 
     #[test]
+    fn seq_len_maps_every_utf8_lead_byte_class() {
+        // Each arm is the load-bearing half of the chunk-boundary carry: it
+        // decides how many bytes a split sequence still needs. Deleting an arm
+        // silently mis-classifies every file whose split lands on that class,
+        // so pin all four plus the two rejection ranges.
+        assert_eq!(seq_len(b'a'), Some(1)); // 0x00..=0x7f
+        assert_eq!(seq_len(0x7f), Some(1));
+        assert_eq!(seq_len(0xc2), Some(2)); // 0xc2..=0xdf
+        assert_eq!(seq_len(0xdf), Some(2));
+        assert_eq!(seq_len(0xe0), Some(3)); // 0xe0..=0xef
+        assert_eq!(seq_len(0xef), Some(3));
+        assert_eq!(seq_len(0xf0), Some(4)); // 0xf0..=0xf4
+        assert_eq!(seq_len(0xf4), Some(4));
+        // Not valid lead bytes: continuation bytes and the two overlong ranges.
+        assert_eq!(seq_len(0x80), None);
+        assert_eq!(seq_len(0xbf), None);
+        assert_eq!(seq_len(0xc0), None);
+        assert_eq!(seq_len(0xc1), None);
+        assert_eq!(seq_len(0xf5), None);
+        assert_eq!(seq_len(0xff), None);
+    }
+
+    #[test]
+    fn the_scan_window_is_sixty_four_kibibytes() {
+        // The window is the memory bound, and `64 * 1024` vs `64 + 1024` is a
+        // one-token swap the digest test cannot see. Pin the value so the
+        // bound the comment promises is the bound that ships.
+        assert_eq!(SCAN_CHUNK_BYTES, 64 * 1024);
+    }
+
+    #[test]
+    fn classify_bytes_draws_the_opaque_boundary_above_the_cap_only() {
+        // `len > cap` vs `len >= cap` is an off-by-one at the exact boundary.
+        // A file exactly at the cap is still line-diffable, so it must stay
+        // Text; only one byte past it is opaque.
+        assert_eq!(
+            classify_bytes(MAX_DIFF_FILE_BYTES, false, true),
+            FileKind::Text,
+            "a file exactly at the cap must still be diffable"
+        );
+        assert_eq!(
+            classify_bytes(MAX_DIFF_FILE_BYTES + 1, false, true),
+            FileKind::OpaqueTooLarge,
+            "one byte past the cap is opaque"
+        );
+    }
+
+    #[test]
+    fn a_carry_completes_only_once_the_whole_sequence_arrives() {
+        // The `pending_len < expected` guard is what keeps a half-arrived
+        // sequence from being judged before its bytes exist. Flipping it to
+        // `>` would judge an empty carry as complete and a full one as
+        // incomplete, so drive both sides of the boundary.
+        //
+        // `valid` starts true, exactly as `scan_file` initialises it; the
+        // `Default` derive would start it false and every feed would no-op.
+        let new_scan = || Utf8Scan {
+            valid: true,
+            ..Default::default()
+        };
+        // A four-byte sequence delivered one byte at a time into the SAME
+        // scan: incomplete at every step but the last, and never judged until
+        // the fourth byte. This is the case the `pending_len < expected` guard
+        // protects — a partial carry meeting a follow-up feed that is still
+        // too short must not be judged. Flipping the guard to `>` would skip
+        // the early return and judge the half-filled carry as malformed.
+        let mut drip = new_scan();
+        for (i, byte) in [0xf0u8, 0x9f, 0x98, 0x80].iter().enumerate() {
+            drip.feed(&[*byte]);
+            if i < 3 {
+                assert!(
+                    drip.valid,
+                    "after {i} byte(s) the carry is incomplete, not invalid"
+                );
+            }
+        }
+        assert!(
+            drip.valid,
+            "the completed four-byte sequence is valid UTF-8"
+        );
+
+        // The completed sequence judges valid, and so does the same sequence
+        // split across two feeds.
+        let mut scan = new_scan();
+        scan.feed(&[0xf0, 0x9f]);
+        assert!(scan.valid, "a two-byte carry is not yet judgeable");
+        scan.feed(&[0x98, 0x80]);
+        assert!(
+            scan.valid,
+            "the completed four-byte sequence is valid UTF-8"
+        );
+
+        // A genuinely malformed lead byte is rejected as soon as it is the
+        // carry's first byte, which is what `seq_len` returning `None` drives.
+        let mut bad = new_scan();
+        bad.feed(&[0xff]);
+        assert!(!bad.valid, "0xff cannot start a UTF-8 sequence");
+    }
+
+    #[test]
     fn detects_file_added_removed_modified() {
         let old_dir = tempfile::tempdir().unwrap();
         let new_dir = tempfile::tempdir().unwrap();

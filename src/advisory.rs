@@ -386,13 +386,23 @@ fn query_osv(query: OsvQuery) -> OsvOutcome {
         Err(e) => Err(format!("OSV advisory request failed: {e}")),
     };
 
-    let ttl_secs = match &report {
-        Ok(report) if report.hits.is_empty() => query.policy.advisories.clean_cache_ttl_secs(),
-        Ok(_) => query.policy.advisories.vulnerable_cache_ttl_secs(),
-        Err(_) => 0,
-    };
+    let ttl_secs = cache_ttl_secs(&report, &query.policy);
 
     OsvOutcome { report, ttl_secs }
+}
+
+/// Cache lifetime for an OSV answer: a clean lookup is cached longer than a
+/// vulnerable one, and a failed lookup is never cached.
+///
+/// Split out of `query_osv` so the three-way choice is testable without a
+/// network: the guard distinguishing a clean report from a vulnerable one is
+/// exactly the line a `hits.is_empty()` mutation would silently erase.
+fn cache_ttl_secs(report: &Result<AdvisoryReport, String>, policy: &Policy) -> i64 {
+    match report {
+        Ok(report) if report.hits.is_empty() => policy.advisories.clean_cache_ttl_secs(),
+        Ok(_) => policy.advisories.vulnerable_cache_ttl_secs(),
+        Err(_) => 0,
+    }
 }
 
 fn fallback_or_fail(
@@ -773,6 +783,46 @@ fn calculate_advisory_severity(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_cache_ttl_distinguishes_clean_from_vulnerable_from_failed() {
+        // The `hits.is_empty()` guard is the whole decision: clean caches for
+        // 12h, vulnerable for 1h, failed for 0. A mutation that flips the
+        // guard to `true` or `false` collapses two of the three, so pin all
+        // three against the distinct policy defaults (12h / 1h).
+        let policy = Policy::default();
+        let clean = AdvisoryReport::clean("osv.dev");
+        let mut vulnerable = AdvisoryReport::clean("osv.dev");
+        vulnerable.status = AdvisoryStatus::Vulnerable;
+        vulnerable.hits = vec![AdvisoryItem {
+            id: "GHSA-test".into(),
+            summary: "test".into(),
+            details: String::new(),
+            aliases: Vec::new(),
+            severity: VerdictBand::High,
+            cvss_score: None,
+            is_malware: false,
+        }];
+
+        assert!(clean.hits.is_empty());
+        assert!(!vulnerable.hits.is_empty());
+
+        assert_eq!(
+            cache_ttl_secs(&Ok(clean.clone()), &policy),
+            12 * 3600,
+            "a clean report caches for the clean TTL"
+        );
+        assert_eq!(
+            cache_ttl_secs(&Ok(vulnerable.clone()), &policy),
+            3600,
+            "a vulnerable report caches for the shorter vulnerable TTL"
+        );
+        assert_eq!(
+            cache_ttl_secs(&Err("network down".to_string()), &policy),
+            0,
+            "a failed lookup is never cached"
+        );
+    }
+
     /// A v2 vector's metric values are per-metric. Matching them by value alone
     /// let `AV:P` be scored with the partial-impact weight, so a malformed
     /// vector scored 4.1 where the well-formed one scores 7.5 -- an advisory

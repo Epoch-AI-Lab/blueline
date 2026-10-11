@@ -12,6 +12,20 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
 
 ### Changed
 
+- **Eight mutant survivors in the windowed file scan are now killed or
+  excluded.** The `--mutants` CI shards found that deleting any arm of the
+  UTF-8 lead-byte table, flipping the carry-completion guard, swapping the
+  64 KiB window constant for `64 + 1024`, or moving the opaque-cap boundary
+  by one byte all left the suite green. New tests pin `seq_len` for every
+  lead-byte class and both rejection ranges, the carry completing only once
+  the whole sequence arrives, the window value, and the cap boundary. The
+  OSV cache-TTL guard is split into a pure `cache_ttl_secs` and pinned
+  three ways. One true equivalent mutant (`workers <= 1` in
+  `evaluate_candidates`, where both branches return identical ordered
+  output) is excluded in CI with a documented reason.
+
+### Changed
+
 - **A review no longer waits for the advisory lookup to finish before it
   starts working.** `fetch_advisories` ran to completion inside the review,
   after both tarballs had been fetched and extracted, and on a small package
