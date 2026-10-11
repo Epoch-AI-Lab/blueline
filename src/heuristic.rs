@@ -6,24 +6,6 @@ use crate::registry::Ecosystem;
 use crate::verdict::{DiffSummary, Finding, TrustSources, Verdict, VerdictBand};
 use crate::version::VersionInfo;
 
-#[allow(dead_code)]
-pub fn evaluate(
-    name: &str,
-    ecosystem: Ecosystem,
-    integrity: &str,
-    delta: &Delta,
-    is_unreviewed_baseline: bool,
-) -> Verdict {
-    evaluate_with_policy(
-        name,
-        ecosystem,
-        integrity,
-        delta,
-        is_unreviewed_baseline,
-        &Policy::default(),
-    )
-}
-
 pub fn evaluate_with_policy(
     name: &str,
     ecosystem: Ecosystem,
@@ -2081,12 +2063,13 @@ mod tests {
             binding_gyp_added: false,
         };
 
-        let verdict = evaluate(
+        let verdict = evaluate_with_policy(
             "test-pkg",
             Ecosystem::Npm,
             "verified (sha512)",
             &delta,
             false,
+            &Policy::default(),
         );
         assert_eq!(verdict.band, VerdictBand::Block);
         assert!(verdict.risk_score >= 50);
@@ -2125,12 +2108,13 @@ mod tests {
             binding_gyp_added: false,
         };
 
-        let verdict = evaluate(
+        let verdict = evaluate_with_policy(
             "test-pkg",
             Ecosystem::Npm,
             "verified (sha512)",
             &delta,
             false,
+            &Policy::default(),
         );
         assert_eq!(verdict.band, VerdictBand::High);
         assert!(
@@ -2174,12 +2158,13 @@ mod tests {
             binding_gyp_added: false,
         };
 
-        let verdict = evaluate(
+        let verdict = evaluate_with_policy(
             "test-pkg",
             Ecosystem::Npm,
             "verified (sha512)",
             &delta,
             false,
+            &Policy::default(),
         );
         assert_eq!(verdict.band, VerdictBand::High);
         assert!(
@@ -2441,12 +2426,13 @@ mod tests {
             binding_gyp_added: true,
         };
 
-        let verdict = evaluate(
+        let verdict = evaluate_with_policy(
             "test-pkg",
             Ecosystem::Npm,
             "verified (sha512)",
             &delta,
             false,
+            &Policy::default(),
         );
         assert_eq!(verdict.band, VerdictBand::Block);
         assert!(
@@ -2500,12 +2486,13 @@ mod tests {
             binding_gyp_added: false,
         };
 
-        let verdict = evaluate(
+        let verdict = evaluate_with_policy(
             "test-pkg",
             Ecosystem::Npm,
             "verified (sha512)",
             &delta,
             false,
+            &Policy::default(),
         );
         assert_eq!(verdict.band, VerdictBand::High);
         assert!(
@@ -2543,12 +2530,13 @@ mod tests {
             binding_gyp_added: false,
         };
 
-        let verdict = evaluate(
+        let verdict = evaluate_with_policy(
             "test-pkg",
             Ecosystem::Npm,
             "verified (sha512)",
             &delta,
             false,
+            &Policy::default(),
         );
         assert_eq!(verdict.band, VerdictBand::Medium);
         assert_eq!(verdict.risk_score, 15);
@@ -2580,12 +2568,13 @@ mod tests {
             binding_gyp_added: false,
         };
 
-        let verdict = evaluate(
+        let verdict = evaluate_with_policy(
             "test-pkg",
             Ecosystem::Npm,
             "verified (sha512)",
             &delta,
             true,
+            &Policy::default(),
         );
         assert_eq!(verdict.band, VerdictBand::Medium);
         assert!(
@@ -2788,12 +2777,13 @@ mod tests {
             binding_gyp_added: false,
         };
 
-        let verdict = evaluate(
+        let verdict = evaluate_with_policy(
             "test-pkg",
             Ecosystem::Npm,
             "verified (sha512)",
             &delta,
             false,
+            &Policy::default(),
         );
         assert_eq!(verdict.band, VerdictBand::High);
         assert!(
@@ -2828,12 +2818,13 @@ mod tests {
             binding_gyp_added: false,
         };
 
-        let verdict = evaluate(
+        let verdict = evaluate_with_policy(
             "test-pkg",
             Ecosystem::Npm,
             "verified (sha512)",
             &delta,
             false,
+            &Policy::default(),
         );
         assert_eq!(verdict.band, VerdictBand::High);
         assert!(
@@ -2913,12 +2904,13 @@ mod tests {
             binding_gyp_added: false,
         };
 
-        let verdict = evaluate(
+        let verdict = evaluate_with_policy(
             "test-pkg",
             Ecosystem::Npm,
             "verified (sha512)",
             &delta,
             false,
+            &Policy::default(),
         );
         assert_eq!(verdict.risk_score, 100);
         assert_eq!(verdict.band, VerdictBand::Block);
@@ -4317,12 +4309,13 @@ maintainers = ["badactor@example.com"]
     #[test]
     fn live_band_ladder_is_monotonic_and_not_a_pure_function_of_score() {
         // One HIGH finding: 25 points, and HIGH because a finding raised it.
-        let verdict = evaluate(
+        let verdict = evaluate_with_policy(
             "test-pkg",
             Ecosystem::Npm,
             "sha512-x",
             &opaque_large_file_delta(&["payload.bin"]),
             false,
+            &Policy::default(),
         );
         assert_eq!(verdict.risk_score, 25, "one HIGH finding is 25 points");
         assert_eq!(
@@ -4371,12 +4364,13 @@ maintainers = ["badactor@example.com"]
             description: "appended after evaluation".into(),
         };
 
-        let mut late = evaluate(
+        let mut late = evaluate_with_policy(
             "test-pkg",
             Ecosystem::Npm,
             "sha512-x",
             &opaque_large_file_delta(&["a.bin"]),
             false,
+            &Policy::default(),
         );
         assert_eq!((late.band, late.risk_score), (VerdictBand::High, 25));
         apply_extra_findings(
@@ -4384,12 +4378,13 @@ maintainers = ["badactor@example.com"]
             vec![high("R02_OPAQUE_LARGE_FILE_ADDED")],
             &policy,
         );
-        let native = evaluate(
+        let native = evaluate_with_policy(
             "test-pkg",
             Ecosystem::Npm,
             "sha512-x",
             &opaque_large_file_delta(&["a.bin", "b.bin"]),
             false,
+            &Policy::default(),
         );
         assert_eq!(native.risk_score, 50);
         assert_eq!(
@@ -4400,12 +4395,13 @@ maintainers = ["badactor@example.com"]
 
         // A late MEDIUM on top of a HIGH: 35 points stays HIGH only because the
         // ladder is monotonic. A score-only map on both ladders would say MEDIUM.
-        let mut late_medium = evaluate(
+        let mut late_medium = evaluate_with_policy(
             "test-pkg",
             Ecosystem::Npm,
             "sha512-x",
             &opaque_large_file_delta(&["a.bin"]),
             false,
+            &Policy::default(),
         );
         apply_extra_findings(
             &mut late_medium,

@@ -125,12 +125,19 @@ npm-only: `impl Registry for` resolves to `NpmRegistry`, `CratesIoRegistry`,
   are accepted.
 - Sparse path: `1/{a}`, `2/{ab}`, `3/{a}/{abc}`, `{c1}{c2}/{c3}{c4}/{name}`.
   Name `len() > 64` → error.
-- **There is NO `serde_json` → `serde-json` normalization.** `canonical_crate_name`
-  only ASCII-lowercases. Tests `canonicalizes_names` asserts
-  `canonical_crate_name("Serde_JSON") == "serde_json"`. crates.io's real index
-  treats `-` and `_` as equivalent; this code does not. Consequence:
-  `verify_single_root` expects a root literally `{lowercased-name}-{version}`.
-  CHANGELOG 0.3.0's claim of `-`/`_` canonicalization is **wrong for this tree**.
+- **Crate names are lowercased, and hyphen/underscore spellings stay
+  distinct.** `canonical_crate_name` ASCII-lowercases only; test
+  `canonicalizes_names` asserts `canonical_crate_name("Serde-JSON") ==
+  "serde-json"`. The real crates.io index stores only the folded file
+  (`se/rd/serde_json` exists, `se/rd/serde-json` 404s — checked against the
+  live sparse index, and the download host 403s the hyphen path), so a
+  hyphen-spelled review of a crates.io crate fails closed at the index fetch
+  rather than resolving. That is kept on purpose: a configured index or mirror
+  may genuinely serve both spellings, and answering one spelling with the
+  other's bytes is worse than refusing. The ci lane pins the same invariant
+  (`lockfile_diff_keeps_pypi_alias_off_cargo_pins`: `foo_bar` must not inherit
+  `foo-bar`'s pin). CHANGELOG 0.3.0's claim of `-`/`_` canonicalization was
+  wrong about this tree and is corrected; see drift entry 4.
 - NDJSON fail-closed rules, verbatim: malformed JSON lines are errors; rows
   with unknown schema `v > 2` are skipped **with a note printed to stderr**;
   recognized rows with unparsable `vers` are errors; missing `yanked` reads false.
@@ -159,8 +166,10 @@ npm-only: `impl Registry for` resolves to `NpmRegistry`, `CratesIoRegistry`,
   `2024-01-17T16:53:12.779164Z → 1705510392` and `1970-01-01T00:00:00Z → 0`.
 - **`resolve_package` performs no name-mismatch check**, unlike npm, crates.io,
   and AUR. `Package.name` comes from the server's response.
-- `SimpleFile` is entirely `#[allow(dead_code)]`; `size` and `provenance` are
-  parsed but never read. PEP 740 lives in [provenance](provenance.md).
+- `SimpleFile` keeps only members something reads (`filename`, `url`,
+  `hashes`, `upload-time`, `yanked`); `size` and `provenance` were `#[serde(default)]`
+  members nothing read and are gone, same as the `api-version` marker `SimpleMeta`
+  refuses to carry. PEP 740 lives in [provenance](provenance.md).
 - The file is minified — no blank lines between functions, no doc comments.
 
 ## AUR
