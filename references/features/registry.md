@@ -73,9 +73,14 @@ RegistryLimits::default()
   max_redirects       = 5
 ```
 
-**`hex_to_bytes` uses `.unwrap_or(0)`** — an invalid hex pair silently becomes
-byte `0` instead of erroring. The only non-fail-closed spot in `mod.rs`,
-reachable only via `to_sri()` on an already-validated `value_hex`.
+**`hex_to_bytes` is fallible** — an invalid hex pair is a refusal naming the
+offending digest, not byte `0`. `to_sri` returns `Result` for this reason: the
+decoder cannot produce a well-formed SRI string from a digest it could not read,
+and the only place `to_sri` renders is the mismatch message naming the expected
+value, where a silently zeroed byte put the wrong bytes in a confident sentence.
+Reachable only through direct `Checksum` construction, since `Checksum::parse`
+validates its hex before storing it. Tests `a_malformed_digest_fails_loud_
+instead_of_zeroing` and `a_well_formed_digest_still_renders`.
 
 **`Checksum::parse` takes the FIRST recognized token of a whitespace-separated
 list**, so npm's multi-algorithm `dist.integrity` resolves deterministically.

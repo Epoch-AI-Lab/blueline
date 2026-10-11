@@ -128,12 +128,16 @@ impl NpmRegistry {
         match &pkg.integrity {
             Some(expected) if expected.alg == ChecksumAlg::Sha512 => {
                 if !expected.value_hex.eq_ignore_ascii_case(&computed.value_hex) {
+                    // Both digests are produced by `Checksum::parse` or
+                    // `hex_encode`, so neither can fail here; `?` keeps it loud
+                    // if that ever stops being true rather than rendering a
+                    // digest with bytes silently zeroed.
                     return Err(BluelineError::Verification(format!(
                         "{}@{}: tarball sha512 mismatch (expected {}, got {})",
                         pkg.name,
                         pkg.version,
-                        expected.to_sri(),
-                        computed.to_sri()
+                        expected.to_sri()?,
+                        computed.to_sri()?
                     )));
                 }
             }

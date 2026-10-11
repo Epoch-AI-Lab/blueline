@@ -247,7 +247,8 @@ fn full_flow_json_output() {
     assert_eq!(
         blueline::registry::Checksum::parse(displayed)
             .unwrap()
-            .to_sri(),
+            .to_sri()
+            .unwrap(),
         integrity
     );
     assert_eq!(json["ecosystem"], "npm");
@@ -272,7 +273,7 @@ fn full_flow_json_output() {
     // The witness is stored in the canonical display form; it must normalize
     // to the same digest content as the SRI the fixture served.
     let stored = blueline::registry::Checksum::parse(&integrity_row).unwrap();
-    assert_eq!(stored.to_sri(), integrity);
+    assert_eq!(stored.to_sri().unwrap(), integrity);
     assert_eq!(clean, 0, "review records evidence, never a clean blessing");
 }
 
