@@ -20,8 +20,8 @@ Severity is this file's own judgement, not the project's.
 | 3 | Integrity mismatch surfaces as `Err` + exit 1, not `Verdict::Block` | Medium — a consumer keying on band never sees BLOCK |
 | 4 | No cargo `-`/`_` name canonicalization, contrary to `CHANGELOG` 0.3.0 | Medium — `serde_json` and `serde-json` are distinct crates |
 | 10 | `diff_single_file` coerces invalid UTF-8 to `""`, so a real change reads as all-add or all-delete | Medium — undocumented, silently mis-scores |
-| 12 | `store.rs` discards the `0o600` pre-create error (`let _ =`) | Low — the DB may be more permissive than intended |
-| 9 | `hex_to_bytes` uses `.unwrap_or(0)`, mapping invalid hex to byte `0` | Low — fails toward "valid-looking" |
+| 12 | ~~`store.rs` discards the `0o600` pre-create error (`let _ =`)~~ **resolved** — all three discarded errors propagate. See below | Low |
+| 9 | ~~`hex_to_bytes` uses `.unwrap_or(0)`, mapping invalid hex to byte `0`~~ **resolved** — the helper is fallible and `to_sri` returns `Result` | Low |
 | 5 | ~~`registry/mod.rs` doc comments are stale~~ **resolved** — both were deleted; the four adapters are all real. See below | Low |
 | 6 | Manager count is six in `CHANGELOG` 0.3.1, eleven in `ARCHITECTURE.md` §5; `--help` says eleven | Low — `--help` is authoritative |
 | 7 | ~~Dead code: `Policy::is_maintainer_blocked`, `blocklist.maintainers`, `allowlist.packages[].max_risk` / `.integrity`~~ **resolved** — the three policy keys are now refused at load. Still dead: `BaselineStore::clear_advisory_cache` | Low — test-only helper, `#[allow(dead_code)]` |
@@ -141,8 +141,12 @@ Each finding is cited in its lane file with the exact source location.
    a name that resolved publicly for the check and privately for the
    connection no longer gets through. Only the configured base is exempt.
    See [registry](features/registry.md).
-9. **`registry/mod.rs::hex_to_bytes` uses `.unwrap_or(0)`**, silently mapping
-   invalid hex to byte `0`.
+9. **~~`registry/mod.rs::hex_to_bytes` uses `.unwrap_or(0)`~~ — resolved.** The
+   helper maps an unparseable byte pair to `0`, silently mapping invalid hex to
+   byte `0`. It is fallible now and `hex_to_bytes` is the only caller of
+   `to_sri`, so an undecodable digest is a refusal that names the offending
+   input. Tests `a_malformed_digest_fails_loud_instead_of_zeroing` and
+   `a_well_formed_digest_still_renders`. See [registry](features/registry.md).
 10. **`diff_single_file` silently converts invalid UTF-8 to `""`**, so a real
     change reads as all-add or all-delete. `ambiguous`, not documented. See
     [diff](features/diff.md).
@@ -154,4 +158,12 @@ Each finding is cited in its lane file with the exact source location.
     refusals name which of those failed. Test
     `a_pypi_archive_whose_metadata_cannot_be_read_is_refused`. See
     [review](features/review.md).
-12. **`store.rs` silently discards the `0o600` pre-create error** (`let _ =`).
+12. **~~`store.rs` silently discards the `0o600` pre-create error~~ — resolved.**
+    Three hardening steps were `let _ = ...`: the data-directory chmod to
+    `0o700`, the pre-create of the database at `0o600`, and the database chmod
+    to `0o600`. All three propagate now. The pre-create was the load-bearing
+    one, because `Connection::open` creates the file at whatever the umask
+    allows, so a failed pre-create meant a database at a default mode and a
+    narrowing step that had failed in silence. Test
+    `an_unopenable_database_path_refuses_at_the_pre_create`. See
+    [store](features/store.md).

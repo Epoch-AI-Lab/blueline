@@ -10,6 +10,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 Targeted at 0.4.0. This release is a behaviour change for anyone who set
 `require_provenance`: see the entry below before upgrading.
 
+### Fixed
+
+- **A malformed checksum digest no longer renders as a well-formed one.**
+  `Checksum::to_sri` decoded the stored hex through a helper that mapped an
+  unparseable byte pair to `0`, so a digest that was not clean hex still
+  produced a valid-looking `sha512-<base64>` string. The only place that string
+  is shown is the mismatch message naming the *expected* value, which meant a
+  corrupt or hand-edited digest was illustrated back to the operator with bytes
+  silently zeroed, and the message read as a confident answer about the wrong
+  bytes. The helper is fallible now and `to_sri` returns `Result`, so an
+  undecodable digest is a refusal naming the offending input rather than a
+  plausible digest.
+
+- **The baseline store no longer discards three permission errors.** Three
+  filesystem hardening steps in `store.rs` were written as `let _ = ...`, so a
+  failure of any of them was invisible: the data directory chmod to `0o700`,
+  the pre-create of the database at `0o600`, and the chmod of the database to
+  `0o600`. The pre-create was the load-bearing one. `Connection::open` creates
+  the file at whatever the umask allows, so when the pre-create failed the
+  database came up at a default mode and a step whose whole purpose was
+  narrowing it had failed in silence. All three propagate now.
+
+  No change to behaviour on the success path: the modes were always being set,
+  and `enforces_unix_file_and_directory_permissions` still pins that.
+
 ### Changed
 
 - `recall sync` follows a bounded redirect chain instead of refusing every

@@ -71,10 +71,14 @@ Audit `action` values actually written (free-form `&str`, not an enum):
   `_new` copies** (PKs change to composites) and only `ALTER`s `audit_log`. The
   advisory expiry index is dropped with the old table and must be recreated
   after the rename.
-- **Filesystem hardening is `#[cfg(unix)]` and mostly best-effort.** Parent dir
-  `0o700`, DB `0o600`, symlink re-checked *before* and *after*
-  `Connection::open`; `set_permissions` and the pre-create `OpenOptions` both
-  use `let _ =`, so they are not fail-closed.
+- **Filesystem hardening is `#[cfg(unix)` and fail-closed on every step.** Parent
+  dir `0o700`, DB `0o600`, symlink re-checked *before* and *after*
+  `Connection::open`; `set_permissions` and the pre-create `OpenOptions` all
+  propagate their errors. The pre-create is the one that matters, because
+  `Connection::open` creates the file at whatever the umask allows, so a
+  swallowed pre-create failure meant a database at a default mode and a
+  narrowing step that failed in silence. Test
+  `an_unopenable_database_path_refuses_at_the_pre_create`.
 - **`AuditEntry` has `row.get::<_, i64>(5)? as u32`** — an unchecked narrowing
   cast. And `hit_count`/`slsa_level` use `.max(0) as u*`, which coerces a
   negative corrupted value to `0` rather than erroring.
