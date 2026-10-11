@@ -47,32 +47,39 @@ Baseline follow-up: `[y/N]`, only `y`/`yes` approves.
  1. parse target version for the ecosystem grammar
  2. registry_base = bases.for_ecosystem(ecosystem)
  3. registry.resolve(name, version)                      → Err propagates
- 4. ctx.fetch_tarball (memoized; verifies integrity inside the adapter)
- 5. REQUIRE target_pkg.integrity                          → refuse "unverifiable bytes"
- 6. tempfile::tempdir()                                   (RAII guard)
- 7. extract_for_ecosystem(...)
- 8. prepare_extracted_root(...)                           → (root, PackageJson)
- 9. store.record_verified(...)                            → witness, clean = 0
-10. resolve_baseline(...)
-11. if a baseline exists: fetch it, tempdir, extract, prepare_root,
+ 4. advisory::resolve_advisories(...) → in flight; joined at step 12
+ 5. ctx.fetch_tarball (memoized; verifies integrity inside the adapter)
+ 6. REQUIRE target_pkg.integrity                          → refuse "unverifiable bytes"
+ 7. tempfile::tempdir()                                   (RAII guard)
+ 8. extract_for_ecosystem(...)
+ 9. prepare_extracted_root(...)                           → (root, PackageJson)
+10. store.record_verified(...)                            → witness, clean = 0
+11. resolve_baseline(...)
+12. if a baseline exists: fetch it, tempdir, extract, prepare_root,
     compute_delta(...); AUR also reads base_root/PKGBUILD
     else compute_delta(None, None, None, ...)
-12. advisory::fetch_advisories(...)                       → degrades to Unverified
-13. provenance::inspect_provenance (npm) / _pypi (pypi)   → None for cargo, aur
-14. release_author() on both sides                        → author_changed
-15. heuristic::evaluate_with_trust(...)                   → Verdict
-16. AUR only: R00_BASELINE_UNREADABLE if the baseline PKGBUILD is unreadable,
+13. advisory join → degrades to Unverified
+14. provenance::inspect_provenance (npm) / _pypi (pypi)   → None for cargo, aur
+15. release_author() on both sides                        → author_changed
+16. heuristic::evaluate_with_trust(...)                   → Verdict
+17. AUR only: R00_BASELINE_UNREADABLE if the baseline PKGBUILD is unreadable,
     then pkgbuild::review_roots → apply_extra_findings
-17. recall::stale_band(policy)                            → R28_RECALL_STALE
-18. collect_install_refs + install_ref_findings; cap at MAX_INSTALL_REFS = 32
+18. recall::stale_band(policy)                            → R28_RECALL_STALE
+19. collect_install_refs + install_ref_findings; cap at MAX_INSTALL_REFS = 32
     → apply_extra_findings
-19. ctx.review_children(...)                              → R27 roll-up
+20. ctx.review_children(...)                              → R27 roll-up
     → apply_extra_findings
 ```
 
-Steps 16, 17, 18, and 19 all end in `apply_extra_findings`, which *recomputes*
+Steps 17, 18, 19, and 20 all end in `apply_extra_findings`, which *recomputes*
 score and band. Skipping that call is how a HIGH finding ends up rendered at
 HIGH while the verdict still says LOW.
+
+Step 4 sits before the fetching and extraction on purpose. The OSV query needs
+only the resolved name, version and ecosystem, and nothing between step 4 and
+step 13 reads its answer. Starting it there overlaps the round trip with the
+work that dominates a small-package review; joining it where it used to be
+called keeps the verdict scored against the same report.
 
 ## Gotchas
 

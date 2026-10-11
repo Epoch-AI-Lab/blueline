@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite_migration::{M, Migrations};
 
@@ -298,6 +298,7 @@ pub struct CachedProvenance {
 /// blesses a release.
 pub struct BaselineStore {
     conn: rusqlite::Connection,
+    path: PathBuf,
 }
 
 /// How many times the journal-mode change is retried before giving up.
@@ -464,7 +465,22 @@ impl BaselineStore {
             });
         }
 
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// A second handle to the same database file.
+    ///
+    /// The connection is opened in WAL mode with a busy timeout, which is what
+    /// makes concurrent access safe, so a caller that needs to work in parallel
+    /// gives each worker its own handle instead of sharing one: a
+    /// `rusqlite::Connection` is `Send` but not `Sync`, and wrapping it in a
+    /// mutex would serialise the whole review rather than just the database.
+    /// Nothing about what is stored changes; only who holds the connection.
+    pub fn reopen(&self) -> Result<Self, BluelineError> {
+        Self::open_at(&self.path)
     }
 
     /// Record that `name@version` was integrity-verified. This is evidence,
@@ -899,7 +915,7 @@ impl BaselineStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT ecosystem, package, version, integrity, action, score, verdict,
+                "SELECT id, ecosystem, package, version, integrity, action, score, verdict,
                         decided_by, notes, decided_at
                  FROM audit_log ORDER BY id DESC LIMIT ?1",
             )
@@ -907,16 +923,17 @@ impl BaselineStore {
         let rows = stmt
             .query_map(rusqlite::params![limit as i64], |row| {
                 Ok(AuditEntry {
-                    ecosystem: row.get(0)?,
-                    package: row.get(1)?,
-                    version: row.get(2)?,
-                    integrity: row.get(3)?,
-                    action: row.get(4)?,
-                    score: row.get::<_, i64>(5)? as u32,
-                    verdict: row.get(6)?,
-                    decided_by: row.get(7)?,
-                    notes: row.get(8)?,
-                    decided_at: row.get(9)?,
+                    id: row.get(0)?,
+                    ecosystem: row.get(1)?,
+                    package: row.get(2)?,
+                    version: row.get(3)?,
+                    integrity: row.get(4)?,
+                    action: row.get(5)?,
+                    score: row.get::<_, i64>(6)? as u32,
+                    verdict: row.get(7)?,
+                    decided_by: row.get(8)?,
+                    notes: row.get(9)?,
+                    decided_at: row.get(10)?,
                 })
             })
             .map_err(|e| BluelineError::Store(format!("querying audit_entries: {e}")))?;
@@ -933,6 +950,7 @@ impl BaselineStore {
 /// One audit-trail row, as read back by the recall curation export.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEntry {
+    pub id: i64,
     pub ecosystem: String,
     pub package: String,
     pub version: String,

@@ -38,3 +38,25 @@ proptest = "1"
 [profile.release]
 strip = true
 lto = true
+
+# The dev profile is where the time goes. Cargo's default is `opt-level = 0`
+# with `debug = 2`, and at this crate's size that is what produces a 100 MB test
+# binary, a linker peak in the gigabytes, and a `target/debug` measured in
+# gigabytes across a hundred stale incremental session caches. Line tables keep
+# a failing test pointing at the right source line, which is all a panic needs,
+# and they cost a fraction of the full DWARF.
+[profile.dev]
+debug = "line-tables-only"
+
+# `cargo test` builds its own profile, and it inherits nothing from `[profile.dev]`
+# unless it is stated here, so both halves have to be set.
+[profile.test]
+debug = "line-tables-only"
+
+# Dependencies are only ever linked in. Nobody steps through `serde_json`, so
+# emitting debug info for it only makes the linker read more than it has to.
+[profile.dev.package."*"]
+debug = false
+
+[profile.test.package."*"]
+debug = false

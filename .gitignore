@@ -18,3 +18,4 @@ packages/@kridaydave/binary-*/blueline.exe
 *.tgz
 
 .useit/
+.perfwork/

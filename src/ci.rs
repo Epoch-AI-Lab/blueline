@@ -3,6 +3,8 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -276,10 +278,12 @@ pub fn evaluate_lockfile_diff(
         policy.ci.max_evaluations,
     )?;
 
-    let mut items = Vec::new();
-    let mut max_band = VerdictBand::Low;
-
-    let eval_candidates = delta
+    // One entry per package to review, in the order the report must print
+    // them. CI output is diffed between runs, so that order is a contract: it
+    // is fixed here, before any review starts, and never depends on which
+    // review happens to finish first.
+    let mut candidates: Vec<Candidate> = Vec::new();
+    for (name, old_version, new_version, is_dev, resolved) in delta
         .added
         .iter()
         .map(|e| (&e.name, None, &e.version, e.is_dev, e.resolved.as_deref()))
@@ -291,9 +295,8 @@ pub fn evaluate_lockfile_diff(
                 u.is_dev,
                 u.resolved.as_deref(),
             )
-        }));
-
-    for (name, old_version, new_version, is_dev, resolved) in eval_candidates {
+        }))
+    {
         if evaluation_skipped(policy.ci.include_dev, is_dev) {
             continue;
         }
@@ -306,46 +309,19 @@ pub fn evaluate_lockfile_diff(
             continue;
         }
 
-        let mut rctx = crate::recursive::ReviewContext::new(policy, ctx.bases.clone());
-        let (mut verdict, _, checksum, _) =
-            evaluate_package(name, new_version, ctx.ecosystem, store, policy, &mut rctx)?;
-
-        // If lockfile declared a hash, verify it matches. The PEP 503
-        // alias lookup is PyPI-only: on npm/cargo `foo_bar` and `foo-bar`
-        // are distinct packages and must never share an integrity entry.
-        let canon_alias = (ctx.ecosystem == Ecosystem::PyPi)
-            .then(|| head_integrity_map.get(&crate::version::canonicalize_name(name)))
-            .flatten();
-        if let Some(expected_integ) = head_integrity_map.get(name).or(canon_alias) {
-            let matches_integ = expected_integ.split_whitespace().any(|expected_one| {
-                let expected_hex = expected_one.strip_prefix("sha256:").unwrap_or(expected_one);
-                checksum.value_hex.eq_ignore_ascii_case(expected_hex)
-            });
-
-            if !matches_integ {
-                verdict.findings.push(crate::verdict::Finding {
-                    rule_id: "R10_LOCKFILE_HASH_MISMATCH".into(),
-                    severity: VerdictBand::Block,
-                    title: format!("Lockfile hash mismatch for `{name}`"),
-                    description: format!(
-                        "Lockfile pinned `{expected_integ}`, but downloaded release has checksum `{}`",
-                        checksum.to_display()
-                    ),
-                });
-                verdict.band = VerdictBand::Block;
-                verdict.risk_score = verdict.risk_score.saturating_add(50);
-            }
-        }
-
-        max_band = update_max_band(max_band, verdict.band);
-
-        items.push(CiReviewItem {
+        candidates.push(Candidate {
             name: name.to_string(),
             old_version,
             new_version: new_version.to_string(),
             is_dev,
-            verdict,
         });
+    }
+
+    let items = evaluate_candidates(&candidates, ctx, store, policy, &head_integrity_map)?;
+
+    let mut max_band = VerdictBand::Low;
+    for item in &items {
+        max_band = update_max_band(max_band, item.verdict.band);
     }
 
     let fail_threshold = ctx
@@ -364,6 +340,149 @@ pub fn evaluate_lockfile_diff(
         passed,
         items,
     })
+}
+
+/// One package the CI lane owes a review, already filtered.
+struct Candidate {
+    name: String,
+    old_version: Option<String>,
+    new_version: String,
+    is_dev: bool,
+}
+
+/// Upper bound on review workers.
+///
+/// A lockfile lane is network-bound, so more workers is faster right up until
+/// the registry starts refusing connections. Eight covers a slow round trip
+/// several times over on a laptop and stays well inside what one client asks a
+/// registry to handle.
+const MAX_CI_REVIEW_WORKERS: usize = 8;
+
+fn evaluate_candidate(
+    candidate: &Candidate,
+    ctx: &CiContext<'_>,
+    store: &BaselineStore,
+    policy: &Policy,
+    head_integrity_map: &std::collections::HashMap<String, String>,
+) -> anyhow::Result<CiReviewItem> {
+    let name = candidate.name.as_str();
+    let new_version = candidate.new_version.as_str();
+
+    let mut rctx = crate::recursive::ReviewContext::new(policy, ctx.bases.clone());
+    let (mut verdict, _, checksum, _) =
+        evaluate_package(name, new_version, ctx.ecosystem, store, policy, &mut rctx)?;
+
+    // If lockfile declared a hash, verify it matches. The PEP 503
+    // alias lookup is PyPI-only: on npm/cargo `foo_bar` and `foo-bar`
+    // are distinct packages and must never share an integrity entry.
+    let canon_alias = (ctx.ecosystem == Ecosystem::PyPi)
+        .then(|| head_integrity_map.get(&crate::version::canonicalize_name(name)))
+        .flatten();
+    if let Some(expected_integ) = head_integrity_map.get(name).or(canon_alias) {
+        let matches_integ = expected_integ.split_whitespace().any(|expected_one| {
+            let expected_hex = expected_one.strip_prefix("sha256:").unwrap_or(expected_one);
+            checksum.value_hex.eq_ignore_ascii_case(expected_hex)
+        });
+
+        if !matches_integ {
+            verdict.findings.push(crate::verdict::Finding {
+                rule_id: "R10_LOCKFILE_HASH_MISMATCH".into(),
+                severity: VerdictBand::Block,
+                title: format!("Lockfile hash mismatch for `{name}`"),
+                description: format!(
+                    "Lockfile pinned `{expected_integ}`, but downloaded release has checksum `{}`",
+                    checksum.to_display()
+                ),
+            });
+            verdict.band = VerdictBand::Block;
+            verdict.risk_score = verdict.risk_score.saturating_add(50);
+        }
+    }
+
+    Ok(CiReviewItem {
+        name: candidate.name.clone(),
+        old_version: candidate.old_version.clone(),
+        new_version: candidate.new_version.clone(),
+        is_dev: candidate.is_dev,
+        verdict,
+    })
+}
+
+/// Review every candidate and return the items in candidate order.
+///
+/// Each worker gets its own `ReviewContext` and its own database handle, since
+/// a context holds `RefCell`s and a `rusqlite::Connection` is `Send` but not
+/// `Sync`. Neither can be shared, and a mutex over either would serialise the
+/// review rather than just the database. What the workers do share is the
+/// network, which is where this lane spends nearly all of its time: at the
+/// default cap of a hundred packages and a few hundred milliseconds of round
+/// trip apiece, the serial order was about a minute of mostly waiting.
+///
+/// The result is ordered by candidate index rather than by completion, so the
+/// report matches the serial one no matter which worker finished first.
+fn evaluate_candidates(
+    candidates: &[Candidate],
+    ctx: &CiContext<'_>,
+    store: &BaselineStore,
+    policy: &Policy,
+    head_integrity_map: &std::collections::HashMap<String, String>,
+) -> anyhow::Result<Vec<CiReviewItem>> {
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .clamp(1, MAX_CI_REVIEW_WORKERS)
+        .min(candidates.len());
+
+    if workers <= 1 {
+        return candidates
+            .iter()
+            .map(|c| evaluate_candidate(c, ctx, store, policy, head_integrity_map))
+            .collect();
+    }
+
+    let slots: Vec<Mutex<Option<anyhow::Result<CiReviewItem>>>> =
+        (0..candidates.len()).map(|_| Mutex::new(None)).collect();
+    let next = AtomicUsize::new(0);
+
+    // Opened here rather than inside a worker: a `rusqlite::Connection` is
+    // `Send` but not `Sync`, so it can be moved onto a worker thread but the
+    // shared reference it came from cannot be captured by one.
+    let worker_stores: Vec<BaselineStore> = (0..workers)
+        .map(|_| store.reopen())
+        .collect::<Result<_, _>>()?;
+
+    std::thread::scope(|scope| {
+        for worker_store in worker_stores {
+            let slots = &slots;
+            let next = &next;
+            scope.spawn(move || {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(candidate) = candidates.get(index) else {
+                        break;
+                    };
+                    let outcome = evaluate_candidate(
+                        candidate,
+                        ctx,
+                        &worker_store,
+                        policy,
+                        head_integrity_map,
+                    );
+                    *slots[index]
+                        .lock()
+                        .expect("slot written once, never panicked under") = Some(outcome);
+                }
+            });
+        }
+    });
+
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .expect("slot written once, never panicked under")
+                .expect("every index is claimed before the scope ends")
+        })
+        .collect()
 }
 
 /// Review the AUR CI file diff: every added or version-changed pkgbase gets
@@ -419,7 +538,6 @@ fn evaluate_aur_ci_diff(
             verdict,
         });
     }
-
     let fail_threshold = ctx
         .fail_on
         .unwrap_or_else(|| parse_band_str(&policy.ci.fail_on).unwrap_or(VerdictBand::High));
@@ -1536,6 +1654,180 @@ source = "path+file:///some/local/path"
         assert!(!report.items.iter().any(|i| i.name == "steady"));
         assert_eq!(report.unchanged_count, 1);
         assert_eq!(report.removed_count, 0);
+    }
+
+    /// CI output is diffed between runs, so the order of `items` is a
+    /// contract rather than an accident of scheduling. The first candidate's
+    /// packument is served after a deliberate delay and the rest answer
+    /// instantly, so a lane that emitted items as they finished would put
+    /// `aaa-slow` last. It must come first.
+    #[test]
+    fn parallel_reviews_still_report_in_candidate_order() {
+        use std::io::{Read, Write};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        fn npm_tgz(name: &str, version: &str) -> Vec<u8> {
+            use std::io::Write as _;
+            let manifest = format!(r#"{{"name":"{name}","version":"{version}"}}"#);
+            let mut tar_data = Vec::new();
+            {
+                let mut builder = tar::Builder::new(&mut tar_data);
+                let mut header = tar::Header::new_gnu();
+                header.set_size(manifest.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, "package/package.json", manifest.as_bytes())
+                    .unwrap();
+                builder.finish().unwrap();
+            }
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(&tar_data).unwrap();
+            encoder.finish().unwrap()
+        }
+
+        fn sri_sha512(bytes: &[u8]) -> String {
+            use base64::Engine as _;
+            use sha2::Digest as _;
+            let mut hasher = sha2::Sha512::new();
+            hasher.update(bytes);
+            format!(
+                "sha512-{}",
+                base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
+            )
+        }
+
+        const SLOW: &str = "aaa-slow";
+        const FAST: [&str; 4] = ["bbb-fast", "ccc-fast", "ddd-fast", "eee-fast"];
+        const SLOW_DELAY_MS: u64 = 700;
+
+        let mut names = vec![SLOW.to_string()];
+        names.extend(FAST.iter().map(|s| s.to_string()));
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base = format!("http://127.0.0.1:{port}");
+
+        let tgz: std::collections::HashMap<String, Vec<u8>> = names
+            .iter()
+            .map(|n| (n.clone(), npm_tgz(n, "1.0.0")))
+            .collect();
+        let packs: std::collections::HashMap<String, Vec<u8>> = names
+            .iter()
+            .map(|n| {
+                let body = format!(
+                    r#"{{"name":"{n}","dist-tags":{{"latest":"1.0.0"}},"versions":{{"1.0.0":{{"name":"{n}","version":"1.0.0","dist":{{"tarball":"{base}/{n}-1.0.0.tgz","integrity":"{}"}}}}}}}}"#,
+                    sri_sha512(&tgz[n])
+                );
+                (n.clone(), body.into_bytes())
+            })
+            .collect();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_srv = Arc::clone(&stop);
+        let packs_srv = packs.clone();
+        let tgz_srv = tgz.clone();
+        let handle = std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            while !stop_srv.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buf = [0u8; 4096];
+                        let n = stream.read(&mut buf).unwrap_or(0);
+                        let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                        let path = req
+                            .lines()
+                            .next()
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .unwrap_or("/");
+                        let body: Vec<u8> = if let Some(name) = path.strip_prefix('/') {
+                            if let Some(rest) = name.strip_suffix("-1.0.0.tgz") {
+                                tgz_srv.get(rest).cloned().unwrap_or_default()
+                            } else {
+                                if name == SLOW {
+                                    std::thread::sleep(std::time::Duration::from_millis(
+                                        SLOW_DELAY_MS,
+                                    ));
+                                }
+                                packs_srv.get(name).cloned().unwrap_or_default()
+                            }
+                        } else {
+                            Vec::new()
+                        };
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(head.as_bytes());
+                        let _ = stream.write_all(&body);
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                }
+            }
+        });
+
+        let mut base_packages = serde_json::Map::new();
+        base_packages.insert(
+            "".into(),
+            serde_json::json!({"name": "app", "version": "1.0.0"}),
+        );
+        for n in &names {
+            base_packages.insert(
+                format!("node_modules/{n}"),
+                serde_json::json!({"version": "0.9.0"}),
+            );
+        }
+        let base_lock = serde_json::json!({
+            "lockfileVersion": 3,
+            "packages": base_packages
+        })
+        .to_string();
+
+        let mut head_packages = serde_json::Map::new();
+        head_packages.insert(
+            "".into(),
+            serde_json::json!({"name": "app", "version": "1.0.0"}),
+        );
+        for n in &names {
+            head_packages.insert(
+                format!("node_modules/{n}"),
+                serde_json::json!({"version": "1.0.0"}),
+            );
+        }
+        let head_lock = serde_json::json!({
+            "lockfileVersion": 3,
+            "packages": head_packages
+        })
+        .to_string();
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&dir.path().join("blueline.db")).unwrap();
+        let mut policy = Policy::default();
+        policy.policy.check_advisories = false;
+        let bases = test_bases(&base);
+        let ctx = CiContext {
+            base_ref: "origin/main",
+            lockfile_path: "package-lock.json",
+            bases: &bases,
+            fail_on: Some(VerdictBand::Block),
+            ecosystem: crate::registry::Ecosystem::Npm,
+        };
+
+        let result = evaluate_lockfile_diff(&base_lock, &head_lock, &ctx, &store, &policy);
+        stop.store(true, Ordering::SeqCst);
+        let _ = handle.join();
+        let report = result.unwrap();
+
+        assert_eq!(report.items.len(), names.len(), "one item per candidate");
+        let got: Vec<&str> = report.items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(
+            got, names,
+            "items must follow candidate order, not finish order"
+        );
     }
 
     #[test]
