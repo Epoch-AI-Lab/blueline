@@ -163,6 +163,13 @@ impl AdvisoryResolution {
 
 /// An OSV query that is already running. Dropping one unjoined is safe: the
 /// worker finishes and its answer is discarded with it.
+///
+/// On an early-exit path between the resolve call and the join — a refused
+/// tarball fetch, a failed extraction, a missing checksum — a `Pending` is
+/// dropped unjoined, which spends the round trip and discards both the answer
+/// and the cache write it would have made. That is accepted: those paths are
+/// already erroring out of the review, and re-querying on the next run is
+/// cheaper than threading a join through every early exit.
 pub struct PendingAdvisory {
     worker: JoinHandle<OsvOutcome>,
     stale_fallback: Option<AdvisoryReport>,

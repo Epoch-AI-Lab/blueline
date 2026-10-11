@@ -10,6 +10,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 Targeted at 0.4.0. This release is a behaviour change for anyone who set
 `require_provenance`: see the entry below before upgrading.
 
+### Changed
+
+- **A review no longer waits for the advisory lookup to finish before it
+  starts working.** `fetch_advisories` ran to completion inside the review,
+  after both tarballs had been fetched and extracted, and on a small package
+  the OSV round trip was about three quarters of the wall clock. Resolution
+  is now split: `resolve_advisories` returns `AdvisoryResolution::Ready`
+  whenever the answer needs no network — a recall-index hit, advisories
+  switched off in policy, a warm cache, or an ecosystem with no coverage —
+  and `AdvisoryResolution::Pending` with the query already running otherwise.
+  The caller fetches, extracts and diffs while the network works, and
+  collects the answer with `PendingAdvisory::join` at scoring time.
+
+  **Breaking for embedders:** `pub fn fetch_advisories` is gone, replaced by
+  `resolve_advisories` returning the `AdvisoryResolution` enum. There are no
+  in-tree callers outside `advisory.rs`, but `pub mod advisory` is
+  re-exported, so a downstream embedder that called it will need the new
+  shape.
+
+  Every security ordering is unchanged. A network error still surfaces as a
+  HIGH finding and an `unverified` report the operator explicitly accepted
+  still surfaces as a MEDIUM one; `fail_closed_network` is still checked
+  before any stale cached report is served; a cache hit still skips the
+  network; and a recall-index hit still blocks regardless of the OSV path.
+  The cache write moved into `join`, so the worker thread never needs the
+  SQLite connection, which is neither `Sync` nor worth reopening.
+
+- **The `ci` lane reviews packages in parallel.** The evaluation loop was a
+  plain sequential `for`, and at the default cap of 100 packages with a few
+  hundred milliseconds of round trip apiece that was about a minute of
+  mostly waiting on a runner whose advisory cache is always cold. Each
+  package now gets its own worker, capped at eight, each with its own
+  `ReviewContext` and its own database handle — neither is shareable across
+  threads. Findings are emitted in **candidate order rather than completion
+  order**, because CI output is diffed between runs, and the evaluation
+  budget is still checked before any work starts.
+
+  Two behavioural notes. A failure in one package no longer stops the
+  remaining packages from being reviewed: the serial lane aborted at the
+  first error, and the parallel one drains every candidate before reporting,
+  so a failed run now writes `record_verified` and advisory-cache entries
+  for packages the serial lane never reached. Both writes are evidence-only
+  (`clean = 0`, idempotent), so this widens what a failed run mutates in the
+  trust anchor without changing any verdict. And `evaluate_aur_ci_diff`, the
+  AUR half of the same lane, is **still serial**: AUR entries are capped at
+  4096 and each does a `git archive`, so the worst case is real but
+  unaddressed here.
+
+- **Each file is read once instead of three times.** `scan_tree` used
+  `fs::read` per file and then hashed and classified the whole buffer; the
+  three questions never needed the buffer, since the size is a running
+  count, the digest is incremental by construction, and classification is a
+  NUL scan plus a UTF-8 check. The scan now streams a 64 KiB window, so peak
+  memory is bounded by the window rather than by the largest file in the
+  package. The digest is unchanged — it decides whether a file is compared
+  at all — and every byte still reaches the hasher; a file ending
+  mid-code-point now classifies Binary rather than Text, because a UTF-8
+  sequence still incomplete at EOF has no bytes left to complete it with.
+
+- **The dev profile emits line tables rather than full DWARF**, and emits
+  none for dependencies. `Cargo.toml` previously set only `[profile.release]`,
+  so the dev profile was the cargo default: `opt-level = 0` with full
+  debuginfo and unbounded incremental compilation, which at this crate's
+  size produced a 100 MB test binary and a `target/debug` measured in
+  gigabytes across a hundred stale session caches. `Cargo.lock` does not move.
+
+### Added
+
+- `PERF.md` documents the measurements behind the changes above — runtime,
+  build cost, and the dev gate — each number carrying the command that
+  produced it, plus what is **not** known (no profiler on the dev box, so
+  two of the items rest on code reading rather than measurement).
+  `scripts/perf_harness.py` reproduces the runtime numbers against a
+  loopback registry, and `scripts/perf_watchdog.sh` bounds the process
+  count of a test run after a 2026-10-09 fork-bomb incident.
+
 ### Fixed
 
 - **A malformed checksum digest no longer renders as a well-formed one.**

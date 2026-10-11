@@ -720,6 +720,34 @@ mod tests {
     }
 
     #[test]
+    fn the_windowed_digest_equals_the_whole_file_digest() {
+        // The hash decides whether a file is compared at all
+        // (`if base_meta.hash != target_meta.hash`), so a digest that covered
+        // fewer bytes than it read would make base and target agree on a
+        // changed file and silently skip the comparison. Every byte must
+        // reach the hasher, so pin the digest against the whole-buffer
+        // answer across sizes that cross the window boundary at every offset
+        // of one, plus a zero-byte file and an exact multiple of the window.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("digest.bin");
+
+        let mut sizes = vec![0usize];
+        for base in [SCAN_CHUNK_BYTES - 1, SCAN_CHUNK_BYTES, SCAN_CHUNK_BYTES + 1] {
+            sizes.extend([base, base * 2, base * 2 + 1]);
+        }
+        for size in sizes {
+            let bytes: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            fs::write(&path, &bytes).unwrap();
+            let scanned = scan_file(&path).unwrap();
+            let expected: [u8; 32] = Sha256::digest(&bytes).into();
+            assert_eq!(
+                scanned.hash, expected,
+                "digest differs from the whole-buffer hash at {size} bytes"
+            );
+        }
+    }
+
+    #[test]
     fn a_text_classified_file_that_does_not_decode_is_refused_not_coerced() {
         // scan_tree classifies invalid UTF-8 as Binary, so this is the
         // meta-vs-bytes disagreement path: a file stamped Text whose bytes

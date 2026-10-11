@@ -1,8 +1,10 @@
 # Blueline performance report
 
-Status: measured 2026-10-11 against v0.3.1 (`2d7864e`). Nothing here has been
-fixed. Every number below was measured on the dev box, and every one carries
-the command that produced it or the file and line it came from.
+Status: measured 2026-10-11 against v0.3.1 (`2d7864e`), a tree that predates
+this file. Items 1, 2 and 4 of section 7 are **implemented** on the
+`perf/overlap-and-window` branch; the rest are not. Every number below was
+measured on the dev box, and every one carries the command that produced it or
+the file and line it came from.
 
 Read this before starting work. Section 8 lists what is *not* known, and two of
 the five items in section 7 rest on code reading rather than measurement.
@@ -195,49 +197,63 @@ about 4.8 s plus 2 s of pure sleeping, all inside `#[cfg(test)]`.
 
 Ordered by conviction, not by size of win.
 
-### 1. Overlap the OSV query with the tarball fetch
+### 1. Overlap the OSV query with the tarball fetch — IMPLEMENTED
 
-`fetch_advisories` is called at `src/review.rs:294`, after both tarballs are
+`fetch_advisories` was called at `src/review.rs:294`, after both tarballs were
 already extracted. The query takes about 560 ms and depends on none of that.
+Resolution is now split into `resolve_advisories`, which returns `Ready`
+without touching the network and `Pending` with the query already running,
+and `PendingAdvisory::join`, called at scoring time. The security orderings
+the item listed are all preserved and pinned by tests.
 
 - Target: 717 ms wall becomes about 175 ms on a 200-file package, CPU unchanged
   at 45 ms.
-- The query must still be joined before the verdict is scored.
-- A cache hit must skip the network exactly as it does now.
-- `fail_closed_network` behaviour on a network error must be unchanged.
-- Needs a test that fails if the advisory result is used before the request
-  completes.
 
-Smallest diff on this list, no behaviour change.
+### 2. Parallelise the `ci.rs` evaluation loop — IMPLEMENTED (npm/cargo half)
 
-### 2. Parallelise the `ci.rs` evaluation loop
-
-`src/ci.rs:296` and `src/ci.rs:409` call `evaluate_package` one package at a
-time. 100 packages at 560 ms each is about 56 s of network waiting.
+`src/ci.rs:296` and `src/ci.rs:409` called `evaluate_package` one package at a
+time. 100 packages at 560 ms each is about 56 s of network waiting. The
+lockfile lane now runs up to eight workers, each with its own `ReviewContext`
+and its own database handle, results ordered by candidate index. **The AUR
+half (`evaluate_aur_ci_diff`) is still serial** and is not covered by this
+item's implementation.
 
 - The store is already opened in WAL mode with a 5 s busy timeout at
   `src/store.rs:389`, so concurrent writers have a path.
-- Findings must be emitted in a **deterministic order** regardless of completion
-  order, because CI output is diffed between runs.
-- The per-package `ReviewContext` built at `src/ci.rs:309` must not be shared
-  across threads.
-- The budget check must still refuse before any work starts, not after.
+- Findings are emitted in candidate order regardless of completion order,
+  because CI output is diffed between runs.
+- Each worker gets its own `ReviewContext`, which holds `RefCell`s.
+- The budget check still refuses before any work starts, not after.
+- Behaviour change: a failure in one package no longer stops the rest; a
+  failed run now records `record_verified` and advisory-cache entries for
+  packages the serial lane never reached.
 
-### 3. Cap the incremental cache
+### 3. Cap the incremental cache — PARTIALLY IMPLEMENTED
 
-Add a `[profile.dev]` to `Cargo.toml` so old session caches are evicted rather
-than accumulating. Reclaims most of the 1.9 GB.
+`[profile.dev]`/`[profile.test]` now set `debug = "line-tables-only"` and emit
+no debug info for dependencies. That **shrinks each of the 101 caches** and the
+100 MB test binary; it does **not** stop them accumulating. Unbounded
+incremental retention is what accumulates them, and nothing in this PR sets
+`incremental = false` or bounds the cache count — cargo has no such knob, so a
+real fix is periodic eviction (`cargo clean` in a hook, or a size-capped
+`CARGO_TARGET_DIR`). Do not read the current diff as delivering this item.
 
 - Do not touch `[profile.release]`: `lto` and `strip` stay.
-- CI builds with `--locked`, so this must not move `Cargo.lock`.
+- CI builds with `--locked`, so this must not move `Cargo.lock` — it does not.
 
-### 4. Stop reading every file twice
+### 4. Stop reading every file twice — IMPLEMENTED
+
+The scan half is done: `scan_tree` streams each file once through a 64 KiB
+window for the hash, the NUL scan and the UTF-8 check, instead of `fs::read`
+plus two passes. Peak memory is bounded by the window, not by the largest
+file. The diff half still reads both sides whole in `diff_single_file`,
+because `similar::TextDiff` needs the strings.
 
 ```
-scan_tree()       src/diff.rs:59   target tree, fs::read per file
-scan_tree()       src/diff.rs:72   base tree,   fs::read per file
-diff_single_file  src/diff.rs:365  fs::read(old)
-diff_single_file  src/diff.rs:369  fs::read(new)
+scan_tree()       src/diff.rs:59   target tree, was fs::read per file
+scan_tree()       src/diff.rs:72   base tree,   was fs::read per file
+diff_single_file  src/diff.rs:365  fs::read(old)   — unchanged
+diff_single_file  src/diff.rs:369  fs::read(new)   — unchanged
 ```
 
 - The SHA-256 of file contents must not change, because it decides whether a
@@ -249,16 +265,17 @@ diff_single_file  src/diff.rs:369  fs::read(new)
 
 **This one is read from the code, not isolated by a measurement.**
 
-### 5. Tighten the sandbox poll
+### 5. Tighten the sandbox poll — NOT APPLICABLE TO CURRENT MAIN
 
 `wait_with_timeout` at `src/sandbox.rs:1120` polls `try_wait` on a 20 ms sleep,
-twice per review for the target and baseline extractions. Worst case 40 ms of
-sleep after the child has already exited, which is up to 23% of the 174 ms
-no-advisories run.
+twice per review for the target and baseline extractions. **`src/sandbox.rs`
+does not exist on current `main`**: it was added after `2d7864e` and removed
+again by the dead-code cleanup, and extraction is in-process on `extract.rs`
+now. This item describes a file that is gone; the 174 ms no-advisories figure
+it is measured against came from a tree that had it. Re-measure before acting.
 
 - Keep the `CHILD_TIMEOUT` bound.
-- Keep the comment at `src/sandbox.rs:1115` accurate, including why `try_wait`
-  is used at all.
+- Keep the comment explaining why `try_wait` is used at all.
 - Latency only. No reply parsing, exit status handling or error path may move.
 
 **Also read from the code, not isolated by a measurement.**
@@ -342,4 +359,5 @@ scripts/perf_watchdog.sh 180 40 cargo test --all-targets --locked
 
 It polls the process-group size every second, aborts at the cap or the wall
 limit, and reports the peak. Use it rather than a bare `cargo test` when
-experimenting near `sandbox.rs`.
+experimenting near process-spawning code (the `git archive` path in the AUR
+registry adapter is the one that actually forks here).

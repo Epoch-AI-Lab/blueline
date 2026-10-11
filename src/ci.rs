@@ -356,6 +356,12 @@ struct Candidate {
 /// the registry starts refusing connections. Eight covers a slow round trip
 /// several times over on a laptop and stays well inside what one client asks a
 /// registry to handle.
+///
+/// There is no rate limiting or jitter, so a burst lands as-is: up to eight
+/// concurrent packument and tarball fetches, a few dozen requests in flight.
+/// That is unremarkable against npm or crates.io and a spike against a small
+/// self-hosted mirror, which `--registry` permits. Lower the cap before
+/// pointing this lane at one.
 const MAX_CI_REVIEW_WORKERS: usize = 8;
 
 fn evaluate_candidate(
@@ -480,8 +486,21 @@ fn evaluate_candidates(
         .map(|slot| {
             slot.into_inner()
                 .expect("slot written once, never panicked under")
+                // Every index below `candidates.len()` is claimed exactly once:
+                // `next` only ever hands out indices the `get` above resolves,
+                // each worker claims one per loop iteration, and the scope
+                // joins every worker before this line runs. The claim is
+                // load-bearing, so it is asserted rather than silently skipped.
                 .expect("every index is claimed before the scope ends")
         })
+        // All candidates are drained, including after a failure, where the
+        // serial lane used `?` to abort at the first error. That is a
+        // deliberate decision, not an artifact of the threading: the store
+        // writes a failing package still makes (`record_verified`, the
+        // advisory-cache fill) are evidence-only — `clean = 0` and idempotent
+        // — so continuing widens what a failed run mutates in the trust
+        // anchor without changing any verdict, and one package's transport
+        // failure does not invalidate the other ninety-nine reviews.
         .collect()
 }
 
@@ -489,6 +508,12 @@ fn evaluate_candidates(
 /// a full `evaluate_package` review. Removed entries need no review.
 /// The stored integrity for each item is the sha256 of the pinned commit's
 /// `git archive` bytes, so the audit trail stays bound to the commit hash.
+///
+/// This half of the lane is still serial, unlike the lockfile half: AUR
+/// entries are capped at 4096 and each review shells out to `git archive`,
+/// so the worst case is real. Parallelising it is the same shape as
+/// `evaluate_candidates`, minus the registry round trips that make the
+/// lockfile lane network-bound.
 fn evaluate_aur_ci_diff(
     base_content: &str,
     head_content: &str,
