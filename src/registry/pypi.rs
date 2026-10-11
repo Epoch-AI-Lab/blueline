@@ -407,21 +407,16 @@ struct SimpleMeta {
     #[serde(default)]
     next: Option<String>,
 }
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct SimpleFile {
     filename: String,
     url: String,
     #[serde(default)]
     hashes: BTreeMap<String, String>,
-    #[serde(default)]
-    size: Option<u64>,
     #[serde(default, rename = "upload-time")]
     upload_time: Option<String>,
     #[serde(default)]
     yanked: YankedField,
-    #[serde(default)]
-    provenance: Option<String>,
 }
 #[derive(Debug, Deserialize, Default)]
 #[serde(untagged)]
@@ -805,10 +800,8 @@ mod tests {
             filename: n.into(),
             url: "https://e.com/a.whl".into(),
             hashes: BTreeMap::new(),
-            size: None,
             upload_time: None,
             yanked: YankedField::NotYanked,
-            provenance: None,
         };
         let a = mk("pkg-1.0-cp311-cp311-linux_x86_64.whl");
         let b = mk("pkg-1.0-py3-none-any.whl");

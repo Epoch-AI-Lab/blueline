@@ -54,9 +54,14 @@ Separately, `is_executable_extension` is a platform-independent 11-entry list
   `base_iter.next()` / `target_iter.next()` immediately after a `peek()`
   returned `Some`, with `#[allow(clippy::unwrap_used)]` and a comment. Do not
   "clean them up"; and do not add more elsewhere.
-- **`diff_single_file`'s `from_utf8(...).unwrap_or("")` means a misclassified
-  non-UTF-8 file diffs as "everything deleted."** It is unreachable in practice
-  because `classify_bytes` already routed it to `Binary`.
+- **A file stamped `Text` whose bytes do not decode is refused, not coerced.**
+  `diff_single_file` used to run `from_utf8(...).unwrap_or("")`, so a
+  misclassified non-UTF-8 file diffed as "everything deleted" (or "everything
+  added" on the other side) and scored accordingly. It is unreachable through
+  `compute_delta` because `classify_bytes` already routed it to `Binary`, so
+  the coercion was defense that could only ever answer wrong: both sides now
+  fail the review with `BluelineError::Extraction` naming the path and side.
+  Test `a_text_classified_file_that_does_not_decode_is_refused_not_coerced`.
 - **`collect_all_dependencies` uses `or_insert`, so `dependencies` shadows
   `optionalDependencies` and `peerDependencies`.** A peer-range flip on an
   existing dep is invisible. Switching to `insert` would make it a *modified*
