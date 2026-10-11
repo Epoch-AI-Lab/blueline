@@ -325,7 +325,10 @@ fn sparse_index_path(canonical: &str) -> Result<String, BluelineError> {
     Ok(path)
 }
 
-/// Lowercase the crate name, matching crates.io index paths.
+/// Lowercase the crate name, matching crates.io index paths. Hyphen and
+/// underscore spellings are deliberately NOT folded: a configured index or
+/// mirror may genuinely serve both, and fetching the other spelling's bytes
+/// for a request is worse than refusing the one that was asked for.
 pub fn canonical_crate_name(name: &str) -> String {
     name.to_ascii_lowercase()
 }
@@ -478,6 +481,13 @@ mod tests {
         assert_eq!(canonical_crate_name("Serde_JSON"), "serde_json");
         assert_eq!(canonical_crate_name("tokio"), "tokio");
         assert_eq!(canonical_crate_name("MiXeD_CaSe"), "mixed_case");
+        // Hyphen and underscore spellings stay distinct on purpose: the real
+        // crates.io index only stores the folded file, but a configured
+        // mirror may serve both, and answering one spelling with the other's
+        // bytes is worse than refusing. `lockfile_diff_keeps_pypi_alias_
+        // off_cargo_pins` pins the same invariant from the ci lane.
+        assert_eq!(canonical_crate_name("Serde-JSON"), "serde-json");
+        assert_eq!(canonical_crate_name("rocket-db-pools"), "rocket-db-pools");
     }
 
     #[test]

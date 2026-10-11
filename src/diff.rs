@@ -370,8 +370,20 @@ fn diff_single_file(
         None => Vec::new(),
     };
 
-    let old_str = std::str::from_utf8(&old_bytes).unwrap_or("");
-    let new_str = std::str::from_utf8(&new_bytes).unwrap_or("");
+    let old_str = std::str::from_utf8(&old_bytes).map_err(|e| {
+        BluelineError::Extraction(format!(
+            "diffing {rel_path}: baseline bytes are not UTF-8 ({e}); a text-classified \
+             file that does not decode cannot be line-diffed, and coercing it to \
+             an empty string scored a real change as all-add or all-delete"
+        ))
+    })?;
+    let new_str = std::str::from_utf8(&new_bytes).map_err(|e| {
+        BluelineError::Extraction(format!(
+            "diffing {rel_path}: payload bytes are not UTF-8 ({e}); a text-classified \
+             file that does not decode cannot be line-diffed, and coercing it to \
+             an empty string scored a real change as all-add or all-delete"
+        ))
+    })?;
 
     let diff = similar::TextDiff::from_lines(old_str, new_str);
     let mut lines_added = 0;
@@ -539,6 +551,39 @@ mod tests {
         let mut data = vec![b'a'; 10000];
         data[9000] = 0;
         assert_eq!(classify_bytes(&data), FileKind::Binary);
+    }
+
+    #[test]
+    fn a_text_classified_file_that_does_not_decode_is_refused_not_coerced() {
+        // scan_tree classifies invalid UTF-8 as Binary, so this is the
+        // meta-vs-bytes disagreement path: a file stamped Text whose bytes
+        // do not decode. Coercing the side to "" made a real change read
+        // as all-add or all-delete, which silently mis-scores the verdict.
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = b"console.log('install')\n".to_vec();
+        bytes.push(0xff); // lone continuation byte: not valid UTF-8
+        let payload = dir.path().join("index.js");
+        fs::write(&payload, &bytes).unwrap();
+        let rel = Path::new("index.js");
+        let meta = DiskFileMeta {
+            hash: [0u8; 32],
+            kind: FileKind::Text,
+            is_executable: false,
+        };
+
+        let err = diff_single_file(None, Some(&payload), rel, &meta).unwrap_err();
+        assert!(
+            err.to_string().contains("payload bytes are not UTF-8"),
+            "{err}"
+        );
+
+        let baseline = dir.path().join("baseline.js");
+        fs::write(&baseline, &bytes).unwrap();
+        let err = diff_single_file(Some(&baseline), Some(&payload), rel, &meta).unwrap_err();
+        assert!(
+            err.to_string().contains("baseline bytes are not UTF-8"),
+            "{err}"
+        );
     }
 
     #[test]

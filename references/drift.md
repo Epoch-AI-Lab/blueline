@@ -18,12 +18,12 @@ Severity is this file's own judgement, not the project's.
 | 8 | ~~SSRF guard fails **open** on DNS failure, port 443 hard-coded~~ **resolved** — `ValidatingResolver` is the guard now, not the pre-flight check | High — see below |
 | 11 | ~~PyPI `METADATA` parse fails **open**~~ **resolved** — every unreadable or undetermined-metadata case is a refusal | High — see below |
 | 3 | Integrity mismatch surfaces as `Err` + exit 1, not `Verdict::Block` | Medium — a consumer keying on band never sees BLOCK |
-| 4 | No cargo `-`/`_` name canonicalization, contrary to `CHANGELOG` 0.3.0 | Medium — `serde_json` and `serde-json` are distinct crates |
-| 10 | `diff_single_file` coerces invalid UTF-8 to `""`, so a real change reads as all-add or all-delete | Medium — undocumented, silently mis-scores |
+| 4 | ~~No cargo `-`/`_` name canonicalization, contrary to `CHANGELOG` 0.3.0~~ — **resolved as a doc correction:** the claim was wrong; the distinctness is deliberate and fails closed | Medium — see below |
+| 10 | ~~`diff_single_file` coerces invalid UTF-8 to `""`, so a real change reads as all-add or all-delete~~ — **resolved:** both sides are refused with a naming error | Medium — was silent mis-scoring; see below |
 | 12 | ~~`store.rs` discards the `0o600` pre-create error (`let _ =`)~~ **resolved** — all three discarded errors propagate. See below | Low |
 | 9 | ~~`hex_to_bytes` uses `.unwrap_or(0)`, mapping invalid hex to byte `0`~~ **resolved** — the helper is fallible and `to_sri` returns `Result` | Low |
 | 5 | ~~`registry/mod.rs` doc comments are stale~~ **resolved** — both were deleted; the four adapters are all real. See below | Low |
-| 6 | Manager count is six in `CHANGELOG` 0.3.1, eleven in `ARCHITECTURE.md` §5; `--help` says eleven | Low — `--help` is authoritative |
+| 6 | ~~Manager count is six in `CHANGELOG` 0.3.1, eleven in `ARCHITECTURE.md` §5; `--help` says eleven~~ — **resolved:** the 0.3.1 entry now says eleven, matching `--help` and `SHIM_MANAGERS` | Low — `--help` was authoritative |
 | 7 | ~~Dead code: `Policy::is_maintainer_blocked`, `blocklist.maintainers`, `allowlist.packages[].max_risk` / `.integrity`~~ **resolved** — the three policy keys are now refused at load. Still dead: `BaselineStore::clear_advisory_cache` | Low — test-only helper, `#[allow(dead_code)]` |
 
 ## Lane verification basis
@@ -37,7 +37,7 @@ the prose docs.
 | [verdict](features/verdict.md) | `src/verdict.rs` full read |
 | [error](features/error.md) | `src/error.rs` full read + cross-referenced callers |
 | [heuristic](features/heuristic.md) | `src/heuristic.rs` production + all 52 test names |
-| [diff](features/diff.md) | `src/diff.rs` production + all 7 test names |
+| [diff](features/diff.md) | `src/diff.rs` production + all 8 test names |
 | [render](features/render.md) | `src/render.rs` production + all 13 test names + 2 proptests |
 | [version](features/version.md) | `src/version.rs` production + all 23 test names |
 | [manifest](features/manifest.md) | `src/manifest.rs` production + all 32 test names |
@@ -57,21 +57,29 @@ the prose docs.
 
 Each finding is cited in its lane file with the exact source location.
 
-1. **~~No Landlock/seccomp/capability-drop sandbox and no `cap-std`~~ —
-   resolved.** §1 said "planned, not implemented" and named the parser-level
-   budget as the real bound for the whole life of this entry, and the fix was
-   always going to be code rather than wording. The code landed: extraction now
-   runs inside a Landlock-restricted child (`src/sandbox.rs`), the ruleset
-   grants write access only to the private temp dir, and the ABI ladder
-   (V5 → V3 → V1) keeps `Truncate` containment on kernels too old for V5.
-   A confinement failure after anything narrowed is `Unusable` — never a
-   fallback — so a partly applied domain cannot turn into an unconfined
-   extraction. `README.md`, D4 and §1 now describe the layer that exists.
-   seccomp and `cap-std` are still absent; they are no longer the missing
-   capability this entry tracked, because Landlock is the confinement that
-   ships. Platforms and kernels without it fall back to the parser-level
-   budget with a `P05_SANDBOX_UNAVAILABLE` disclosure, or refuse outright
-   under `[policy] require_sandbox = true`. See [sandbox](features/sandbox.md).
+1. **No Landlock/seccomp/capability-drop sandbox and no `cap-std`. Still
+   unfixed, and this entry stays live.** §1 has said "planned, not implemented"
+   and named the parser-level budget as the real bound, but `README.md` still
+   called the temp dir "an isolated sandbox", D4 still read "Read-only sandbox
+   extraction", and the §1 header rule and §1 diagram both said "sandbox". Those
+   are now corrected, so the *documentation* no longer claims a capability the
+   code lacks — which is the half of this that prose could fix.
+
+   The half prose could not fix is the missing capability itself, and it is the
+   half that matters. What bounds a hostile archive today is
+   `decompressed_stream_cap` plus the three `ExtractionLimits` fields, enforced
+   on the declared size *and* on the inflated stream. There is no OS-level
+   confinement behind that, so the guarantee a reader takes from the word
+   "sandbox" does not exist. Closing this means adding a confinement mechanism
+   (Landlock on Linux, `cap-std`, or seccomp), which is a dependency decision
+   and therefore not something to do silently. See [extract](features/extract.md)
+   for what the bounds actually are.
+
+   One more prose-level claim was corrected while the capability was still
+   absent: the 0.3.0 entry described `blueline install` as shipping "sandboxed
+   extraction". It never did, and the entry now says fail-closed script
+   execution and points here, so the history does not assert the capability
+   either. Entry stays **High, unfixed**; the fix is code.
 2. **The npm registry signature is read for presence and never verified. Partly
    resolved; the verification gap itself is untouched.** `release_signatures`
    still returns the block as raw JSON, nothing compares the bytes to it, and
@@ -95,19 +103,40 @@ Each finding is cited in its lane file with the exact source location.
 3. **Integrity mismatch produces an `Err`, not `Verdict::Block`.** A CI report
    contains an error and exit 1, not a BLOCK verdict. See
    [extract](features/extract.md).
-4. **No cargo `-`/`_` canonicalization.** `canonical_crate_name` only lowercases,
-   so `serde_json` and `serde-json` are distinct crates — contrary to CHANGELOG
-   0.3.0. See [registry](features/registry.md).
+4. **~~No cargo `-`/`_` canonicalization, contrary to CHANGELOG 0.3.0~~ —
+   resolved as a doc correction; the code stance was right and stays.**
+   `canonical_crate_name` only lowercases, so `serde_json` and `serde-json`
+   were distinct crates — which CHANGELOG 0.3.0 claimed was not the case. The
+   claim was wrong about this tree, and it is now corrected. The code is right
+   to stay as it is, for two reasons that survived checking the claim against
+   the live registry:
+
+   - The real crates.io index does store only the folded file
+     (`index.crates.io/se/rd/serde_json` is 200; `/se/rd/serde-json` is 404;
+     `static.crates.io/crates/rocket-db-pools/0.2.0/download` is 403 where
+     `/rocket_db_pools/` is 200), so a hyphen-spelled review of a crates.io
+     crate fails closed at the index fetch today. That is a named, loud
+     refusal, not a wrong answer.
+   - This tool is not restricted to crates.io: `--index` and the `dl` in
+     `config.json` point at whatever registry is configured, and a mirror may
+     genuinely serve both spellings. Folding would answer one spelling with
+     the other's bytes — the ci lane pins that invariant from its side
+     (`lockfile_diff_keeps_pypi_alias_off_cargo_pins`).
+
+   The ergonomic cost (a hyphen-spelled crates.io request refuses) is a
+   judgement call for the project, not a defect: the failure is closed and
+   names the package. See [registry](features/registry.md).
 5. **~~`registry/mod.rs` doc comments were stale~~ — resolved.** Two comments
    claimed npm was the only wired adapter ("npm is fully wired; cargo, PyPI,
    and AUR adapters build on these seams in later PRs", and "npm is the only
    full impl for now") while `NpmRegistry`, `CratesIoRegistry`, `PyPIRegistry`,
    and `AurRegistry` all implement the trait. Both comments are deleted.
-6. **CHANGELOG 0.3.1 says "all six managers are reviewed through one grammar"
-   and "eleven scanned managers" in ARCHITECTURE.md §5 — the CLI enumerates
-   eleven** (`npm npx pnpm yarn bun bunx pip pip3 cargo yay paru`) while the
-   0.3.1 entry lists six. Both counts appear in the project's own docs; the
-   `--help` text is authoritative and says eleven.
+6. **~~CHANGELOG 0.3.1 says "all six managers are reviewed through one grammar"~~
+   — resolved.** "eleven scanned managers" in ARCHITECTURE.md §5 and the CLI's
+   eleven (`npm npx pnpm yarn bun bunx pip pip3 cargo yay paru`, the same list
+   as `SHIM_MANAGERS`) were right; the 0.3.1 entry listed six. Both counts
+   appeared in the project's own docs and `--help` was authoritative, so the
+   entry now says eleven.
 7. **~~`BaselineStore::clear_advisory_cache` and
    `BaselineResolution::display_summary` are dead~~ — `display_summary` is
    deleted; `impl BaselineResolution` carries only `package()`. The one that
@@ -146,8 +175,17 @@ Each finding is cited in its lane file with the exact source location.
    `to_sri`, so an undecodable digest is a refusal that names the offending
    input. Tests `a_malformed_digest_fails_loud_instead_of_zeroing` and
    `a_well_formed_digest_still_renders`. See [registry](features/registry.md).
-10. **`diff_single_file` silently converts invalid UTF-8 to `""`**, so a real
-    change reads as all-add or all-delete. `ambiguous`, not documented. See
+10. **~~`diff_single_file` silently converts invalid UTF-8 to `""`~~ —
+    resolved.** A real change read as all-add or all-delete, because one side
+    decoded to the empty string and every line then counted as inserted or
+    deleted. `diff_single_file` refuses with `BluelineError::Extraction` naming
+    the path and the side. The path is unreachable through `compute_delta`
+    (`classify_bytes` routes non-UTF-8 to `Binary` and `diff_single_file`
+    returns early for non-text), so this only ever fired on a
+    classification-vs-bytes disagreement — which is exactly the state a
+    coercion cannot answer correctly. Test
+    `a_text_classified_file_that_does_not_decode_is_refused_not_coerced`,
+    verified failing on the pre-fix coercion. See
     [diff](features/diff.md).
 11. **~~PyPI `METADATA` parsing fails OPEN~~ — resolved.** The old
     `if let Ok(raw) = read_to_string(root.join("METADATA"))` is gone. A PyPI

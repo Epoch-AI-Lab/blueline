@@ -1556,6 +1556,46 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
 - `references/` link integrity: `error.md` and `wheel_extract.md` existed but
   were unreachable from the map index.
 
+### Fixed
+
+- **A file stamped text whose bytes do not decode no longer diffs as "everything
+  deleted".** `diff_single_file` coerced either side's invalid UTF-8 to `""`,
+  so a real change scored as all-add or all-delete depending on which side it
+  was on. Both sides are refused now, with an error naming the path and the
+  side. The path is unreachable through `compute_delta` — `classify_bytes`
+  already routes non-UTF-8 to `Binary` — so this could only fire where the
+  classification and the bytes disagree, which is the one state a coercion
+  cannot answer correctly.
+
+### Removed
+
+- `heuristic::evaluate`, a five-argument wrapper around `evaluate_with_policy`
+  with `Policy::default()` baked in. Production had no callers; only its tests
+  did, and they now call `evaluate_with_policy` directly, so the default-policy
+  path is pinned at its one real call site rather than in a second copy.
+
+- `SimpleFile::size` and `SimpleFile::provenance` in the PyPI `/simple/`
+  response model. Both were `#[serde(default)]` members nothing read — the same
+  shape as the `SimpleMeta::api-version` marker the struct's own doc comment
+  already refuses to carry.
+
+### Documentation corrections
+
+- CHANGELOG 0.3.1 said "all six managers are reviewed through one grammar".
+  The CLI enumerates eleven (`npm npx pnpm yarn bun bunx pip pip3 cargo yay
+  paru`, the same list as `SHIM_MANAGERS`), `--help` is authoritative, and the
+  entry now says eleven. Resolves drift entry 6.
+- CHANGELOG 0.3.0 claimed `-`/`_` canonicalization of crate names
+  (`serde_json` → `serde-json`). The adapter lowercases only, deliberately:
+  a configured index may serve both spellings, so folding would risk answering
+  one spelling with the other's bytes. A hyphen-spelled crates.io request
+  fails closed at the index fetch (the live index has no hyphen file), which
+  was checked rather than assumed. The claim is removed and the lane records
+  the stance. Resolves drift entry 4.
+- CHANGELOG 0.3.0 described `blueline install` as shipping "sandboxed
+  extraction". It never did; the entry now says what shipped and points at
+  drift entry 1, which stays High and unfixed.
+
 ## [0.3.1] - 2026-09-21
 
 ### Added
@@ -1567,8 +1607,8 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
   Fail closed everywhere — blueline missing, errored, or refusing means the
   install does not run, and a missing real binary refuses shim creation.
   The scanner gained `cargo install`, and `yay`/`paru -S` operands
-  (AUR-grammar specs with `name=version` pinning), so all six managers are
-  reviewed through one grammar; pip flags that name non-registry sources
+  (AUR-grammar specs with `name=version` pinning), so all eleven scanned
+  managers are reviewed through one grammar; pip flags that name non-registry sources
   (`-r`, `-e`, `--constraint`, …) are refused with a pointer to
   `blueline ci`. `BLUELINE_REGISTRY` and `BLUELINE_POLICY` environment
   variables scope a shimmed shell to a mirror and a project policy.
@@ -1791,9 +1831,9 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
   sparse-index NDJSON client with fail-closed parsing (bad `vers` on a
   recognized row aborts; unknown schema `v > 2` rows are skipped with a note;
   missing `yanked` reads as false), `config.json` handling that refuses
-  authenticated registries, canonical crate names (`serde_json` → `serde-json`),
-  and `.crate` downloads verified by sha256 against the index checksum before
-  extraction. Extracted archives must unpack to exactly one top-level
+  authenticated registries, and `.crate` downloads verified by sha256 against
+  the index checksum before extraction. Extracted archives must unpack to
+  exactly one top-level
   `{name}-{version}` directory.
 - Packed `Cargo.toml` reader: `[package] build`/`links`, `[[bin]]` targets,
   dependency maps, and `[features]`; dependencies project onto the existing
@@ -1889,8 +1929,9 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
 
 - `blueline review <pkg@ver>` command with text and JSON output, `--registry`
   override, and a fail-closed `--yes` flag.
-- `blueline install` command with sandboxed extraction and fail-closed script
-  execution.
+- `blueline install` command with fail-closed script execution (extraction was
+  parser-bounded; the OS-level sandbox this line once claimed was never
+  shipped, see drift entry 1).
 - `blueline ci --output-file <path>` parameter to save formatted CI review
   reports directly to disk.
 - npm registry client with SHA-512 integrity verification before extraction.
