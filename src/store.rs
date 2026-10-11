@@ -355,7 +355,12 @@ impl BaselineStore {
                     use std::os::unix::fs::PermissionsExt;
                     let mut perms = meta.permissions();
                     perms.set_mode(0o700);
-                    let _ = fs::set_permissions(parent, perms);
+                    fs::set_permissions(parent, perms).map_err(|e| {
+                        BluelineError::Store(format!(
+                            "setting permissions on {}: {e}",
+                            parent.display()
+                        ))
+                    })?;
                 }
             }
             #[cfg(not(unix))]
@@ -376,12 +381,22 @@ impl BaselineStore {
                 ));
             }
             use std::os::unix::fs::OpenOptionsExt;
-            let _ = fs::OpenOptions::new()
+            // Pre-create the file at 0o600 so it is never briefly world-readable
+            // before SQLite opens it: `Connection::open` would otherwise create
+            // it at whatever the umask allows, and the chmod after open cannot
+            // close a window it did not measure. Failure is fatal rather than
+            // ignored, because the step below creates the file anyway, so an
+            // ignored error here is exactly the permission the mode was chosen
+            // to avoid.
+            fs::OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(false)
                 .mode(0o600)
-                .open(path);
+                .open(path)
+                .map_err(|e| {
+                    BluelineError::Store(format!("creating {} at mode 0o600: {e}", path.display()))
+                })?;
         }
 
         let mut conn = rusqlite::Connection::open(path)
@@ -1003,7 +1018,7 @@ mod tests {
                 Ecosystem::Npm,
                 "pkg",
                 "1.0.0",
-                &Checksum::parse(&ck("one").to_sri()).unwrap(),
+                &Checksum::parse(&ck("one").to_sri().unwrap()).unwrap(),
             )
             .unwrap();
         assert_eq!(
@@ -1334,7 +1349,7 @@ mod tests {
             migrations.to_latest(&mut conn).unwrap();
             conn.execute(
                 "INSERT INTO known_clean (name, version, integrity, clean) VALUES ('legacy', '1.0.0', ?1, 1)",
-                rusqlite::params![legacy_checksum.to_sri()],
+                rusqlite::params![legacy_checksum.to_sri().unwrap()],
             )
             .unwrap();
             conn.execute(
@@ -1365,7 +1380,7 @@ mod tests {
         assert_eq!(clean.len(), 1);
         assert_eq!(clean[0].0.to_string(), "1.0.0");
         // The legacy SRI value survives verbatim and normalizes to the same content.
-        assert_eq!(clean[0].1, legacy_checksum.to_sri());
+        assert_eq!(clean[0].1, legacy_checksum.to_sri().unwrap());
         assert_eq!(Checksum::parse(&clean[0].1).unwrap(), legacy_checksum);
 
         assert!(
@@ -1493,6 +1508,35 @@ mod tests {
 
         let file_meta = fs::metadata(&db_path).unwrap();
         assert_eq!(file_meta.permissions().mode() & 0o777, 0o600);
+    }
+
+    /// The pre-create at 0o600 is load-bearing, and its error used to be
+    /// discarded with `let _ =`. Dropping it silently was the defect: the step
+    /// below creates the file anyway, so an ignored failure simply meant SQLite
+    /// made it at the umask default, which is what the mode exists to prevent.
+    #[test]
+    #[cfg(unix)]
+    fn an_unopenable_database_path_refuses_at_the_pre_create() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory at the path the database should occupy: everything up to
+        // the pre-create succeeds, which is what isolates that arm. The old
+        // `let _ =` swallowed this and let SQLite fail later with a message that
+        // named no mode and no reason to suspect the permissions.
+        let db_path = dir.path().join("t.db");
+        fs::create_dir(&db_path).unwrap();
+
+        let err = BaselineStore::open_at(&db_path).err().expect(
+            "a database path that cannot be opened must refuse, not fall through to SQLite",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("at mode 0o600"),
+            "the refusal must come from the pre-create and name the mode it wanted, got: {msg}"
+        );
+        assert!(
+            msg.contains("t.db"),
+            "the refusal must name the path it could not use, got: {msg}"
+        );
     }
 
     #[test]

@@ -117,13 +117,19 @@ impl Checksum {
 
     /// npm SRI form (`sha512-<base64>`), used when talking to npm-shaped
     /// registries and preserved for backwards-compatible display.
-    pub fn to_sri(&self) -> String {
+    ///
+    /// Fallible because decoding the digest is. The old form mapped an
+    /// unparseable hex pair to `0`, so a malformed digest rendered as a
+    /// well-formed SRI string and the only place an operator ever saw it was a
+    /// mismatch message naming the expected value, which then illustrated the
+    /// wrong bytes without saying so.
+    pub fn to_sri(&self) -> Result<String, BluelineError> {
         match self.alg {
-            ChecksumAlg::Sha512 => format!(
+            ChecksumAlg::Sha512 => Ok(format!(
                 "sha512-{}",
-                base64::engine::general_purpose::STANDARD.encode(hex_to_bytes(&self.value_hex))
-            ),
-            ChecksumAlg::Sha256 => self.to_display(),
+                base64::engine::general_purpose::STANDARD.encode(hex_to_bytes(&self.value_hex)?)
+            )),
+            ChecksumAlg::Sha256 => Ok(self.to_display()),
         }
     }
 
@@ -137,9 +143,23 @@ pub fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn hex_to_bytes(hex: &str) -> Vec<u8> {
+/// Decode a lowercase hex digest into bytes. Fail closed on anything that is
+/// not clean hex, rather than mapping an unparseable pair to `0`, which would
+/// produce a digest that still decodes and still compares as a mismatch later.
+fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, BluelineError> {
+    if !hex.len().is_multiple_of(2) {
+        return Err(BluelineError::Verification(format!(
+            "digest `{hex}` has an odd number of hex digits"
+        )));
+    }
     (0..hex.len() / 2)
-        .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap_or(0))
+        .map(|i| {
+            u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).map_err(|_| {
+                BluelineError::Verification(format!(
+                    "digest `{hex}` contains a non-hexadecimal pair at byte {i}"
+                ))
+            })
+        })
         .collect()
 }
 
@@ -321,9 +341,51 @@ mod tests {
     #[test]
     fn sri_round_trips_through_display() {
         let c = Checksum::parse(TEST_SRI).unwrap();
-        assert_eq!(c.to_sri(), TEST_SRI);
+        assert_eq!(c.to_sri().unwrap(), TEST_SRI);
         let again = Checksum::parse(&c.to_display()).unwrap();
         assert_eq!(again, c);
+    }
+
+    /// The old `hex_to_bytes` mapped an unparseable hex pair to `0`, so a
+    /// malformed digest rendered as a well-formed SRI string. The only place it
+    /// surfaced was a mismatch message naming the expected value, where the
+    /// zeroed bytes illustrated the wrong answer without saying so.
+    #[test]
+    fn a_malformed_digest_fails_loud_instead_of_zeroing() {
+        let mut bad = Checksum::parse(TEST_SRI).unwrap();
+        bad.value_hex = TEST_HEX[..126].to_string();
+        bad.value_hex.push_str("zz");
+
+        let err = bad
+            .to_sri()
+            .expect_err("a non-hexadecimal digest must not render as an SRI string");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("zz") && msg.contains("non-hexadecimal"),
+            "the refusal must name the offending digest, got: {msg}"
+        );
+
+        // And an odd-length one, which the old `len() / 2` truncated silently.
+        let mut odd = Checksum::parse(TEST_SRI).unwrap();
+        odd.value_hex.pop();
+        let err = odd
+            .to_sri()
+            .expect_err("an odd-length digest must not be silently truncated");
+        assert!(
+            err.to_string().contains("odd number of hex digits"),
+            "got: {}",
+            err
+        );
+    }
+
+    /// The honest path still round-trips: this is what would have caught a fix
+    /// that made every digest refuse.
+    #[test]
+    fn a_well_formed_digest_still_renders() {
+        let c = Checksum::parse(TEST_HEX).unwrap();
+        let sri = c.to_sri().unwrap();
+        assert!(sri.starts_with("sha512-"), "got {sri}");
+        assert_eq!(Checksum::parse(&sri).unwrap(), c);
     }
 
     #[test]
