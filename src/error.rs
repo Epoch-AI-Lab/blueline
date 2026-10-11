@@ -22,6 +22,12 @@ pub enum BluelineError {
     #[error("extraction limit exceeded: {0}")]
     ExtractionLimit(String),
 
+    /// The extraction child died or broke its protocol, so the destination may
+    /// hold a partial tree. Never a fallback: an in-process retry would read
+    /// whatever the dead child managed to write.
+    #[error("extraction sandbox child failed: {0}")]
+    Sandbox(String),
+
     #[error("integrity verification failed: {0}")]
     Verification(String),
 

@@ -26,6 +26,7 @@ pub mod recursive;
 pub mod registry;
 pub mod render;
 pub mod review;
+pub mod sandbox;
 pub mod shim;
 pub mod store;
 pub mod verdict;

@@ -140,6 +140,31 @@ in that file. Neither is installed by default, so `--mutants` and `--all` exit
 - Skipping the CI gate. If CI breaks, fix it in the same branch.
 - Shipping a fix you could not verify. A patch with no test that fails without
   it is a guess. Re-introduce the bug, watch the test catch it, then restore.
+- Executing a process from a test. See "No self-exec from a test" below. This
+  is the one rule in this file that can cost the user a reboot.
+
+## No self-exec from a test
+
+A test that runs `current_exe()` re-runs the test suite. `spawn_child` in
+`src/sandbox.rs` once did exactly that: under `cargo test`, `current_exe()` is
+the libtest harness, so each spawned child ran the whole suite and every
+extract test spawned the next generation. One `cargo test --lib review::` run
+produced 529 live processes, a load average of 733, exhausted RAM, and a
+machine that had to be rebooted (2026-10-09).
+
+- Never call `Command::new(current_exe())`, `spawn`, or `exec` from code that
+  `#[cfg(test)]` can reach. Guard it with `cfg!(test)` and an environment
+  marker, as `may_spawn_child` does, and take an in-process fallback instead.
+- A test that must observe real process behaviour drives a **built binary**
+  through `assert_cmd::Command::cargo_bin`, never the harness.
+- Never run a command that spawns processes without a bound. Add `timeout`,
+  run it in the background, and poll the process count. Stop if the count
+  grows: kill the tree and report it, do not let it finish and do not "wait it
+  out".
+- The guard in `src/sandbox.rs` is pinned by
+  `the_test_harness_is_never_allowed_to_spawn_an_extraction_child` and
+  `extraction_in_a_test_never_re_execs_the_harness`. Do not weaken it, and do
+  not delete it to simplify `spawn_child`.
 
 ## Conventions
 - The engine is Rust. `src/` is the security-critical path and is written

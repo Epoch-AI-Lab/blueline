@@ -41,6 +41,14 @@ pub struct ReviewContext {
     registries: RefCell<HashMap<Ecosystem, Rc<dyn Registry>>>,
     tarballs: RefCell<TarballMemo>,
     memo_bytes: std::cell::Cell<usize>,
+    /// Whether extraction ran under OS-level confinement, per review.
+    ///
+    /// A plain field, not a `RefCell` like `registries` and `tarballs`: those
+    /// need interior mutability because `fetch_tarball` takes `&self`, and
+    /// nothing here does. Both extractions in a review hit the same
+    /// unavailable platform, so this is read and written at the same two points
+    /// where no borrow of the context is live.
+    pub sandbox: crate::sandbox::SandboxLedger,
     pub bases: RegistryBases,
 }
 
@@ -58,6 +66,7 @@ impl ReviewContext {
             registries: RefCell::new(HashMap::new()),
             tarballs: RefCell::new(HashMap::new()),
             memo_bytes: std::cell::Cell::new(0),
+            sandbox: crate::sandbox::SandboxLedger::default(),
             bases,
         }
     }

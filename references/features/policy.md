@@ -26,6 +26,7 @@ max_low_score = 19; max_medium_score = 49; block_score = 80
 [policy]
 require_provenance = false; block_unreviewed_scripts = true
 allow_git_dependencies = false; check_advisories = true; fail_closed_network = false
+require_sandbox = false   # true REFUSES a review the sandbox could not cover
 [advisories]
 block_on_malware = true; block_on_critical_cve = true
 cache_ttl_hours_clean = 12; cache_ttl_hours_vulnerable = 1
@@ -75,13 +76,17 @@ otherwise exact `==` (**case-sensitive**). No `?`, no `[...]`, no escaping.
   Shims compensate by translating `BLUELINE_POLICY` into an explicit `--policy`.
   **MCP uses `load_or_default` and therefore DOES honor the env var** — the only
   surface that does.
-- **No `deny_unknown_fields` anywhere.** A typo'd key (`block_on_malwares`)
-  is silently dropped and the default applies. For `block_on_critical_cve`,
-  `fail_closed_network`, and `block_on_stale` that default is the fail-open one.
-  `require_signatures` is the exception: setting it to `true` is refused outright,
-  because the flag is satisfied by the *presence* of a `dist.signatures` block
-  and nothing compares the tarball against it. `npm.rs` never parses
-  `dist.shasum` either, so the sha1 the signature signs is not available.
+- **A typo'd key is refused at load, not defaulted.** `Policy` and every config
+  struct derive `deny_unknown_fields`, so `block_on_malwares`, `[general]`, or an
+  unknown table is an error naming the offending key
+  (`a_misspelled_key_is_refused_rather_than_defaulted`,
+  `require_sandbox_lives_under_the_policy_table`). Omitting a table entirely is
+  still fine: `#[serde(default)]` fills it in
+  (`an_absent_table_is_not_a_refusal`). For `require_sandbox` the old silent
+  default was the fail-open one, which is why that key got the entry below.
+  `require_signatures` remains the one key refused for what it cannot do rather
+  than for being unknown: it is satisfied by the *presence* of a
+  `dist.signatures` block and nothing compares the tarball against it.
   The registry checksum that does run before extraction is the one the refusal
   message names: sha512 for npm, sha256 for cargo, pypi and aur. The refusal is
   ecosystem-agnostic (policy loads without lane context), so the message cannot
@@ -125,6 +130,18 @@ otherwise exact `==` (**case-sensitive**). No `?`, no `[...]`, no escaping.
 - **`glob_match("**")` is `true`** (`contains("")`), and `a*b*c` degrades to an
   `a*` prefix match. Replacing this with `globset`/`glob` silently changes
   blocking semantics.
+- **`require_sandbox` lives under `[policy]`, and `[general]` is now refused
+  instead of silently doing nothing.** It used to load cleanly, be dropped, and
+  leave the flag false — an operator who set it expecting fail-closed refusals
+  got an unconfined extraction with only a LOW disclosure.
+  `require_sandbox_lives_under_the_policy_table` pins both the right table and
+  the refusal. When the flag is true and `sandbox::extract` would fall back,
+  the review stops with an error naming the skip reason. On the AUR lane the
+  flag refuses the review outright, because `git clone` and `git archive` run
+  outside the Landlock domain and a confined extraction there would keep a
+  promise the key cannot make
+  (`require_sandbox_refuses_an_aur_review_before_any_registry_call`). See
+  [sandbox](sandbox.md).
 - **An env-probing test must re-exec the test binary.** `std::env::set_var` is
   `unsafe` and forbidden in edition 2024, so
   `env_policy_present_reads_process_environment` spawns itself with
