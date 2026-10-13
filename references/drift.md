@@ -13,7 +13,7 @@ Severity is this file's own judgement, not the project's.
 
 | # | Drift | Severity |
 |---|---|---|
-| 1 | No Landlock/seccomp/`cap-std` sandbox — the parser-level bounds are real, and every claim of an OS-level one is now removed from `README.md`, D4, the §1 diagram and the §1 header rule | **High, unfixed** — this is a real missing capability, and the fix is code, not wording |
+| 1 | ~~No Landlock/seccomp/`cap-std` sandbox~~ — **resolved:** extraction now runs in a Landlock-restricted child (`src/sandbox.rs`, ABI ladder V5/V3/V1 under `HardRequirement`); macOS, Windows, and a Landlock-less kernel fall back with a `P05_SANDBOX_UNAVAILABLE` disclosure or refuse under `[policy] require_sandbox = true` | Was High — see below |
 | 2 | ~~npm registry signature checked for *presence* only~~ — **the key that read it as verification is refused at load; verification itself is still absent** | **High, unchanged in severity** — see below |
 | 8 | ~~SSRF guard fails **open** on DNS failure, port 443 hard-coded~~ **resolved** — `ValidatingResolver` is the guard now, not the pre-flight check | High — see below |
 | 11 | ~~PyPI `METADATA` parse fails **open**~~ **resolved** — every unreadable or undetermined-metadata case is a refusal | High — see below |
@@ -46,6 +46,7 @@ the prose docs.
 | [registry](features/registry.md) | all six `src/registry/*.rs` + ~87 test names |
 | [pkgbuild](features/pkgbuild.md) | `src/pkgbuild.rs` production + all 69 test names + the corpus gate |
 | [extract](features/extract.md) | `src/extract.rs` production + all 42 test names |
+| [sandbox](features/sandbox.md) | `src/sandbox.rs` production + all test names |
 | [store](features/store.md) | `src/store.rs` production + schema + 12 test names |
 | [policy](features/policy.md) | `src/policy.rs` production + 15 test names |
 | [baseline](features/baseline.md) | `src/baseline.rs` production + 12 test names |

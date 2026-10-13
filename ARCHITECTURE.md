@@ -8,8 +8,9 @@ every release as a proof sheet and demands sign-off before the byte runs.
 **Hard rule: nothing executes until judged.** Tarballs are fetched, **integrity-verified
 against the registry's own per-lane checksum (fail closed)**, then extracted read-only into a
 private temp dir
-under hard size and entry caps — never executed, diffed, and scored. The temp dir
-is not an OS-level sandbox; see §1. The package's own code is
+under hard size and entry caps — never executed, diffed, and scored. On Linux
+the extraction step itself runs inside a Landlock-confined child; see §1. The
+package's own code is
 never run: even on approve, install proceeds with `npm install --ignore-scripts`,
 and any `postinstall`/`preinstall` script is surfaced for a *separate* human decision.
 
@@ -52,6 +53,7 @@ change should land — see the Feature Map at
 │  baseline::store ── SQLite: installed/known-clean versions,   │
 │                     approval overrides, policy                │
 │  extract         ── verify hash → bounded temp-dir extract    │
+│  sandbox         ── Landlock child around extraction (Linux)  │
 │  diff            ── file-level + line-level (similar crate)   │
 │  install_ref     ── scan payload for referenced installs      │
 │  recursive       ── re-review referenced installs: depth caps,│
@@ -122,14 +124,19 @@ Every tarball and registry response is fully untrusted. The `extract` stage enfo
   would otherwise overwrite the first); setuid/setgid bits are stripped. Pin
   The manifest allows any `0.4.x`; `Cargo.lock` pins the exact version and CI
   builds with `--locked`, so an unlocked local build can resolve a different one.
-- **Sandbox the step (planned, not implemented):** the intent is to run extract
-  + diff in a Landlock-restricted child (read-only host FS, write only to the
-  sandbox temp dir), capability-dropped, optionally seccomp-filtered, non-root,
-  with macOS/Windows falling back to the parser-level bounds above plus a
-  dedicated non-writable temp dir. No Landlock, seccomp, `cap-std` or
-  capability-drop code exists in `src/` today, and `Cargo.lock` carries none of
-  those crates. What actually bounds a hostile archive is the parser-level
-  budget above; there is no OS-level confinement behind it.
+- **Sandbox the step:** extraction runs inside a Landlock-restricted child
+  (`src/sandbox.rs`). The child applies a ruleset granting write access only to
+  the private temp dir, on the highest ABI tier the kernel supports (V5, then
+  V3 for `Truncate`, then V1), under `CompatLevel::HardRequirement` so a
+  partly applied domain is refused instead of extracted from. macOS, Windows,
+  and a kernel without Landlock get the parser-level bounds above plus a
+  `P05_SANDBOX_UNAVAILABLE` disclosure — or a refusal, when
+  `[policy] require_sandbox = true`. seccomp and `cap-std` are still absent;
+  Landlock is the confinement layer that ships. It covers the extraction step
+  only: AUR review bytes are assembled by `git clone` and `git archive` in the
+  review process, which no Landlock domain can reach (no network control, and a
+  clone writes its own tree), so that lane refuses rather than discloses under
+  the same key.
 - **Treat extracted bytes as hostile:** the extracted `package.json` (`scripts`,
   `dependencies`) is diffed/flagged as attack surface, not trusted.
 
@@ -142,7 +149,7 @@ Every tarball and registry response is fully untrusted. The `extract` stage enfo
 | D1 | Rust core + Node shim                               | Security-critical path in a memory-safe, single-binary language; Node only for `npx` ergonomics. |
 | D2 | Local deterministic heuristic first                 | Transparent, auditable, offline. Hosted ML *refines* score when token present — never required. Keeps "the wedge stays open" honest. |
 | D3 | One registry deep, `Registry` trait seam, then four | Deepen one registry first; avoid speculative multi-registry code. npm, crates.io, PyPI, and review-only AUR now share the seam. |
-| D4 | Read-only extraction into a temp dir + integrity verify | Core safety invariant. Verify the registry's sha512/sha256 *before* extract; bound size/entry; reject symlinks/special files; Landlock-sandbox the step (planned, not implemented — §1). Package code never runs. |
+| D4 | Read-only extraction into a temp dir + integrity verify | Core safety invariant. Verify the registry's sha512/sha256 *before* extract; bound size/entry; reject symlinks/special files; run the step inside a Landlock-confined child on Linux (§1). Package code never runs. |
 | D5 | Baseline = last known-clean version                 | Source: locally installed version in `node_modules` → else previous version in registry list (neutral verdict on first sighting). Overrides persisted in SQLite. |
 | D6 | Revocation = OSV + GitHub Advisory cache            | Reuse the open vulnerability corpus; paid tier adds human-verified recall (hosted index). |
 | D7 | Stable `Verdict` JSON schema                        | Same struct feeds CLI card, CI comment, and MCP tool. One source of truth.|
