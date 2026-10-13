@@ -298,16 +298,40 @@ fn packument_size_estimate(p: &Packument) -> u64 {
             // shape. Omitting it made a packument carrying a 32 MiB block
             // measure 1050 bytes, and a 64 MiB ceiling that does not bind is
             // worse than no ceiling: it looks like a bound.
-            let signatures = v
-                .dist
-                .signatures
-                .as_ref()
-                .and_then(|sig| serde_json::to_string(sig).ok())
-                .map_or(0, |s| s.len() as u64);
+            let signatures = v.dist.signatures.as_ref().map_or(0, serialised_len);
             512 + v.dist.tarball.len() as u64 + signatures
         })
         .sum();
     p.name.len() as u64 + 512 + versions
+}
+
+/// Serialised length of a value without building the string.
+///
+/// `serde_json::to_string(..).len()` is the obvious spelling and it allocates
+/// the whole document to measure it: a packument carrying a 64 MiB signature
+/// block paid 64 MiB of transient `String` on every call, on the hot path of
+/// every memo insert. `to_writer` runs the same `CompactFormatter` over the
+/// same `Value`, so the byte count is identical -- `String`, `Vec<u8>` and a
+/// counting sink are the same stream -- and only the destination differs.
+///
+/// Serialisation can still fail on a `Value` that cannot be written, so a
+/// failed write counts as zero exactly as the old `.ok()` did.
+fn serialised_len(v: &serde_json::Value) -> u64 {
+    struct CountingWriter(u64);
+
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len() as u64;
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = CountingWriter(0);
+    serde_json::to_writer(&mut counter, v).map_or(0, |()| counter.0)
 }
 
 #[derive(Default)]
