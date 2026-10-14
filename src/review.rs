@@ -144,6 +144,16 @@ fn evaluate_with_registry<V: VersionInfo>(
     let registry_base = ctx.bases.for_ecosystem(ecosystem).to_string();
     let target_pkg = registry.resolve(name, version_str)?;
 
+    // Started here because the answer is needed only at scoring time, and
+    // everything between this line and there is work the query does not touch.
+    let advisories_resolved = crate::advisory::resolve_advisories(
+        &target_pkg.name,
+        &target_pkg.version,
+        ecosystem,
+        Some(store),
+        policy,
+    );
+
     let target_tarball = ctx.fetch_tarball(registry, &target_pkg)?;
 
     let checksum = target_pkg.integrity.clone().ok_or_else(|| {
@@ -275,40 +285,39 @@ fn evaluate_with_registry<V: VersionInfo>(
     // came out the same as a clean advisory pass. It becomes a finding below.
     //
     // The `Ok` arm needed the same treatment for the case where policy does NOT
-    // fail closed. `fetch_advisories` returns `Ok(unverified(..))` when the
-    // lookup could not complete but the operator asked for the review to carry
-    // on -- and that arm set no error at all, so a network failure and a clean
-    // advisory pass reached the verdict identically. Nothing downstream could
-    // tell them apart: the only reader of the status was a colour label on the
-    // interactive card, and the CI text and markdown summaries, the JSON verdict
-    // and every MCP response reported the same thing for both. A lockfile diff
-    // adding one already-baselined package therefore printed `Status: PASSED`
-    // and exited 0 with the advisory host down.
+    // fail closed. An unverified report returned when the lookup could not
+    // complete but the operator asked for the review to carry on set no error
+    // at all, so a network failure and a clean advisory pass reached the
+    // verdict identically. A lockfile diff adding one already-baselined
+    // package therefore printed `Status: PASSED` and exited 0 with the advisory
+    // host down.
     //
     // The two cases are not the same severity. An `Err` is a real failure and
     // stays HIGH. An `unverified` report the operator has already accepted is a
     // coverage hole worth saying out loud, not worth blocking on -- so it is a
-    // MEDIUM disclosure that escalates for anyone running a stricter
-    // `fail_on`. Advisory checking switched off in policy is the operator's
-    // deliberate choice and is not a coverage hole, so it stays silent.
-    let (advisories, advisory_error, advisory_coverage_unknown) =
-        match crate::advisory::fetch_advisories(
-            &target_pkg.name,
-            &target_pkg.version,
-            ecosystem,
-            Some(store),
-            policy,
-        ) {
-            Ok(report) => {
-                let unknown = crate::advisory::coverage_unknown(&report, policy);
-                (report, None, unknown)
-            }
-            Err(e) => (
-                crate::advisory::AdvisoryReport::unverified(&e.to_string()),
-                Some(e.to_string()),
-                None,
-            ),
-        };
+    // MEDIUM disclosure that escalates for anyone running a stricter `fail_on`.
+    // Advisory checking switched off in policy is the operator's deliberate
+    // choice and is not a coverage hole, so it stays silent.
+    //
+    // The join is where the pending OSV round trip is collected. It was
+    // started before the tarballs were fetched precisely so the fetch and
+    // extraction ran while the network worked.
+    let advisories_joined = match advisories_resolved {
+        Ok(crate::advisory::AdvisoryResolution::Ready(report)) => Ok(report),
+        Ok(crate::advisory::AdvisoryResolution::Pending(pending)) => pending.join(Some(store)),
+        Err(e) => Err(e),
+    };
+    let (advisories, advisory_error, advisory_coverage_unknown) = match advisories_joined {
+        Ok(report) => {
+            let unknown = crate::advisory::coverage_unknown(&report, policy);
+            (report, None, unknown)
+        }
+        Err(e) => (
+            crate::advisory::AdvisoryReport::unverified(&e.to_string()),
+            Some(e.to_string()),
+            None,
+        ),
+    };
 
     let provenance = match ecosystem {
         Ecosystem::Npm => Some(crate::provenance::inspect_provenance(

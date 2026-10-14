@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::io::Read;
+use std::thread::{self, JoinHandle};
 
 use crate::error::BluelineError;
 use crate::policy::Policy;
@@ -122,27 +123,6 @@ fn osv_ecosystem(ecosystem: Ecosystem) -> &'static str {
     }
 }
 
-/// Whether an advisory report that arrived as `Ok` means *no answer was
-/// obtained* rather than *the answer was clean*.
-///
-/// `fetch_advisories` returns `Ok` for both, so a caller that only inspects the
-/// `Err` arm cannot tell a completed lookup from an abandoned one. That
-/// distinction is the whole disclosure: an `unverified` report has no hits, so
-/// nothing downstream raises a finding on its own, and a verdict built from it
-/// is identical to a clean advisory pass.
-///
-/// Two `unverified` reports are deliberately not treated the same:
-///
-/// * Advisories switched off in policy is the operator's own choice, made
-///   knowingly before the review ran. It is not a hole discovered at review
-///   time, so it stays out of the verdict.
-/// * Everything else -- a refused connection, a timeout, a body that would not
-///   parse, or an ecosystem with no advisory coverage at all -- means this
-///   release's revocation coverage is *unknown* rather than clear, and the
-///   caller must say so.
-///
-/// Told apart by policy rather than by matching on the message text, so
-/// rewording a disclosure cannot silently change which of the two it is.
 pub(crate) fn coverage_unknown(report: &AdvisoryReport, policy: &Policy) -> Option<String> {
     if !policy.policy.check_advisories || report.status != AdvisoryStatus::Unverified {
         return None;
@@ -155,18 +135,128 @@ pub(crate) fn coverage_unknown(report: &AdvisoryReport, policy: &Policy) -> Opti
     )
 }
 
-pub fn fetch_advisories(
+/// Advisories for one `package@version`, resolved as far as it goes without
+/// stopping the caller.
+///
+/// The answer has two shapes. `Ready` means nothing crossed the network: the
+/// recall index hit, the policy disabled the check, or the advisory cache was
+/// warm. `Pending` means the OSV round trip has already started and is still
+/// in flight, and `PendingAdvisory::join` is the only way to read its answer.
+pub enum AdvisoryResolution {
+    Ready(AdvisoryReport),
+    Pending(PendingAdvisory),
+}
+
+impl AdvisoryResolution {
+    /// The report, for the paths that must not pend: a recall hit, a policy
+    /// switch, a warm cache, an ecosystem with no coverage.
+    ///
+    /// `Err` carries the same message `join` would, so a caller that only ever
+    /// expects a synchronous answer gets the same disclosure either way.
+    pub fn into_report(self) -> Result<AdvisoryReport, BluelineError> {
+        match self {
+            Self::Ready(report) => Ok(report),
+            Self::Pending(pending) => pending.join(None),
+        }
+    }
+}
+
+/// An OSV query that is already running. Dropping one unjoined is safe: the
+/// worker finishes and its answer is discarded with it.
+///
+/// On an early-exit path between the resolve call and the join — a refused
+/// tarball fetch, a failed extraction, a missing checksum — a `Pending` is
+/// dropped unjoined, which spends the round trip and discards both the answer
+/// and the cache write it would have made. That is accepted: those paths are
+/// already erroring out of the review, and re-querying on the next run is
+/// cheaper than threading a join through every early exit.
+pub struct PendingAdvisory {
+    worker: JoinHandle<OsvOutcome>,
+    stale_fallback: Option<AdvisoryReport>,
+    fail_closed: bool,
+    cache_key: Option<AdvisoryCacheKey>,
+}
+
+struct AdvisoryCacheKey {
+    ecosystem: Ecosystem,
+    package: String,
+    version: String,
+}
+
+struct OsvOutcome {
+    report: Result<AdvisoryReport, String>,
+    ttl_secs: i64,
+}
+
+impl PendingAdvisory {
+    /// Block for the query, then write the answer to the advisory cache.
+    ///
+    /// The write stays here instead of in the worker so the worker never needs
+    /// the SQLite connection, which is neither `Sync` nor worth reopening. The
+    /// write is local and bounded; the round trip it used to sit behind is not.
+    pub fn join(self, store: Option<&BaselineStore>) -> Result<AdvisoryReport, BluelineError> {
+        let Self {
+            worker,
+            stale_fallback,
+            fail_closed,
+            cache_key,
+        } = self;
+
+        let OsvOutcome { report, ttl_secs } = match worker.join() {
+            Ok(outcome) => outcome,
+            // A panicked worker is indistinguishable from the network failing,
+            // so it takes the same path a transport error would.
+            Err(_) => {
+                return fallback_or_fail(
+                    stale_fallback,
+                    fail_closed,
+                    "OSV advisory worker thread panicked",
+                );
+            }
+        };
+
+        let report = match report {
+            Ok(report) => report,
+            Err(msg) => return fallback_or_fail(stale_fallback, fail_closed, &msg),
+        };
+
+        if let (Some(store), Some(key)) = (store, cache_key)
+            && let Ok(json) = serde_json::to_string(&report)
+        {
+            let _ = store.put_cached_advisories(
+                key.ecosystem,
+                &key.package,
+                &key.version,
+                &json,
+                report.hits.len(),
+                report.has_blocking(),
+                ttl_secs,
+            );
+        }
+
+        Ok(report)
+    }
+}
+
+/// Start advisory resolution for `package@version`.
+///
+/// Everything answerable without a network round trip is answered here. A
+/// cache miss hands back a `Pending` with the OSV query already running, so the
+/// caller can fetch, extract and diff while the network works. That ordering is
+/// the whole point: the diff does not depend on the advisories, and on a small
+/// package the round trip was roughly three quarters of the wall clock.
+pub fn resolve_advisories(
     package: &str,
     version: &str,
     ecosystem: Ecosystem,
     store: Option<&BaselineStore>,
     policy: &Policy,
-) -> Result<AdvisoryReport, BluelineError> {
+) -> Result<AdvisoryResolution, BluelineError> {
     // The recall index is local, curated truth: a hit blocks regardless of
     // the OSV path, and never routes through the advisory cache (a stale
     // OSV cache entry must not mask a fresh revocation).
     if let Some(revocation) = crate::recall::lookup(ecosystem, package, version)? {
-        return Ok(AdvisoryReport {
+        return Ok(AdvisoryResolution::Ready(AdvisoryReport {
             status: AdvisoryStatus::Vulnerable,
             hits: vec![AdvisoryItem {
                 id: revocation.id,
@@ -179,13 +269,13 @@ pub fn fetch_advisories(
             }],
             source: "blueline-recall".to_string(),
             message: None,
-        });
+        }));
     }
 
     if !policy.policy.check_advisories {
-        return Ok(AdvisoryReport::unverified(
+        return Ok(AdvisoryResolution::Ready(AdvisoryReport::unverified(
             "advisory checking disabled by policy",
-        ));
+        )));
     }
 
     // The AUR has no OSV coverage. `osv_ecosystem` maps it to a placeholder
@@ -199,10 +289,10 @@ pub fn fetch_advisories(
     // The recall index above still applies, so a curated revocation blocks an
     // AUR package exactly as it blocks any other.
     if ecosystem == Ecosystem::Aur {
-        return Ok(AdvisoryReport::unverified(
+        return Ok(AdvisoryResolution::Ready(AdvisoryReport::unverified(
             "the AUR has no OSV advisory coverage; revocation coverage for this release comes \
              from the recall index only",
-        ));
+        )));
     }
 
     // 1. Check SQLite cache
@@ -212,7 +302,7 @@ pub fn fetch_advisories(
     {
         if !cached.is_expired {
             if let Ok(report) = serde_json::from_str::<AdvisoryReport>(&cached.advisories_json) {
-                return Ok(report);
+                return Ok(AdvisoryResolution::Ready(report));
             }
         } else if let Ok(mut report) =
             serde_json::from_str::<AdvisoryReport>(&cached.advisories_json)
@@ -222,110 +312,109 @@ pub fn fetch_advisories(
         }
     }
 
-    // 2. Query OSV.dev REST API
-    //
-    // The shared registry agent, so this request carries the same SSRF guards the
-    // registry fetches do: `redirects(0)` and a resolver that validates every
-    // resolved address against the configured host.
-    //
-    // This is defence in depth, and the reason is worth stating precisely so the
-    // comment does not go stale in either direction. Probing found no case in
-    // which OSV redirects — 108+ requests across unknown shapes, malformed
-    // bodies and unusual names all answered directly — so the redirect guard is
-    // not holding up a currently-observed behaviour. It stays because "the origin
-    // we do not control does not currently do this" is not a property worth
-    // relying on: OSV is a third party, its edge configuration can change without
-    // notice, and a bare `AgentBuilder` follows up to 5 redirects to any host with
-    // no validation on any hop, so a single changed response header would walk
-    // this request off api.osv.dev and onto a link-local address. The guard costs
-    // one agent and no behaviour, and the alternative is depending on the origin's
-    // current configuration for our SSRF posture.
+    let worker = thread::spawn({
+        let (package, version, policy) = (package.to_string(), version.to_string(), policy.clone());
+        move || {
+            query_osv(OsvQuery {
+                package,
+                version,
+                ecosystem,
+                policy,
+            })
+        }
+    });
+
+    Ok(AdvisoryResolution::Pending(PendingAdvisory {
+        worker,
+        stale_fallback,
+        fail_closed: policy.policy.fail_closed_network,
+        cache_key: Some(AdvisoryCacheKey {
+            ecosystem,
+            package: package.to_string(),
+            version: version.to_string(),
+        }),
+    }))
+}
+
+struct OsvQuery {
+    package: String,
+    version: String,
+    ecosystem: Ecosystem,
+    policy: Policy,
+}
+
+/// The whole OSV request: transport, parse, and the cache lifetime the answer
+/// should get. Returns the transport error rather than resolving it, because
+/// the stale-cache fallback is decided on the joining thread.
+///
+/// The shared registry agent, so this request carries the same SSRF guards the
+/// registry fetches do: `redirects(0)` and a resolver that validates every
+/// resolved address against the configured host.
+fn query_osv(query: OsvQuery) -> OsvOutcome {
     let agent = crate::registry::http_util::registry_agent_with_timeout(
         "blueline-security/0.1.0",
         OSV_BASE_URL,
         std::time::Duration::from_millis(DEFAULT_TIMEOUT_MS),
     );
 
-    let query_payload = serde_json::json!({
-        "version": version,
+    let payload_str = serde_json::json!({
+        "version": query.version,
         "package": {
-            "name": package,
-            "ecosystem": osv_ecosystem(ecosystem)
+            "name": query.package,
+            "ecosystem": osv_ecosystem(query.ecosystem)
         }
-    });
+    })
+    .to_string();
 
-    let payload_str = query_payload.to_string();
-    let resp_result = agent
+    let report = match agent
         .post(&format!("{OSV_BASE_URL}/v1/query"))
         .set("Content-Type", "application/json")
         .set("User-Agent", "blueline-security/0.1.0")
-        .send_string(&payload_str);
-
-    match resp_result {
+        .send_string(&payload_str)
+    {
         Ok(resp) => {
             let mut reader = resp.into_reader().take(MAX_OSV_RESPONSE_BYTES);
             let mut body = String::new();
-            if let Err(e) = reader.read_to_string(&mut body) {
-                return fallback_or_fail(
-                    stale_fallback,
-                    policy,
-                    &format!("failed to read OSV response body: {e}"),
-                );
+            match reader.read_to_string(&mut body) {
+                Err(e) => Err(format!("failed to read OSV response body: {e}")),
+                Ok(_) => match serde_json::from_str::<OsvQueryResponse>(&body) {
+                    Err(e) => Err(format!("invalid JSON from OSV API: {e}")),
+                    Ok(r) => Ok(parse_osv_response(r, &query.policy)),
+                },
             }
-
-            let osv_resp: OsvQueryResponse = match serde_json::from_str(&body) {
-                Ok(r) => r,
-                Err(e) => {
-                    return fallback_or_fail(
-                        stale_fallback,
-                        policy,
-                        &format!("invalid JSON from OSV API: {e}"),
-                    );
-                }
-            };
-
-            let report = parse_osv_response(osv_resp, policy);
-
-            // Cache report in SQLite store
-            if let Some(store) = store
-                && let Ok(report_json) = serde_json::to_string(&report)
-            {
-                let ttl = if report.hits.is_empty() {
-                    policy.advisories.clean_cache_ttl_secs()
-                } else {
-                    policy.advisories.vulnerable_cache_ttl_secs()
-                };
-                let _ = store.put_cached_advisories(
-                    ecosystem,
-                    package,
-                    version,
-                    &report_json,
-                    report.hits.len(),
-                    report.has_blocking(),
-                    ttl,
-                );
-            }
-
-            Ok(report)
         }
-        Err(e) => fallback_or_fail(
-            stale_fallback,
-            policy,
-            &format!("OSV advisory request failed: {e}"),
-        ),
+        Err(e) => Err(format!("OSV advisory request failed: {e}")),
+    };
+
+    let ttl_secs = cache_ttl_secs(&report, &query.policy);
+
+    OsvOutcome { report, ttl_secs }
+}
+
+/// Cache lifetime for an OSV answer: a clean lookup is cached longer than a
+/// vulnerable one, and a failed lookup is never cached.
+///
+/// Split out of `query_osv` so the three-way choice is testable without a
+/// network: the guard distinguishing a clean report from a vulnerable one is
+/// exactly the line a `hits.is_empty()` mutation would silently erase.
+fn cache_ttl_secs(report: &Result<AdvisoryReport, String>, policy: &Policy) -> i64 {
+    match report {
+        Ok(report) if report.hits.is_empty() => policy.advisories.clean_cache_ttl_secs(),
+        Ok(_) => policy.advisories.vulnerable_cache_ttl_secs(),
+        Err(_) => 0,
     }
 }
 
 fn fallback_or_fail(
     stale_fallback: Option<AdvisoryReport>,
-    policy: &Policy,
+    fail_closed: bool,
     err_msg: &str,
 ) -> Result<AdvisoryReport, BluelineError> {
     // Checked before the stale fallback. Serving a cached report while the
     // policy says fail closed returned a possibly month-old answer as if it
     // were fresh, and a stale CLEAN report produces no hits and no staleness
     // disclosure, so it was indistinguishable from a clean pass.
-    if policy.policy.fail_closed_network {
+    if fail_closed {
         return Err(BluelineError::Advisory(format!(
             "{err_msg} (failing closed as configured by policy)"
         )));
@@ -694,6 +783,46 @@ fn calculate_advisory_severity(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_cache_ttl_distinguishes_clean_from_vulnerable_from_failed() {
+        // The `hits.is_empty()` guard is the whole decision: clean caches for
+        // 12h, vulnerable for 1h, failed for 0. A mutation that flips the
+        // guard to `true` or `false` collapses two of the three, so pin all
+        // three against the distinct policy defaults (12h / 1h).
+        let policy = Policy::default();
+        let clean = AdvisoryReport::clean("osv.dev");
+        let mut vulnerable = AdvisoryReport::clean("osv.dev");
+        vulnerable.status = AdvisoryStatus::Vulnerable;
+        vulnerable.hits = vec![AdvisoryItem {
+            id: "GHSA-test".into(),
+            summary: "test".into(),
+            details: String::new(),
+            aliases: Vec::new(),
+            severity: VerdictBand::High,
+            cvss_score: None,
+            is_malware: false,
+        }];
+
+        assert!(clean.hits.is_empty());
+        assert!(!vulnerable.hits.is_empty());
+
+        assert_eq!(
+            cache_ttl_secs(&Ok(clean.clone()), &policy),
+            12 * 3600,
+            "a clean report caches for the clean TTL"
+        );
+        assert_eq!(
+            cache_ttl_secs(&Ok(vulnerable.clone()), &policy),
+            3600,
+            "a vulnerable report caches for the shorter vulnerable TTL"
+        );
+        assert_eq!(
+            cache_ttl_secs(&Err("network down".to_string()), &policy),
+            0,
+            "a failed lookup is never cached"
+        );
+    }
+
     /// A v2 vector's metric values are per-metric. Matching them by value alone
     /// let `AV:P` be scored with the partial-impact weight, so a malformed
     /// vector scored 4.1 where the well-formed one scores 7.5 -- an advisory
@@ -741,16 +870,149 @@ mod tests {
             source: "cache".to_string(),
             message: None,
         };
-        let result = fallback_or_fail(Some(stale.clone()), &policy, "osv unreachable");
+        let result = fallback_or_fail(Some(stale.clone()), true, "osv unreachable");
         assert!(
             result.is_err(),
             "fail_closed_network must not be satisfied by a cached report"
         );
 
         // Without the policy the fallback is still the answer.
-        let mut lenient = Policy::default();
-        lenient.policy.fail_closed_network = false;
-        assert!(fallback_or_fail(Some(stale), &lenient, "osv unreachable").is_ok());
+        assert!(fallback_or_fail(Some(stale), false, "osv unreachable").is_ok());
+    }
+
+    #[test]
+    fn a_cache_miss_defers_the_query_instead_of_running_it_inline() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
+        let policy = Policy::default();
+
+        let resolution = resolve_advisories(
+            "blueline-no-such-package-xyz",
+            "1.0.0",
+            Ecosystem::Npm,
+            Some(&store),
+            &policy,
+        )
+        .unwrap();
+
+        // A cold cache must hand back work in flight, not an answer. Anything
+        // else puts the round trip back on the critical path, which is the
+        // entire reason this is two phases.
+        assert!(
+            matches!(resolution, AdvisoryResolution::Pending(_)),
+            "expected a pending query, got a ready answer"
+        );
+    }
+
+    #[test]
+    fn the_cache_is_answered_without_a_query_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
+        let policy = Policy::default();
+        let name = "blueline-no-such-package-xyz";
+
+        store
+            .put_cached_advisories(
+                Ecosystem::Npm,
+                name,
+                "1.0.0",
+                r#"{"status":"clean","hits":[],"source":"osv.dev","message":null}"#,
+                0,
+                false,
+                3600,
+            )
+            .unwrap();
+
+        let resolution =
+            resolve_advisories(name, "1.0.0", Ecosystem::Npm, Some(&store), &policy).unwrap();
+
+        match resolution {
+            AdvisoryResolution::Ready(report) => {
+                assert_eq!(report.status, AdvisoryStatus::Clean);
+            }
+            AdvisoryResolution::Pending(_) => {
+                panic!("a warm cache must not start a query")
+            }
+        }
+    }
+
+    #[test]
+    fn disabling_advisories_never_starts_a_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
+        let mut policy = Policy::default();
+        policy.policy.check_advisories = false;
+
+        let resolution = resolve_advisories(
+            "blueline-no-such-package-xyz",
+            "1.0.0",
+            Ecosystem::Npm,
+            Some(&store),
+            &policy,
+        )
+        .unwrap();
+
+        match resolution {
+            AdvisoryResolution::Ready(report) => {
+                assert_eq!(report.status, AdvisoryStatus::Unverified);
+            }
+            AdvisoryResolution::Pending(_) => {
+                panic!("advisories are off; no query should exist")
+            }
+        }
+    }
+
+    #[test]
+    fn dropping_a_pending_query_is_not_a_use_of_its_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
+        let policy = Policy::default();
+
+        // A review that refuses before scoring never joins. The worker must
+        // simply finish and be forgotten, not leak or panic.
+        let resolution = resolve_advisories(
+            "blueline-no-such-package-xyz",
+            "1.0.0",
+            Ecosystem::Npm,
+            Some(&store),
+            &policy,
+        )
+        .unwrap();
+
+        drop(resolution);
+    }
+
+    #[test]
+    fn joining_always_yields_a_report_even_when_the_network_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::open_at(&dir.path().join("t.db")).unwrap();
+        let policy = Policy::default();
+
+        let resolution = resolve_advisories(
+            "blueline-no-such-package-xyz",
+            "1.0.0",
+            Ecosystem::Npm,
+            Some(&store),
+            &policy,
+        )
+        .unwrap();
+
+        let pending = match resolution {
+            AdvisoryResolution::Pending(pending) => pending,
+            AdvisoryResolution::Ready(report) => return assert!(report.hits.is_empty()),
+        };
+
+        // Either the query answered or it did not. Both are reports: the
+        // fail-closed and unverified decisions belong to the caller, which is
+        // the same place they lived before the query moved off the main thread.
+        let outcome = pending.join(Some(&store));
+        if let Err(e) = &outcome {
+            assert!(
+                e.to_string()
+                    .contains("failing closed as configured by policy"),
+                "unexpected failure shape: {e}"
+            );
+        }
     }
 
     #[test]
@@ -856,14 +1118,16 @@ mod tests {
     /// quietly turn this test back into a tautology.
     #[test]
     fn the_aur_never_claims_clean_advisory_coverage() {
-        let report = fetch_advisories(
+        let report = resolve_advisories(
             "webtorrent-desktop",
             "1.9.0-1",
             crate::registry::Ecosystem::Aur,
             None,
             &Policy::default(),
         )
-        .expect("AUR advisory lookup must not error");
+        .expect("AUR advisory lookup must not error")
+        .into_report()
+        .expect("AUR advisory resolution must not pend");
 
         assert_eq!(
             report.status,
@@ -885,14 +1149,16 @@ mod tests {
     fn policy_disabled_advisories_stay_distinguishable_from_a_failed_lookup() {
         let mut policy = Policy::default();
         policy.policy.check_advisories = false;
-        let report = fetch_advisories(
+        let report = resolve_advisories(
             "webtorrent-desktop",
             "1.9.0-1",
             crate::registry::Ecosystem::Aur,
             None,
             &policy,
         )
-        .expect("disabling advisories must not error");
+        .expect("disabling advisories must not error")
+        .into_report()
+        .expect("a disabled policy must never pend");
 
         assert_eq!(report.status, AdvisoryStatus::Unverified);
         assert!(

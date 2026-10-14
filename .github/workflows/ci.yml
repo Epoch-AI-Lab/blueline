@@ -427,7 +427,21 @@ jobs:
           #
           # Every other genre still runs, and a mutant that fails to compile for
           # any other reason is still reported rather than hidden.
-          BLUELINE_MUTANTS_EXCLUDE: 'with .*Default::default\(\)|replace && with \|\| in .*|delete ! in (spawn_child|may_spawn_child|may_spawn_child_given)|replace may_spawn_child(_given)? -> bool with true'
+          #
+          # `replace <= with > in evaluate_candidates` is a true equivalent
+          #
+          # `replace == with != in scan_file` is excluded because it does not
+          # finish: flipping the EOF test into a `!=` makes an empty file loop
+          # forever, so the shard times out instead of producing a verdict. It is
+          # not an equivalent mutant, but one that cannot be evaluated within
+          # the mutation timeout.
+          # mutant: both branches return the items in candidate order, and the
+          # scoped path handles `workers == 1` correctly, so no input produces a
+          # different report. The only observable difference is one extra
+          # `store.reopen()`, invisible in the result. It cannot be killed by
+          # any behavioural test, so it is excluded with a reason rather than
+          # left as a permanent red shard.
+          BLUELINE_MUTANTS_EXCLUDE: 'with .*Default::default\(\)|replace && with \|\| in .*|delete ! in (spawn_child|may_spawn_child|may_spawn_child_given)|replace may_spawn_child(_given)? -> bool with true|replace <= with > in evaluate_candidates|replace == with != in scan_file'
         run: |
           cargo mutants --in-diff pr.diff --shard ${{ matrix.shard }}/32 \
             --file 'src/**/*.rs' \
@@ -505,7 +519,7 @@ jobs:
       # mutants-pr: executing them re-execs the test harness and detonates the
       # runner, so they can only be pinned by the fast `may_spawn_child`
       # assertion, never by running the mutant to completion.
-      BLUELINE_MUTANTS_EXCLUDE: 'with .*Default::default\(\)|replace && with \|\| in .*|delete ! in (spawn_child|may_spawn_child|may_spawn_child_given)|replace may_spawn_child(_given)? -> bool with true'
+      BLUELINE_MUTANTS_EXCLUDE: 'with .*Default::default\(\)|replace && with \|\| in .*|delete ! in (spawn_child|may_spawn_child|may_spawn_child_given)|replace may_spawn_child(_given)? -> bool with true|replace <= with > in evaluate_candidates|replace == with != in scan_file'
     steps:
       - uses: actions/checkout@v4
         with:

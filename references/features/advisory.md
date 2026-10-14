@@ -6,12 +6,29 @@ else**, so disabling OSV never silences a revocation and a stale OSV cache entry
 can never mask a fresh one.
 
 ## Sub-features
-- `fetch_advisories` — the entry point.
+- `resolve_advisories` — the entry point. Returns `AdvisoryResolution`.
+- `PendingAdvisory::join` — the only way to read an in-flight answer.
+- `query_osv` — the OSV round trip, on its own thread.
 - `osv_ecosystem` — the schema-cased mapping.
 - `parse_osv_response` / `calculate_advisory_severity` / `check_is_malware`.
 - `parse_cvss_vector` — hand-rolled CVSS v3.x calculator.
 - `AdvisoryReport` / `AdvisoryItem` / `AdvisoryStatus`.
 - `fallback_or_fail` — stale cache vs fail-closed vs unverified.
+
+## Two phases
+`resolve_advisories` answers everything it can on the calling thread: the recall
+pre-check, the `check_advisories` gate, and the SQLite cache. Only a genuine
+cache miss reaches the network, and that part is handed back as a `Pending`
+with the request **already running**. The caller keeps working and calls
+`join` at scoring time, so the OSV round trip overlaps fetching, extraction and
+the diff instead of following them.
+
+Two consequences worth knowing:
+- `join` is where `fallback_or_fail` runs, and where the cache write happens. The
+  worker carries no `BaselineStore`: a `rusqlite::Connection` is `Send` but not
+  `Sync`, and reopening one would be more expensive than the write it enables.
+- The policy is snapshotted at `resolve_advisories`, so a worker cannot observe a
+  policy different from the one the rest of the review ran under.
 
 ## How to get to it (user POV)
 ```sh
@@ -46,7 +63,7 @@ Rule wiring: `R09_ADVISORY_MALWARE` (`Block`), `R09_ADVISORY_CRITICAL_CVE`
 (`Block`), `R09_ADVISORY_CVE` (**`hit.severity` passed through verbatim**).
 
 ## Gotchas
-- **The recall pre-check is the first statement in `fetch_advisories`.** A hit
+- **The recall pre-check is the first statement in `resolve_advisories`.** A hit
   synthesizes an item with `severity: Block` **and `is_malware: true`**
   regardless of `block_on_malware`, and returns *before* the cache read and
   *before* `if !policy.policy.check_advisories`. Moving that block later makes

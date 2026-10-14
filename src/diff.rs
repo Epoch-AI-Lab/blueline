@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -300,37 +301,162 @@ fn scan_tree(root: &Path) -> Result<BTreeMap<PathBuf, DiskFileMeta>, BluelineErr
                 .map_err(|e| BluelineError::Extraction(format!("path strip error: {e}")))?
                 .to_path_buf();
 
-            let bytes = fs::read(path).map_err(|e| {
-                BluelineError::Extraction(format!("reading {}: {e}", path.display()))
-            })?;
-            let mut hasher = Sha256::new();
-            hasher.update(&bytes);
-            let hash = hasher.finalize().into();
-
-            let kind = classify_bytes(&bytes);
-            let is_executable = check_is_executable(path);
-
-            files.insert(
-                rel,
-                DiskFileMeta {
-                    hash,
-                    kind,
-                    is_executable,
-                },
-            );
+            files.insert(rel, scan_file(path)?);
         }
     }
     Ok(files)
 }
 
-fn classify_bytes(bytes: &[u8]) -> FileKind {
-    if bytes.len() as u64 > MAX_DIFF_FILE_BYTES {
+/// Window used to read each file. Large enough that syscall overhead is noise,
+/// small enough that peak memory is set by this rather than by the package.
+const SCAN_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Longest UTF-8 sequence, so a code point split across two reads can be
+/// carried over whole.
+const UTF8_MAX_SEQ: usize = 4;
+
+/// Sequence length implied by a UTF-8 lead byte, or `None` if the byte cannot
+/// start a valid sequence.
+fn seq_len(lead: u8) -> Option<usize> {
+    match lead {
+        0x00..=0x7f => Some(1),
+        0xc2..=0xdf => Some(2),
+        0xe0..=0xef => Some(3),
+        0xf0..=0xf4 => Some(4),
+        _ => None,
+    }
+}
+
+/// Incremental UTF-8 validity check.
+///
+/// `from_utf8` rejects a sequence that is merely truncated by the end of the
+/// buffer, so the tail of a chunk has to be carried into the next one before it
+/// can be judged. The carry is at most `UTF8_MAX_SEQ - 1` bytes, and a valid
+/// result on the carried bytes means those bytes are settled, so the carry
+/// never grows without bound.
+#[derive(Default)]
+struct Utf8Scan {
+    valid: bool,
+    pending: [u8; UTF8_MAX_SEQ],
+    pending_len: usize,
+}
+
+impl Utf8Scan {
+    fn feed(&mut self, chunk: &[u8]) {
+        if !self.valid {
+            return;
+        }
+        let mut rest = chunk;
+
+        if self.pending_len > 0 {
+            // Complete the carried sequence by its actual length, taken from the
+            // lead byte. Padding to a fixed four bytes would steal the lead of
+            // the next character whenever the split sequence is shorter, and
+            // from_utf8 would then reject the carry as malformed.
+            let expected = match seq_len(self.pending[0]) {
+                Some(n) => n,
+                None => {
+                    self.valid = false;
+                    return;
+                }
+            };
+            let take = (expected - self.pending_len).min(rest.len());
+            self.pending[self.pending_len..self.pending_len + take].copy_from_slice(&rest[..take]);
+            self.pending_len += take;
+            rest = &rest[take..];
+            if self.pending_len < expected {
+                // Still short of a full sequence. Nothing new is judgeable yet.
+                return;
+            }
+            if std::str::from_utf8(&self.pending[..expected]).is_err() {
+                self.valid = false;
+                return;
+            }
+            self.pending_len = 0;
+        }
+
+        match std::str::from_utf8(rest) {
+            Ok(_) => {}
+            Err(e) => match e.error_len() {
+                Some(_) => self.valid = false,
+                None => {
+                    let tail = rest.len() - e.valid_up_to();
+                    self.pending[..tail].copy_from_slice(&rest[rest.len() - tail..]);
+                    self.pending_len = tail;
+                }
+            },
+        }
+    }
+
+    /// Judge whatever carry is left once the file is exhausted.
+    ///
+    /// A sequence still incomplete at EOF is malformed input, not a truncation
+    /// of a longer buffer: there are no further bytes to complete it with.
+    /// Judging it here is what keeps a file that ends mid-code-point from
+    /// reading as text.
+    fn finish(&mut self) {
+        if self.pending_len > 0 {
+            self.valid = false;
+        }
+    }
+}
+
+/// Read one file once and keep only what the comparison needs.
+///
+/// The previous shape was `fs::read` followed by a hash and a classify over the
+/// whole buffer. None of the three questions need the buffer: the size is a
+/// running count, the digest is incremental by construction, and "is this
+/// text" is a NUL scan plus a UTF-8 check. A fixed window answers all three, so
+/// peak memory stops scaling with the largest file in the package. Every byte
+/// still reaches the hasher, because the digest is what decides whether a file
+/// is compared at all.
+fn scan_file(path: &Path) -> Result<DiskFileMeta, BluelineError> {
+    let read_err =
+        |e: std::io::Error| BluelineError::Extraction(format!("reading {}: {e}", path.display()));
+    let mut file = fs::File::open(path).map_err(read_err)?;
+
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; SCAN_CHUNK_BYTES];
+    let mut utf8 = Utf8Scan {
+        valid: true,
+        ..Default::default()
+    };
+    let mut len: u64 = 0;
+    let mut has_nul = false;
+
+    loop {
+        let n = file.read(&mut buf).map_err(read_err)?;
+        if n == 0 {
+            break;
+        }
+        let chunk = &buf[..n];
+        hasher.update(chunk);
+        len += n as u64;
+        // Past the cap the file is opaque whatever its bytes look like, so the
+        // two scans stop. The hash keeps going: it decides the comparison.
+        if len <= MAX_DIFF_FILE_BYTES {
+            if !has_nul {
+                has_nul = chunk.contains(&0);
+            }
+            utf8.feed(chunk);
+        }
+    }
+    utf8.finish();
+
+    let hash = hasher.finalize().into();
+    let kind = classify_bytes(len, has_nul, utf8.valid);
+    Ok(DiskFileMeta {
+        hash,
+        kind,
+        is_executable: check_is_executable(path),
+    })
+}
+
+fn classify_bytes(len: u64, has_nul: bool, utf8_valid: bool) -> FileKind {
+    if len > MAX_DIFF_FILE_BYTES {
         return FileKind::OpaqueTooLarge;
     }
-    if bytes.contains(&0) {
-        return FileKind::Binary;
-    }
-    if std::str::from_utf8(bytes).is_err() {
+    if has_nul || !utf8_valid {
         return FileKind::Binary;
     }
     FileKind::Text
@@ -471,6 +597,106 @@ mod tests {
     use super::*;
 
     #[test]
+    fn seq_len_maps_every_utf8_lead_byte_class() {
+        // Each arm is the load-bearing half of the chunk-boundary carry: it
+        // decides how many bytes a split sequence still needs. Deleting an arm
+        // silently mis-classifies every file whose split lands on that class,
+        // so pin all four plus the two rejection ranges.
+        assert_eq!(seq_len(b'a'), Some(1)); // 0x00..=0x7f
+        assert_eq!(seq_len(0x7f), Some(1));
+        assert_eq!(seq_len(0xc2), Some(2)); // 0xc2..=0xdf
+        assert_eq!(seq_len(0xdf), Some(2));
+        assert_eq!(seq_len(0xe0), Some(3)); // 0xe0..=0xef
+        assert_eq!(seq_len(0xef), Some(3));
+        assert_eq!(seq_len(0xf0), Some(4)); // 0xf0..=0xf4
+        assert_eq!(seq_len(0xf4), Some(4));
+        // Not valid lead bytes: continuation bytes and the two overlong ranges.
+        assert_eq!(seq_len(0x80), None);
+        assert_eq!(seq_len(0xbf), None);
+        assert_eq!(seq_len(0xc0), None);
+        assert_eq!(seq_len(0xc1), None);
+        assert_eq!(seq_len(0xf5), None);
+        assert_eq!(seq_len(0xff), None);
+    }
+
+    #[test]
+    fn the_scan_window_is_sixty_four_kibibytes() {
+        // The window is the memory bound, and `64 * 1024` vs `64 + 1024` is a
+        // one-token swap the digest test cannot see. Pin the value so the
+        // bound the comment promises is the bound that ships.
+        assert_eq!(SCAN_CHUNK_BYTES, 64 * 1024);
+    }
+
+    #[test]
+    fn classify_bytes_draws_the_opaque_boundary_above_the_cap_only() {
+        // `len > cap` vs `len >= cap` is an off-by-one at the exact boundary.
+        // A file exactly at the cap is still line-diffable, so it must stay
+        // Text; only one byte past it is opaque.
+        assert_eq!(
+            classify_bytes(MAX_DIFF_FILE_BYTES, false, true),
+            FileKind::Text,
+            "a file exactly at the cap must still be diffable"
+        );
+        assert_eq!(
+            classify_bytes(MAX_DIFF_FILE_BYTES + 1, false, true),
+            FileKind::OpaqueTooLarge,
+            "one byte past the cap is opaque"
+        );
+    }
+
+    #[test]
+    fn a_carry_completes_only_once_the_whole_sequence_arrives() {
+        // The `pending_len < expected` guard is what keeps a half-arrived
+        // sequence from being judged before its bytes exist. Flipping it to
+        // `>` would judge an empty carry as complete and a full one as
+        // incomplete, so drive both sides of the boundary.
+        //
+        // `valid` starts true, exactly as `scan_file` initialises it; the
+        // `Default` derive would start it false and every feed would no-op.
+        let new_scan = || Utf8Scan {
+            valid: true,
+            ..Default::default()
+        };
+        // A four-byte sequence delivered one byte at a time into the SAME
+        // scan: incomplete at every step but the last, and never judged until
+        // the fourth byte. This is the case the `pending_len < expected` guard
+        // protects — a partial carry meeting a follow-up feed that is still
+        // too short must not be judged. Flipping the guard to `>` would skip
+        // the early return and judge the half-filled carry as malformed.
+        let mut drip = new_scan();
+        for (i, byte) in [0xf0u8, 0x9f, 0x98, 0x80].iter().enumerate() {
+            drip.feed(&[*byte]);
+            if i < 3 {
+                assert!(
+                    drip.valid,
+                    "after {i} byte(s) the carry is incomplete, not invalid"
+                );
+            }
+        }
+        assert!(
+            drip.valid,
+            "the completed four-byte sequence is valid UTF-8"
+        );
+
+        // The completed sequence judges valid, and so does the same sequence
+        // split across two feeds.
+        let mut scan = new_scan();
+        scan.feed(&[0xf0, 0x9f]);
+        assert!(scan.valid, "a two-byte carry is not yet judgeable");
+        scan.feed(&[0x98, 0x80]);
+        assert!(
+            scan.valid,
+            "the completed four-byte sequence is valid UTF-8"
+        );
+
+        // A genuinely malformed lead byte is rejected as soon as it is the
+        // carry's first byte, which is what `seq_len` returning `None` drives.
+        let mut bad = new_scan();
+        bad.feed(&[0xff]);
+        assert!(!bad.valid, "0xff cannot start a UTF-8 sequence");
+    }
+
+    #[test]
     fn detects_file_added_removed_modified() {
         let old_dir = tempfile::tempdir().unwrap();
         let new_dir = tempfile::tempdir().unwrap();
@@ -547,10 +773,78 @@ mod tests {
 
     #[test]
     fn scans_entire_file_for_nul_byte() {
-        // NUL byte placed past 8192 bytes
-        let mut data = vec![b'a'; 10000];
-        data[9000] = 0;
-        assert_eq!(classify_bytes(&data), FileKind::Binary);
+        // NUL byte placed past 8192 bytes, and past the read window, so only a
+        // scan that keeps going to the end of the file can see it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("late-nul.bin");
+        let mut data = vec![b'a'; SCAN_CHUNK_BYTES * 3];
+        data[SCAN_CHUNK_BYTES + 17] = 0;
+        fs::write(&path, &data).unwrap();
+
+        assert_eq!(scan_file(&path).unwrap().kind, FileKind::Binary);
+    }
+
+    #[test]
+    fn chunked_reads_agree_with_a_single_read_on_the_classification() {
+        // A multi-byte code point straddling the window boundary is the case
+        // most likely to be misjudged by an incremental check, so pin every
+        // offset of a four-byte sequence against the whole-buffer answer.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edge.txt");
+        let euro = "€".repeat(SCAN_CHUNK_BYTES);
+        for pad in 0..8usize {
+            let mut data = vec![b'a'; pad];
+            data.extend_from_slice(euro.as_bytes());
+            fs::write(&path, &data).unwrap();
+            assert_eq!(
+                scan_file(&path).unwrap().kind,
+                FileKind::Text,
+                "misclassified with {pad} bytes of padding"
+            );
+        }
+
+        fs::write(&path, b"\xff\xfe not utf8").unwrap();
+        assert_eq!(scan_file(&path).unwrap().kind, FileKind::Binary);
+
+        // A file that ends mid-code-point has no further bytes to complete the
+        // sequence with, so the leftover carry is malformed, not truncated.
+        for truncated in [&[0xc2][..], &[0xe2, 0x82][..], &[0xf0, 0x9f, 0x98][..]] {
+            fs::write(&path, truncated).unwrap();
+            assert_eq!(scan_file(&path).unwrap().kind, FileKind::Binary);
+        }
+
+        let mut oversize = vec![b'a'; MAX_DIFF_FILE_BYTES as usize + 1];
+        oversize[MAX_DIFF_FILE_BYTES as usize / 2] = 0;
+        fs::write(&path, &oversize).unwrap();
+        assert_eq!(scan_file(&path).unwrap().kind, FileKind::OpaqueTooLarge);
+    }
+
+    #[test]
+    fn the_windowed_digest_equals_the_whole_file_digest() {
+        // The hash decides whether a file is compared at all
+        // (`if base_meta.hash != target_meta.hash`), so a digest that covered
+        // fewer bytes than it read would make base and target agree on a
+        // changed file and silently skip the comparison. Every byte must
+        // reach the hasher, so pin the digest against the whole-buffer
+        // answer across sizes that cross the window boundary at every offset
+        // of one, plus a zero-byte file and an exact multiple of the window.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("digest.bin");
+
+        let mut sizes = vec![0usize];
+        for base in [SCAN_CHUNK_BYTES - 1, SCAN_CHUNK_BYTES, SCAN_CHUNK_BYTES + 1] {
+            sizes.extend([base, base * 2, base * 2 + 1]);
+        }
+        for size in sizes {
+            let bytes: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            fs::write(&path, &bytes).unwrap();
+            let scanned = scan_file(&path).unwrap();
+            let expected: [u8; 32] = Sha256::digest(&bytes).into();
+            assert_eq!(
+                scanned.hash, expected,
+                "digest differs from the whole-buffer hash at {size} bytes"
+            );
+        }
     }
 
     #[test]
