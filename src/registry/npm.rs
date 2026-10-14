@@ -495,6 +495,18 @@ mod tests {
     /// sha512 SRI of the bytes "tarball-content".
     const TEST_SRI: &str = "sha512-dWJ6JIJkmHG8N3fH1b/hbpmBQ7wKIpEw3zsVl2873OtFXh9QhR1KUU3uojohuIJ/xd+hb1R0q/57C8sMt4tstQ==";
 
+    /// One signature block in the over-ceiling packument fixture, and how much
+    /// the fixture carries in total: 64 versions x 2 blocks x 768 KiB = 96 MiB,
+    /// against a 64 MiB per-document ceiling.
+    ///
+    /// Enough margin that the refusal the fixture asserts cannot be an
+    /// off-by-a-bit, and small enough that building and serialising it costs a
+    /// fraction of the 256 MiB this replaced. What that size was carrying, and
+    /// what still pins the ceiling without it, is in
+    /// `the_packument_memo_is_bounded_and_the_estimate_is_not_a_fig_leaf`.
+    const SIGNATURE_BLOCK_BYTES: usize = 768 * 1024;
+    const SIGNATURE_FIXTURE_BYTES: u64 = 64 * 2 * SIGNATURE_BLOCK_BYTES as u64;
+
     #[test]
     fn list_versions_orders_and_limits() {
         let versions: BTreeMap<String, VersionMeta> =
@@ -1256,9 +1268,30 @@ mod tests {
     /// and the memo as a whole. A packument over the first is not cached at
     /// all; exceeding the second clears what is held, so a recursive review
     /// cannot grow the memo without limit.
+    ///
+    /// The fixture carries [`SIGNATURE_FIXTURE_BYTES`] of signature payload, which
+    /// is 1.5x the per-document ceiling. It used to be 256 MiB (4x), and that
+    /// size was not carrying more coverage:
+    ///
+    /// * the ceiling constants are pinned as values by
+    ///   `the_packument_memo_ceilings_are_the_documented_sizes`, so a mutant
+    ///   that changes `64 * 1024 * 1024` dies there whatever this fixture is;
+    /// * the one-byte comparison (`>` against `>=`) is pinned by
+    ///   `the_per_document_ceiling_is_strict`, which passes the ceilings in and
+    ///   needs a 1057-byte document -- its own comment says the real ceiling
+    ///   "cannot express this without a 64 MiB fixture";
+    /// * the whole-memo ceiling, including sum-versus-product, is pinned by
+    ///   `the_whole_memo_ceiling_is_strict_and_adds_rather_than_multiplies`;
+    /// * the estimate's own arithmetic is pinned by `the_packument_estimate_is_exact`.
+    ///
+    /// What this fixture is for is the wiring: a large, many-version packument
+    /// that goes through the production `insert` with the real ceiling and is
+    /// refused. It still does that. What it no longer buys is a 4x margin over
+    /// the ceiling, which mattered only against a mutant that raised the
+    /// constant *and* the assertion pinning it in the same build.
     #[test]
     fn the_packument_memo_is_bounded_and_the_estimate_is_not_a_fig_leaf() {
-        let big = "x".repeat(2 * 1024 * 1024);
+        let block = "x".repeat(SIGNATURE_BLOCK_BYTES);
         let mut versions = BTreeMap::new();
         for i in 0..64 {
             versions.insert(
@@ -1269,7 +1302,7 @@ mod tests {
                     dist: Dist {
                         tarball: "https://example.invalid/p.tgz".into(),
                         integrity: None,
-                        signatures: Some(serde_json::json!([big, big])),
+                        signatures: Some(serde_json::json!([block, block])),
                     },
                 },
             );
@@ -1281,8 +1314,9 @@ mod tests {
         };
         let size = packument_size_estimate(&p);
         assert!(
-            size > 200 * 1024 * 1024,
-            "a packument carrying 256 MiB of signature blocks must not estimate to {size} bytes"
+            size >= SIGNATURE_FIXTURE_BYTES,
+            "a packument carrying {} signature bytes must not estimate to {size} bytes",
+            SIGNATURE_FIXTURE_BYTES
         );
 
         // Over the per-document ceiling: not cached.
