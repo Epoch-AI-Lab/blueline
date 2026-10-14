@@ -133,7 +133,11 @@ impl Entry {
 
 /// Gzip a raw tar stream: the shape every npm tarball arrives in.
 pub fn archive(entries: &[Entry]) -> Vec<u8> {
-    let mut tar: Vec<u8> = Vec::new();
+    // Written straight into the encoder. The entry-count fixture carries
+    // 100_001 headers and the bomb carries 200 MiB of payload, so staging the
+    // tar in a `Vec` first held a second full copy of every fixture (the bomb
+    // peaked at 209 MB) and copied it twice before the encoder ever saw it.
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), fixture_compression());
     for entry in entries {
         let size = match &entry.payload {
             Payload::Bytes(b) => b.len() as u64,
@@ -143,34 +147,49 @@ pub fn archive(entries: &[Entry]) -> Vec<u8> {
             EntryKind::Symlink | EntryKind::Hardlink => entry.link_target.as_str(),
             _ => "",
         };
-        tar.extend_from_slice(&ustar_header(
-            &entry.path,
-            entry.kind,
-            size,
-            link,
-            entry.mode,
-        ));
+        encoder
+            .write_all(&ustar_header(
+                &entry.path,
+                entry.kind,
+                size,
+                link,
+                entry.mode,
+            ))
+            .expect("write ustar header into fixture tarball");
         match &entry.payload {
             Payload::Bytes(bytes) => {
-                tar.extend_from_slice(bytes);
-                pad_to_block(&mut tar, bytes.len() as u64);
+                encoder
+                    .write_all(bytes)
+                    .expect("write payload into fixture tarball");
+                pad_to_block(&mut encoder, bytes.len() as u64);
             }
             Payload::Zeroes { len, chunk } => {
                 let mut written: u64 = 0;
                 while written < *len {
                     let take = chunk.len().min((*len - written) as usize);
-                    tar.extend_from_slice(&chunk[..take]);
+                    encoder
+                        .write_all(&chunk[..take])
+                        .expect("write zeroes into fixture tarball");
                     written += take as u64;
                 }
-                pad_to_block(&mut tar, *len);
+                pad_to_block(&mut encoder, *len);
             }
         }
     }
-    tar.extend_from_slice(&[0u8; 1024]);
-
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    encoder.write_all(&tar).expect("gzip fixture tarball");
+    encoder.write_all(&[0u8; 1024]).expect("write tar trailer");
     encoder.finish().expect("finish gzip fixture tarball")
+}
+
+/// Compression level for fixture tarballs.
+///
+/// `fast` rather than `default`, and nothing here can tell the difference:
+/// every consumer of a fixture infers it, and the only ratio any test asserts
+/// is that a bomb of zeroes still arrives under 1 MiB, which holds at every
+/// level. Level 6 on 100 MiB of synthetic tar in an `opt-level = 0` build was
+/// the whole cost of `tar_entry_count_over_the_cap_is_refused`: 16.01 s of
+/// which the review under test was a fraction.
+fn fixture_compression() -> flate2::Compression {
+    flate2::Compression::fast()
 }
 
 /// Zero padding to the next 512-byte boundary.
@@ -178,8 +197,9 @@ pub fn pad_to_512(len: usize) -> Vec<u8> {
     vec![0u8; (512 - len % 512) % 512]
 }
 
-fn pad_to_block(buf: &mut Vec<u8>, written: u64) {
-    buf.extend_from_slice(&pad_to_512(written as usize));
+fn pad_to_block<W: std::io::Write>(buf: &mut W, written: u64) {
+    buf.write_all(&pad_to_512(written as usize))
+        .expect("write tar block padding");
 }
 
 /// A raw ustar header with an explicit typeflag, for the archive shapes
@@ -238,7 +258,7 @@ fn ustar_header_raw(name: &str, typeflag: u8, size: u64, link_target: &str, mode
 /// Gzip raw tar bytes: the wire shape of every npm tarball. Paired with
 /// [`raw_header`] for archive shapes a builder cannot express.
 pub fn gzip(raw: &[u8]) -> Vec<u8> {
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), fixture_compression());
     encoder.write_all(raw).expect("gzip fixture tarball");
     encoder.finish().expect("finish gzip fixture tarball")
 }
