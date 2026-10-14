@@ -57,21 +57,29 @@ the prose docs.
 
 Each finding is cited in its lane file with the exact source location.
 
-1. **~~No Landlock/seccomp/capability-drop sandbox and no `cap-std`~~ —
-   resolved.** §1 said "planned, not implemented" and named the parser-level
-   budget as the real bound for the whole life of this entry, and the fix was
-   always going to be code rather than wording. The code landed: extraction now
-   runs inside a Landlock-restricted child (`src/sandbox.rs`), the ruleset
-   grants write access only to the private temp dir, and the ABI ladder
-   (V5 → V3 → V1) keeps `Truncate` containment on kernels too old for V5.
-   A confinement failure after anything narrowed is `Unusable` — never a
-   fallback — so a partly applied domain cannot turn into an unconfined
-   extraction. `README.md`, D4 and §1 now describe the layer that exists.
-   seccomp and `cap-std` are still absent; they are no longer the missing
-   capability this entry tracked, because Landlock is the confinement that
-   ships. Platforms and kernels without it fall back to the parser-level
-   budget with a `P05_SANDBOX_UNAVAILABLE` disclosure, or refuse outright
-   under `[policy] require_sandbox = true`. See [sandbox](features/sandbox.md).
+1. **No Landlock/seccomp/capability-drop sandbox and no `cap-std`. Still
+   unfixed, and this entry stays live.** §1 has said "planned, not implemented"
+   and named the parser-level budget as the real bound, but `README.md` still
+   called the temp dir "an isolated sandbox", D4 still read "Read-only sandbox
+   extraction", and the §1 header rule and §1 diagram both said "sandbox". Those
+   are now corrected, so the *documentation* no longer claims a capability the
+   code lacks — which is the half of this that prose could fix.
+
+   The half prose could not fix is the missing capability itself, and it is the
+   half that matters. What bounds a hostile archive today is
+   `decompressed_stream_cap` plus the three `ExtractionLimits` fields, enforced
+   on the declared size *and* on the inflated stream. There is no OS-level
+   confinement behind that, so the guarantee a reader takes from the word
+   "sandbox" does not exist. Closing this means adding a confinement mechanism
+   (Landlock on Linux, `cap-std`, or seccomp), which is a dependency decision
+   and therefore not something to do silently. See [extract](features/extract.md)
+   for what the bounds actually are.
+
+   One more prose-level claim was corrected while the capability was still
+   absent: the 0.3.0 entry described `blueline install` as shipping "sandboxed
+   extraction". It never did, and the entry now says fail-closed script
+   execution and points here, so the history does not assert the capability
+   either. Entry stays **High, unfixed**; the fix is code.
 2. **The npm registry signature is read for presence and never verified. Partly
    resolved; the verification gap itself is untouched.** `release_signatures`
    still returns the block as raw JSON, nothing compares the bytes to it, and
