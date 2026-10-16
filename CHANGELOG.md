@@ -7,10 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Dependency swap / rename-under-a-new-name detection.** `compute_delta`
+  now records removed dependencies (`Delta.removed_dependencies`), and a
+  new heuristic rule `R04_DEPENDENCY_SWAP` (Low) fires when a name from
+  the removed set has a near-identical counterpart in the added set
+  (normalized name comparison, or Levenshtein distance 1). A bare
+  dependency drop is still unscored, because shrinking the install graph
+  on its own is defensible; only the swap pair is disclosed. Swapping a
+  dead dependency for a maintained fork is common, so the rule stays a
+  score-neutral disclosure rather than escalating the verdict; the pair is
+  named on the card.
+
 Targeted at 0.4.0. This release is a behaviour change for anyone who set
 `require_provenance`: see the entry below before upgrading.
 
 ### Changed
+
+- **The AUR CI lane reviews pins in parallel.** `evaluate_aur_ci_diff` ran
+  one `evaluate_package` review at a time while the lockfile half already
+  fanned out to eight workers. It now goes through the same shared
+  `evaluate_candidates` driver: each worker gets its own `ReviewContext`
+  and database handle, and items come back in pin-file order. One failed
+  pin no longer stops the rest from being reviewed; the run still fails,
+  with the same evidence-only store writes the lockfile lane already made.
 
 - **Eight mutant survivors in the windowed file scan are now killed or
   excluded.** The `--mutants` CI shards found that deleting any arm of the

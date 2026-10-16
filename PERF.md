@@ -209,14 +209,16 @@ the item listed are all preserved and pinned by tests.
 - Target: 717 ms wall becomes about 175 ms on a 200-file package, CPU unchanged
   at 45 ms.
 
-### 2. Parallelise the `ci.rs` evaluation loop — IMPLEMENTED (npm/cargo half)
+### 2. Parallelise the `ci.rs` evaluation loop — IMPLEMENTED
 
 `src/ci.rs:296` and `src/ci.rs:409` called `evaluate_package` one package at a
 time. 100 packages at 560 ms each is about 56 s of network waiting. The
 lockfile lane now runs up to eight workers, each with its own `ReviewContext`
 and its own database handle, results ordered by candidate index. **The AUR
-half (`evaluate_aur_ci_diff`) is still serial** and is not covered by this
-item's implementation.
+half (`evaluate_aur_ci_diff`) now runs through the same driver** with an
+empty integrity map: same worker cap, same per-worker context and store
+handle, same candidate-order guarantee, pinned by
+`tests/aur_ci_parallel.rs` (slow-first pin still reported first).
 
 - The store is already opened in WAL mode with a 5 s busy timeout at
   `src/store.rs:389`, so concurrent writers have a path.

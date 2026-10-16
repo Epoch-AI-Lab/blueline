@@ -1862,7 +1862,102 @@ fn dependency_findings(delta: &Delta, policy: &Policy) -> Vec<Finding> {
         }
     }
 
+    // Dependency swap / rename-under-a-new-name detection. A name that was in
+    // the baseline dependency set disappearing at the same time that a
+    // near-identical name appears in the added set is the shape of a typosquat:
+    // the payload ships under a spelling the reviewer has never seen, while the
+    // familiar name quietly drops out. A bare drop shrinks the graph and is
+    // defensible on its own, so only the pair is scored.
+    //
+    // Swapping a dead dependency for a maintained fork is common, so this stays
+    // a disclosure (Low): it names the pair and leaves the verdict alone unless
+    // policy tightens thresholds. Names are compared case- and
+    // separator-insensitively, and a single edit is treated as "near
+    // identical". No claim is made that the swap is malicious.
+    let mut swaps: Vec<String> = Vec::new();
+    for (removed, _) in &delta.removed_dependencies {
+        for (added, _) in &delta.new_dependencies {
+            if removed == added {
+                continue;
+            }
+            let rn = normalize_dep_name(removed);
+            let an = normalize_dep_name(added);
+            if rn.is_empty() || an.is_empty() {
+                continue;
+            }
+            if levenshtein_at_most_one(&rn, &an) {
+                swaps.push(format!("{removed} -> {added}"));
+            }
+        }
+    }
+    if !swaps.is_empty() {
+        findings.push(Finding {
+            rule_id: "R04_DEPENDENCY_SWAP".into(),
+            severity: VerdictBand::Low,
+            title: format!(
+                "{} dependency rename candidate{} under a new name",
+                swaps.len(),
+                if swaps.len() == 1 { "" } else { "s" }
+            ),
+            description: format!(
+                "A removed dependency has a near-identical name among the added dependencies ({}). This is the rename-under-a-new-name shape associated with typosquats, but it is also the ordinary shape of replacing a dead dependency with a maintained fork, so this finding discloses the pair and leaves the verdict to policy.",
+                swaps.join(", ")
+            ),
+        });
+    }
+
     findings
+}
+
+fn normalize_dep_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Levenshtein distance of at most one between two already-normalized strings.
+fn levenshtein_at_most_one(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.len().abs_diff(b.len()) > 1 {
+        return false;
+    }
+    // Ensure `a` is the longer (or equal) so only one branch handles deletion.
+    let (long, short) = if a.len() >= b.len() {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
+
+    let mut i = 0usize;
+    let mut j = 0usize;
+    let mut edits = 0usize;
+    while j < short.len() {
+        if i < long.len() && long[i] == short[j] {
+            i += 1;
+            j += 1;
+        } else {
+            edits += 1;
+            if edits > 1 {
+                return false;
+            }
+            if long.len() > short.len() {
+                // deletion in the shorter / insertion in the longer
+                i += 1;
+            } else {
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    if i < long.len() {
+        edits += 1;
+    }
+    edits <= 1
 }
 
 /// Every rule that reads the provenance report. Split out from the main
@@ -2061,6 +2156,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
 
         let verdict = evaluate_with_policy(
@@ -2106,6 +2202,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
 
         let verdict = evaluate_with_policy(
@@ -2156,6 +2253,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
 
         let verdict = evaluate_with_policy(
@@ -2231,6 +2329,65 @@ mod tests {
                 .iter()
                 .any(|f| f.rule_id == "R04_DEPENDENCY_MODIFIED" && f.severity == VerdictBand::High),
             "moving off a URL is the mirror of the redirect and must be HIGH"
+        );
+    }
+
+    #[test]
+    fn detects_a_dependency_swap_under_a_new_name() {
+        let mut delta = Delta::default();
+        delta
+            .removed_dependencies
+            .push(("lodash".into(), "4.17.20".into()));
+        delta
+            .new_dependencies
+            .push(("lodas".into(), "4.17.21".into()));
+        let findings = dependency_findings(&delta, &Policy::default());
+        let swaps: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "R04_DEPENDENCY_SWAP")
+            .collect();
+        assert_eq!(
+            swaps.len(),
+            1,
+            "a near-identical added name must be flagged"
+        );
+        assert_eq!(
+            swaps[0].severity,
+            VerdictBand::Low,
+            "benign forks are common, so the swap stays score-neutral"
+        );
+    }
+
+    #[test]
+    fn a_plain_dependency_drop_does_not_fire_a_swap() {
+        let mut delta = Delta::default();
+        delta
+            .removed_dependencies
+            .push(("old-dep".into(), "1.0.0".into()));
+        // Nothing near-identical is added.
+        delta
+            .new_dependencies
+            .push(("fresh-lib".into(), "1.0.0".into()));
+        let findings = dependency_findings(&delta, &Policy::default());
+        assert!(
+            !findings.iter().any(|f| f.rule_id == "R04_DEPENDENCY_SWAP"),
+            "an unrelated drop must not be a typosquat"
+        );
+    }
+
+    #[test]
+    fn a_normalized_name_match_counts_as_a_swap() {
+        let mut delta = Delta::default();
+        delta
+            .removed_dependencies
+            .push(("my-lib".into(), "1.0.0".into()));
+        delta
+            .new_dependencies
+            .push(("MyLib".into(), "1.0.0".into()));
+        let findings = dependency_findings(&delta, &Policy::default());
+        assert!(
+            findings.iter().any(|f| f.rule_id == "R04_DEPENDENCY_SWAP"),
+            "case and separator differences are normalized"
         );
     }
 
@@ -2424,6 +2581,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: true,
+            removed_dependencies: Vec::new(),
         };
 
         let verdict = evaluate_with_policy(
@@ -2484,6 +2642,7 @@ mod tests {
             new_dependencies: vec![("malicious-pkg".into(), "ssh://git@host/repo".into())],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
 
         let verdict = evaluate_with_policy(
@@ -2528,6 +2687,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
 
         let verdict = evaluate_with_policy(
@@ -2566,6 +2726,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
 
         let verdict = evaluate_with_policy(
@@ -2603,6 +2764,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
         let unreviewed = Delta {
             baseline_version: Some("1.0.0".into()),
@@ -2688,6 +2850,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
 
         let mut policy = Policy::default();
@@ -2775,6 +2938,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
 
         let verdict = evaluate_with_policy(
@@ -2816,6 +2980,7 @@ mod tests {
                 "https://evil.com/cookie.tgz".into(),
             )],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
 
         let verdict = evaluate_with_policy(
@@ -2902,6 +3067,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
 
         let verdict = evaluate_with_policy(
@@ -2934,6 +3100,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
 
         let mut policy = Policy::default();
@@ -2980,6 +3147,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
 
         let mut policy = Policy::default();
@@ -3042,6 +3210,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
 
         let adv = AdvisoryReport {
@@ -3103,6 +3272,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
 
         let adv = AdvisoryReport {
@@ -3164,6 +3334,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
 
         let prov = ProvenanceReport::failed_mismatch("digest hash mismatch");
@@ -3212,6 +3383,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
 
         let mut policy = Policy::default();
@@ -3597,6 +3769,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         }
     }
 
@@ -3883,6 +4056,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
         let verdict = evaluate_with_trust(
             "test-pkg",
@@ -3938,6 +4112,7 @@ maintainers = ["badactor@example.com"]
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
         let verdict = evaluate_with_trust(
             "pkg",
@@ -3997,6 +4172,7 @@ maintainers = ["  BadActor@Example.com "]
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
         let verdict = evaluate_with_trust(
             "pkg",
@@ -4050,6 +4226,7 @@ maintainers = ["badactor@example.com"]
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
         let verdict = evaluate_with_trust(
             "pkg",
@@ -4122,6 +4299,7 @@ maintainers = ["badactor@example.com"]
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
         let verdict = evaluate_with_trust(
             "pkg",
@@ -4193,6 +4371,7 @@ maintainers = ["badactor@example.com"]
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
         let verdict = evaluate_with_trust(
             "yay",
@@ -4253,6 +4432,7 @@ maintainers = ["badactor@example.com"]
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
         let verdict = evaluate_with_trust(
             "pkg",

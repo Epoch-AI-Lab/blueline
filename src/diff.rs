@@ -45,6 +45,7 @@ pub struct Delta {
     pub modified_lifecycle_scripts: Vec<String>,
     pub new_dependencies: Vec<(String, String)>,
     pub modified_dependencies: Vec<(String, String, String)>,
+    pub removed_dependencies: Vec<(String, String)>,
     pub binding_gyp_added: bool,
 }
 
@@ -218,6 +219,7 @@ pub fn compute_delta(
 
     let mut new_dependencies = Vec::new();
     let mut modified_dependencies = Vec::new();
+    let mut removed_dependencies = Vec::new();
 
     let target_deps = collect_all_dependencies(target_manifest);
     if let Some(base_m) = baseline_manifest {
@@ -229,6 +231,11 @@ pub fn compute_delta(
                 }
             } else {
                 new_dependencies.push((dep.clone(), ver.clone()));
+            }
+        }
+        for (dep, ver) in &base_deps {
+            if !target_deps.contains_key(dep) {
+                removed_dependencies.push((dep.clone(), ver.clone()));
             }
         }
     } else {
@@ -261,6 +268,7 @@ pub fn compute_delta(
         modified_lifecycle_scripts,
         new_dependencies,
         modified_dependencies,
+        removed_dependencies,
         binding_gyp_added,
     })
 }
