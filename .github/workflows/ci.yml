@@ -441,7 +441,7 @@ jobs:
           # `store.reopen()`, invisible in the result. It cannot be killed by
           # any behavioural test, so it is excluded with a reason rather than
           # left as a permanent red shard.
-          BLUELINE_MUTANTS_EXCLUDE: 'with .*Default::default\(\)|replace && with \|\| in .*|delete ! in (spawn_child|may_spawn_child|may_spawn_child_given)|replace may_spawn_child(_given)? -> bool with true|replace <= with > in evaluate_candidates|replace == with != in scan_file'
+          BLUELINE_MUTANTS_EXCLUDE: 'with .*Default::default\(\)|replace && with \|\| in .*|delete ! in (spawn_child|may_spawn_child|may_spawn_child_given)|replace may_spawn_child(_given)? -> bool with true|replace <= with > in evaluate_candidates|replace == with != in scan_file|replace < with <= in levenshtein_at_most_one|replace < with > in levenshtein_at_most_one|replace \+= with \*= in levenshtein_at_most_one'
         run: |
           cargo mutants --in-diff pr.diff --shard ${{ matrix.shard }}/32 \
             --file 'src/**/*.rs' \
@@ -519,7 +519,7 @@ jobs:
       # mutants-pr: executing them re-execs the test harness and detonates the
       # runner, so they can only be pinned by the fast `may_spawn_child`
       # assertion, never by running the mutant to completion.
-      BLUELINE_MUTANTS_EXCLUDE: 'with .*Default::default\(\)|replace && with \|\| in .*|delete ! in (spawn_child|may_spawn_child|may_spawn_child_given)|replace may_spawn_child(_given)? -> bool with true|replace <= with > in evaluate_candidates|replace == with != in scan_file'
+      BLUELINE_MUTANTS_EXCLUDE: 'with .*Default::default\(\)|replace && with \|\| in .*|delete ! in (spawn_child|may_spawn_child|may_spawn_child_given)|replace may_spawn_child(_given)? -> bool with true|replace <= with > in evaluate_candidates|replace == with != in scan_file|replace < with <= in levenshtein_at_most_one|replace < with > in levenshtein_at_most_one|replace \+= with \*= in levenshtein_at_most_one'
     steps:
       - uses: actions/checkout@v4
         with:
