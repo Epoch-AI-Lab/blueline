@@ -43,9 +43,10 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
   OSV cache-TTL guard is split into a pure `cache_ttl_secs` and pinned
   three ways. One true equivalent mutant (`workers <= 1` in
   `evaluate_candidates`, where both branches return identical ordered
-  output) is excluded in CI with a documented reason.
-
-### Changed
+  output) is excluded in CI with a documented reason. A fourth exclusion
+  (`>` to `<` in `levenshtein_at_most_one`) joins them: the flipped guard
+  is never taken, and the scan advances one index past the point where it
+  can match, so the shard times out instead of producing a verdict.
 
 - **A review no longer waits for the advisory lookup to finish before it
   starts working.** `fetch_advisories` ran to completion inside the review,
@@ -122,6 +123,15 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
   count of a test run after a 2026-10-09 fork-bomb incident.
 
 ### Fixed
+
+- **The PyPI CLI tests no longer write to the developer's real baseline
+  store.** `tests/pypi_cli.rs` isolated itself with `HOME` alone, but
+  `default_db_path` prefers `XDG_DATA_HOME`, so on any machine with that
+  variable set the fixture packages (`demo-pkg`, `demo-lock`) were
+  recorded in the real `known_clean` store. A later run with different
+  wheel bytes then died on the fail-closed "integrity changed" refusal —
+  the test's own pollution blocking the test. Every command now also sets
+  `BLUELINE_DATA_DIR`, the convention the other CLI tests already use.
 
 - **A malformed checksum digest no longer renders as a well-formed one.**
   `Checksum::to_sri` decoded the stored hex through a helper that mapped an
@@ -1706,6 +1716,35 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
 - CHANGELOG 0.3.0 described `blueline install` as shipping "sandboxed
   extraction". It never did; the entry now says what shipped and points at
   drift entry 1, which stays High and unfixed.
+
+### Security
+
+- **The `zip` crate is bumped from 2.4.2 to 9.0.4**, clearing three
+  critical advisories (RUSTSEC-2026-0367, -0368, -0369) that landed
+  against `ZipArchive::extract()` and the stream extractor. Blueline
+  never called those APIs, but the upgrade surfaced a behaviour change in
+  `enclosed_name()`: zip 9 strips a leading root or drive prefix instead
+  of refusing the entry, and splits on backslashes, so a raw `/etc/evil`
+  or `foo\bar` name came back "contained" as `etc/evil` and `foo/bar`.
+  `safe_extract_wheel` now refuses those raw names itself, against the
+  undecoded entry bytes, before any sanitization can hide what the
+  archive asked for. Entry names whose bytes fail to decode are refused
+  too (`name()` is a `Result` in zip 9). The extraction tests that pinned
+  absolute-path and backslash rejection caught the regression, and are
+  unchanged.
+
+  The dependency uses zip's `deflate-flate2` feature, not the `deflate`
+  meta-feature: `deflate` also enables `flate2/zlib-rs`, and Cargo
+  unifies features across the whole build, so that one flag would have
+  silently switched every `flate2` user — blueline's own gunzip in
+  `safe_extract` and ureq's HTTP gzip — from miniz_oxide to zlib-rs.
+  `deflate-flate2` defers the backend choice to flate2's own default,
+  keeping the production decompression path on miniz_oxide exactly as
+  before. The gzip-bomb scenario fixture caught the switch on the first
+  run: zlib-rs at `Compression::fast()` packed the 200 MiB bomb to
+  ~2 MiB where miniz_oxide packs it to ~200 KiB, and the fixture's
+  "arrives small" assertion failed. zopfli leaves the dependency tree
+  with this choice (it was only reachable through the meta-feature).
 
 ## [0.3.1] - 2026-09-21
 
