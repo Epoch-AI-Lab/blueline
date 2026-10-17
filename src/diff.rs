@@ -1199,4 +1199,143 @@ mod tests {
             delta.new_binaries
         );
     }
+
+    /// Every dependency lands in exactly one of the three lists, decided by
+    /// presence on each side and then by whether the version moved.
+    ///
+    /// The four fixtures are one per arm of the classification, so a mutant that
+    /// reorders the `else`, drops the version equality check, or inverts
+    /// `contains_key` moves a name and fails a literal assertion below rather
+    /// than silently shrinking a list.
+    #[test]
+    fn a_dependency_lands_in_exactly_one_of_the_three_lists() {
+        fn manifest(deps: &[(&str, &str)]) -> PackageJson {
+            PackageJson {
+                name: "test".into(),
+                version: "1.0.0".into(),
+                gypfile: None,
+                scripts: BTreeMap::new(),
+                dependencies: deps
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+                optional_dependencies: BTreeMap::new(),
+                peer_dependencies: BTreeMap::new(),
+            }
+        }
+
+        let old_dir = tempfile::tempdir().unwrap();
+        let new_dir = tempfile::tempdir().unwrap();
+        let base_m = manifest(&[("kept", "1.0.0"), ("bumped", "1.0.0"), ("dropped", "0.1.0")]);
+        let target_m = manifest(&[("kept", "1.0.0"), ("bumped", "2.0.0"), ("added", "3.0.0")]);
+
+        let delta = compute_delta(
+            Some(old_dir.path()),
+            Some(&base_m),
+            Some("1.0.0"),
+            new_dir.path(),
+            &target_m,
+            "1.1.0",
+        )
+        .unwrap();
+
+        assert_eq!(
+            delta.new_dependencies,
+            vec![("added".to_string(), "3.0.0".to_string())],
+            "only the name absent from the baseline is new"
+        );
+        // The triple carries both versions, because the heuristic tells a range
+        // bump from a move onto a URL, and either end can be the URL.
+        assert_eq!(
+            delta.modified_dependencies,
+            vec![(
+                "bumped".to_string(),
+                "1.0.0".to_string(),
+                "2.0.0".to_string()
+            )],
+            "a version change is a modification, not an add and a removal"
+        );
+        assert_eq!(
+            delta.removed_dependencies,
+            vec![("dropped".to_string(), "0.1.0".to_string())],
+            "a name absent from the target is removed, at the baseline version"
+        );
+        // `kept` is in both manifests at the same version, so it is in none of
+        // them. The `assert_eq!`s above pin the lists to exact contents, so this
+        // is already implied; it is spelled out because "unchanged" is the case
+        // with no list of its own, and a reader has to be able to see it here.
+        let everywhere = |name: &str| {
+            delta.new_dependencies.iter().any(|(d, _)| d == name)
+                || delta
+                    .modified_dependencies
+                    .iter()
+                    .any(|(d, _, _)| d == name)
+                || delta.removed_dependencies.iter().any(|(d, _)| d == name)
+        };
+        assert!(
+            !everywhere("kept"),
+            "an unchanged dependency must be reported by no list"
+        );
+    }
+
+    /// No baseline manifest: there is nothing to subtract a dependency set from,
+    /// so the whole target dependency set is new and nothing can be modified or
+    /// removed.
+    ///
+    /// The `else` arm is the one that decides this. A mutant that falls through
+    /// to the subtraction arm with an empty baseline map still yields the same
+    /// `new_dependencies`, but the other two lists are only empty because the
+    /// branch is never taken, and that is what the emptiness assertions carry.
+    #[test]
+    fn without_a_baseline_every_dependency_is_new_and_nothing_is_modified_or_removed() {
+        fn manifest(deps: &[(&str, &str)]) -> PackageJson {
+            PackageJson {
+                name: "test".into(),
+                version: "1.0.0".into(),
+                gypfile: None,
+                scripts: BTreeMap::new(),
+                dependencies: deps
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+                optional_dependencies: BTreeMap::new(),
+                peer_dependencies: BTreeMap::new(),
+            }
+        }
+
+        let old_dir = tempfile::tempdir().unwrap();
+        let new_dir = tempfile::tempdir().unwrap();
+        let target_m = manifest(&[("alpha", "1.0.0"), ("beta", "2.0.0")]);
+
+        // A baseline *root* with no baseline *manifest*, so the branch under test
+        // is keyed on the manifest and not on the tree.
+        let delta = compute_delta(
+            Some(old_dir.path()),
+            None,
+            None,
+            new_dir.path(),
+            &target_m,
+            "1.0.0",
+        )
+        .unwrap();
+
+        assert_eq!(
+            delta.new_dependencies,
+            vec![
+                ("alpha".to_string(), "1.0.0".to_string()),
+                ("beta".to_string(), "2.0.0".to_string())
+            ],
+            "with no baseline every target dependency is new"
+        );
+        assert!(
+            delta.modified_dependencies.is_empty(),
+            "nothing exists to modify a version against: {:?}",
+            delta.modified_dependencies
+        );
+        assert!(
+            delta.removed_dependencies.is_empty(),
+            "nothing exists to remove: {:?}",
+            delta.removed_dependencies
+        );
+    }
 }

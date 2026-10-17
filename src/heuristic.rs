@@ -2391,6 +2391,310 @@ mod tests {
         );
     }
 
+    /// Every edit shape the swap rule accepts has to keep firing: a typosquat
+    /// only has to misspell by one edit, and the length-based path in
+    /// `levenshtein_at_most_one` runs the mismatch branch differently depending
+    /// on which string is longer. A single substitution pair covers only one of
+    /// those branches.
+    #[test]
+    fn a_swap_fires_on_an_insertion_and_on_a_deletion_too() {
+        // The added name is one char longer: the loop's mismatch branch takes
+        // `long.len() > short.len()`.
+        let mut longer = Delta::default();
+        longer
+            .removed_dependencies
+            .push(("requests".into(), "2.0.0".into()));
+        longer
+            .new_dependencies
+            .push(("requestss".into(), "1.0.0".into()));
+        assert!(
+            dependency_findings(&longer, &Policy::default())
+                .iter()
+                .any(|f| f.rule_id == "R04_DEPENDENCY_SWAP"),
+            "an inserted character is still one edit away"
+        );
+
+        // The added name is one char shorter: the same branch now sees equal
+        // lengths after the swap, and the tail of `long` is left over.
+        let mut shorter = Delta::default();
+        shorter
+            .removed_dependencies
+            .push(("requests".into(), "2.0.0".into()));
+        shorter
+            .new_dependencies
+            .push(("request".into(), "1.0.0".into()));
+        assert!(
+            dependency_findings(&shorter, &Policy::default())
+                .iter()
+                .any(|f| f.rule_id == "R04_DEPENDENCY_SWAP"),
+            "a dropped character is still one edit away"
+        );
+    }
+
+    /// Two edits are past the threshold, and the finding is a disclosure that
+    /// fires on ordinary fork renames, so the bound is what keeps the noise
+    /// down. `reqeusts` is a transposition, which Levenshtein scores as two
+    /// substitutions.
+    #[test]
+    fn a_swap_does_not_fire_at_two_edits() {
+        let mut delta = Delta::default();
+        delta
+            .removed_dependencies
+            .push(("requests".into(), "2.0.0".into()));
+        delta
+            .new_dependencies
+            .push(("reqeusts".into(), "1.0.0".into()));
+        let findings = dependency_findings(&delta, &Policy::default());
+        assert!(
+            !findings.iter().any(|f| f.rule_id == "R04_DEPENDENCY_SWAP"),
+            "two edits out is an unrelated rename, not a typosquat: {:?}",
+            findings.iter().map(|f| &f.rule_id).collect::<Vec<_>>()
+        );
+    }
+
+    /// A name that is all separators normalizes to the empty string, and the
+    /// empty string is at distance one from every one-character name. Without
+    /// the guard, `___` dropped for `___` — or for any single-character
+    /// package — would be reported as a typosquat.
+    ///
+    /// Both directions are driven, because the guard is checked against the
+    /// removed name first and then the added one, and deleting either check
+    /// leaves the other arm to catch nothing.
+    #[test]
+    fn a_name_that_normalizes_to_nothing_never_forms_a_swap() {
+        let mut empty_removed = Delta::default();
+        empty_removed
+            .removed_dependencies
+            .push(("___".into(), "1.0.0".into()));
+        empty_removed
+            .new_dependencies
+            .push(("abc".into(), "1.0.0".into()));
+        let findings = dependency_findings(&empty_removed, &Policy::default());
+        assert!(
+            !findings.iter().any(|f| f.rule_id == "R04_DEPENDENCY_SWAP"),
+            "an all-separator removed name must not pair with anything: {:?}",
+            findings.iter().map(|f| &f.rule_id).collect::<Vec<_>>()
+        );
+
+        let mut empty_added = Delta::default();
+        empty_added
+            .removed_dependencies
+            .push(("abc".into(), "1.0.0".into()));
+        empty_added
+            .new_dependencies
+            .push(("---".into(), "1.0.0".into()));
+        let findings = dependency_findings(&empty_added, &Policy::default());
+        assert!(
+            !findings.iter().any(|f| f.rule_id == "R04_DEPENDENCY_SWAP"),
+            "an all-separator added name must not pair with anything: {:?}",
+            findings.iter().map(|f| &f.rule_id).collect::<Vec<_>>()
+        );
+
+        // The two cases above clear on distance alone: an empty name is three
+        // edits from `abc` whatever the guard does. These two are the ones that
+        // actually reach the guard, because a one-character name is exactly one
+        // edit from the empty string. The first only exercises `rn.is_empty()`
+        // and the second only `an.is_empty()`, so deleting either half of the
+        // `||` is caught by one of them.
+        let mut empty_removed_close = Delta::default();
+        empty_removed_close
+            .removed_dependencies
+            .push(("___".into(), "1.0.0".into()));
+        empty_removed_close
+            .new_dependencies
+            .push(("a".into(), "1.0.0".into()));
+        let findings = dependency_findings(&empty_removed_close, &Policy::default());
+        assert!(
+            !findings.iter().any(|f| f.rule_id == "R04_DEPENDENCY_SWAP"),
+            "one edit from the empty string is still not a typosquat: {:?}",
+            findings.iter().map(|f| &f.rule_id).collect::<Vec<_>>()
+        );
+
+        let mut empty_added_close = Delta::default();
+        empty_added_close
+            .removed_dependencies
+            .push(("a".into(), "1.0.0".into()));
+        empty_added_close
+            .new_dependencies
+            .push(("---".into(), "1.0.0".into()));
+        let findings = dependency_findings(&empty_added_close, &Policy::default());
+        assert!(
+            !findings.iter().any(|f| f.rule_id == "R04_DEPENDENCY_SWAP"),
+            "one edit from the empty string is still not a typosquat: {:?}",
+            findings.iter().map(|f| &f.rule_id).collect::<Vec<_>>()
+        );
+    }
+
+    /// The count in the title and the pairs in the description are the whole
+    /// disclosure: a reviewer has to be able to see how many pairs matched
+    /// without re-running the diff. The title is the only place the count
+    /// appears, and its singular/plural branch has no other caller, so nothing
+    /// else in the suite can see it change. Both sides of the branch are pinned,
+    /// because a title that reads "2 dependency rename candidate" is wrong in a
+    /// way nothing downstream checks.
+    #[test]
+    fn the_swap_finding_counts_its_pairs_and_names_each_one() {
+        fn delta_with(pairs: &[(&str, &str)]) -> Delta {
+            let mut delta = Delta::default();
+            for (removed, added) in pairs {
+                delta
+                    .removed_dependencies
+                    .push(((*removed).to_string(), "1.0.0".to_string()));
+                delta
+                    .new_dependencies
+                    .push(((*added).to_string(), "1.0.0".to_string()));
+            }
+            delta
+        }
+        fn swap_finding(pairs: &[(&str, &str)]) -> Finding {
+            dependency_findings(&delta_with(pairs), &Policy::default())
+                .into_iter()
+                .find(|f| f.rule_id == "R04_DEPENDENCY_SWAP")
+                .expect("a swap pair must produce the finding")
+        }
+
+        let one = swap_finding(&[("lodash", "lodas")]);
+        assert_eq!(
+            one.title, "1 dependency rename candidate under a new name",
+            "one pair is a candidate"
+        );
+        assert!(
+            one.description.contains("lodash -> lodas"),
+            "the description must name the pair: {}",
+            one.description
+        );
+
+        let two = swap_finding(&[("lodash", "lodas"), ("chalk", "chalx")]);
+        assert_eq!(
+            two.title, "2 dependency rename candidates under a new name",
+            "two pairs are candidates, and the count is not the finding count"
+        );
+        for pair in ["lodash -> lodas", "chalk -> chalx"] {
+            assert!(
+                two.description.contains(pair),
+                "the description must name {pair}: {}",
+                two.description
+            );
+        }
+    }
+
+    /// A removed name byte-identical to an added one is skipped before any
+    /// distance is computed. A rename that changed nothing is not a rename, and
+    /// it reaches the rule as a pair because the two lists are independent — the
+    /// same name can appear in both when a dependency moves between dependency
+    /// kinds (regular and optional, say) at one version.
+    #[test]
+    fn an_identical_removed_and_added_name_is_not_a_swap() {
+        let mut delta = Delta::default();
+        delta
+            .removed_dependencies
+            .push(("lodash".into(), "4.17.20".into()));
+        delta
+            .new_dependencies
+            .push(("lodash".into(), "4.17.20".into()));
+        let findings = dependency_findings(&delta, &Policy::default());
+        assert!(
+            !findings.iter().any(|f| f.rule_id == "R04_DEPENDENCY_SWAP"),
+            "the name never changed, so nothing was renamed: {:?}",
+            findings.iter().map(|f| &f.rule_id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn dep_name_normalization_drops_separators_and_folds_case() {
+        // The four spellings are the ones npm treats as distinct package names,
+        // so this is what makes `my-lib` and `MyLib` the same swap candidate.
+        for name in ["my-lib", "my_lib", "MyLib", "my.lib"] {
+            assert_eq!(normalize_dep_name(name), "mylib", "{name}");
+        }
+        assert_eq!(
+            normalize_dep_name("@scope/Name-Pkg"),
+            "scopenamepkg",
+            "the scope separator and slash go too"
+        );
+        assert_eq!(
+            normalize_dep_name("___"),
+            "",
+            "a name made only of separators normalizes to nothing, which the swap rule guards on"
+        );
+    }
+
+    /// The predicate the swap rule rests on, driven shape by shape.
+    ///
+    /// `levenshtein_at_most_one` is not a general edit-distance function: it
+    /// compares two already-normalized strings, skips the whole walk when
+    /// `a == b`, bails on a length gap above one, and then reorders its
+    /// arguments so only one direction of the mismatch branch is written. Each
+    /// group below is a mutation that changes an answer only in that shape, and
+    /// the false cases matter as much as the true ones: the rule fires on
+    /// ordinary fork renames, so an over-broad predicate is noise on every
+    /// release that swaps a dependency.
+    #[test]
+    fn at_most_one_edit_is_accepted_in_every_position() {
+        // A substitution is the equal-length case: the mismatch branch advances
+        // both cursors and the walk ends with no tail left over.
+        assert!(levenshtein_at_most_one("abc", "abc"), "identical");
+        assert!(levenshtein_at_most_one("abc", "xbc"), "head");
+        assert!(levenshtein_at_most_one("abc", "axc"), "middle");
+        assert!(levenshtein_at_most_one("abc", "abx"), "tail");
+        // An insertion makes the first argument the longer one.
+        assert!(levenshtein_at_most_one("abc", "zabc"), "head");
+        assert!(levenshtein_at_most_one("abc", "azbc"), "middle");
+        assert!(levenshtein_at_most_one("abc", "abcx"), "tail");
+        // A deletion makes it the shorter one, so the leftover tail is what
+        // spends the edit.
+        assert!(levenshtein_at_most_one("xbc", "abc"), "head");
+        assert!(levenshtein_at_most_one("axbc", "abc"), "middle");
+        assert!(levenshtein_at_most_one("abcx", "abc"), "tail");
+        // Both empty: the equality short-circuit answers this, and the walk
+        // would not run at all.
+        assert!(levenshtein_at_most_one("", ""), "both empty");
+        assert!(levenshtein_at_most_one("", "a"), "empty vs one char");
+        assert!(levenshtein_at_most_one("a", ""), "one char vs empty");
+        assert!(!levenshtein_at_most_one("", "ab"), "empty vs two chars");
+        assert!(!levenshtein_at_most_one("ab", ""), "two chars vs empty");
+    }
+
+    #[test]
+    fn two_edits_are_rejected_and_the_argument_order_does_not_matter() {
+        assert!(!levenshtein_at_most_one("abcde", "xycde"), "two subs");
+        // One substitution plus one deletion. The gap is exactly one, so the
+        // walk runs, and the mismatch inside it has to spend the edit it has
+        // left before the leftover tail spends a second.
+        assert!(!levenshtein_at_most_one("abcx", "abd"), "sub and deletion");
+        assert!(!levenshtein_at_most_one("ab", "abxy"), "two insertions");
+        // The length-gap bail is `> 1` and not `>= 1`, so a gap of one is still
+        // walked and only a gap of two is refused up front.
+        assert!(!levenshtein_at_most_one("ab", "abcd"), "gap of two");
+        assert!(levenshtein_at_most_one("ab", "abc"), "gap of one");
+
+        // The caller normalizes both names and then compares, so the predicate
+        // is handed an arbitrary order. Every answer above has to hold in both
+        // directions; a one-sided implementation passes the first block of the
+        // test above and fails here.
+        for (a, b, expected) in [
+            ("abc", "xbc", true),
+            ("abc", "xbd", false),
+            ("abc", "zabc", true),
+            ("ab", "abxy", false),
+            ("abcx", "abc", true),
+            ("abcx", "abd", false),
+            ("", "a", true),
+            ("", "ab", false),
+        ] {
+            assert_eq!(
+                levenshtein_at_most_one(a, b),
+                expected,
+                "levenshtein_at_most_one({a:?}, {b:?})"
+            );
+            assert_eq!(
+                levenshtein_at_most_one(b, a),
+                expected,
+                "levenshtein_at_most_one({b:?}, {a:?}) must match the other order"
+            );
+        }
+    }
+
     #[test]
     fn require_provenance_holds_an_attestation_it_cannot_verify_without_refusing_it() {
         // Policy asked for verified provenance. An attestation is not that, and
