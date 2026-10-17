@@ -352,16 +352,18 @@ struct Candidate {
 
 /// Upper bound on review workers.
 ///
-/// A lockfile lane is network-bound, so more workers is faster right up until
-/// the registry starts refusing connections. Eight covers a slow round trip
-/// several times over on a laptop and stays well inside what one client asks a
-/// registry to handle.
+/// Both CI lanes are network-bound (registry fetches on the lockfile half,
+/// RPC plus `git clone`/`git archive` on the AUR half), so more workers is
+/// faster right up until the remote starts refusing connections. Eight covers
+/// a slow round trip several times over on a laptop and stays well inside
+/// what one client asks a registry to handle.
 ///
 /// There is no rate limiting or jitter, so a burst lands as-is: up to eight
 /// concurrent packument and tarball fetches, a few dozen requests in flight.
 /// That is unremarkable against npm or crates.io and a spike against a small
 /// self-hosted mirror, which `--registry` permits. Lower the cap before
-/// pointing this lane at one.
+/// pointing this lane at one. AUR git clones are heavier still; the same cap
+/// applies, and the budget check refuses before any work starts.
 const MAX_CI_REVIEW_WORKERS: usize = 8;
 
 fn evaluate_candidate(
@@ -509,11 +511,10 @@ fn evaluate_candidates(
 /// The stored integrity for each item is the sha256 of the pinned commit's
 /// `git archive` bytes, so the audit trail stays bound to the commit hash.
 ///
-/// This half of the lane is still serial, unlike the lockfile half: AUR
-/// entries are capped at 4096 and each review shells out to `git archive`,
-/// so the worst case is real. Parallelising it is the same shape as
-/// `evaluate_candidates`, minus the registry round trips that make the
-/// lockfile lane network-bound.
+/// Items come back in pin-file order through the shared `evaluate_candidates`
+/// driver, so this half matches the lockfile half: each worker gets its own
+/// `ReviewContext` and database handle, and every package is drained even
+/// after one fails.
 fn evaluate_aur_ci_diff(
     base_content: &str,
     head_content: &str,
@@ -548,20 +549,23 @@ fn evaluate_aur_ci_diff(
 
     check_evaluation_budget(added, upgraded, policy.ci.max_evaluations)?;
 
-    let mut items = Vec::new();
-    let mut max_band = VerdictBand::Low;
-    for (name, old_version, new_version) in evals {
-        let mut rctx = crate::recursive::ReviewContext::new(policy, ctx.bases.clone());
-        let (verdict, _, _, _) =
-            evaluate_package(&name, &new_version, ctx.ecosystem, store, policy, &mut rctx)?;
-        max_band = update_max_band(max_band, verdict.band);
-        items.push(CiReviewItem {
+    // Fixed here, before any review starts, so the report order never depends
+    // on which review finishes first. AUR pins carry no integrity map, so the
+    // shared driver runs with an empty one.
+    let candidates: Vec<Candidate> = evals
+        .into_iter()
+        .map(|(name, old_version, new_version)| Candidate {
             name,
             old_version,
             new_version,
             is_dev: false,
-            verdict,
-        });
+        })
+        .collect();
+    let empty_integrity = std::collections::HashMap::new();
+    let items = evaluate_candidates(&candidates, ctx, store, policy, &empty_integrity)?;
+    let mut max_band = VerdictBand::Low;
+    for item in &items {
+        max_band = update_max_band(max_band, item.verdict.band);
     }
     let fail_threshold = ctx
         .fail_on

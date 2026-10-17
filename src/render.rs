@@ -488,6 +488,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
         let verdict = crate::verdict::Verdict {
             name: "my-pkg".into(),

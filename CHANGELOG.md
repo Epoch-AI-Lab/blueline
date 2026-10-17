@@ -7,10 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Dependency swap / rename-under-a-new-name detection.** `compute_delta`
+  now records removed dependencies (`Delta.removed_dependencies`), and a
+  new heuristic rule `R04_DEPENDENCY_SWAP` (Low) fires when a name from
+  the removed set has a near-identical counterpart in the added set
+  (normalized name comparison, or Levenshtein distance 1). A bare
+  dependency drop is still unscored, because shrinking the install graph
+  on its own is defensible; only the swap pair is disclosed. Swapping a
+  dead dependency for a maintained fork is common, so the rule stays a
+  score-neutral disclosure rather than escalating the verdict; the pair is
+  named on the card.
+
 Targeted at 0.4.0. This release is a behaviour change for anyone who set
 `require_provenance`: see the entry below before upgrading.
 
+- `PERF.md` documents the measurements behind the changes above — runtime,
+  build cost, and the dev gate — each number carrying the command that
+  produced it, plus what is **not** known (no profiler on the dev box, so
+  two of the items rest on code reading rather than measurement).
+  `scripts/perf_harness.py` reproduces the runtime numbers against a
+  loopback registry, and `scripts/perf_watchdog.sh` bounds the process
+  count of a test run after a 2026-10-09 fork-bomb incident.
+
+- **`scripts/check-references.sh` + a `Feature map citations` CI job.** The
+  feature map in `references/` is prose, so no Rust gate could see it rot. The
+  script resolves every source citation in `references/` against `git ls-files`
+  and fails when a cited path no longer exists, a cited line falls past the end
+  of its file, a lane file is unreachable from the index, or the index links a
+  lane file that is gone. It runs as a stage in `./scripts/verify.sh` and as its
+  own CI job. Globs (`src/registry/*.rs`) and brace forms
+  (`src/registry/{mod,http_util}.rs`) are accepted so prose citations are not
+  read as broken. Currently 36 path citations, 5 line citations, and 28 lane
+  files.
+- `heuristic.rs` gained its first direct tests for `apply_extra_findings`, which
+  previously had none. They pin that it re-scores *all* findings rather than just
+  the extras, the `R06_FIRST_SIGHTING` weight, the cap at 100, and the
+  no-downgrade guard.
+- **Feature map** (`references/`) — materialized memory for agents. A scannable
+  index plus one file per lane, each with sub-features, user-POV invocation, the
+  CLI commands that drive it, and a Gotchas section. Replaces the need to read
+  the full source or the research docs to learn what a lane does.
+- **Attack-scenario harness** (`tests/support/`, `tests/scenarios.rs`) — 22
+  named scenarios that stand up a known-bad release over loopback and assert the
+  band or refusal: postinstall injection, tar absolute-path / parent-traversal /
+  symlink-escape / hardlink-escape entries, GNU longname and longlink and pax
+  absolute-path overrides, gzip bomb over the per-entry cap, entry-count over
+  the cap, sha512 integrity mismatch refused before any verdict, release
+  published without integrity, install-time dependency reach reviewed as a child
+  verdict, PKGBUILD curl-pipe-to-shell, recall backward-sequence replay refused
+  without writing, and the shim failing closed when its binary is missing.
+  `scenario_harness_never_opens_a_non_loopback_socket` keeps the suite hermetic
+  by test rather than by convention. Run one with
+  `scripts/scenarios/run.sh <name>`.
+- `scripts/verify.sh` — the single source of truth for "did I pass". Runs the
+  exact command lines `.github/workflows/ci.yml` runs, flags included. `--fast`
+  (default), `--mutants`, `--all`.
+- `clippy.toml` + `#![deny(clippy::unwrap_used)]` — the AGENTS.md rule against
+  `unwrap()` on untrusted input is now a compile error rather than a convention.
+  Tests are exempt via `allow-unwrap-in-tests`; the six invariant sites in
+  `src/diff.rs` carry a per-site `#[allow]` and a stated reason.
+- `references/drift.md` — twelve cited places where the shipped code and the
+  project's own docs disagree, four of them fail-open paths. Evidence, not fixes.
+
 ### Changed
+
+- **The AUR CI lane reviews pins in parallel.** `evaluate_aur_ci_diff` ran
+  one `evaluate_package` review at a time while the lockfile half already
+  fanned out to eight workers. It now goes through the same shared
+  `evaluate_candidates` driver: each worker gets its own `ReviewContext`
+  and database handle, and items come back in pin-file order. One failed
+  pin no longer stops the rest from being reviewed; the run still fails,
+  with the same evidence-only store writes the lockfile lane already made.
 
 - **Eight mutant survivors in the windowed file scan are now killed or
   excluded.** The `--mutants` CI shards found that deleting any arm of the
@@ -22,9 +91,10 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
   OSV cache-TTL guard is split into a pure `cache_ttl_secs` and pinned
   three ways. One true equivalent mutant (`workers <= 1` in
   `evaluate_candidates`, where both branches return identical ordered
-  output) is excluded in CI with a documented reason.
-
-### Changed
+  output) is excluded in CI with a documented reason. A fourth exclusion
+  (`>` to `<` in `levenshtein_at_most_one`) joins them: the flipped guard
+  is never taken, and the scan advances one index past the point where it
+  can match, so the shard times out instead of producing a verdict.
 
 - **A review no longer waits for the advisory lookup to finish before it
   starts working.** `fetch_advisories` ran to completion inside the review,
@@ -89,43 +159,6 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
   debuginfo and unbounded incremental compilation, which at this crate's
   size produced a 100 MB test binary and a `target/debug` measured in
   gigabytes across a hundred stale session caches. `Cargo.lock` does not move.
-
-### Added
-
-- `PERF.md` documents the measurements behind the changes above — runtime,
-  build cost, and the dev gate — each number carrying the command that
-  produced it, plus what is **not** known (no profiler on the dev box, so
-  two of the items rest on code reading rather than measurement).
-  `scripts/perf_harness.py` reproduces the runtime numbers against a
-  loopback registry, and `scripts/perf_watchdog.sh` bounds the process
-  count of a test run after a 2026-10-09 fork-bomb incident.
-
-### Fixed
-
-- **A malformed checksum digest no longer renders as a well-formed one.**
-  `Checksum::to_sri` decoded the stored hex through a helper that mapped an
-  unparseable byte pair to `0`, so a digest that was not clean hex still
-  produced a valid-looking `sha512-<base64>` string. The only place that string
-  is shown is the mismatch message naming the *expected* value, which meant a
-  corrupt or hand-edited digest was illustrated back to the operator with bytes
-  silently zeroed, and the message read as a confident answer about the wrong
-  bytes. The helper is fallible now and `to_sri` returns `Result`, so an
-  undecodable digest is a refusal naming the offending input rather than a
-  plausible digest.
-
-- **The baseline store no longer discards three permission errors.** Three
-  filesystem hardening steps in `store.rs` were written as `let _ = ...`, so a
-  failure of any of them was invisible: the data directory chmod to `0o700`,
-  the pre-create of the database at `0o600`, and the chmod of the database to
-  `0o600`. The pre-create was the load-bearing one. `Connection::open` creates
-  the file at whatever the umask allows, so when the pre-create failed the
-  database came up at a default mode and a step whose whole purpose was
-  narrowing it had failed in silence. All three propagate now.
-
-  No change to behaviour on the success path: the modes were always being set,
-  and `enforces_unix_file_and_directory_permissions` still pins that.
-
-### Changed
 
 - `recall sync` follows a bounded redirect chain instead of refusing every
   redirect. The snapshot fetch was left at `redirects(0)` and never followed
@@ -291,7 +324,152 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
   kernel granted is read back off the built binary's stderr, which is the one
   place confinement can be observed without applying it to the observer.
 
+- `AGENTS.md` and `ARCHITECTURE.md` now state the defect policy explicitly:
+  a bug is fixed even when it predates the branch, "pre-existing" is not a
+  reason to leave it live, and a fix without a test that fails without it is
+  a guess. Both record why, using this store bug as the worked example.
+
+
+- Docs refresh: `ROADMAP.md` marks the local-first recall index shipped
+  (hosted API stays under Someday); `ARCHITECTURE.md` drops the stale
+  Phase-0/1 notes, lists the heuristic inventory, and records
+  the recursion (D12), local-first recall (D13), and agent-enforcement
+  (D14) decisions. The inventory was first written as "the full R00–R28"; it
+  now carries `R29_PKGBUILD_DEPENDS_NOT_IN_SRCINFO` and the `P01`–`P04` policy
+  rules as well, so the list is actually complete.
+- Mutation testing now covers the verdict path: `heuristic.rs`, `diff.rs`,
+  `advisory.rs`, `provenance.rs`, `verdict.rs`, and the crates.io / AUR /
+  `http_util` / registry-mod files join the `--file` scope in both mutants
+  jobs.
+- The `blueline-ci` composite action downloads the checksum-verified
+  prebuilt release binary (new `version` input, default `latest`) instead
+  of `cargo run --release` on every run; `build-from-source: true`
+  preserves the source build for unreleased code, and this repo's dogfood
+  job pins it.
+
+- **Policy keys that govern nothing are now refused at load.**
+  `allowlist.packages[].max_risk` and `allowlist.packages[].integrity` were
+  `serde` fields that parsed cleanly and were then ignored. A user who pinned a
+  package's integrity got a config that read as active protection and was not. In
+  a fail-closed tool that is fail-open, and it was silent.
+  `Policy::reject_unimplemented_keys` now returns an error naming the offending
+  rule and the check that does apply, pointing `integrity` at the registry's
+  `dist.integrity` check.
+
+  **Breaking.** A config that sets either key now fails to load instead of
+  loading inert. There is no `deny_unknown_fields` anywhere, so deleting the
+  struct fields would have kept the behavior identical and the trap just as
+  silent. The fields stay precisely so the key is still visible at the point of
+  refusal.
+
+  `blocklist.maintainers` was on that list and is no longer. It was refused
+  because nothing read it, which was true while `is_maintainer_blocked` had no
+  caller and false once `P04_MAINTAINER_BLOCKED` began calling it. AUR resolves a
+  per-release commit author and that identity reaches the rule, so refusing the
+  key would have forbidden a protection that works. `Policy::is_maintainer_blocked`
+  is therefore not deleted.
+
+  A policy is loaded without ecosystem context, so which lanes can apply the key
+  is not knowable at load time. The lane that cannot is disclosed per review
+  instead: see `P04_MAINTAINER_UNEVALUABLE` below.
+- The score-to-band rule has one implementation. The weight table and the
+  threshold pass were copy-pasted between `heuristic::evaluate_with_trust` and
+  `heuristic::apply_extra_findings`, with a third divergent copy of the
+  threshold pass sitting dead in `policy.rs` as `Policy::calculate_band`. That
+  dead copy was the function the threshold test exercised, so editing a
+  threshold failed that test while live behavior stayed governed by the other
+  two copies. The table is now `heuristic::score_findings` and the threshold
+  pass is `Policy::escalate_band`, each with one copy and its own tests.
+  Behavior is unchanged; 576 lib tests and the 22 attack scenarios pass before
+  and after.
+- `Policy::escalate_band` never downgrades a band a finding already earned. The
+  old `calculate_band` ignored the incoming band entirely and computed from
+  score alone, which is why its tests could not express the rule production
+  actually follows. It is written as `current.max(from_score)` rather than a
+  chain of `current < Band` guards, because those guards generate `<` to `<=`
+  mutants that are unkillable by construction.
+
+- Mutation testing in CI derives its file list from
+  `git ls-files 'src/*.rs' 'src/registry/*.rs'` via one shared `env:` skip list,
+  replacing a 21-file list duplicated across two jobs. Coverage goes 21 → 32
+  files: `heuristic.rs` (the risk-band rule engine) and the registry adapters,
+  `diff.rs`, `advisory.rs`, `provenance.rs` and `verdict.rs` are now mutated too.
+- `AGENTS.md` no longer claims the three bare cargo commands are the CI gate —
+  they are not (`cargo fmt` without `--check` rewrites files instead of failing;
+  `cargo clippy` without `--locked` may lint a different dependency graph). It
+  now points at `scripts/verify.sh`, scopes the Rust-only rule so it no longer
+  contradicts the repo's own Node shims and Python benchmark harness, and notes
+  that the `rust-toolchain.toml` pin is inert without rustup.
+- `ARCHITECTURE.md` sections renumbered (they read 1, 2, 5, 3, 4), the stale
+  "design target, not shipped code" header replaced, and resolved open risks
+  marked as resolved.
+
+### Removed
+
+- `BaselineResolution::display_summary`, which had no caller outside its own
+  test.
+- `Policy::calculate_band`, which had no caller outside its own test and
+  disagreed with the live band ladder: it was a pure function of score, while
+  the production ladder is monotonic and never lowers an already-raised band. A
+  package with one High finding and 25 points is High in production and Medium
+  through `calculate_band`. Wiring it in as written would have silently weakened
+  severity. The two identical inline copies of the ladder are now one shared
+  helper, so they cannot drift.
+- Dead code that made the codebase look safer than it was: `Delta::is_empty`
+  (zero callers, and its semantics were wrong for an "unchanged" check anyway),
+  `DiskFileMeta.size` (written, never read, already re-derived by
+  `classify_bytes`), an unused wheel test helper, and an unreferenced
+  `ci::render_text_summary` print wrapper.
+- Three `#[allow(dead_code)]` suppressions that were hiding live checks from
+  the compiler: `Packument.name` (guards `validate_package_name`),
+  `AurRpcResponse.version` (guards the RPC protocol version), and
+  `Delta.binding_gyp_added` (drives a Block-severity native-build trigger), plus
+  a blanket suppression on `PackageJson`. If any of those checks were deleted,
+  the build would have stayed silent.
+
+- `heuristic::evaluate`, a five-argument wrapper around `evaluate_with_policy`
+  with `Policy::default()` baked in. Production had no callers; only its tests
+  did, and they now call `evaluate_with_policy` directly, so the default-policy
+  path is pinned at its one real call site rather than in a second copy.
+
+- `SimpleFile::size` and `SimpleFile::provenance` in the PyPI `/simple/`
+  response model. Both were `#[serde(default)]` members nothing read — the same
+  shape as the `SimpleMeta::api-version` marker the struct's own doc comment
+  already refuses to carry.
+
 ### Fixed
+
+- **The PyPI CLI tests no longer write to the developer's real baseline
+  store.** `tests/pypi_cli.rs` isolated itself with `HOME` alone, but
+  `default_db_path` prefers `XDG_DATA_HOME`, so on any machine with that
+  variable set the fixture packages (`demo-pkg`, `demo-lock`) were
+  recorded in the real `known_clean` store. A later run with different
+  wheel bytes then died on the fail-closed "integrity changed" refusal —
+  the test's own pollution blocking the test. Every command now also sets
+  `BLUELINE_DATA_DIR`, the convention the other CLI tests already use.
+
+- **A malformed checksum digest no longer renders as a well-formed one.**
+  `Checksum::to_sri` decoded the stored hex through a helper that mapped an
+  unparseable byte pair to `0`, so a digest that was not clean hex still
+  produced a valid-looking `sha512-<base64>` string. The only place that string
+  is shown is the mismatch message naming the *expected* value, which meant a
+  corrupt or hand-edited digest was illustrated back to the operator with bytes
+  silently zeroed, and the message read as a confident answer about the wrong
+  bytes. The helper is fallible now and `to_sri` returns `Result`, so an
+  undecodable digest is a refusal naming the offending input rather than a
+  plausible digest.
+
+- **The baseline store no longer discards three permission errors.** Three
+  filesystem hardening steps in `store.rs` were written as `let _ = ...`, so a
+  failure of any of them was invisible: the data directory chmod to `0o700`,
+  the pre-create of the database at `0o600`, and the chmod of the database to
+  `0o600`. The pre-create was the load-bearing one. `Connection::open` creates
+  the file at whatever the umask allows, so when the pre-create failed the
+  database came up at a default mode and a step whose whole purpose was
+  narrowing it had failed in silence. All three propagate now.
+
+  No change to behaviour on the success path: the modes were always being set,
+  and `enforces_unix_file_and_directory_permissions` still pins that.
 
 - **A confinement failure that already narrowed something is no longer reported
   as an unavailable kernel.** The Landlock ladder returned one "try a lower
@@ -1490,163 +1668,8 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
   the `[blocklist] maintainers` key is inert and nothing discloses that, which
   is the very complaint the key was wired to answer.
 
-### Removed
-
-- `BaselineResolution::display_summary`, which had no caller outside its own
-  test.
-- `Policy::calculate_band`, which had no caller outside its own test and
-  disagreed with the live band ladder: it was a pure function of score, while
-  the production ladder is monotonic and never lowers an already-raised band. A
-  package with one High finding and 25 points is High in production and Medium
-  through `calculate_band`. Wiring it in as written would have silently weakened
-  severity. The two identical inline copies of the ladder are now one shared
-  helper, so they cannot drift.
-- Dead code that made the codebase look safer than it was: `Delta::is_empty`
-  (zero callers, and its semantics were wrong for an "unchanged" check anyway),
-  `DiskFileMeta.size` (written, never read, already re-derived by
-  `classify_bytes`), an unused wheel test helper, and an unreferenced
-  `ci::render_text_summary` print wrapper.
-- Three `#[allow(dead_code)]` suppressions that were hiding live checks from
-  the compiler: `Packument.name` (guards `validate_package_name`),
-  `AurRpcResponse.version` (guards the RPC protocol version), and
-  `Delta.binding_gyp_added` (drives a Block-severity native-build trigger), plus
-  a blanket suppression on `PackageJson`. If any of those checks were deleted,
-  the build would have stayed silent.
-
-### Changed
-
-- `AGENTS.md` and `ARCHITECTURE.md` now state the defect policy explicitly:
-  a bug is fixed even when it predates the branch, "pre-existing" is not a
-  reason to leave it live, and a fix without a test that fails without it is
-  a guess. Both record why, using this store bug as the worked example.
-
-
-- Docs refresh: `ROADMAP.md` marks the local-first recall index shipped
-  (hosted API stays under Someday); `ARCHITECTURE.md` drops the stale
-  Phase-0/1 notes, lists the heuristic inventory, and records
-  the recursion (D12), local-first recall (D13), and agent-enforcement
-  (D14) decisions. The inventory was first written as "the full R00–R28"; it
-  now carries `R29_PKGBUILD_DEPENDS_NOT_IN_SRCINFO` and the `P01`–`P04` policy
-  rules as well, so the list is actually complete.
-- Mutation testing now covers the verdict path: `heuristic.rs`, `diff.rs`,
-  `advisory.rs`, `provenance.rs`, `verdict.rs`, and the crates.io / AUR /
-  `http_util` / registry-mod files join the `--file` scope in both mutants
-  jobs.
-- The `blueline-ci` composite action downloads the checksum-verified
-  prebuilt release binary (new `version` input, default `latest`) instead
-  of `cargo run --release` on every run; `build-from-source: true`
-  preserves the source build for unreleased code, and this repo's dogfood
-  job pins it.
-
-### Changed
-
-- **Policy keys that govern nothing are now refused at load.**
-  `allowlist.packages[].max_risk` and `allowlist.packages[].integrity` were
-  `serde` fields that parsed cleanly and were then ignored. A user who pinned a
-  package's integrity got a config that read as active protection and was not. In
-  a fail-closed tool that is fail-open, and it was silent.
-  `Policy::reject_unimplemented_keys` now returns an error naming the offending
-  rule and the check that does apply, pointing `integrity` at the registry's
-  `dist.integrity` check.
-
-  **Breaking.** A config that sets either key now fails to load instead of
-  loading inert. There is no `deny_unknown_fields` anywhere, so deleting the
-  struct fields would have kept the behavior identical and the trap just as
-  silent. The fields stay precisely so the key is still visible at the point of
-  refusal.
-
-  `blocklist.maintainers` was on that list and is no longer. It was refused
-  because nothing read it, which was true while `is_maintainer_blocked` had no
-  caller and false once `P04_MAINTAINER_BLOCKED` began calling it. AUR resolves a
-  per-release commit author and that identity reaches the rule, so refusing the
-  key would have forbidden a protection that works. `Policy::is_maintainer_blocked`
-  is therefore not deleted.
-
-  A policy is loaded without ecosystem context, so which lanes can apply the key
-  is not knowable at load time. The lane that cannot is disclosed per review
-  instead: see `P04_MAINTAINER_UNEVALUABLE` below.
-- The score-to-band rule has one implementation. The weight table and the
-  threshold pass were copy-pasted between `heuristic::evaluate_with_trust` and
-  `heuristic::apply_extra_findings`, with a third divergent copy of the
-  threshold pass sitting dead in `policy.rs` as `Policy::calculate_band`. That
-  dead copy was the function the threshold test exercised, so editing a
-  threshold failed that test while live behavior stayed governed by the other
-  two copies. The table is now `heuristic::score_findings` and the threshold
-  pass is `Policy::escalate_band`, each with one copy and its own tests.
-  Behavior is unchanged; 576 lib tests and the 22 attack scenarios pass before
-  and after.
-- `Policy::escalate_band` never downgrades a band a finding already earned. The
-  old `calculate_band` ignored the incoming band entirely and computed from
-  score alone, which is why its tests could not express the rule production
-  actually follows. It is written as `current.max(from_score)` rather than a
-  chain of `current < Band` guards, because those guards generate `<` to `<=`
-  mutants that are unkillable by construction.
-
-### Added
-
-- **`scripts/check-references.sh` + a `Feature map citations` CI job.** The
-  feature map in `references/` is prose, so no Rust gate could see it rot. The
-  script resolves every source citation in `references/` against `git ls-files`
-  and fails when a cited path no longer exists, a cited line falls past the end
-  of its file, a lane file is unreachable from the index, or the index links a
-  lane file that is gone. It runs as a stage in `./scripts/verify.sh` and as its
-  own CI job. Globs (`src/registry/*.rs`) and brace forms
-  (`src/registry/{mod,http_util}.rs`) are accepted so prose citations are not
-  read as broken. Currently 36 path citations, 5 line citations, and 28 lane
-  files.
-- `heuristic.rs` gained its first direct tests for `apply_extra_findings`, which
-  previously had none. They pin that it re-scores *all* findings rather than just
-  the extras, the `R06_FIRST_SIGHTING` weight, the cap at 100, and the
-  no-downgrade guard.
-- **Feature map** (`references/`) — materialized memory for agents. A scannable
-  index plus one file per lane, each with sub-features, user-POV invocation, the
-  CLI commands that drive it, and a Gotchas section. Replaces the need to read
-  the full source or the research docs to learn what a lane does.
-- **Attack-scenario harness** (`tests/support/`, `tests/scenarios.rs`) — 22
-  named scenarios that stand up a known-bad release over loopback and assert the
-  band or refusal: postinstall injection, tar absolute-path / parent-traversal /
-  symlink-escape / hardlink-escape entries, GNU longname and longlink and pax
-  absolute-path overrides, gzip bomb over the per-entry cap, entry-count over
-  the cap, sha512 integrity mismatch refused before any verdict, release
-  published without integrity, install-time dependency reach reviewed as a child
-  verdict, PKGBUILD curl-pipe-to-shell, recall backward-sequence replay refused
-  without writing, and the shim failing closed when its binary is missing.
-  `scenario_harness_never_opens_a_non_loopback_socket` keeps the suite hermetic
-  by test rather than by convention. Run one with
-  `scripts/scenarios/run.sh <name>`.
-- `scripts/verify.sh` — the single source of truth for "did I pass". Runs the
-  exact command lines `.github/workflows/ci.yml` runs, flags included. `--fast`
-  (default), `--mutants`, `--all`.
-- `clippy.toml` + `#![deny(clippy::unwrap_used)]` — the AGENTS.md rule against
-  `unwrap()` on untrusted input is now a compile error rather than a convention.
-  Tests are exempt via `allow-unwrap-in-tests`; the six invariant sites in
-  `src/diff.rs` carry a per-site `#[allow]` and a stated reason.
-- `references/drift.md` — twelve cited places where the shipped code and the
-  project's own docs disagree, four of them fail-open paths. Evidence, not fixes.
-
-### Changed
-
-- Mutation testing in CI derives its file list from
-  `git ls-files 'src/*.rs' 'src/registry/*.rs'` via one shared `env:` skip list,
-  replacing a 21-file list duplicated across two jobs. Coverage goes 21 → 32
-  files: `heuristic.rs` (the risk-band rule engine) and the registry adapters,
-  `diff.rs`, `advisory.rs`, `provenance.rs` and `verdict.rs` are now mutated too.
-- `AGENTS.md` no longer claims the three bare cargo commands are the CI gate —
-  they are not (`cargo fmt` without `--check` rewrites files instead of failing;
-  `cargo clippy` without `--locked` may lint a different dependency graph). It
-  now points at `scripts/verify.sh`, scopes the Rust-only rule so it no longer
-  contradicts the repo's own Node shims and Python benchmark harness, and notes
-  that the `rust-toolchain.toml` pin is inert without rustup.
-- `ARCHITECTURE.md` sections renumbered (they read 1, 2, 5, 3, 4), the stale
-  "design target, not shipped code" header replaced, and resolved open risks
-  marked as resolved.
-
-### Fixed
-
 - `references/` link integrity: `error.md` and `wheel_extract.md` existed but
   were unreachable from the map index.
-
-### Fixed
 
 - **A file stamped text whose bytes do not decode no longer diffs as "everything
   deleted".** `diff_single_file` coerced either side's invalid UTF-8 to `""`,
@@ -1656,20 +1679,6 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
   already routes non-UTF-8 to `Binary` — so this could only fire where the
   classification and the bytes disagree, which is the one state a coercion
   cannot answer correctly.
-
-### Removed
-
-- `heuristic::evaluate`, a five-argument wrapper around `evaluate_with_policy`
-  with `Policy::default()` baked in. Production had no callers; only its tests
-  did, and they now call `evaluate_with_policy` directly, so the default-policy
-  path is pinned at its one real call site rather than in a second copy.
-
-- `SimpleFile::size` and `SimpleFile::provenance` in the PyPI `/simple/`
-  response model. Both were `#[serde(default)]` members nothing read — the same
-  shape as the `SimpleMeta::api-version` marker the struct's own doc comment
-  already refuses to carry.
-
-### Documentation corrections
 
 - CHANGELOG 0.3.1 said "all six managers are reviewed through one grammar".
   The CLI enumerates eleven (`npm npx pnpm yarn bun bunx pip pip3 cargo yay
@@ -1686,6 +1695,34 @@ Targeted at 0.4.0. This release is a behaviour change for anyone who set
   extraction". It never did; the entry now says what shipped and points at
   drift entry 1, which stays High and unfixed.
 
+### Security
+
+- **The `zip` crate is bumped from 2.4.2 to 9.0.4**, clearing three
+  critical advisories (RUSTSEC-2026-0367, -0368, -0369) that landed
+  against `ZipArchive::extract()` and the stream extractor. Blueline
+  never called those APIs, but the upgrade surfaced a behaviour change in
+  `enclosed_name()`: zip 9 strips a leading root or drive prefix instead
+  of refusing the entry, and splits on backslashes, so a raw `/etc/evil`
+  or `foo\bar` name came back "contained" as `etc/evil` and `foo/bar`.
+  `safe_extract_wheel` now refuses those raw names itself, against the
+  undecoded entry bytes, before any sanitization can hide what the
+  archive asked for. Entry names whose bytes fail to decode are refused
+  too (`name()` is a `Result` in zip 9). The extraction tests that pinned
+  absolute-path and backslash rejection caught the regression, and are
+  unchanged.
+
+  The dependency uses zip's `deflate-flate2` feature, not the `deflate`
+  meta-feature: `deflate` also enables `flate2/zlib-rs`, and Cargo
+  unifies features across the whole build, so that one flag would have
+  silently switched every `flate2` user — blueline's own gunzip in
+  `safe_extract` and ureq's HTTP gzip — from miniz_oxide to zlib-rs.
+  `deflate-flate2` defers the backend choice to flate2's own default,
+  keeping the production decompression path on miniz_oxide exactly as
+  before. The gzip-bomb scenario fixture caught the switch on the first
+  run: zlib-rs at `Compression::fast()` packed the 200 MiB bomb to
+  ~2 MiB where miniz_oxide packs it to ~200 KiB, and the fixture's
+  "arrives small" assertion failed. zopfli leaves the dependency tree
+  with this choice (it was only reachable through the meta-feature).
 ## [0.3.1] - 2026-09-21
 
 ### Added

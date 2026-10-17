@@ -2708,6 +2708,7 @@ mod tests {
             new_dependencies: Vec::new(),
             modified_dependencies: Vec::new(),
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         }
     }
 

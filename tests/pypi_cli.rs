@@ -172,6 +172,7 @@ fn review_pypi_first_sighting_renders_ecosystem_and_sha256() {
     let output = Command::cargo_bin("blueline")
         .unwrap()
         .env("HOME", dir.path())
+        .env("BLUELINE_DATA_DIR", dir.path())
         .args([
             "--ecosystem",
             "pypi",
@@ -236,6 +237,7 @@ fn review_pypi_rejects_checksum_mismatch() {
     Command::cargo_bin("blueline")
         .unwrap()
         .env("HOME", dir.path())
+        .env("BLUELINE_DATA_DIR", dir.path())
         .args([
             "--ecosystem",
             "pypi",
@@ -299,6 +301,7 @@ fn ci_pypi_lockfile_hash_verification() {
     Command::cargo_bin("blueline")
         .unwrap()
         .env("HOME", dir.path())
+        .env("BLUELINE_DATA_DIR", dir.path())
         .args([
             "--ecosystem",
             "pypi",
@@ -324,6 +327,7 @@ fn ci_pypi_lockfile_hash_verification() {
     Command::cargo_bin("blueline")
         .unwrap()
         .env("HOME", dir.path())
+        .env("BLUELINE_DATA_DIR", dir.path())
         .args([
             "--ecosystem",
             "pypi",

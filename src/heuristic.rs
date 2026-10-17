@@ -1862,7 +1862,102 @@ fn dependency_findings(delta: &Delta, policy: &Policy) -> Vec<Finding> {
         }
     }
 
+    // Dependency swap / rename-under-a-new-name detection. A name that was in
+    // the baseline dependency set disappearing at the same time that a
+    // near-identical name appears in the added set is the shape of a typosquat:
+    // the payload ships under a spelling the reviewer has never seen, while the
+    // familiar name quietly drops out. A bare drop shrinks the graph and is
+    // defensible on its own, so only the pair is scored.
+    //
+    // Swapping a dead dependency for a maintained fork is common, so this stays
+    // a disclosure (Low): it names the pair and leaves the verdict alone unless
+    // policy tightens thresholds. Names are compared case- and
+    // separator-insensitively, and a single edit is treated as "near
+    // identical". No claim is made that the swap is malicious.
+    let mut swaps: Vec<String> = Vec::new();
+    for (removed, _) in &delta.removed_dependencies {
+        for (added, _) in &delta.new_dependencies {
+            if removed == added {
+                continue;
+            }
+            let rn = normalize_dep_name(removed);
+            let an = normalize_dep_name(added);
+            if rn.is_empty() || an.is_empty() {
+                continue;
+            }
+            if levenshtein_at_most_one(&rn, &an) {
+                swaps.push(format!("{removed} -> {added}"));
+            }
+        }
+    }
+    if !swaps.is_empty() {
+        findings.push(Finding {
+            rule_id: "R04_DEPENDENCY_SWAP".into(),
+            severity: VerdictBand::Low,
+            title: format!(
+                "{} dependency rename candidate{} under a new name",
+                swaps.len(),
+                if swaps.len() == 1 { "" } else { "s" }
+            ),
+            description: format!(
+                "A removed dependency has a near-identical name among the added dependencies ({}). This is the rename-under-a-new-name shape associated with typosquats, but it is also the ordinary shape of replacing a dead dependency with a maintained fork, so this finding discloses the pair and leaves the verdict to policy.",
+                swaps.join(", ")
+            ),
+        });
+    }
+
     findings
+}
+
+fn normalize_dep_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Levenshtein distance of at most one between two already-normalized strings.
+fn levenshtein_at_most_one(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.len().abs_diff(b.len()) > 1 {
+        return false;
+    }
+    // Ensure `a` is the longer (or equal) so only one branch handles deletion.
+    let (long, short) = if a.len() >= b.len() {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
+
+    let mut i = 0usize;
+    let mut j = 0usize;
+    let mut edits = 0usize;
+    while j < short.len() {
+        if i < long.len() && long[i] == short[j] {
+            i += 1;
+            j += 1;
+        } else {
+            edits += 1;
+            if edits > 1 {
+                return false;
+            }
+            if long.len() > short.len() {
+                // deletion in the shorter / insertion in the longer
+                i += 1;
+            } else {
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    if i < long.len() {
+        edits += 1;
+    }
+    edits <= 1
 }
 
 /// Every rule that reads the provenance report. Split out from the main
@@ -2061,6 +2156,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
 
         let verdict = evaluate_with_policy(
@@ -2106,6 +2202,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
 
         let verdict = evaluate_with_policy(
@@ -2156,6 +2253,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
 
         let verdict = evaluate_with_policy(
@@ -2232,6 +2330,369 @@ mod tests {
                 .any(|f| f.rule_id == "R04_DEPENDENCY_MODIFIED" && f.severity == VerdictBand::High),
             "moving off a URL is the mirror of the redirect and must be HIGH"
         );
+    }
+
+    #[test]
+    fn detects_a_dependency_swap_under_a_new_name() {
+        let mut delta = Delta::default();
+        delta
+            .removed_dependencies
+            .push(("lodash".into(), "4.17.20".into()));
+        delta
+            .new_dependencies
+            .push(("lodas".into(), "4.17.21".into()));
+        let findings = dependency_findings(&delta, &Policy::default());
+        let swaps: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "R04_DEPENDENCY_SWAP")
+            .collect();
+        assert_eq!(
+            swaps.len(),
+            1,
+            "a near-identical added name must be flagged"
+        );
+        assert_eq!(
+            swaps[0].severity,
+            VerdictBand::Low,
+            "benign forks are common, so the swap stays score-neutral"
+        );
+    }
+
+    #[test]
+    fn a_plain_dependency_drop_does_not_fire_a_swap() {
+        let mut delta = Delta::default();
+        delta
+            .removed_dependencies
+            .push(("old-dep".into(), "1.0.0".into()));
+        // Nothing near-identical is added.
+        delta
+            .new_dependencies
+            .push(("fresh-lib".into(), "1.0.0".into()));
+        let findings = dependency_findings(&delta, &Policy::default());
+        assert!(
+            !findings.iter().any(|f| f.rule_id == "R04_DEPENDENCY_SWAP"),
+            "an unrelated drop must not be a typosquat"
+        );
+    }
+
+    #[test]
+    fn a_normalized_name_match_counts_as_a_swap() {
+        let mut delta = Delta::default();
+        delta
+            .removed_dependencies
+            .push(("my-lib".into(), "1.0.0".into()));
+        delta
+            .new_dependencies
+            .push(("MyLib".into(), "1.0.0".into()));
+        let findings = dependency_findings(&delta, &Policy::default());
+        assert!(
+            findings.iter().any(|f| f.rule_id == "R04_DEPENDENCY_SWAP"),
+            "case and separator differences are normalized"
+        );
+    }
+
+    /// Every edit shape the swap rule accepts has to keep firing: a typosquat
+    /// only has to misspell by one edit, and the length-based path in
+    /// `levenshtein_at_most_one` runs the mismatch branch differently depending
+    /// on which string is longer. A single substitution pair covers only one of
+    /// those branches.
+    #[test]
+    fn a_swap_fires_on_an_insertion_and_on_a_deletion_too() {
+        // The added name is one char longer: the loop's mismatch branch takes
+        // `long.len() > short.len()`.
+        let mut longer = Delta::default();
+        longer
+            .removed_dependencies
+            .push(("requests".into(), "2.0.0".into()));
+        longer
+            .new_dependencies
+            .push(("requestss".into(), "1.0.0".into()));
+        assert!(
+            dependency_findings(&longer, &Policy::default())
+                .iter()
+                .any(|f| f.rule_id == "R04_DEPENDENCY_SWAP"),
+            "an inserted character is still one edit away"
+        );
+
+        // The added name is one char shorter: the same branch now sees equal
+        // lengths after the swap, and the tail of `long` is left over.
+        let mut shorter = Delta::default();
+        shorter
+            .removed_dependencies
+            .push(("requests".into(), "2.0.0".into()));
+        shorter
+            .new_dependencies
+            .push(("request".into(), "1.0.0".into()));
+        assert!(
+            dependency_findings(&shorter, &Policy::default())
+                .iter()
+                .any(|f| f.rule_id == "R04_DEPENDENCY_SWAP"),
+            "a dropped character is still one edit away"
+        );
+    }
+
+    /// Two edits are past the threshold, and the finding is a disclosure that
+    /// fires on ordinary fork renames, so the bound is what keeps the noise
+    /// down. `reqeusts` is a transposition, which Levenshtein scores as two
+    /// substitutions.
+    #[test]
+    fn a_swap_does_not_fire_at_two_edits() {
+        let mut delta = Delta::default();
+        delta
+            .removed_dependencies
+            .push(("requests".into(), "2.0.0".into()));
+        delta
+            .new_dependencies
+            .push(("reqeusts".into(), "1.0.0".into()));
+        let findings = dependency_findings(&delta, &Policy::default());
+        assert!(
+            !findings.iter().any(|f| f.rule_id == "R04_DEPENDENCY_SWAP"),
+            "two edits out is an unrelated rename, not a typosquat: {:?}",
+            findings.iter().map(|f| &f.rule_id).collect::<Vec<_>>()
+        );
+    }
+
+    /// A name that is all separators normalizes to the empty string, and the
+    /// empty string is at distance one from every one-character name. Without
+    /// the guard, `___` dropped for `___` — or for any single-character
+    /// package — would be reported as a typosquat.
+    ///
+    /// Both directions are driven, because the guard is checked against the
+    /// removed name first and then the added one, and deleting either check
+    /// leaves the other arm to catch nothing.
+    #[test]
+    fn a_name_that_normalizes_to_nothing_never_forms_a_swap() {
+        let mut empty_removed = Delta::default();
+        empty_removed
+            .removed_dependencies
+            .push(("___".into(), "1.0.0".into()));
+        empty_removed
+            .new_dependencies
+            .push(("abc".into(), "1.0.0".into()));
+        let findings = dependency_findings(&empty_removed, &Policy::default());
+        assert!(
+            !findings.iter().any(|f| f.rule_id == "R04_DEPENDENCY_SWAP"),
+            "an all-separator removed name must not pair with anything: {:?}",
+            findings.iter().map(|f| &f.rule_id).collect::<Vec<_>>()
+        );
+
+        let mut empty_added = Delta::default();
+        empty_added
+            .removed_dependencies
+            .push(("abc".into(), "1.0.0".into()));
+        empty_added
+            .new_dependencies
+            .push(("---".into(), "1.0.0".into()));
+        let findings = dependency_findings(&empty_added, &Policy::default());
+        assert!(
+            !findings.iter().any(|f| f.rule_id == "R04_DEPENDENCY_SWAP"),
+            "an all-separator added name must not pair with anything: {:?}",
+            findings.iter().map(|f| &f.rule_id).collect::<Vec<_>>()
+        );
+
+        // The two cases above clear on distance alone: an empty name is three
+        // edits from `abc` whatever the guard does. These two are the ones that
+        // actually reach the guard, because a one-character name is exactly one
+        // edit from the empty string. The first only exercises `rn.is_empty()`
+        // and the second only `an.is_empty()`, so deleting either half of the
+        // `||` is caught by one of them.
+        let mut empty_removed_close = Delta::default();
+        empty_removed_close
+            .removed_dependencies
+            .push(("___".into(), "1.0.0".into()));
+        empty_removed_close
+            .new_dependencies
+            .push(("a".into(), "1.0.0".into()));
+        let findings = dependency_findings(&empty_removed_close, &Policy::default());
+        assert!(
+            !findings.iter().any(|f| f.rule_id == "R04_DEPENDENCY_SWAP"),
+            "one edit from the empty string is still not a typosquat: {:?}",
+            findings.iter().map(|f| &f.rule_id).collect::<Vec<_>>()
+        );
+
+        let mut empty_added_close = Delta::default();
+        empty_added_close
+            .removed_dependencies
+            .push(("a".into(), "1.0.0".into()));
+        empty_added_close
+            .new_dependencies
+            .push(("---".into(), "1.0.0".into()));
+        let findings = dependency_findings(&empty_added_close, &Policy::default());
+        assert!(
+            !findings.iter().any(|f| f.rule_id == "R04_DEPENDENCY_SWAP"),
+            "one edit from the empty string is still not a typosquat: {:?}",
+            findings.iter().map(|f| &f.rule_id).collect::<Vec<_>>()
+        );
+    }
+
+    /// The count in the title and the pairs in the description are the whole
+    /// disclosure: a reviewer has to be able to see how many pairs matched
+    /// without re-running the diff. The title is the only place the count
+    /// appears, and its singular/plural branch has no other caller, so nothing
+    /// else in the suite can see it change. Both sides of the branch are pinned,
+    /// because a title that reads "2 dependency rename candidate" is wrong in a
+    /// way nothing downstream checks.
+    #[test]
+    fn the_swap_finding_counts_its_pairs_and_names_each_one() {
+        fn delta_with(pairs: &[(&str, &str)]) -> Delta {
+            let mut delta = Delta::default();
+            for (removed, added) in pairs {
+                delta
+                    .removed_dependencies
+                    .push(((*removed).to_string(), "1.0.0".to_string()));
+                delta
+                    .new_dependencies
+                    .push(((*added).to_string(), "1.0.0".to_string()));
+            }
+            delta
+        }
+        fn swap_finding(pairs: &[(&str, &str)]) -> Finding {
+            dependency_findings(&delta_with(pairs), &Policy::default())
+                .into_iter()
+                .find(|f| f.rule_id == "R04_DEPENDENCY_SWAP")
+                .expect("a swap pair must produce the finding")
+        }
+
+        let one = swap_finding(&[("lodash", "lodas")]);
+        assert_eq!(
+            one.title, "1 dependency rename candidate under a new name",
+            "one pair is a candidate"
+        );
+        assert!(
+            one.description.contains("lodash -> lodas"),
+            "the description must name the pair: {}",
+            one.description
+        );
+
+        let two = swap_finding(&[("lodash", "lodas"), ("chalk", "chalx")]);
+        assert_eq!(
+            two.title, "2 dependency rename candidates under a new name",
+            "two pairs are candidates, and the count is not the finding count"
+        );
+        for pair in ["lodash -> lodas", "chalk -> chalx"] {
+            assert!(
+                two.description.contains(pair),
+                "the description must name {pair}: {}",
+                two.description
+            );
+        }
+    }
+
+    /// A removed name byte-identical to an added one is skipped before any
+    /// distance is computed. A rename that changed nothing is not a rename, and
+    /// it reaches the rule as a pair because the two lists are independent — the
+    /// same name can appear in both when a dependency moves between dependency
+    /// kinds (regular and optional, say) at one version.
+    #[test]
+    fn an_identical_removed_and_added_name_is_not_a_swap() {
+        let mut delta = Delta::default();
+        delta
+            .removed_dependencies
+            .push(("lodash".into(), "4.17.20".into()));
+        delta
+            .new_dependencies
+            .push(("lodash".into(), "4.17.20".into()));
+        let findings = dependency_findings(&delta, &Policy::default());
+        assert!(
+            !findings.iter().any(|f| f.rule_id == "R04_DEPENDENCY_SWAP"),
+            "the name never changed, so nothing was renamed: {:?}",
+            findings.iter().map(|f| &f.rule_id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn dep_name_normalization_drops_separators_and_folds_case() {
+        // The four spellings are the ones npm treats as distinct package names,
+        // so this is what makes `my-lib` and `MyLib` the same swap candidate.
+        for name in ["my-lib", "my_lib", "MyLib", "my.lib"] {
+            assert_eq!(normalize_dep_name(name), "mylib", "{name}");
+        }
+        assert_eq!(
+            normalize_dep_name("@scope/Name-Pkg"),
+            "scopenamepkg",
+            "the scope separator and slash go too"
+        );
+        assert_eq!(
+            normalize_dep_name("___"),
+            "",
+            "a name made only of separators normalizes to nothing, which the swap rule guards on"
+        );
+    }
+
+    /// The predicate the swap rule rests on, driven shape by shape.
+    ///
+    /// `levenshtein_at_most_one` is not a general edit-distance function: it
+    /// compares two already-normalized strings, skips the whole walk when
+    /// `a == b`, bails on a length gap above one, and then reorders its
+    /// arguments so only one direction of the mismatch branch is written. Each
+    /// group below is a mutation that changes an answer only in that shape, and
+    /// the false cases matter as much as the true ones: the rule fires on
+    /// ordinary fork renames, so an over-broad predicate is noise on every
+    /// release that swaps a dependency.
+    #[test]
+    fn at_most_one_edit_is_accepted_in_every_position() {
+        // A substitution is the equal-length case: the mismatch branch advances
+        // both cursors and the walk ends with no tail left over.
+        assert!(levenshtein_at_most_one("abc", "abc"), "identical");
+        assert!(levenshtein_at_most_one("abc", "xbc"), "head");
+        assert!(levenshtein_at_most_one("abc", "axc"), "middle");
+        assert!(levenshtein_at_most_one("abc", "abx"), "tail");
+        // An insertion makes the first argument the longer one.
+        assert!(levenshtein_at_most_one("abc", "zabc"), "head");
+        assert!(levenshtein_at_most_one("abc", "azbc"), "middle");
+        assert!(levenshtein_at_most_one("abc", "abcx"), "tail");
+        // A deletion makes it the shorter one, so the leftover tail is what
+        // spends the edit.
+        assert!(levenshtein_at_most_one("xbc", "abc"), "head");
+        assert!(levenshtein_at_most_one("axbc", "abc"), "middle");
+        assert!(levenshtein_at_most_one("abcx", "abc"), "tail");
+        // Both empty: the equality short-circuit answers this, and the walk
+        // would not run at all.
+        assert!(levenshtein_at_most_one("", ""), "both empty");
+        assert!(levenshtein_at_most_one("", "a"), "empty vs one char");
+        assert!(levenshtein_at_most_one("a", ""), "one char vs empty");
+        assert!(!levenshtein_at_most_one("", "ab"), "empty vs two chars");
+        assert!(!levenshtein_at_most_one("ab", ""), "two chars vs empty");
+    }
+
+    #[test]
+    fn two_edits_are_rejected_and_the_argument_order_does_not_matter() {
+        assert!(!levenshtein_at_most_one("abcde", "xycde"), "two subs");
+        // One substitution plus one deletion. The gap is exactly one, so the
+        // walk runs, and the mismatch inside it has to spend the edit it has
+        // left before the leftover tail spends a second.
+        assert!(!levenshtein_at_most_one("abcx", "abd"), "sub and deletion");
+        assert!(!levenshtein_at_most_one("ab", "abxy"), "two insertions");
+        // The length-gap bail is `> 1` and not `>= 1`, so a gap of one is still
+        // walked and only a gap of two is refused up front.
+        assert!(!levenshtein_at_most_one("ab", "abcd"), "gap of two");
+        assert!(levenshtein_at_most_one("ab", "abc"), "gap of one");
+
+        // The caller normalizes both names and then compares, so the predicate
+        // is handed an arbitrary order. Every answer above has to hold in both
+        // directions; a one-sided implementation passes the first block of the
+        // test above and fails here.
+        for (a, b, expected) in [
+            ("abc", "xbc", true),
+            ("abc", "xbd", false),
+            ("abc", "zabc", true),
+            ("ab", "abxy", false),
+            ("abcx", "abc", true),
+            ("abcx", "abd", false),
+            ("", "a", true),
+            ("", "ab", false),
+        ] {
+            assert_eq!(
+                levenshtein_at_most_one(a, b),
+                expected,
+                "levenshtein_at_most_one({a:?}, {b:?})"
+            );
+            assert_eq!(
+                levenshtein_at_most_one(b, a),
+                expected,
+                "levenshtein_at_most_one({b:?}, {a:?}) must match the other order"
+            );
+        }
     }
 
     #[test]
@@ -2424,6 +2885,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: true,
+            removed_dependencies: Vec::new(),
         };
 
         let verdict = evaluate_with_policy(
@@ -2484,6 +2946,7 @@ mod tests {
             new_dependencies: vec![("malicious-pkg".into(), "ssh://git@host/repo".into())],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
 
         let verdict = evaluate_with_policy(
@@ -2528,6 +2991,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
 
         let verdict = evaluate_with_policy(
@@ -2566,6 +3030,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
 
         let verdict = evaluate_with_policy(
@@ -2603,6 +3068,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
         let unreviewed = Delta {
             baseline_version: Some("1.0.0".into()),
@@ -2688,6 +3154,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
 
         let mut policy = Policy::default();
@@ -2775,6 +3242,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
 
         let verdict = evaluate_with_policy(
@@ -2816,6 +3284,7 @@ mod tests {
                 "https://evil.com/cookie.tgz".into(),
             )],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
 
         let verdict = evaluate_with_policy(
@@ -2902,6 +3371,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
 
         let verdict = evaluate_with_policy(
@@ -2934,6 +3404,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
 
         let mut policy = Policy::default();
@@ -2980,6 +3451,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
 
         let mut policy = Policy::default();
@@ -3042,6 +3514,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
 
         let adv = AdvisoryReport {
@@ -3103,6 +3576,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
 
         let adv = AdvisoryReport {
@@ -3164,6 +3638,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
 
         let prov = ProvenanceReport::failed_mismatch("digest hash mismatch");
@@ -3212,6 +3687,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
 
         let mut policy = Policy::default();
@@ -3597,6 +4073,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         }
     }
 
@@ -3883,6 +4360,7 @@ mod tests {
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
         let verdict = evaluate_with_trust(
             "test-pkg",
@@ -3938,6 +4416,7 @@ maintainers = ["badactor@example.com"]
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
         let verdict = evaluate_with_trust(
             "pkg",
@@ -3997,6 +4476,7 @@ maintainers = ["  BadActor@Example.com "]
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
         let verdict = evaluate_with_trust(
             "pkg",
@@ -4050,6 +4530,7 @@ maintainers = ["badactor@example.com"]
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
         let verdict = evaluate_with_trust(
             "pkg",
@@ -4122,6 +4603,7 @@ maintainers = ["badactor@example.com"]
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
         let verdict = evaluate_with_trust(
             "pkg",
@@ -4193,6 +4675,7 @@ maintainers = ["badactor@example.com"]
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
         let verdict = evaluate_with_trust(
             "yay",
@@ -4253,6 +4736,7 @@ maintainers = ["badactor@example.com"]
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
         };
         let verdict = evaluate_with_trust(
             "pkg",
