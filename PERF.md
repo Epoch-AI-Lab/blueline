@@ -524,13 +524,14 @@ costs more compile time for no measured return.
 * `tests/aur_ci_parallel.rs:15` sleeps 1500 ms on purpose, to prove the
   slow-first candidate is still reported first. That is a real property and
   shrinking the delay weakens the test.
-* Eight tests in `src/registry/npm.rs` spin a mock server in a
-  `while start.elapsed() < 600ms` loop and then join the thread, so each costs
-  600 ms of sleeping however fast the work is. Letting the server exit once the
-  request it is waiting for has been served takes 8 x 600 ms of sleeping out,
-  about 1.2 s of the lib binary's wall at four threads. Not done: it touches
-  eight test bodies and a fixture that has to stay alive until the client has
-  spoken, and the gain is 5% of the gate.
+* Eight tests in `src/registry/npm.rs` used to spin a mock server in a
+  `while start.elapsed() < 600ms` loop and then join the thread, so each cost
+  600 ms of sleeping however fast the work was. Each loop now exits as soon as
+  the expected number of requests has been served, with a 50 ms idle fallback
+  and a 5 s safety deadline. Measured 2026-10-19: `cargo test --lib registry::npm`
+  single-threaded went 7.11 s to 2.37 s, five consecutive runs all green. The
+  default-thread wall stayed around 2.1 to 2.3 s because the unchanged
+  `a_packument_is_fetched_once_per_package` test carries a 2 s tail.
 * More libtest threads than cores helps a little and costs memory. On the
   baseline binaries: 1 thread 36 to 42 s, 4 (default) 17 to 19 s at 275 MB, 8
   threads 13.9 to 14.5 s at 387 to 449 MB. 8 threads is 1.25x for 40 to 60% more

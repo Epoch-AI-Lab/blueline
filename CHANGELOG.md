@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   5 m 47 s at `CARGO_BUILD_JOBS=2`, and rebuilding this crate goes 34.9 s to
   129.4 s. A one-file edit still rebuilds every test target in 2.9 s, so the
   everyday loop is unaffected.
+- **Eight npm registry tests no longer spin a mock server for 600 ms each.**
+  `src/registry/npm.rs` loops now exit as soon as the expected requests have
+  been served, with a 50 ms idle fallback and a 5 s safety deadline.
+  `cargo test --lib registry::npm` went 7.11 s to 2.37 s single-threaded,
+  five consecutive runs clean.
 - **New `scripts/prune_incremental.sh`.** Cargo never deletes a stale
   incremental session and has no knob to bound them; `target/debug/incremental`
   had reached 4.1 GB across 251 sessions, 3.2 GB of them blueline's own, because
