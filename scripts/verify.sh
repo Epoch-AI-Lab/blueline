@@ -105,7 +105,15 @@ echo "stages:    $stages"
 # resolve a different dependency graph than CI).
 stage "Format"    cargo fmt --all -- --check
 stage "Clippy"    cargo clippy --all-targets --locked -- -D warnings
-stage "Tests"     cargo test --all-targets --locked
+# nextest is preferred when it is installed: it overlaps the 15 test binaries
+# instead of running them one at a time, which is the difference between 22 s
+# and about 12 s on the dev box. Fall back to `cargo test` so a checkout
+# without nextest still passes the gate identically (same flags, same tests).
+if command -v cargo-nextest >/dev/null 2>&1; then
+    stage "Tests" cargo nextest run --all-targets --locked --test-threads 8
+else
+    stage "Tests" cargo test --all-targets --locked
+fi
 
 # The agent-facing map is prose, so no Rust gate can see it rot. This resolves
 # every citation in references/ against the tracked tree. Not part of "the Rust

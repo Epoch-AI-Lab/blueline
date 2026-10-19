@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   129.4 s. A one-file edit still rebuilds every test target in 2.9 s, so the
   everyday loop is unaffected.
 - **Eight npm registry tests no longer spin a mock server for 600 ms each.**
+- **The gate now runs `cargo nextest` at 8 threads.** verify.sh uses nextest
+  when it is installed and falls back to `cargo test` otherwise. CI installs
+  nextest through `taiki-e/install-action@v2`. The whole gate went from 23.8 s
+  to 11.4 s wall. `.cargo/config.toml` sets `test-threads = 8` for the cargo
+  test fallback.
   `src/registry/npm.rs` loops now exit as soon as the expected requests have
   been served, with a 50 ms idle fallback and a 5 s safety deadline.
   `cargo test --lib registry::npm` went 7.11 s to 2.37 s single-threaded,

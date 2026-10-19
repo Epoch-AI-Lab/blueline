@@ -517,10 +517,12 @@ costs more compile time for no measured return.
 
 ### 10.6 What this did not fix, and what is left
 
-* `cargo test` runs 15 test binaries serially, which is about 4 s of the
-  remaining 20 s. `cargo nextest` would overlap them and is the obvious next
-  step. It is a new tool in the gate, so it needs a decision, and it runs one
-  process per test, which is not free for 870 unit tests.
+* `cargo nextest` is now the default in the gate. It overlaps the 15 test
+  binaries instead of running them one at a time. Measured 2026-10-19 with 8
+  threads: the whole gate went from 23.8 s to 11.4 s wall, 3.1x over the
+  pre-opt-level baseline of 48.9 s. It is installed as a prebuilt binary from
+  the GitHub releases page rather than built from source, and CI installs it
+  through `taiki-e/install-action@v2`.
 * `tests/aur_ci_parallel.rs:15` sleeps 1500 ms on purpose, to prove the
   slow-first candidate is still reported first. That is a real property and
   shrinking the delay weakens the test.
@@ -529,13 +531,12 @@ costs more compile time for no measured return.
   600 ms of sleeping however fast the work was. Each loop now exits as soon as
   the expected number of requests has been served, with a 50 ms idle fallback
   and a 5 s safety deadline. Measured 2026-10-19: `cargo test --lib registry::npm`
-  single-threaded went 7.11 s to 2.37 s, five consecutive runs all green. The
-  default-thread wall stayed around 2.1 to 2.3 s because the unchanged
-  `a_packument_is_fetched_once_per_package` test carries a 2 s tail.
-* More libtest threads than cores helps a little and costs memory. On the
-  baseline binaries: 1 thread 36 to 42 s, 4 (default) 17 to 19 s at 275 MB, 8
-  threads 13.9 to 14.5 s at 387 to 449 MB. 8 threads is 1.25x for 40 to 60% more
-  peak RSS, which on a shared box is a trade rather than a win.
+  single-threaded went 7.11 s to 2.37 s, five consecutive runs all green.
+* `test-threads = 8` in `.cargo/config.toml` and passed explicitly to
+  `cargo nextest run`. On the baseline binaries: 1 thread 36 to 42 s, 4
+  (default) 17 to 19 s at 275 MB, 8 threads 13.9 to 14.5 s at 387 to 449 MB.
+  8 threads is 1.25x for 40 to 60% more peak RSS, which on a shared box is a
+  trade rather than a win, but on a dedicated CI runner it is free.
 
 ### 10.7 Limits of section 10
 
