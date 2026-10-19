@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **The dev and test profiles now build at `opt-level = 1`.** The gate's test
+  stage goes from 46.4 s to 20 to 24 s wall and 53.2 s to 14 to 15 s CPU, with
+  peak RSS down from 342 MB to about 270 MB, measured at `fae8050` under
+  1.97.1 and recorded in `PERF.md` section 10. `[profile.release]` is untouched,
+  so the shipped binary is unchanged. The cost is a cold build: 1 m 18 s becomes
+  5 m 47 s at `CARGO_BUILD_JOBS=2`, and rebuilding this crate goes 34.9 s to
+  129.4 s. A one-file edit still rebuilds every test target in 2.9 s, so the
+  everyday loop is unaffected.
+- **New `scripts/prune_incremental.sh`.** Cargo never deletes a stale
+  incremental session and has no knob to bound them; `target/debug/incremental`
+  had reached 4.1 GB across 251 sessions, 3.2 GB of them blueline's own, because
+  `cargo mutants` changes `RUSTFLAGS` and writes a fresh session per run. The
+  script judges a session by the newest file inside it rather than the
+  directory's mtime, which cargo touches on reuse. Dry run by default;
+  `--apply` to delete, `--days` to set the window.
+
 ### Added
 
 - **Dependency swap / rename-under-a-new-name detection.** `compute_delta`
