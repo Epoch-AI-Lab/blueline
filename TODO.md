@@ -487,12 +487,10 @@ Slices (each independently green, small commits, CHANGELOG entry per slice):
 
 Mark each campaign's box `[x]` in the same branch when it lands.
 
-- A removed dependency is currently not scored at all: `compute_delta` used to
-  compute `removed_dependencies` and nothing ever read it, so the field is gone
-  and a dependency *drop* produces no finding. A bare drop shrinks the install
-  graph, so on its own that is defensible. The pair worth scoring is a **swap**:
-  a name in the removed set alongside a near-identical name in the added set
-  (normalized, or edit distance 1) is a rename under a new name, which is the
-  shape of a typosquat. `R04_DEPENDENCY_ADDED` and `R04_DEPENDENCY_MODIFIED`
-  both exist; a swap rule would need its own id and its own false-positive budget,
-  because honestly swapping a dead dependency for a maintained fork is common.
+- Dependency swap scoring: DONE. Shipped as `R04_DEPENDENCY_SWAP` in
+  commits `f02e9ab` ("Add dependency-swap heuristic and parallelize AUR CI
+  lane") and `811b10f` ("Pin the dependency-swap rule with tests, not with a
+  comment"). A name in the removed set alongside a near-identical name in the
+  added set (normalized, or edit distance 1) is scored as a rename-under-a-new-name
+  finding, with its own rule id and false-positive budget. A bare dependency drop
+  still produces no finding on its own, since it only shrinks the install graph.
