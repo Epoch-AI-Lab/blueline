@@ -75,9 +75,13 @@ hard error *before* any byte is returned from `fetch_tarball`.
   `@LongLink` flood from being free.
 - **The zip path has extra rejections with no tar equivalent:** encrypted
   entries, `CompressionMethod` not `Stored | Deflated`, `enclosed_name()` None,
-  normalized-path duplicates (`a.txt` vs `./a.txt`), and a
-  `declared_size != actual_written` lie check. Modes are hard-set to
-  `0o644`/`0o755` rather than stripped.
+  raw entry names starting with `/` or containing `\` or `:` (zip 9's
+  `enclosed_name` sanitizes those away instead of refusing, so
+  `safe_extract_wheel` checks the raw bytes itself before any
+  sanitization), undecodable entry names (`name()` is a `Result` in zip 9
+  and a decode failure refuses the archive), normalized-path duplicates
+  (`a.txt` vs `./a.txt`), and a `declared_size != actual_written` lie
+  check. Modes are hard-set to `0o644`/`0o755` rather than stripped.
 - **The error *variant* is load-bearing.** npm packument oversize maps to
   `BluelineError::Manifest`; every other oversize maps to `ExtractionLimit`.
   Adapters `.map_err` on `ExtractionLimit(_)` to rewrite the message — change

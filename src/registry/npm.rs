@@ -754,8 +754,14 @@ mod tests {
         let handle = std::thread::spawn(move || {
             let _ = listener.set_nonblocking(true);
             let start = std::time::Instant::now();
-            while start.elapsed() < std::time::Duration::from_millis(600) {
+            let deadline = start + std::time::Duration::from_secs(5);
+            let expected = 8usize;
+            let mut served = 0usize;
+            let mut last = std::time::Instant::now();
+            while served < expected && std::time::Instant::now() < deadline {
                 if let Ok((mut stream, _)) = listener.accept() {
+                    served += 1;
+                    last = std::time::Instant::now();
                     let mut buf = [0u8; 1024];
                     let n = stream.read(&mut buf).unwrap_or(0);
                     let req = String::from_utf8_lossy(&buf[..n]);
@@ -778,6 +784,9 @@ mod tests {
                         let _ = stream.write_all(resp.as_bytes());
                     }
                 } else {
+                    if served > 0 && last.elapsed() > std::time::Duration::from_millis(50) {
+                        break;
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
             }
@@ -827,8 +836,14 @@ mod tests {
         let handle = std::thread::spawn(move || {
             let _ = listener.set_nonblocking(true);
             let start = std::time::Instant::now();
-            while start.elapsed() < std::time::Duration::from_millis(600) {
+            let deadline = start + std::time::Duration::from_secs(5);
+            let expected = 2usize;
+            let mut served = 0usize;
+            let mut last = std::time::Instant::now();
+            while served < expected && std::time::Instant::now() < deadline {
                 if let Ok((mut stream, _)) = listener.accept() {
+                    served += 1;
+                    last = std::time::Instant::now();
                     let mut buf = [0u8; 1024];
                     let n = stream.read(&mut buf).unwrap_or(0);
                     let req = String::from_utf8_lossy(&buf[..n]);
@@ -854,6 +869,9 @@ mod tests {
                         let _ = stream.write_all(&payload);
                     }
                 } else {
+                    if served > 0 && last.elapsed() > std::time::Duration::from_millis(50) {
+                        break;
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
             }
@@ -885,8 +903,14 @@ mod tests {
         let handle = std::thread::spawn(move || {
             let _ = listener.set_nonblocking(true);
             let start = std::time::Instant::now();
-            while start.elapsed() < std::time::Duration::from_millis(600) {
+            let deadline = start + std::time::Duration::from_secs(5);
+            let expected = 2usize;
+            let mut served = 0usize;
+            let mut last = std::time::Instant::now();
+            while served < expected && std::time::Instant::now() < deadline {
                 if let Ok((mut stream, _)) = listener.accept() {
+                    served += 1;
+                    last = std::time::Instant::now();
                     let mut buf = [0u8; 1024];
                     let n = stream.read(&mut buf).unwrap_or(0);
                     let req = String::from_utf8_lossy(&buf[..n]);
@@ -907,6 +931,9 @@ mod tests {
                         let _ = stream.write_all(resp.as_bytes());
                     }
                 } else {
+                    if served > 0 && last.elapsed() > std::time::Duration::from_millis(50) {
+                        break;
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
             }
@@ -953,8 +980,14 @@ mod tests {
         let handle = std::thread::spawn(move || {
             let _ = listener.set_nonblocking(true);
             let start = std::time::Instant::now();
-            while start.elapsed() < std::time::Duration::from_millis(600) {
+            let deadline = start + std::time::Duration::from_secs(5);
+            let expected = 2usize;
+            let mut served = 0usize;
+            let mut last = std::time::Instant::now();
+            while served < expected && std::time::Instant::now() < deadline {
                 if let Ok((mut stream, _)) = listener.accept() {
+                    served += 1;
+                    last = std::time::Instant::now();
                     let mut buf = [0u8; 1024];
                     let n = stream.read(&mut buf).unwrap_or(0);
                     let req = String::from_utf8_lossy(&buf[..n]);
@@ -975,6 +1008,9 @@ mod tests {
                         let _ = stream.write_all(&over_payload);
                     }
                 } else {
+                    if served > 0 && last.elapsed() > std::time::Duration::from_millis(50) {
+                        break;
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
             }
@@ -1027,8 +1063,14 @@ mod tests {
         let handle = std::thread::spawn(move || {
             let _ = listener.set_nonblocking(true);
             let start = std::time::Instant::now();
-            while start.elapsed() < std::time::Duration::from_millis(600) {
+            let deadline = start + std::time::Duration::from_secs(5);
+            let expected = 6usize;
+            let mut served = 0usize;
+            let mut last = std::time::Instant::now();
+            while served < expected && std::time::Instant::now() < deadline {
                 if let Ok((mut stream, _)) = listener.accept() {
+                    served += 1;
+                    last = std::time::Instant::now();
                     let mut buf = [0u8; 1024];
                     let n = stream.read(&mut buf).unwrap_or(0);
                     let req = String::from_utf8_lossy(&buf[..n]);
@@ -1067,6 +1109,9 @@ mod tests {
                         let _ = stream.write_all(resp.as_bytes());
                     }
                 } else {
+                    if served > 0 && last.elapsed() > std::time::Duration::from_millis(50) {
+                        break;
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
             }
@@ -1120,8 +1165,14 @@ mod tests {
         let handle = std::thread::spawn(move || {
             let _ = listener.set_nonblocking(true);
             let start = std::time::Instant::now();
-            while start.elapsed() < std::time::Duration::from_millis(600) {
+            let deadline = start + std::time::Duration::from_secs(5);
+            let expected = 1usize;
+            let mut served = 0usize;
+            let mut last = std::time::Instant::now();
+            while served < expected && std::time::Instant::now() < deadline {
                 if let Ok((mut stream, _)) = listener.accept() {
+                    served += 1;
+                    last = std::time::Instant::now();
                     let mut buf = [0u8; 1024];
                     let n = stream.read(&mut buf).unwrap_or(0);
                     let req = String::from_utf8_lossy(&buf[..n]);
@@ -1137,6 +1188,9 @@ mod tests {
                         let _ = stream.write_all(resp.as_bytes());
                     }
                 } else {
+                    if served > 0 && last.elapsed() > std::time::Duration::from_millis(50) {
+                        break;
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
             }
@@ -1191,8 +1245,14 @@ mod tests {
         let handle = std::thread::spawn(move || {
             let _ = listener.set_nonblocking(true);
             let start = std::time::Instant::now();
-            while start.elapsed() < std::time::Duration::from_millis(600) {
+            let deadline = start + std::time::Duration::from_secs(5);
+            let expected = 1usize;
+            let mut served = 0usize;
+            let mut last = std::time::Instant::now();
+            while served < expected && std::time::Instant::now() < deadline {
                 if let Ok((mut stream, _)) = listener.accept() {
+                    served += 1;
+                    last = std::time::Instant::now();
                     let mut buf = [0u8; 1024];
                     let n = stream.read(&mut buf).unwrap_or(0);
                     let req = String::from_utf8_lossy(&buf[..n]);
@@ -1211,6 +1271,9 @@ mod tests {
                         let _ = stream.write_all(resp.as_bytes());
                     }
                 } else {
+                    if served > 0 && last.elapsed() > std::time::Duration::from_millis(50) {
+                        break;
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
             }
@@ -1240,8 +1303,14 @@ mod tests {
         let handle = std::thread::spawn(move || {
             let _ = listener.set_nonblocking(true);
             let start = std::time::Instant::now();
-            while start.elapsed() < std::time::Duration::from_millis(600) {
+            let deadline = start + std::time::Duration::from_secs(5);
+            let expected = 1usize;
+            let mut served = 0usize;
+            let mut last = std::time::Instant::now();
+            while served < expected && std::time::Instant::now() < deadline {
                 if let Ok((mut stream, _)) = listener.accept() {
+                    served += 1;
+                    last = std::time::Instant::now();
                     let mut buf = [0u8; 1024];
                     let n = stream.read(&mut buf).unwrap_or(0);
                     let req = String::from_utf8_lossy(&buf[..n]);
@@ -1250,6 +1319,9 @@ mod tests {
                         let _ = stream.write_all(resp.as_bytes());
                     }
                 } else {
+                    if served > 0 && last.elapsed() > std::time::Duration::from_millis(50) {
+                        break;
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
             }

@@ -328,11 +328,36 @@ pub fn safe_extract_wheel(
             .by_index(idx)
             .map_err(|e| BluelineError::Extraction(format!("reading zip entry {idx}: {e}")))?;
 
-        let raw_name = file.name().to_string();
+        let raw_name = file
+            .name()
+            .map_err(|e| {
+                BluelineError::Extraction(format!(
+                    "zip entry {idx} has a name that cannot be decoded: {e}"
+                ))
+            })?
+            .to_string();
 
         if raw_name.as_bytes().contains(&0) {
             return Err(BluelineError::Extraction(format!(
                 "entry `{raw_name}` contains NUL byte"
+            )));
+        }
+
+        // zip 9's `enclosed_name` applies Windows path semantics: it strips a
+        // leading root or drive prefix instead of refusing the entry, and it
+        // splits on backslashes. A raw `/etc/evil` therefore comes back
+        // contained as `etc/evil`, and `foo\bar` as `foo/bar`. Containment is
+        // not the bar here: the name itself is refused, checked against the
+        // raw bytes before any sanitization can hide what the archive asked
+        // for.
+        if raw_name.starts_with('/') {
+            return Err(BluelineError::Extraction(format!(
+                "entry `{raw_name}` fails enclosed_name check (absolute or traversal)"
+            )));
+        }
+        if raw_name.contains('\\') || raw_name.contains(':') {
+            return Err(BluelineError::Extraction(format!(
+                "entry path `{raw_name}` containing backslash or colon rejected"
             )));
         }
 
@@ -1680,8 +1705,12 @@ mod wheel_tests {
         let err =
             safe_extract_wheel(&mutated, dir.path(), &ExtractionLimits::default()).unwrap_err();
         let msg = err.to_string().to_ascii_lowercase();
+        // zip 9 refuses unsupported methods inside `by_index` itself ("not
+        // supported"), before our own match on `file.compression()` can run;
+        // either phrasing names the same rejection.
         assert!(
-            msg.contains("unsupported") && (msg.contains("compression") || msg.contains("method")),
+            (msg.contains("unsupported") || msg.contains("not supported"))
+                && (msg.contains("compression") || msg.contains("method")),
             "{err}"
         );
     }

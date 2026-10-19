@@ -1,0 +1,10 @@
+# Cargo configuration for blueline.
+#
+# `test-threads = 8` runs the suite on 8 threads instead of the default 4
+# (ncpu). Measured 2026-10-19 on the dev box: the lib binary went from
+# 17-19 s to 13.9-14.5 s, at the cost of peak RSS rising from 275 MB to
+# 387-449 MB. On a shared box that is a speed-for-memory trade; drop this
+# line (or pass `--test-threads 4`) if RSS matters more. CI passes the same
+# value explicitly to `cargo nextest run`.
+[test]
+test-threads = 8

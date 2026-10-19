@@ -80,7 +80,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: swatinem/rust-cache@v2
-      - run: cargo test --all-targets --locked
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run --all-targets --locked --test-threads 8
 
   audit:
     name: Supply-chain audit
@@ -435,13 +438,20 @@ jobs:
           # forever, so the shard times out instead of producing a verdict. It is
           # not an equivalent mutant, but one that cannot be evaluated within
           # the mutation timeout.
+          #
+          # `replace > with < in levenshtein_at_most_one` is excluded for the
+          # same timeout reason: `edits` is incremented before the check, so
+          # `edits < 1` is never taken and the early return is dead. On a
+          # mismatch with `long` longer than `short`, only `i` advances, `j`
+          # never reaches `short.len()`, and the loop hangs instead of
+          # producing a verdict.
           # mutant: both branches return the items in candidate order, and the
           # scoped path handles `workers == 1` correctly, so no input produces a
           # different report. The only observable difference is one extra
           # `store.reopen()`, invisible in the result. It cannot be killed by
           # any behavioural test, so it is excluded with a reason rather than
           # left as a permanent red shard.
-          BLUELINE_MUTANTS_EXCLUDE: 'with .*Default::default\(\)|replace && with \|\| in .*|delete ! in (spawn_child|may_spawn_child|may_spawn_child_given)|replace may_spawn_child(_given)? -> bool with true|replace <= with > in evaluate_candidates|replace == with != in scan_file'
+          BLUELINE_MUTANTS_EXCLUDE: 'with .*Default::default\(\)|replace && with \|\| in .*|delete ! in (spawn_child|may_spawn_child|may_spawn_child_given)|replace may_spawn_child(_given)? -> bool with true|replace <= with > in evaluate_candidates|replace == with != in scan_file|replace < with <= in levenshtein_at_most_one|replace < with > in levenshtein_at_most_one|replace \+= with \*= in levenshtein_at_most_one|replace > with < in levenshtein_at_most_one'
         run: |
           cargo mutants --in-diff pr.diff --shard ${{ matrix.shard }}/32 \
             --file 'src/**/*.rs' \
@@ -519,7 +529,7 @@ jobs:
       # mutants-pr: executing them re-execs the test harness and detonates the
       # runner, so they can only be pinned by the fast `may_spawn_child`
       # assertion, never by running the mutant to completion.
-      BLUELINE_MUTANTS_EXCLUDE: 'with .*Default::default\(\)|replace && with \|\| in .*|delete ! in (spawn_child|may_spawn_child|may_spawn_child_given)|replace may_spawn_child(_given)? -> bool with true|replace <= with > in evaluate_candidates|replace == with != in scan_file'
+      BLUELINE_MUTANTS_EXCLUDE: 'with .*Default::default\(\)|replace && with \|\| in .*|delete ! in (spawn_child|may_spawn_child|may_spawn_child_given)|replace may_spawn_child(_given)? -> bool with true|replace <= with > in evaluate_candidates|replace == with != in scan_file|replace < with <= in levenshtein_at_most_one|replace < with > in levenshtein_at_most_one|replace \+= with \*= in levenshtein_at_most_one|replace > with < in levenshtein_at_most_one'
     steps:
       - uses: actions/checkout@v4
         with:

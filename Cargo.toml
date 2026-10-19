@@ -18,7 +18,14 @@ tar = "0.4"
 flate2 = "1"
 sha2 = "0.10"
 base64 = "0.22"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+# `deflate-flate2`, not the `deflate` meta-feature: `deflate` also enables
+# `flate2/zlib-rs`, and Cargo unifies features across the build, so that one
+# flag silently switches every flate2 user — blueline's own gunzip in
+# `safe_extract` and ureq's HTTP gzip — from miniz_oxide to zlib-rs.
+# `deflate-flate2` picks no backend; flate2's own default (`rust_backend`)
+# still supplies miniz_oxide, keeping the production decompression path
+# byte-identical to what shipped before the zip 9 bump.
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 rusqlite_migration = "1.3.1"
 semver = "1"
@@ -52,18 +59,37 @@ lto = true
 # gigabytes across a hundred stale incremental session caches. Line tables keep
 # a failing test pointing at the right source line, which is all a panic needs,
 # and they cost a fraction of the full DWARF.
+#
+# `opt-level = 1` is the other half of that. It is not here for the shipped
+# binary, which is `[profile.release]` and untouched; it is here because a test
+# suite that runs unoptimized code measures the absence of optimization rather
+# than the code. Measured on the dev box at `fae8050`, interleaved A/B, see
+# `PERF.md` section 10: the gate's test stage went 46.4 s to 21 s wall and
+# 53.2 s to 15.2 s CPU, and peak RSS 342 MB to 254 MB. It is level 1 and not 2
+# because the whole win is already banked at 1 and 2 costs more compile time for
+# no measured return.
 [profile.dev]
+opt-level = 1
 debug = "line-tables-only"
 
 # `cargo test` builds its own profile, and it inherits nothing from `[profile.dev]`
 # unless it is stated here, so both halves have to be set.
 [profile.test]
+opt-level = 1
 debug = "line-tables-only"
 
 # Dependencies are only ever linked in. Nobody steps through `serde_json`, so
 # emitting debug info for it only makes the linker read more than it has to.
+#
+# They are optimized because they run during the tests: `tests/scenarios.rs`
+# spends its time in sha2, flate2, walkdir and SQLite inside the spawned
+# binary, and that binary is mostly dependency code. Measured, optimizing the
+# dependencies and leaving this crate at 0 took the 22 attack scenarios from
+# 13.7 s to 6.2 s on their own.
 [profile.dev.package."*"]
+opt-level = 1
 debug = false
 
 [profile.test.package."*"]
+opt-level = 1
 debug = false
