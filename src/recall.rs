@@ -764,14 +764,26 @@ fn rfc3339_now() -> String {
 /// ecosystem) and counted in the returned total's companion print. Returns the
 /// number of documents written.
 pub fn export_osv(snapshot_path: &Path, out: &Path) -> anyhow::Result<usize> {
-    let text = std::fs::read_to_string(snapshot_path)
+    let file = std::fs::File::open(snapshot_path)
         .map_err(|e| anyhow::anyhow!("reading snapshot {}: {e}", snapshot_path.display()))?;
-    if text.len() > MAX_SNAPSHOT_BYTES {
-        anyhow::bail!("snapshot {} exceeds {MAX_SNAPSHOT_BYTES} bytes", snapshot_path.display());
+    let mut buf = Vec::new();
+    use std::io::Read;
+    file.take((MAX_SNAPSHOT_BYTES as u64) + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| anyhow::anyhow!("reading snapshot {}: {e}", snapshot_path.display()))?;
+    if buf.len() > MAX_SNAPSHOT_BYTES {
+        anyhow::bail!(
+            "snapshot {} exceeds {MAX_SNAPSHOT_BYTES} bytes",
+            snapshot_path.display()
+        );
     }
+    let text = String::from_utf8(buf)
+        .map_err(|e| anyhow::anyhow!("parsing snapshot {}: {e}", snapshot_path.display()))?;
     // Accept either a synced snapshot (as written by `recall sync`) or a raw
     // curated snapshot (as served by `recall serve`); both carry revocations.
-    let revocations: Vec<Revocation> = if let Ok(synced) = serde_json::from_str::<SyncedSnapshot>(&text) {
+    let revocations: Vec<Revocation> = if let Ok(synced) =
+        serde_json::from_str::<SyncedSnapshot>(&text)
+    {
         synced.snapshot.validate()?;
         synced.snapshot.revocations
     } else {
@@ -831,12 +843,9 @@ pub fn export_osv(snapshot_path: &Path, out: &Path) -> anyhow::Result<usize> {
         std::fs::create_dir_all(parent)
             .map_err(|e| anyhow::anyhow!("creating {}: {e}", parent.display()))?;
     }
-    std::fs::write(out, json)
-        .map_err(|e| anyhow::anyhow!("writing {}: {e}", out.display()))?;
+    std::fs::write(out, json).map_err(|e| anyhow::anyhow!("writing {}: {e}", out.display()))?;
     if skipped_aur > 0 {
-        eprintln!(
-            "skipped {skipped_aur} AUR revocation(s): OSV has no AUR ecosystem"
-        );
+        eprintln!("skipped {skipped_aur} AUR revocation(s): OSV has no AUR ecosystem");
     }
     Ok(docs.len())
 }
