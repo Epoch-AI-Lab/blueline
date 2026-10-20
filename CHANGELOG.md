@@ -53,7 +53,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   review and submit to OSV, closing the loop from local revocations to the
   upstream advisory feed without automated submission. AUR revocations are
   skipped because OSV has no AUR ecosystem, with a count reported on
-  stderr.
+  stderr. The same output is directly submittable to the GitHub Advisory
+  Database, which is an OSV-format consumer, so no separate `export-github`
+  command exists.
 
 Targeted at 0.4.0. This release is a behaviour change for anyone who set
 `require_provenance`: see the entry below before upgrading.

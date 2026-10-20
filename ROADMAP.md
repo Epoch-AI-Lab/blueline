@@ -37,7 +37,7 @@ Phased plan from greenfield to a trustworthy release-diff review desk. See
 - [x] PyPI registry adapter (`--ecosystem pypi`, `requirements.txt` CI scanning, PEP 440 / PEP 503, wheel extraction, PEP 740 provenance)
 - [x] AUR registry adapter (`--ecosystem aur`, review-only): git-history-backed reviews with vercmp ordering, static PKGBUILD heuristics (R11-R23), maintainer-transition finding, pin-file CI scanning, and a yay `AURPreInstall` gate hook
 - [x] Advisory feed contributions back to OSV (export-only: `blueline recall export-osv` emits OSV-schema documents from a curated snapshot for human review/submission)
-- [ ] Advisory feed contributions back to GitHub
+- [x] Advisory feed contributions back to GitHub (covered: GitHub Advisory Database is an OSV-format consumer, so `blueline recall export-osv` output is directly submittable; no separate command needed)
 
 ---
 
