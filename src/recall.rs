@@ -674,6 +674,182 @@ fn index_size_within_cap(len: usize) -> bool {
 /// Serve a curated index file over a minimal HTTP server. The file is
 /// validated once at startup and the served bytes are exactly the file
 /// bytes; the server never mutates anything.
+/// OSV-schema document emitted by `export_osv`. A draft for human review and
+/// submission; OSV assigns the final `id` on intake, but the schema requires
+/// one, so we prefix the curator's id to stay valid.
+#[derive(serde::Serialize)]
+struct OsvDoc {
+    id: String,
+    modified: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    published: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<String>,
+    affected: Vec<OsvAffected>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    references: Vec<OsvRef>,
+}
+
+#[derive(serde::Serialize)]
+struct OsvAffected {
+    package: OsvPackage,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    versions: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    ranges: Vec<OsvRange>,
+}
+
+#[derive(serde::Serialize)]
+struct OsvPackage {
+    ecosystem: String,
+    name: String,
+}
+
+#[derive(serde::Serialize)]
+struct OsvRange {
+    #[serde(rename = "type")]
+    range_type: String,
+    events: Vec<OsvRangeEvent>,
+}
+
+#[derive(serde::Serialize)]
+struct OsvRangeEvent {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    introduced: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct OsvRef {
+    #[serde(rename = "type")]
+    ref_type: String,
+    url: String,
+}
+
+fn osv_ecosystem(e: Ecosystem) -> Option<&'static str> {
+    match e {
+        Ecosystem::Npm => Some("npm"),
+        Ecosystem::Cargo => Some("crates.io"),
+        Ecosystem::PyPi => Some("PyPI"),
+        Ecosystem::Aur => None,
+    }
+}
+
+fn rfc3339_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // Howard Hinnant's civil-from-days, inverted.
+    let z = secs.div_euclid(86400) + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    let rem = secs.rem_euclid(86400);
+    let hh = rem / 3600;
+    let mm = (rem % 3600) / 60;
+    let ss = rem % 60;
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
+}
+
+/// Convert a curated recall snapshot into OSV-schema documents that a human
+/// can review and submit to OSV. AUR revocations are skipped (OSV has no AUR
+/// ecosystem) and counted in the returned total's companion print. Returns the
+/// number of documents written.
+pub fn export_osv(snapshot_path: &Path, out: &Path) -> anyhow::Result<usize> {
+    let file = std::fs::File::open(snapshot_path)
+        .map_err(|e| anyhow::anyhow!("reading snapshot {}: {e}", snapshot_path.display()))?;
+    let mut buf = Vec::new();
+    use std::io::Read;
+    file.take((MAX_SNAPSHOT_BYTES as u64) + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| anyhow::anyhow!("reading snapshot {}: {e}", snapshot_path.display()))?;
+    if buf.len() > MAX_SNAPSHOT_BYTES {
+        anyhow::bail!(
+            "snapshot {} exceeds {MAX_SNAPSHOT_BYTES} bytes",
+            snapshot_path.display()
+        );
+    }
+    let text = String::from_utf8(buf)
+        .map_err(|e| anyhow::anyhow!("parsing snapshot {}: {e}", snapshot_path.display()))?;
+    // Accept either a synced snapshot (as written by `recall sync`) or a raw
+    // curated snapshot (as served by `recall serve`); both carry revocations.
+    let revocations: Vec<Revocation> = if let Ok(synced) =
+        serde_json::from_str::<SyncedSnapshot>(&text)
+    {
+        synced.snapshot.validate()?;
+        synced.snapshot.revocations
+    } else {
+        let snapshot: Snapshot = serde_json::from_str(&text)
+            .map_err(|e| anyhow::anyhow!("parsing snapshot {}: {e}", snapshot_path.display()))?;
+        snapshot.validate()?;
+        snapshot.revocations
+    };
+    let now = rfc3339_now();
+    let mut docs: Vec<OsvDoc> = Vec::new();
+    let mut skipped_aur = 0usize;
+    for rev in &revocations {
+        let Some(ecosystem) = osv_ecosystem(rev.ecosystem) else {
+            skipped_aur += 1;
+            continue;
+        };
+        let id = if rev.id.starts_with("OSV-") {
+            rev.id.clone()
+        } else {
+            format!("OSV-{}", rev.id)
+        };
+        let (versions, ranges) = if rev.all_versions {
+            (
+                Vec::new(),
+                vec![OsvRange {
+                    range_type: "ECOSYSTEM".into(),
+                    events: vec![OsvRangeEvent {
+                        introduced: Some("0".into()),
+                    }],
+                }],
+            )
+        } else {
+            (rev.versions.clone(), Vec::new())
+        };
+        docs.push(OsvDoc {
+            id,
+            modified: now.clone(),
+            published: None,
+            summary: Some(rev.reason.clone()),
+            details: Some(rev.reason.clone()),
+            affected: vec![OsvAffected {
+                package: OsvPackage {
+                    ecosystem: ecosystem.into(),
+                    name: rev.name.clone(),
+                },
+                versions,
+                ranges,
+            }],
+            references: Vec::new(),
+        });
+    }
+    let json = serde_json::to_string_pretty(&docs)
+        .map_err(|e| anyhow::anyhow!("serialising OSV documents: {e}"))?;
+    if let Some(parent) = out.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("creating {}: {e}", parent.display()))?;
+    }
+    std::fs::write(out, json).map_err(|e| anyhow::anyhow!("writing {}: {e}", out.display()))?;
+    if skipped_aur > 0 {
+        eprintln!("skipped {skipped_aur} AUR revocation(s): OSV has no AUR ecosystem");
+    }
+    Ok(docs.len())
+}
+
 pub fn serve(port: u16, index: &Path) -> anyhow::Result<()> {
     let bytes = std::fs::read(index)
         .map_err(|e| anyhow::anyhow!("reading index {}: {e}", index.display()))?;

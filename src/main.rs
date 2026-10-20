@@ -100,6 +100,11 @@ fn run() -> anyhow::Result<()> {
                 );
                 Ok(())
             }
+            cli::RecallAction::ExportOsv { snapshot, out } => {
+                let n = blueline::recall::export_osv(&snapshot, &out)?;
+                println!("exported {n} OSV document(s) to {}", out.display());
+                Ok(())
+            }
         },
         cli::Command::Shim { action } => match action {
             cli::ShimAction::Install { managers, dir } => shim::install(&managers, dir.as_deref()),

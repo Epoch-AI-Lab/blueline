@@ -299,20 +299,19 @@ it is measured against came from a tree that had it. Re-measure before acting.
 
 **Also read from the code, not isolated by a measurement.**
 
-### 6. The 20-second test
+### 6. The 20-second test — DONE
 
-Not ranked because every fix touches a test mutation testing currently leans
-on. The tension is real and documented at `src/registry/npm.rs:1315`: the
-256 MiB fixture exists so the ceilings bind even when the arithmetic is mutated,
-and `the_packument_memo_ceilings_are_the_documented_sizes` already pins both
-constants exactly. One of those is redundant, and which one is a question about
-what the test is for.
+Implemented in commit `b0055f3` ("Stop allocating whole documents just to
+measure them"). `packument_size_estimate` now counts bytes through a
+`CountingWriter` + `serde_json::to_writer` (`serialised_len`) instead of
+building a transient `String`, so the 256 MiB signature block no longer
+materialises a second 256 MiB `String` on every call. No assertion changed.
 
-The least invasive option that keeps every assertion intact: change
-`packument_size_estimate` to count bytes through a streaming writer instead of
-building a `String`. That halves the work and removes the transient 256 MiB
-without touching a single assertion. **It edits production code, so it needs
-approval** per the "ask first" list in `AGENTS.md`.
+The remaining tension is unchanged and still open: the 256 MiB fixture exists
+so the ceilings bind even when the arithmetic is mutated, and
+`the_packument_memo_ceilings_are_the_documented_sizes` pins both constants
+exactly. Whether one of those two is redundant is still a question about what
+the test is for, and is left alone.
 
 ---
 

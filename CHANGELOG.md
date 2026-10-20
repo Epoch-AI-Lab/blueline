@@ -48,6 +48,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   score-neutral disclosure rather than escalating the verdict; the pair is
   named on the card.
 
+- **`blueline recall export-osv`.** Converts a curated recall snapshot
+  (raw or synced) into OSV-schema documents (JSON array) that a human can
+  review and submit to OSV, closing the loop from local revocations to the
+  upstream advisory feed without automated submission. AUR revocations are
+  skipped because OSV has no AUR ecosystem, with a count reported on
+  stderr.
+
 Targeted at 0.4.0. This release is a behaviour change for anyone who set
 `require_provenance`: see the entry below before upgrading.
 

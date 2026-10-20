@@ -523,3 +523,102 @@ fn audit_export_candidates_lists_denials_for_curation() {
         "the gate summary denial must be a curation candidate: {entries:?}"
     );
 }
+
+#[test]
+fn recall_export_osv_writes_osv_documents_from_curated_snapshot() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let snap_path = data_dir.path().join("snap.json");
+    std::fs::write(&snap_path, curated_index(now)).unwrap();
+
+    let out_path = data_dir.path().join("osv.json");
+    let out = blueline(data_dir.path())
+        .args([
+            "recall",
+            "export-osv",
+            "--snapshot",
+            snap_path.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let docs: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let docs = docs.as_array().unwrap();
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0]["affected"][0]["package"]["ecosystem"], "npm");
+    assert_eq!(docs[0]["affected"][0]["package"]["name"], "evil-pkg");
+    assert_eq!(docs[0]["affected"][0]["versions"][0], "1.0.0");
+}
+
+#[test]
+fn recall_export_osv_refuses_corrupt_snapshot() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let snap_path = data_dir.path().join("bad.json");
+    std::fs::write(&snap_path, "{not json").unwrap();
+    let out_path = data_dir.path().join("out.json");
+    let out = blueline(data_dir.path())
+        .args([
+            "recall",
+            "export-osv",
+            "--snapshot",
+            snap_path.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "corrupt snapshot must be refused");
+}
+
+#[test]
+fn recall_export_osv_skips_aur_and_reports_count() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let snap_path = data_dir.path().join("snap.json");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    // AUR-only revocation: OSV has no AUR ecosystem, so nothing is exported.
+    let snap = serde_json::json!({
+        "schema": 1,
+        "generated_at": now,
+        "sequence": 1,
+        "revocations": [{
+            "ecosystem": "aur",
+            "name": "evil-aur",
+            "versions": ["1.0.0"],
+            "all_versions": false,
+            "reason": "aur bad",
+            "id": "BL-AUR-1"
+        }]
+    });
+    std::fs::write(&snap_path, snap.to_string()).unwrap();
+    let out_path = data_dir.path().join("out.json");
+    let out = blueline(data_dir.path())
+        .args([
+            "recall",
+            "export-osv",
+            "--snapshot",
+            snap_path.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("skipped 1"), "stderr: {stderr}");
+    let docs: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    assert!(docs.as_array().unwrap().is_empty());
+}
