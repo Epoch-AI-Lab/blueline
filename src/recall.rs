@@ -781,16 +781,23 @@ pub fn export_osv(snapshot_path: &Path, out: &Path) -> anyhow::Result<usize> {
         .map_err(|e| anyhow::anyhow!("parsing snapshot {}: {e}", snapshot_path.display()))?;
     // Accept either a synced snapshot (as written by `recall sync`) or a raw
     // curated snapshot (as served by `recall serve`); both carry revocations.
-    let revocations: Vec<Revocation> = if let Ok(synced) =
-        serde_json::from_str::<SyncedSnapshot>(&text)
-    {
-        synced.snapshot.validate()?;
-        synced.snapshot.revocations
-    } else {
-        let snapshot: Snapshot = serde_json::from_str(&text)
-            .map_err(|e| anyhow::anyhow!("parsing snapshot {}: {e}", snapshot_path.display()))?;
-        snapshot.validate()?;
-        snapshot.revocations
+    let revocations: Vec<Revocation> = match serde_json::from_str::<SyncedSnapshot>(&text) {
+        Ok(synced) => {
+            synced.snapshot.validate()?;
+            synced.snapshot.revocations
+        }
+        Err(synced_err) => match serde_json::from_str::<Snapshot>(&text) {
+            Ok(snapshot) => {
+                snapshot.validate()?;
+                snapshot.revocations
+            }
+            Err(raw_err) => {
+                anyhow::bail!(
+                    "parsing snapshot {} (tried synced: {synced_err}; raw: {raw_err})",
+                    snapshot_path.display()
+                );
+            }
+        },
     };
     let now = rfc3339_now();
     let mut docs: Vec<OsvDoc> = Vec::new();
@@ -800,7 +807,7 @@ pub fn export_osv(snapshot_path: &Path, out: &Path) -> anyhow::Result<usize> {
             skipped_aur += 1;
             continue;
         };
-        let id = if rev.id.starts_with("OSV-") {
+        let id = if rev.id.starts_with("OSV-") || rev.id.starts_with("MAL-") {
             rev.id.clone()
         } else {
             format!("OSV-{}", rev.id)
@@ -809,7 +816,10 @@ pub fn export_osv(snapshot_path: &Path, out: &Path) -> anyhow::Result<usize> {
             (
                 Vec::new(),
                 vec![OsvRange {
-                    range_type: "ECOSYSTEM".into(),
+                    range_type: match rev.ecosystem {
+                        Ecosystem::Npm | Ecosystem::Cargo => "SEMVER".into(),
+                        Ecosystem::PyPi | Ecosystem::Aur => "ECOSYSTEM".into(),
+                    },
                     events: vec![OsvRangeEvent {
                         introduced: Some("0".into()),
                     }],
@@ -821,7 +831,7 @@ pub fn export_osv(snapshot_path: &Path, out: &Path) -> anyhow::Result<usize> {
         docs.push(OsvDoc {
             id,
             modified: now.clone(),
-            published: None,
+            published: Some(now.clone()),
             summary: Some(rev.reason.clone()),
             details: Some(rev.reason.clone()),
             affected: vec![OsvAffected {
@@ -843,7 +853,25 @@ pub fn export_osv(snapshot_path: &Path, out: &Path) -> anyhow::Result<usize> {
         std::fs::create_dir_all(parent)
             .map_err(|e| anyhow::anyhow!("creating {}: {e}", parent.display()))?;
     }
-    std::fs::write(out, json).map_err(|e| anyhow::anyhow!("writing {}: {e}", out.display()))?;
+    if let Ok(meta) = std::fs::symlink_metadata(out)
+        && meta.file_type().is_symlink()
+    {
+        anyhow::bail!("refusing to write through symlink {}", out.display());
+    }
+    let parent = out.parent().filter(|p| !p.as_os_str().is_empty());
+    let tmp = match parent {
+        Some(p) => p.join(format!(
+            ".{}.tmp-{}",
+            out.file_name().unwrap_or_default().to_string_lossy(),
+            std::process::id()
+        )),
+        None => std::path::PathBuf::from(format!(".{}.tmp-{}", out.display(), std::process::id())),
+    };
+    std::fs::write(&tmp, &json).map_err(|e| anyhow::anyhow!("writing {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, out).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::anyhow!("writing {}: {e}", out.display())
+    })?;
     if skipped_aur > 0 {
         eprintln!("skipped {skipped_aur} AUR revocation(s): OSV has no AUR ecosystem");
     }
@@ -904,6 +932,19 @@ pub fn serve(port: u16, index: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn rfc3339_now_is_rfc3339_and_current() {
+        let s = rfc3339_now();
+        assert_eq!(s.len(), 20, "rfc3339_now: {s}");
+        assert_eq!(s.as_bytes()[4], b'-');
+        assert_eq!(s.as_bytes()[7], b'-');
+        assert_eq!(s.as_bytes()[10], b'T');
+        assert_eq!(s.as_bytes()[13], b':');
+        assert_eq!(s.as_bytes()[16], b':');
+        assert_eq!(s.as_bytes()[19], b'Z');
+        let y: i32 = s[..4].parse().unwrap();
+        assert!(y >= 2020, "rfc3339_now year too small: {y}");
+    }
     /// A redirect chain the fetch is allowed to follow: same host, path only.
     ///
     /// Control for the refusal tests below. Without it, a `check_hop` that

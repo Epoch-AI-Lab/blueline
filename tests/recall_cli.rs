@@ -622,3 +622,287 @@ fn recall_export_osv_skips_aur_and_reports_count() {
         serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
     assert!(docs.as_array().unwrap().is_empty());
 }
+
+#[test]
+fn recall_export_osv_all_versions_emits_semver_range() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let snap_path = data_dir.path().join("snap.json");
+    let snap = serde_json::json!({
+        "schema": 1,
+        "generated_at": now,
+        "sequence": 1,
+        "revocations": [{
+            "ecosystem": "cargo",
+            "name": "evil-crate",
+            "versions": [],
+            "all_versions": true,
+            "reason": "all versions compromised",
+            "id": "BL-CARGO-1"
+        }]
+    });
+    std::fs::write(&snap_path, snap.to_string()).unwrap();
+    let out_path = data_dir.path().join("out.json");
+    let out = blueline(data_dir.path())
+        .args([
+            "recall",
+            "export-osv",
+            "--snapshot",
+            snap_path.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let docs: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let d = &docs.as_array().unwrap()[0];
+    assert!(
+        d["affected"][0]
+            .get("versions")
+            .map(|v| v.as_array().unwrap().is_empty())
+            .unwrap_or(true)
+    );
+    assert_eq!(d["affected"][0]["ranges"][0]["type"], "SEMVER");
+    assert_eq!(
+        d["affected"][0]["ranges"][0]["events"][0]["introduced"],
+        "0"
+    );
+    assert!(d["published"].is_string());
+}
+
+#[test]
+fn recall_export_osv_handles_pypi_ecosystem() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let snap_path = data_dir.path().join("snap.json");
+    let snap = serde_json::json!({
+        "schema": 1,
+        "generated_at": now,
+        "sequence": 1,
+        "revocations": [{
+            "ecosystem": "pypi",
+            "name": "evil-pypi",
+            "versions": ["1.0.0"],
+            "all_versions": false,
+            "reason": "pypi bad",
+            "id": "BL-PY-1"
+        }]
+    });
+    std::fs::write(&snap_path, snap.to_string()).unwrap();
+    let out_path = data_dir.path().join("out.json");
+    let out = blueline(data_dir.path())
+        .args([
+            "recall",
+            "export-osv",
+            "--snapshot",
+            snap_path.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let docs: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    assert_eq!(docs[0]["affected"][0]["package"]["ecosystem"], "PyPI");
+}
+
+#[test]
+fn recall_export_osv_prefixes_and_preserves_ids() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let snap_path = data_dir.path().join("snap.json");
+    let snap = serde_json::json!({
+        "schema": 1,
+        "generated_at": now,
+        "sequence": 1,
+        "revocations": [
+            {"ecosystem":"npm","name":"a","versions":["1.0.0"],"all_versions":false,"reason":"r","id":"BL-1"},
+            {"ecosystem":"npm","name":"b","versions":["1.0.0"],"all_versions":false,"reason":"r","id":"OSV-KEEP"}
+        ]
+    });
+    std::fs::write(&snap_path, snap.to_string()).unwrap();
+    let out_path = data_dir.path().join("out.json");
+    let out = blueline(data_dir.path())
+        .args([
+            "recall",
+            "export-osv",
+            "--snapshot",
+            snap_path.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let docs: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let docs = docs.as_array().unwrap();
+    assert_eq!(docs[0]["id"], "OSV-BL-1");
+    assert_eq!(docs[1]["id"], "OSV-KEEP");
+}
+
+#[test]
+fn recall_export_osv_refuses_oversized_snapshot() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let snap_path = data_dir.path().join("big.json");
+    let big = vec![b'a'; 8 * 1024 * 1024 + 100];
+    std::fs::write(&snap_path, &big).unwrap();
+    let out_path = data_dir.path().join("out.json");
+    let out = blueline(data_dir.path())
+        .args([
+            "recall",
+            "export-osv",
+            "--snapshot",
+            snap_path.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "oversized snapshot must be refused");
+    assert!(!out_path.exists(), "out must not be created on refusal");
+}
+
+#[test]
+fn recall_export_osv_refuses_invalid_snapshot() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let snap_path = data_dir.path().join("bad.json");
+    let snap = serde_json::json!({
+        "schema": 99,
+        "generated_at": now,
+        "sequence": 1,
+        "revocations": []
+    });
+    std::fs::write(&snap_path, snap.to_string()).unwrap();
+    let out_path = data_dir.path().join("out.json");
+    let out = blueline(data_dir.path())
+        .args([
+            "recall",
+            "export-osv",
+            "--snapshot",
+            snap_path.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "invalid snapshot must be refused");
+}
+
+#[test]
+fn recall_export_osv_accepts_synced_snapshot() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let snap_path = data_dir.path().join("synced.json");
+    let snap = serde_json::json!({
+        "fetched_at": now,
+        "url": "http://127.0.0.1:7979",
+        "snapshot": {
+            "schema": 1,
+            "generated_at": now,
+            "sequence": 7,
+            "revocations": [{
+                "ecosystem": "npm",
+                "name": "evil-pkg",
+                "versions": ["1.0.0"],
+                "all_versions": false,
+                "reason": "synced bad",
+                "id": "BL-SYNC-1"
+            }]
+        }
+    });
+    std::fs::write(&snap_path, snap.to_string()).unwrap();
+    let out_path = data_dir.path().join("out.json");
+    let out = blueline(data_dir.path())
+        .args([
+            "recall",
+            "export-osv",
+            "--snapshot",
+            snap_path.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let docs: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    assert_eq!(docs[0]["affected"][0]["package"]["name"], "evil-pkg");
+}
+
+#[test]
+fn recall_export_osv_refuses_symlink_out() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let snap_path = data_dir.path().join("snap.json");
+    let snap = serde_json::json!({
+        "schema": 1,
+        "generated_at": now,
+        "sequence": 1,
+        "revocations": [{
+            "ecosystem": "npm",
+            "name": "evil-pkg",
+            "versions": ["1.0.0"],
+            "all_versions": false,
+            "reason": "r",
+            "id": "BL-1"
+        }]
+    });
+    std::fs::write(&snap_path, snap.to_string()).unwrap();
+    let victim = data_dir.path().join("victim.txt");
+    std::fs::write(&victim, b"original").unwrap();
+    let link = data_dir.path().join("out.json");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&victim, &link).unwrap();
+    let out = blueline(data_dir.path())
+        .args([
+            "recall",
+            "export-osv",
+            "--snapshot",
+            snap_path.to_str().unwrap(),
+            "--out",
+            link.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "symlink out must be refused");
+    assert_eq!(std::fs::read(&victim).unwrap(), b"original");
+}
