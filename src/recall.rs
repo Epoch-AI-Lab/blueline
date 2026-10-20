@@ -741,7 +741,13 @@ fn rfc3339_now() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    // Howard Hinnant's civil-from-days, inverted.
+    rfc3339_utc(secs)
+}
+
+/// Format a Unix timestamp as an RFC 3339 UTC instant. Howard Hinnant's
+/// civil-from-days, inverted: blueline stamps two fields on an exported
+/// advisory and does not need a date crate for it.
+fn rfc3339_utc(secs: i64) -> String {
     let z = secs.div_euclid(86400) + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
     let doe = z - era * 146097;
@@ -944,6 +950,41 @@ mod tests {
         assert_eq!(s.as_bytes()[19], b'Z');
         let y: i32 = s[..4].parse().unwrap();
         assert!(y >= 2020, "rfc3339_now year too small: {y}");
+    }
+
+    /// Fixed instants with the answer asserted literally, not derived from the
+    /// code under test. The vectors cover both `mp` arms of the month
+    /// arithmetic (January and February sit above the branch, March through
+    /// December below it), midnight and a non-midnight second-of-day, a
+    /// non-leap century, a leap century, a leap day, the pre-epoch side, and a
+    /// timestamp whose civil date lands in year 0 so the negative-`z` arm of
+    /// the era calculation is live.
+    ///
+    /// Expected values are GNU `date -u -d @<secs>`, so an arithmetic mutant
+    /// that still yields a 20-character string with the right separators
+    /// cannot slip through on shape alone.
+    #[test]
+    fn rfc3339_utc_matches_fixed_instants() {
+        let cases: [(i64, &str); 15] = [
+            (0, "1970-01-01T00:00:00Z"),
+            (1_000_000_000, "2001-09-09T01:46:40Z"),
+            (-86_400, "1969-12-31T00:00:00Z"),
+            (-2_208_988_800, "1900-01-01T00:00:00Z"),
+            (-62_167_000_000, "0000-01-03T12:53:20Z"),
+            (946_684_800, "2000-01-01T00:00:00Z"),
+            (949_363_200, "2000-02-01T00:00:00Z"),
+            (951_782_400, "2000-02-29T00:00:00Z"),
+            (1_583_020_800, "2020-03-01T00:00:00Z"),
+            (1_600_000_000, "2020-09-13T12:26:40Z"),
+            (1_700_000_000, "2023-11-14T22:13:20Z"),
+            (1_735_689_600, "2025-01-01T00:00:00Z"),
+            (2_145_916_800, "2038-01-01T00:00:00Z"),
+            (4_102_444_800, "2100-01-01T00:00:00Z"),
+            (4_107_532_800, "2100-02-28T21:20:00Z"),
+        ];
+        for (secs, want) in cases {
+            assert_eq!(rfc3339_utc(secs), want, "secs={secs}");
+        }
     }
     /// A redirect chain the fetch is allowed to follow: same host, path only.
     ///

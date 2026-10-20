@@ -195,6 +195,18 @@ fn curated_index(now: i64) -> String {
     .to_string()
 }
 
+/// A well-formed snapshot padded with trailing whitespace to exactly `bytes`.
+/// Whitespace after a JSON document is legal, so the byte cap is the only
+/// thing that can reject this file. An all-`a` blob would fail the parser
+/// regardless, which lets a broken cap read as a pass.
+fn padded_snapshot(bytes: usize) -> String {
+    let mut text = curated_index(now_secs());
+    assert!(text.len() < bytes, "snapshot body is already over the cap");
+    text.push_str(&" ".repeat(bytes - text.len()));
+    assert_eq!(text.len(), bytes);
+    text
+}
+
 #[test]
 fn recall_index_hit_blocks_a_clean_looking_release() {
     let work = tempfile::tempdir().unwrap();
@@ -551,6 +563,13 @@ fn recall_export_osv_writes_osv_documents_from_curated_snapshot() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // Nothing was skipped, so nothing may be reported as skipped. The counter
+    // gate is `> 0`, not `>= 0`.
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("skipped"),
+        "no skip notice when there is no AUR entry: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let docs: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
     let docs = docs.as_array().unwrap();
@@ -769,7 +788,9 @@ fn recall_export_osv_prefixes_and_preserves_ids() {
 fn recall_export_osv_refuses_oversized_snapshot() {
     let data_dir = tempfile::tempdir().unwrap();
     let snap_path = data_dir.path().join("big.json");
-    let big = vec![b'a'; 8 * 1024 * 1024 + 100];
+    // Well-formed JSON over the cap. An all-`a` blob would be refused by the
+    // parser anyway, which would let a broken byte cap read as a pass.
+    let big = padded_snapshot(8 * 1024 * 1024 + 100);
     std::fs::write(&snap_path, &big).unwrap();
     let out_path = data_dir.path().join("out.json");
     let out = blueline(data_dir.path())
@@ -863,6 +884,212 @@ fn recall_export_osv_accepts_synced_snapshot() {
     let docs: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
     assert_eq!(docs[0]["affected"][0]["package"]["name"], "evil-pkg");
+}
+
+#[test]
+fn audit_export_candidates_filters_by_action_or_verdict() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let db_path = data_dir.path().join("baseline.db");
+    let store = blueline::store::BaselineStore::open_at(&db_path).unwrap();
+    // action-match arm: hold with a non-BLOCK/HIGH verdict must still be a candidate.
+    store
+        .record_audit_log(
+            blueline::registry::Ecosystem::Npm,
+            "hold-pkg",
+            "1.0.0",
+            "sha512-AAAA",
+            "hold",
+            10,
+            "LOW",
+            "reviewer",
+            None,
+        )
+        .unwrap();
+    // verdict-match arm: a BLOCK verdict with an unrelated action must be a candidate.
+    store
+        .record_audit_log(
+            blueline::registry::Ecosystem::Npm,
+            "block-pkg",
+            "2.0.0",
+            "sha512-BBBB",
+            "other",
+            90,
+            "BLOCK",
+            "reviewer",
+            None,
+        )
+        .unwrap();
+    // excluded: neither action nor verdict qualifies.
+    store
+        .record_audit_log(
+            blueline::registry::Ecosystem::Npm,
+            "noise-pkg",
+            "3.0.0",
+            "sha512-CCCC",
+            "other",
+            1,
+            "LOW",
+            "reviewer",
+            None,
+        )
+        .unwrap();
+
+    let out_path = data_dir.path().join("candidates.json");
+    let out = blueline(data_dir.path())
+        .args([
+            "recall",
+            "export-candidates",
+            "--out",
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let candidates: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let entries = candidates.as_array().unwrap();
+    assert_eq!(
+        entries.len(),
+        2,
+        "only the hold and BLOCK entries qualify: {entries:?}"
+    );
+    assert!(
+        entries.iter().any(|e| e["package"] == "hold-pkg"),
+        "hold action entry must be a candidate: {entries:?}"
+    );
+    assert!(
+        entries.iter().any(|e| e["package"] == "block-pkg"),
+        "BLOCK verdict entry must be a candidate: {entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|e| e["package"] == "noise-pkg"),
+        "unqualified entry must be excluded: {entries:?}"
+    );
+}
+
+#[test]
+fn recall_export_osv_accepts_a_snapshot_sitting_exactly_on_the_cap() {
+    // The refusal arm is `buf.len() > MAX`, so a file at exactly the cap must
+    // still export. Without this, an off-by-one in the boundary (or a `>` that
+    // became `>=`) reads as a pass.
+    let data_dir = tempfile::tempdir().unwrap();
+    let snap_path = data_dir.path().join("snap.json");
+    std::fs::write(&snap_path, padded_snapshot(8 * 1024 * 1024)).unwrap();
+    let out_path = data_dir.path().join("out.json");
+    let out = blueline(data_dir.path())
+        .args([
+            "recall",
+            "export-osv",
+            "--snapshot",
+            snap_path.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "a snapshot on the cap must be accepted: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out_path.exists(), "out must be written");
+}
+
+#[test]
+fn recall_export_osv_creates_a_missing_out_directory() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let snap_path = data_dir.path().join("snap.json");
+    let snap = serde_json::json!({
+        "schema": 1,
+        "generated_at": now,
+        "sequence": 1,
+        "revocations": [{
+            "ecosystem": "npm",
+            "name": "evil-pkg",
+            "versions": ["1.0.0"],
+            "all_versions": false,
+            "reason": "r",
+            "id": "BL-1"
+        }]
+    });
+    std::fs::write(&snap_path, snap.to_string()).unwrap();
+    let out_path = data_dir
+        .path()
+        .join("newdir")
+        .join("deeper")
+        .join("out.json");
+    let out = blueline(data_dir.path())
+        .args([
+            "recall",
+            "export-osv",
+            "--snapshot",
+            snap_path.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "a missing out directory must be created: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out_path.exists(),
+        "out must be written into the new directory"
+    );
+}
+
+#[test]
+fn recall_export_osv_preserves_mal_ids_and_ecosystem_strings() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let snap_path = data_dir.path().join("snap.json");
+    let snap = serde_json::json!({
+        "schema": 1,
+        "generated_at": now,
+        "sequence": 1,
+        "revocations": [
+            {"ecosystem":"npm","name":"n","versions":["1.0.0"],"all_versions":false,"reason":"r","id":"MAL-NPM-1"},
+            {"ecosystem":"cargo","name":"c","versions":["1.0.0"],"all_versions":false,"reason":"r","id":"BL-C-1"}
+        ]
+    });
+    std::fs::write(&snap_path, snap.to_string()).unwrap();
+    let out_path = data_dir.path().join("out.json");
+    let out = blueline(data_dir.path())
+        .args([
+            "recall",
+            "export-osv",
+            "--snapshot",
+            snap_path.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let docs: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let docs = docs.as_array().unwrap();
+    assert_eq!(docs[0]["id"], "MAL-NPM-1");
+    assert_eq!(docs[0]["affected"][0]["package"]["ecosystem"], "npm");
+    assert_eq!(docs[1]["id"], "OSV-BL-C-1");
+    assert_eq!(docs[1]["affected"][0]["package"]["ecosystem"], "crates.io");
 }
 
 #[test]
