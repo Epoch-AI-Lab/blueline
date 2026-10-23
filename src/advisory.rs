@@ -124,13 +124,15 @@ fn osv_ecosystem(ecosystem: Ecosystem) -> &'static str {
 }
 
 pub(crate) fn coverage_unknown(report: &AdvisoryReport, policy: &Policy) -> Option<String> {
-    match report.status {
-        AdvisoryStatus::Unverified if policy.policy.check_advisories => {
-            Some(report.message.clone().unwrap_or_default())
-        }
-        AdvisoryStatus::Unverified => None,
-        AdvisoryStatus::Clean | AdvisoryStatus::Vulnerable | AdvisoryStatus::StaleCache => None,
+    if !policy.policy.check_advisories || report.status != AdvisoryStatus::Unverified {
+        return None;
     }
+    Some(
+        report
+            .message
+            .clone()
+            .unwrap_or_else(|| "the advisory source gave no reason".to_string()),
+    )
 }
 
 /// Advisories for one `package@version`, resolved as far as it goes without
