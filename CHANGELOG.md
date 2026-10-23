@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`blueline recall export-osv` no longer follows a planted symlink at its
+  temp path**, and refuses control characters in `reason`/`id` fields. The
+  temp file is now created with `tempfile` (O_EXCL, random name) instead of
+  a predictable `.{out}.tmp-<pid>` path; a snapshot carrying control
+  characters in `reason` or `id` is rejected during validation.
+
 ### Changed
 
 - **The dev and test profiles now build at `opt-level = 1`.** The gate's test

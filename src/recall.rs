@@ -212,15 +212,21 @@ impl Snapshot {
                     rev.ecosystem.key()
                 )));
             }
-            if rev.reason.is_empty() || rev.reason.len() > MAX_TEXT_BYTES {
+            if rev.reason.is_empty()
+                || rev.reason.len() > MAX_TEXT_BYTES
+                || rev.reason.chars().any(char::is_control)
+            {
                 return Err(BluelineError::Advisory(format!(
-                    "recall entry `{}`: reason missing or over {MAX_TEXT_BYTES} bytes",
+                    "recall entry `{}`: reason missing, oversized, or contains a control character",
                     rev.id
                 )));
             }
-            if rev.id.is_empty() || rev.id.len() > MAX_TEXT_BYTES {
+            if rev.id.is_empty()
+                || rev.id.len() > MAX_TEXT_BYTES
+                || rev.id.chars().any(char::is_control)
+            {
                 return Err(BluelineError::Advisory(
-                    "recall entry id missing or oversized".into(),
+                    "recall entry id missing, oversized, or contains a control character".into(),
                 ));
             }
             if rev.all_versions {
@@ -864,20 +870,21 @@ pub fn export_osv(snapshot_path: &Path, out: &Path) -> anyhow::Result<usize> {
     {
         anyhow::bail!("refusing to write through symlink {}", out.display());
     }
-    let parent = out.parent().filter(|p| !p.as_os_str().is_empty());
-    let tmp = match parent {
-        Some(p) => p.join(format!(
-            ".{}.tmp-{}",
-            out.file_name().unwrap_or_default().to_string_lossy(),
-            std::process::id()
-        )),
-        None => std::path::PathBuf::from(format!(".{}.tmp-{}", out.display(), std::process::id())),
-    };
-    std::fs::write(&tmp, &json).map_err(|e| anyhow::anyhow!("writing {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, out).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        anyhow::anyhow!("writing {}: {e}", out.display())
-    })?;
+    let parent = out
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".blueline-osv.")
+        .tempfile_in(parent)
+        .map_err(|e| anyhow::anyhow!("creating a temp file in {}: {e}", parent.display()))?;
+    tmp.write_all(json.as_bytes())
+        .map_err(|e| anyhow::anyhow!("writing {}: {e}", out.display()))?;
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| anyhow::anyhow!("flushing {}: {e}", out.display()))?;
+    tmp.persist(out)
+        .map_err(|e| anyhow::anyhow!("writing {}: {}", out.display(), e.error))?;
     if skipped_aur > 0 {
         eprintln!("skipped {skipped_aur} AUR revocation(s): OSV has no AUR ecosystem");
     }
@@ -986,6 +993,44 @@ mod tests {
             assert_eq!(rfc3339_utc(secs), want, "secs={secs}");
         }
     }
+    /// The temp name used to be `.{out}.tmp-<pid>`, a fully predictable path,
+    /// and `fs::write` follows a symlink. A link planted at that name turned
+    /// an export into an arbitrary-file overwrite, then `rename` moved the
+    /// link itself over `out`. The name is now random and created with
+    /// O_EXCL, so a link at the old name is never touched.
+    #[test]
+    #[cfg(unix)]
+    fn export_osv_does_not_follow_a_planted_symlink_at_the_old_tmp_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("snap.json");
+        std::fs::write(
+            &snap_path,
+            serde_json::to_string(&valid_snapshot()).unwrap(),
+        )
+        .unwrap();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"original").unwrap();
+        let out = dir.path().join("out.json");
+        let planted = dir
+            .path()
+            .join(format!(".out.json.tmp-{}", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+
+        assert_eq!(export_osv(&snap_path, &out).unwrap(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "original",
+            "export_osv followed a planted symlink and overwrote its target"
+        );
+        assert!(
+            std::fs::symlink_metadata(&out)
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "out must be a regular file, not the planted link renamed over it"
+        );
+    }
+
     /// A redirect chain the fetch is allowed to follow: same host, path only.
     ///
     /// Control for the refusal tests below. Without it, a `check_hop` that
@@ -1802,6 +1847,35 @@ mod tests {
         let mut over = valid_snapshot();
         over.revocations[0].id = "b".repeat(MAX_TEXT_BYTES + 1);
         assert!(over.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_control_characters_in_reason_and_id() {
+        for bad in [
+            "bad\u{0}reason",
+            "bad\nreason",
+            "bad\treason",
+            "bad\rreason",
+        ] {
+            let mut snap = valid_snapshot();
+            snap.revocations[0].reason = bad.to_string();
+            assert!(
+                snap.validate().is_err(),
+                "control char in reason must be rejected: {bad:?}"
+            );
+        }
+        for bad in ["bad\u{0}id", "bad\nid", "bad\tid", "bad\rid"] {
+            let mut snap = valid_snapshot();
+            snap.revocations[0].id = bad.to_string();
+            assert!(
+                snap.validate().is_err(),
+                "control char in id must be rejected: {bad:?}"
+            );
+        }
+        let mut clean = valid_snapshot();
+        clean.revocations[0].reason = "clean reason".to_string();
+        clean.revocations[0].id = "clean-id".to_string();
+        assert!(clean.validate().is_ok());
     }
 
     #[test]
