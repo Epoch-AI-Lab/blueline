@@ -11,7 +11,7 @@ boundary. Protects the property that **the agent entry points ignore ambient
 - `validate()` — the threshold, recursion, recall, and recall-bound checks, plus
   `reject_unimplemented_keys`.
 - Matchers: `is_script_allowed`, `allows_unreviewed_baseline`,
-  `is_package_blocked`, `glob_match`.
+  `allows_new_binary`, `is_package_blocked`, `glob_match`.
 - `parse_band_str` lives in `ci.rs`, not here.
 
 ## How to get to it (user POV)
@@ -36,6 +36,7 @@ allowed_builders = []; allowed_repositories = []
 [[allowlist.packages]]
 name = "demo"; ecosystem = "npm"; allowed_scripts = ["postinstall"]
 allow_unreviewed_baseline = false
+allowed_new_binary_paths = ["src/data/distrusted/*"]
 [blocklist]
 packages = ["evil-*"]; maintainers = []
 [ci]
@@ -112,6 +113,19 @@ otherwise exact `==` (**case-sensitive**). No `?`, no `[...]`, no escaping.
   so `--yes` auto-approves a first sighting. It does *not* suppress content
   heuristics — which is why the repo's own `blueline.toml` is 934 lines of
   per-crate rules.
+- **`allowed_new_binary_paths` is the one deliberate opening in "content
+  heuristics apply in full".** It lowers `R02_BINARY_BLOB_ADDED` from HIGH to
+  LOW — the finding stays on the card — when the added path matches one of the
+  rule's globs for that exact package and ecosystem. A *modified* binary is
+  never covered (`R02_BINARY_BLOB_MODIFIED` stays HIGH even under a `**` glob,
+  `binary_blob_allowance_never_covers_a_modified_binary`), and
+  `R02_EXECUTABLE_ADDED` and `R02_OPAQUE_LARGE_FILE_ADDED` are untouched. The
+  reason it exists: upstream releases legitimately add binary data files
+  (rustls-webpki 0.103.16 ships the distrusted emSign keys as `.spki.der`),
+  and the dogfood CI job reviews every PR with the *base* branch's policy, so
+  a PR can never both introduce a key and rely on it — the key had to carry a
+  human-reviewed justification in `blueline.toml` on the branch that added it.
+  A path the globs do not match still scores at full weight.
 - **Two `require_provenance` fields exist** (`[policy]` and `[provenance]`) and
   are OR'd in `heuristic.rs`. Setting only one is ambiguous; set both.
 - **`provenance.allowed_builders` is a dead knob.** `max_risk`,

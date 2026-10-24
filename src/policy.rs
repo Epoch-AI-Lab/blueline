@@ -310,6 +310,19 @@ impl Policy {
                 && r.ecosystem.is_none_or(|rule_eco| rule_eco == ecosystem)
         })
     }
+
+    /// Check whether an added binary at `path` inside `package_name` is
+    /// forgiven by the package's allowlist rule. Exact name match, ecosystem
+    /// match, then `*`-glob against the rule's `allowed_new_binary_paths`.
+    pub fn allows_new_binary(&self, package_name: &str, ecosystem: Ecosystem, path: &str) -> bool {
+        self.allowlist.packages.iter().any(|r| {
+            r.name == package_name
+                && r.ecosystem.is_none_or(|rule_eco| rule_eco == ecosystem)
+                && r.allowed_new_binary_paths
+                    .iter()
+                    .any(|pattern| glob_match(pattern, path))
+        })
+    }
 }
 
 /// Threshold configurations for mapping numeric risk scores to verdict bands.
@@ -541,6 +554,16 @@ pub struct PackageAllowRule {
     /// longer contribute risk. Content heuristics still apply in full.
     #[serde(default)]
     pub allow_unreviewed_baseline: bool,
+    /// Added-binary paths this rule forgives, matched as `*`-globs against the
+    /// path inside the package. The `R02_BINARY_BLOB_ADDED` finding stays
+    /// visible at Low; a path the globs do not match still scores at full
+    /// weight, and a *modified* binary is never covered — only files that did
+    /// not exist in the predecessor. This is the one deliberate opening in
+    /// "content heuristics apply in full": upstream releases legitimately add
+    /// data files (rustls-webpki's distrusted-key pins), and without it the
+    /// only human answer is a permanently red gate.
+    #[serde(default)]
+    pub allowed_new_binary_paths: Vec<String>,
 }
 
 /// Specific package blocklist rule. TOML accepts either a plain glob string
@@ -983,6 +1006,44 @@ name = "other-pkg"
         assert!(!policy.allows_unreviewed_baseline("other-pkg", Ecosystem::Npm));
         assert!(!policy.allows_unreviewed_baseline("internal-tool-jr", Ecosystem::Npm));
         assert!(!Policy::default().allows_unreviewed_baseline("internal-tool", Ecosystem::Npm));
+    }
+
+    #[test]
+    fn parses_allowed_new_binary_paths_rule() {
+        let toml_content = r#"
+[[allowlist.packages]]
+name = "tls-crate"
+ecosystem = "cargo"
+allowed_new_binary_paths = ["src/data/distrusted/*"]
+
+[[allowlist.packages]]
+name = "other-pkg"
+"#;
+        let policy = Policy::from_toml_str(toml_content).unwrap();
+        assert!(policy.allows_new_binary(
+            "tls-crate",
+            Ecosystem::Cargo,
+            "src/data/distrusted/EMOVTLSCAG3B.spki.der"
+        ));
+        // The matcher is the blocklist's minimal one: a leading or trailing
+        // star, or an exact string. An interior star is not a wildcard.
+        assert!(!policy.allows_new_binary("tls-crate", Ecosystem::Cargo, "src/eval/pin.der"));
+        assert!(!policy.allows_new_binary(
+            "other-pkg",
+            Ecosystem::Cargo,
+            "src/data/distrusted/x.der"
+        ));
+        assert!(!policy.allows_new_binary(
+            "tls-crate",
+            Ecosystem::Npm,
+            "src/data/distrusted/x.der"
+        ));
+        assert!(!policy.allows_new_binary(
+            "tls-crate-jr",
+            Ecosystem::Cargo,
+            "src/data/distrusted/x.der"
+        ));
+        assert!(!Policy::default().allows_new_binary("tls-crate", Ecosystem::Cargo, "anything"));
     }
 
     #[test]

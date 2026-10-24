@@ -551,6 +551,10 @@ allow_unreviewed_baseline = true
 name = "rustls-webpki"
 ecosystem = "cargo"
 allow_unreviewed_baseline = true
+# 0.103.16 ships the distrusted emSign intermediate keys as .spki.der blobs
+# (the RUSTSEC-2026-0382 fix); the content diff cannot read them as text, so
+# each one is a HIGH R02_BINARY_BLOB_ADDED. Forgive exactly that directory.
+allowed_new_binary_paths = ["src/data/distrusted/*"]
 
 [[allowlist.packages]]
 name = "rusty-fork"
