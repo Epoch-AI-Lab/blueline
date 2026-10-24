@@ -212,15 +212,21 @@ impl Snapshot {
                     rev.ecosystem.key()
                 )));
             }
-            if rev.reason.is_empty() || rev.reason.len() > MAX_TEXT_BYTES {
+            if rev.reason.is_empty()
+                || rev.reason.len() > MAX_TEXT_BYTES
+                || rev.reason.chars().any(char::is_control)
+            {
                 return Err(BluelineError::Advisory(format!(
-                    "recall entry `{}`: reason missing or over {MAX_TEXT_BYTES} bytes",
+                    "recall entry `{}`: reason missing, oversized, or contains a control character",
                     rev.id
                 )));
             }
-            if rev.id.is_empty() || rev.id.len() > MAX_TEXT_BYTES {
+            if rev.id.is_empty()
+                || rev.id.len() > MAX_TEXT_BYTES
+                || rev.id.chars().any(char::is_control)
+            {
                 return Err(BluelineError::Advisory(
-                    "recall entry id missing or oversized".into(),
+                    "recall entry id missing, oversized, or contains a control character".into(),
                 ));
             }
             if rev.all_versions {
@@ -674,6 +680,217 @@ fn index_size_within_cap(len: usize) -> bool {
 /// Serve a curated index file over a minimal HTTP server. The file is
 /// validated once at startup and the served bytes are exactly the file
 /// bytes; the server never mutates anything.
+/// OSV-schema document emitted by `export_osv`. A draft for human review and
+/// submission; OSV assigns the final `id` on intake, but the schema requires
+/// one, so we prefix the curator's id to stay valid.
+#[derive(serde::Serialize)]
+struct OsvDoc {
+    id: String,
+    modified: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    published: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<String>,
+    affected: Vec<OsvAffected>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    references: Vec<OsvRef>,
+}
+
+#[derive(serde::Serialize)]
+struct OsvAffected {
+    package: OsvPackage,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    versions: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    ranges: Vec<OsvRange>,
+}
+
+#[derive(serde::Serialize)]
+struct OsvPackage {
+    ecosystem: String,
+    name: String,
+}
+
+#[derive(serde::Serialize)]
+struct OsvRange {
+    #[serde(rename = "type")]
+    range_type: String,
+    events: Vec<OsvRangeEvent>,
+}
+
+#[derive(serde::Serialize)]
+struct OsvRangeEvent {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    introduced: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct OsvRef {
+    #[serde(rename = "type")]
+    ref_type: String,
+    url: String,
+}
+
+fn osv_ecosystem(e: Ecosystem) -> Option<&'static str> {
+    match e {
+        Ecosystem::Npm => Some("npm"),
+        Ecosystem::Cargo => Some("crates.io"),
+        Ecosystem::PyPi => Some("PyPI"),
+        Ecosystem::Aur => None,
+    }
+}
+
+fn rfc3339_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    rfc3339_utc(secs)
+}
+
+/// Format a Unix timestamp as an RFC 3339 UTC instant. Howard Hinnant's
+/// civil-from-days, inverted: blueline stamps two fields on an exported
+/// advisory and does not need a date crate for it.
+fn rfc3339_utc(secs: i64) -> String {
+    let z = secs.div_euclid(86400) + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    let rem = secs.rem_euclid(86400);
+    let hh = rem / 3600;
+    let mm = (rem % 3600) / 60;
+    let ss = rem % 60;
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
+}
+
+/// Convert a curated recall snapshot into OSV-schema documents that a human
+/// can review and submit to OSV. AUR revocations are skipped (OSV has no AUR
+/// ecosystem) and counted in the returned total's companion print. Returns the
+/// number of documents written.
+pub fn export_osv(snapshot_path: &Path, out: &Path) -> anyhow::Result<usize> {
+    let file = std::fs::File::open(snapshot_path)
+        .map_err(|e| anyhow::anyhow!("reading snapshot {}: {e}", snapshot_path.display()))?;
+    let mut buf = Vec::new();
+    use std::io::Read;
+    file.take((MAX_SNAPSHOT_BYTES as u64) + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| anyhow::anyhow!("reading snapshot {}: {e}", snapshot_path.display()))?;
+    if buf.len() > MAX_SNAPSHOT_BYTES {
+        anyhow::bail!(
+            "snapshot {} exceeds {MAX_SNAPSHOT_BYTES} bytes",
+            snapshot_path.display()
+        );
+    }
+    let text = String::from_utf8(buf)
+        .map_err(|e| anyhow::anyhow!("parsing snapshot {}: {e}", snapshot_path.display()))?;
+    // Accept either a synced snapshot (as written by `recall sync`) or a raw
+    // curated snapshot (as served by `recall serve`); both carry revocations.
+    let revocations: Vec<Revocation> = match serde_json::from_str::<SyncedSnapshot>(&text) {
+        Ok(synced) => {
+            synced.snapshot.validate()?;
+            synced.snapshot.revocations
+        }
+        Err(synced_err) => match serde_json::from_str::<Snapshot>(&text) {
+            Ok(snapshot) => {
+                snapshot.validate()?;
+                snapshot.revocations
+            }
+            Err(raw_err) => {
+                anyhow::bail!(
+                    "parsing snapshot {} (tried synced: {synced_err}; raw: {raw_err})",
+                    snapshot_path.display()
+                );
+            }
+        },
+    };
+    let now = rfc3339_now();
+    let mut docs: Vec<OsvDoc> = Vec::new();
+    let mut skipped_aur = 0usize;
+    for rev in &revocations {
+        let Some(ecosystem) = osv_ecosystem(rev.ecosystem) else {
+            skipped_aur += 1;
+            continue;
+        };
+        let id = if rev.id.starts_with("OSV-") || rev.id.starts_with("MAL-") {
+            rev.id.clone()
+        } else {
+            format!("OSV-{}", rev.id)
+        };
+        let (versions, ranges) = if rev.all_versions {
+            (
+                Vec::new(),
+                vec![OsvRange {
+                    range_type: match rev.ecosystem {
+                        Ecosystem::Npm | Ecosystem::Cargo => "SEMVER".into(),
+                        Ecosystem::PyPi | Ecosystem::Aur => "ECOSYSTEM".into(),
+                    },
+                    events: vec![OsvRangeEvent {
+                        introduced: Some("0".into()),
+                    }],
+                }],
+            )
+        } else {
+            (rev.versions.clone(), Vec::new())
+        };
+        docs.push(OsvDoc {
+            id,
+            modified: now.clone(),
+            published: Some(now.clone()),
+            summary: Some(rev.reason.clone()),
+            details: Some(rev.reason.clone()),
+            affected: vec![OsvAffected {
+                package: OsvPackage {
+                    ecosystem: ecosystem.into(),
+                    name: rev.name.clone(),
+                },
+                versions,
+                ranges,
+            }],
+            references: Vec::new(),
+        });
+    }
+    let json = serde_json::to_string_pretty(&docs)
+        .map_err(|e| anyhow::anyhow!("serialising OSV documents: {e}"))?;
+    if let Some(parent) = out.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("creating {}: {e}", parent.display()))?;
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(out)
+        && meta.file_type().is_symlink()
+    {
+        anyhow::bail!("refusing to write through symlink {}", out.display());
+    }
+    let parent = out
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".blueline-osv.")
+        .tempfile_in(parent)
+        .map_err(|e| anyhow::anyhow!("creating a temp file in {}: {e}", parent.display()))?;
+    tmp.write_all(json.as_bytes())
+        .map_err(|e| anyhow::anyhow!("writing {}: {e}", out.display()))?;
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| anyhow::anyhow!("flushing {}: {e}", out.display()))?;
+    tmp.persist(out)
+        .map_err(|e| anyhow::anyhow!("writing {}: {}", out.display(), e.error))?;
+    if skipped_aur > 0 {
+        eprintln!("skipped {skipped_aur} AUR revocation(s): OSV has no AUR ecosystem");
+    }
+    Ok(docs.len())
+}
+
 pub fn serve(port: u16, index: &Path) -> anyhow::Result<()> {
     let bytes = std::fs::read(index)
         .map_err(|e| anyhow::anyhow!("reading index {}: {e}", index.display()))?;
@@ -727,6 +944,92 @@ pub fn serve(port: u16, index: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rfc3339_now_is_rfc3339_and_current() {
+        let s = rfc3339_now();
+        assert_eq!(s.len(), 20, "rfc3339_now: {s}");
+        assert_eq!(s.as_bytes()[4], b'-');
+        assert_eq!(s.as_bytes()[7], b'-');
+        assert_eq!(s.as_bytes()[10], b'T');
+        assert_eq!(s.as_bytes()[13], b':');
+        assert_eq!(s.as_bytes()[16], b':');
+        assert_eq!(s.as_bytes()[19], b'Z');
+        let y: i32 = s[..4].parse().unwrap();
+        assert!(y >= 2020, "rfc3339_now year too small: {y}");
+    }
+
+    /// Fixed instants with the answer asserted literally, not derived from the
+    /// code under test. The vectors cover both `mp` arms of the month
+    /// arithmetic (January and February sit above the branch, March through
+    /// December below it), midnight and a non-midnight second-of-day, a
+    /// non-leap century, a leap century, a leap day, the pre-epoch side, and a
+    /// timestamp whose civil date lands in year 0 so the negative-`z` arm of
+    /// the era calculation is live.
+    ///
+    /// Expected values are GNU `date -u -d @<secs>`, so an arithmetic mutant
+    /// that still yields a 20-character string with the right separators
+    /// cannot slip through on shape alone.
+    #[test]
+    fn rfc3339_utc_matches_fixed_instants() {
+        let cases: [(i64, &str); 15] = [
+            (0, "1970-01-01T00:00:00Z"),
+            (1_000_000_000, "2001-09-09T01:46:40Z"),
+            (-86_400, "1969-12-31T00:00:00Z"),
+            (-2_208_988_800, "1900-01-01T00:00:00Z"),
+            (-62_167_000_000, "0000-01-03T12:53:20Z"),
+            (946_684_800, "2000-01-01T00:00:00Z"),
+            (949_363_200, "2000-02-01T00:00:00Z"),
+            (951_782_400, "2000-02-29T00:00:00Z"),
+            (1_583_020_800, "2020-03-01T00:00:00Z"),
+            (1_600_000_000, "2020-09-13T12:26:40Z"),
+            (1_700_000_000, "2023-11-14T22:13:20Z"),
+            (1_735_689_600, "2025-01-01T00:00:00Z"),
+            (2_145_916_800, "2038-01-01T00:00:00Z"),
+            (4_102_444_800, "2100-01-01T00:00:00Z"),
+            (4_107_532_800, "2100-02-28T21:20:00Z"),
+        ];
+        for (secs, want) in cases {
+            assert_eq!(rfc3339_utc(secs), want, "secs={secs}");
+        }
+    }
+    /// The temp name used to be `.{out}.tmp-<pid>`, a fully predictable path,
+    /// and `fs::write` follows a symlink. A link planted at that name turned
+    /// an export into an arbitrary-file overwrite, then `rename` moved the
+    /// link itself over `out`. The name is now random and created with
+    /// O_EXCL, so a link at the old name is never touched.
+    #[test]
+    #[cfg(unix)]
+    fn export_osv_does_not_follow_a_planted_symlink_at_the_old_tmp_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("snap.json");
+        std::fs::write(
+            &snap_path,
+            serde_json::to_string(&valid_snapshot()).unwrap(),
+        )
+        .unwrap();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"original").unwrap();
+        let out = dir.path().join("out.json");
+        let planted = dir
+            .path()
+            .join(format!(".out.json.tmp-{}", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+
+        assert_eq!(export_osv(&snap_path, &out).unwrap(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "original",
+            "export_osv followed a planted symlink and overwrote its target"
+        );
+        assert!(
+            std::fs::symlink_metadata(&out)
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "out must be a regular file, not the planted link renamed over it"
+        );
+    }
 
     /// A redirect chain the fetch is allowed to follow: same host, path only.
     ///
@@ -1544,6 +1847,35 @@ mod tests {
         let mut over = valid_snapshot();
         over.revocations[0].id = "b".repeat(MAX_TEXT_BYTES + 1);
         assert!(over.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_control_characters_in_reason_and_id() {
+        for bad in [
+            "bad\u{0}reason",
+            "bad\nreason",
+            "bad\treason",
+            "bad\rreason",
+        ] {
+            let mut snap = valid_snapshot();
+            snap.revocations[0].reason = bad.to_string();
+            assert!(
+                snap.validate().is_err(),
+                "control char in reason must be rejected: {bad:?}"
+            );
+        }
+        for bad in ["bad\u{0}id", "bad\nid", "bad\tid", "bad\rid"] {
+            let mut snap = valid_snapshot();
+            snap.revocations[0].id = bad.to_string();
+            assert!(
+                snap.validate().is_err(),
+                "control char in id must be rejected: {bad:?}"
+            );
+        }
+        let mut clean = valid_snapshot();
+        clean.revocations[0].reason = "clean reason".to_string();
+        clean.revocations[0].id = "clean-id".to_string();
+        assert!(clean.validate().is_ok());
     }
 
     #[test]

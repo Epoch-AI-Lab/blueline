@@ -37,6 +37,7 @@ blueline agent gate [--command <line>] [--format plain|claude|cursor]
 blueline recall sync --url <URL>
 blueline recall serve [--port <N>] --snapshot <PATH>
 blueline recall export-candidates --out <PATH> [--limit <N>]
+blueline recall export-osv --snapshot <PATH> --out <PATH>
 blueline shim install|uninstall [MANAGERS]... [--dir <PATH>]
 ```
 

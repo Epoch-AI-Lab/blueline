@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`blueline recall export-osv` no longer follows a planted symlink at its
+  temp path**, and refuses control characters in `reason`/`id` fields. The
+  temp file is now created with `tempfile` (O_EXCL, random name) instead of
+  a predictable `.{out}.tmp-<pid>` path; a snapshot carrying control
+  characters in `reason` or `id` is rejected during validation.
+
 ### Changed
 
 - **The dev and test profiles now build at `opt-level = 1`.** The gate's test
@@ -47,6 +55,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   dead dependency for a maintained fork is common, so the rule stays a
   score-neutral disclosure rather than escalating the verdict; the pair is
   named on the card.
+
+- **`blueline recall export-osv`.** Converts a curated recall snapshot
+  (raw or synced) into OSV-schema documents (JSON array) that a human can
+  review and submit to OSV, closing the loop from local revocations to the
+  upstream advisory feed without automated submission. AUR revocations are
+  skipped because OSV has no AUR ecosystem, with a count reported on
+  stderr. The same output is directly submittable to the GitHub Advisory
+  Database, which is an OSV-format consumer, so no separate `export-github`
+  command exists.
 
 Targeted at 0.4.0. This release is a behaviour change for anyone who set
 `require_provenance`: see the entry below before upgrading.

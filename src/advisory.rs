@@ -1226,6 +1226,11 @@ mod tests {
             coverage_unknown(&reasonless, &enabled).is_some(),
             "an unverified report with no message is still unknown coverage"
         );
+        assert_eq!(
+            coverage_unknown(&reasonless, &enabled).as_deref(),
+            Some("the advisory source gave no reason"),
+            "a missing reason must be replaced with the fallback, not an empty string"
+        );
     }
 
     #[test]
