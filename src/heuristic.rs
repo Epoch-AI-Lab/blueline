@@ -316,9 +316,14 @@ pub fn evaluate_with_trust(
                 .chain(delta.files_modified.iter())
                 .any(|f| &f.relative_path == bin && f.kind == FileKind::OpaqueTooLarge);
             if !is_opaque_large {
+                let severity = if policy.allows_new_binary(name, ecosystem, bin) {
+                    VerdictBand::Low
+                } else {
+                    VerdictBand::High
+                };
                 findings.push(Finding {
                     rule_id: "R02_BINARY_BLOB_ADDED".into(),
-                    severity: VerdictBand::High,
+                    severity,
                     title: format!("Binary or opaque blob added: `{bin}`"),
                     description: format!(
                         "File `{bin}` contains NUL bytes or non-UTF-8 content and cannot be inspected as text."
@@ -2273,6 +2278,162 @@ mod tests {
         );
     }
 
+    /// A plain added binary that is neither executable nor opaque-large: the
+    /// finding this rule forgives. The three tests below vary the one input
+    /// that matters — the path — against the same delta, so a mutant in the
+    /// glob match or in the name/ecosystem guard cannot hide behind a fixture
+    /// whose constant never exercises it.
+    fn delta_with_added_binary(path: &str) -> Delta {
+        Delta {
+            baseline_version: Some("1.0.0".into()),
+            target_version: "1.0.1".into(),
+            files_added: vec![FileChange {
+                relative_path: path.into(),
+                kind: FileKind::Binary,
+                lines_added: 0,
+                lines_deleted: 0,
+                is_executable: false,
+                unified_diff: None,
+            }],
+            files_removed: vec![],
+            files_modified: vec![],
+            total_lines_added: 0,
+            total_lines_deleted: 0,
+            new_executables: vec![],
+            new_binaries: vec![path.into()],
+            modified_binaries: vec![],
+            new_lifecycle_scripts: vec![],
+            modified_lifecycle_scripts: vec![],
+            new_dependencies: vec![],
+            modified_dependencies: vec![],
+            binding_gyp_added: false,
+            removed_dependencies: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn binary_blob_added_scores_high_without_an_allow_rule() {
+        let verdict = evaluate_with_policy(
+            "test-pkg",
+            Ecosystem::Npm,
+            "verified (sha512)",
+            &delta_with_added_binary("src/data/pin.spki.der"),
+            false,
+            &Policy::default(),
+        );
+        assert_eq!(verdict.band, VerdictBand::High);
+        let blob = verdict
+            .findings
+            .iter()
+            .find(|f| f.rule_id == "R02_BINARY_BLOB_ADDED")
+            .unwrap();
+        assert_eq!(blob.severity, VerdictBand::High);
+    }
+
+    #[test]
+    fn binary_blob_added_is_low_when_the_path_is_allowed() {
+        use crate::policy::PackageAllowRule;
+        let mut policy = Policy::default();
+        policy.allowlist.packages.push(PackageAllowRule {
+            name: "test-pkg".into(),
+            ecosystem: Some(Ecosystem::Npm),
+            allowed_scripts: vec![],
+            max_risk: None,
+            integrity: None,
+            allow_unreviewed_baseline: false,
+            allowed_new_binary_paths: vec!["src/data/*".into()],
+        });
+        let verdict = evaluate_with_policy(
+            "test-pkg",
+            Ecosystem::Npm,
+            "verified (sha512)",
+            &delta_with_added_binary("src/data/pin.spki.der"),
+            false,
+            &policy,
+        );
+        let blob = verdict
+            .findings
+            .iter()
+            .find(|f| f.rule_id == "R02_BINARY_BLOB_ADDED")
+            .unwrap();
+        assert_eq!(blob.severity, VerdictBand::Low);
+    }
+
+    #[test]
+    fn binary_blob_allowance_is_pinned_to_package_ecosystem_and_path() {
+        use crate::policy::PackageAllowRule;
+        let mut policy = Policy::default();
+        policy.allowlist.packages.push(PackageAllowRule {
+            name: "test-pkg".into(),
+            ecosystem: Some(Ecosystem::Npm),
+            allowed_scripts: vec![],
+            max_risk: None,
+            integrity: None,
+            allow_unreviewed_baseline: false,
+            allowed_new_binary_paths: vec!["src/data/*".into()],
+        });
+        let blob_band = |name: &str, eco: Ecosystem, path: &str| {
+            evaluate_with_policy(
+                name,
+                eco,
+                "verified (sha512)",
+                &delta_with_added_binary(path),
+                false,
+                &policy,
+            )
+            .findings
+            .iter()
+            .find(|f| f.rule_id == "R02_BINARY_BLOB_ADDED")
+            .unwrap()
+            .severity
+        };
+        assert_eq!(
+            blob_band("other-pkg", Ecosystem::Npm, "src/data/pin.spki.der"),
+            VerdictBand::High
+        );
+        assert_eq!(
+            blob_band("test-pkg", Ecosystem::Cargo, "src/data/pin.spki.der"),
+            VerdictBand::High
+        );
+        assert_eq!(
+            blob_band("test-pkg", Ecosystem::Npm, "src/eval/pin.spki.der"),
+            VerdictBand::High
+        );
+    }
+
+    #[test]
+    fn binary_blob_allowance_never_covers_a_modified_binary() {
+        use crate::policy::PackageAllowRule;
+        let mut policy = Policy::default();
+        policy.allowlist.packages.push(PackageAllowRule {
+            name: "test-pkg".into(),
+            ecosystem: None,
+            allowed_scripts: vec![],
+            max_risk: None,
+            integrity: None,
+            allow_unreviewed_baseline: false,
+            allowed_new_binary_paths: vec!["**".into()],
+        });
+        let mut delta = delta_with_added_binary("src/data/pin.spki.der");
+        delta.new_binaries.clear();
+        delta.modified_binaries = vec!["src/data/pin.spki.der".into()];
+        let verdict = evaluate_with_policy(
+            "test-pkg",
+            Ecosystem::Npm,
+            "verified (sha512)",
+            &delta,
+            false,
+            &policy,
+        );
+        assert_eq!(verdict.band, VerdictBand::High);
+        let blob = verdict
+            .findings
+            .iter()
+            .find(|f| f.rule_id == "R02_BINARY_BLOB_MODIFIED")
+            .unwrap();
+        assert_eq!(blob.severity, VerdictBand::High);
+    }
+
     #[test]
     fn non_semver_url_check_survives_multibyte_input() {
         // Byte-slicing by prefix length panicked on any value whose prefix
@@ -3086,6 +3247,7 @@ mod tests {
                 max_risk: None,
                 integrity: None,
                 allow_unreviewed_baseline: true,
+                allowed_new_binary_paths: vec![],
             });
 
         for (name, delta, unreviewed_flag) in [
@@ -3168,6 +3330,7 @@ mod tests {
                 max_risk: None,
                 integrity: None,
                 allow_unreviewed_baseline: true,
+                allowed_new_binary_paths: vec![],
             });
 
         let verdict = evaluate_with_policy(
@@ -3465,6 +3628,7 @@ mod tests {
                 max_risk: None,
                 integrity: None,
                 allow_unreviewed_baseline: false,
+                allowed_new_binary_paths: vec![],
             });
 
         let verdict = evaluate_with_policy(
