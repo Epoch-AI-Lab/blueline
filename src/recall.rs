@@ -859,25 +859,21 @@ pub fn export_osv(snapshot_path: &Path, out: &Path) -> anyhow::Result<usize> {
     }
     let json = serde_json::to_string_pretty(&docs)
         .map_err(|e| anyhow::anyhow!("serialising OSV documents: {e}"))?;
-    if let Some(parent) = out.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| anyhow::anyhow!("creating {}: {e}", parent.display()))?;
-    }
     if let Ok(meta) = std::fs::symlink_metadata(out)
         && meta.file_type().is_symlink()
     {
         anyhow::bail!("refusing to write through symlink {}", out.display());
     }
-    let parent = out
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
+    let dir = out.parent().filter(|p| !p.as_os_str().is_empty());
+    if let Some(parent) = dir {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("creating {}: {e}", parent.display()))?;
+    }
+    let dir = dir.unwrap_or(Path::new("."));
     let mut tmp = tempfile::Builder::new()
         .prefix(".blueline-osv.")
-        .tempfile_in(parent)
-        .map_err(|e| anyhow::anyhow!("creating a temp file in {}: {e}", parent.display()))?;
+        .tempfile_in(dir)
+        .map_err(|e| anyhow::anyhow!("creating a temp file in {}: {e}", dir.display()))?;
     tmp.write_all(json.as_bytes())
         .map_err(|e| anyhow::anyhow!("writing {}: {e}", out.display()))?;
     tmp.as_file()
@@ -967,12 +963,18 @@ mod tests {
     /// timestamp whose civil date lands in year 0 so the negative-`z` arm of
     /// the era calculation is live.
     ///
+    /// The era is anchored at March 1, so the `doe / 36524` century
+    /// correction is zero for every instant a January 2100 vector can reach:
+    /// 2100-03-01 is the first day it is one, and 2400-02-29 the only day
+    /// `doe / 146096` is ever one. Without those two, the correction terms
+    /// and everything multiplied into them survive every mutant.
+    ///
     /// Expected values are GNU `date -u -d @<secs>`, so an arithmetic mutant
     /// that still yields a 20-character string with the right separators
     /// cannot slip through on shape alone.
     #[test]
     fn rfc3339_utc_matches_fixed_instants() {
-        let cases: [(i64, &str); 15] = [
+        let cases: [(i64, &str); 18] = [
             (0, "1970-01-01T00:00:00Z"),
             (1_000_000_000, "2001-09-09T01:46:40Z"),
             (-86_400, "1969-12-31T00:00:00Z"),
@@ -988,6 +990,9 @@ mod tests {
             (2_145_916_800, "2038-01-01T00:00:00Z"),
             (4_102_444_800, "2100-01-01T00:00:00Z"),
             (4_107_532_800, "2100-02-28T21:20:00Z"),
+            (4_107_542_400, "2100-03-01T00:00:00Z"),
+            (13_574_563_200, "2400-02-29T00:00:00Z"),
+            (13_574_649_600, "2400-03-01T00:00:00Z"),
         ];
         for (secs, want) in cases {
             assert_eq!(rfc3339_utc(secs), want, "secs={secs}");
@@ -1028,6 +1033,28 @@ mod tests {
                 .file_type()
                 .is_file(),
             "out must be a regular file, not the planted link renamed over it"
+        );
+    }
+
+    /// A bare relative filename has parent `Some("")`, which the export must
+    /// resolve to the current directory, not hand to `tempfile_in` as an
+    /// empty dir — there the temp file would land wherever the process cwd
+    /// points and the persist would follow it.
+    #[test]
+    fn export_osv_to_a_bare_relative_filename_resolves_against_the_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap = dir.path().join("snap.json");
+        std::fs::write(&snap, serde_json::to_string(&valid_snapshot()).unwrap()).unwrap();
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let written = export_osv(Path::new("snap.json"), Path::new("out.json"));
+        std::env::set_current_dir(prev).unwrap();
+
+        assert_eq!(written.unwrap(), 1);
+        assert!(
+            dir.path().join("out.json").is_file(),
+            "export_osv did not resolve the bare filename against the current directory"
         );
     }
 
