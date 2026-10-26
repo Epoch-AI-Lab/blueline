@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **rustls-webpki bumped to 0.103.16 and webpki-roots to 1.0.10**, clearing
+  RUSTSEC-2026-0382 and RUSTSEC-2026-0381 (distrusted emSign intermediates;
+  CVE-2026-111943). The fix ships the 8 `.spki.der` key blobs that motivated
+  the `allowed_new_binary_paths` policy below.
+
 - **`blueline recall export-osv` no longer follows a planted symlink at its
   temp path**, and refuses control characters in `reason`/`id` fields. The
   temp file is now created with `tempfile` (O_EXCL, random name) instead of
