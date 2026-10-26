@@ -226,6 +226,16 @@ pub enum RecallAction {
         #[arg(long, default_value_t = 1000)]
         limit: usize,
     },
+    /// Export a curated recall snapshot as OSV-schema documents for upstream submission
+    ExportOsv {
+        /// Path to the curated recall snapshot (revocations.json)
+        #[arg(long)]
+        snapshot: std::path::PathBuf,
+
+        /// Path to write the OSV documents (JSON array)
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]

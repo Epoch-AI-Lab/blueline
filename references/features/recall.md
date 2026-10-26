@@ -20,6 +20,9 @@ blueline recall sync --url http://127.0.0.1:7979
 blueline recall serve --port 7979 --snapshot revocations.json
 # recall index serving on http://127.0.0.1:7979/revocations.json
 blueline recall export-candidates --out candidates.json --limit 1000
+blueline recall export-osv --snapshot revocations.json --out osv.json
+# GitHub Advisory Database is an OSV-format consumer, so the same output is
+# directly submittable there; no separate export-github command exists.
 ```
 `snapshot_path()` = `$BLUELINE_DATA_DIR/recall_snapshot.json`, else
 `dirs::data_dir()/blueline/recall_snapshot.json`.

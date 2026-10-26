@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **rustls-webpki bumped to 0.103.16 and webpki-roots to 1.0.10**, clearing
+  RUSTSEC-2026-0382 and RUSTSEC-2026-0381 (distrusted emSign intermediates;
+  CVE-2026-111943). The fix ships the 8 `.spki.der` key blobs that motivated
+  the `allowed_new_binary_paths` policy below.
+
+- **`blueline recall export-osv` no longer follows a planted symlink at its
+  temp path**, and refuses control characters in `reason`/`id` fields. The
+  temp file is now created with `tempfile` (O_EXCL, random name) instead of
+  a predictable `.{out}.tmp-<pid>` path; a snapshot carrying control
+  characters in `reason` or `id` is rejected during validation.
+
 ### Changed
 
 - **The dev and test profiles now build at `opt-level = 1`.** The gate's test
@@ -47,6 +60,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   dead dependency for a maintained fork is common, so the rule stays a
   score-neutral disclosure rather than escalating the verdict; the pair is
   named on the card.
+
+- **`blueline recall export-osv`.** Converts a curated recall snapshot
+  (raw or synced) into OSV-schema documents (JSON array) that a human can
+  review and submit to OSV, closing the loop from local revocations to the
+  upstream advisory feed without automated submission. AUR revocations are
+  skipped because OSV has no AUR ecosystem, with a count reported on
+  stderr. The same output is directly submittable to the GitHub Advisory
+  Database, which is an OSV-format consumer, so no separate `export-github`
+  command exists.
+
+- **`allowlist.packages[].allowed_new_binary_paths`.** A per-package list of
+  `*`-glob path patterns (leading/trailing star or exact match, the same
+  minimal matcher the blocklist uses) whose added-binary
+  `R02_BINARY_BLOB_ADDED` findings stay visible but drop from HIGH to LOW.
+  Modified binaries are never covered, a path the globs do not match still
+  scores at full weight, and `R02_EXECUTABLE_ADDED` and
+  `R02_OPAQUE_LARGE_FILE_ADDED` are untouched. This is the one deliberate
+  opening in "content heuristics apply in full": upstream releases
+  legitimately add binary data files — rustls-webpki 0.103.16 ships the
+  distrusted emSign intermediate keys as `.spki.der` blobs — and without it
+  the only human answer to a true-positive-with-benign-explanation was a
+  permanently red gate, because the dogfood CI job reviews every PR with the
+  base branch's policy, so a PR can never both introduce a key and rely on
+  it. The entry for `rustls-webpki` in `blueline.toml` pins exactly
+  `src/data/distrusted/*`.
 
 Targeted at 0.4.0. This release is a behaviour change for anyone who set
 `require_provenance`: see the entry below before upgrading.

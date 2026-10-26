@@ -44,7 +44,7 @@ and fix this file in the same branch.
 | Lane | What it is for | File |
 |---|---|---|
 | [Advisory](features/advisory.md) | OSV.dev query, CVE parsing, cache TTLs, recall pre-check | `src/advisory.rs` |
-| [Recall index](features/recall.md) | local curated revocations: sync, serve, staleness (R28) | `src/recall.rs` |
+| [Recall index](features/recall.md) | local curated revocations: sync, serve, staleness (R28), export-candidates, export-osv | `src/recall.rs` |
 | [Provenance](features/provenance.md) | in-toto/DSSE attestation *surfacing* (one digest is verified) | `src/provenance.rs` |
 
 ## State & policy
