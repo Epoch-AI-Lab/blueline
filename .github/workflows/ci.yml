@@ -219,7 +219,9 @@ jobs:
           trap 'rm -rf "$corpus_dir"' EXIT
           for target in safe_extract read_package_json pypi_version aur_version pkgbuild_tokenizer install_ref_scan; do
             cp -r "fuzz/corpus/$target" "$corpus_dir/$target"
-            cargo +nightly fuzz run "$target" "$corpus_dir/$target" -- \
+            # gnu, not cargo-fuzz's musl default: ASan is incompatible with
+            # musl's statically linked libc.
+            cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$target" "$corpus_dir/$target" -- \
               -max_total_time=60 -rss_limit_mb=4096 -timeout=25
           done
       - uses: actions/upload-artifact@v4

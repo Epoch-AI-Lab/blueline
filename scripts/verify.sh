@@ -118,7 +118,9 @@ stage_fuzz() {
     for target in safe_extract read_package_json pypi_version aur_version pkgbuild_tokenizer install_ref_scan; do
         rm -rf "$FUZZ_CORPUS_DIR/$target"
         cp -r "fuzz/corpus/$target" "$FUZZ_CORPUS_DIR/$target"
-        cargo +nightly fuzz run "$target" "$FUZZ_CORPUS_DIR/$target" -- \
+        # gnu, not cargo-fuzz's musl default: ASan is incompatible with musl's
+        # statically linked libc. Same invocation as the CI fuzz-smoke job.
+        cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$target" "$FUZZ_CORPUS_DIR/$target" -- \
             -max_total_time="$secs" -rss_limit_mb=4096 -timeout=25
     done
 }

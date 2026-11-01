@@ -58,7 +58,9 @@ jobs:
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
           restore-keys: fuzz-corpus-${{ matrix.target }}-
       - name: Soak
-        run: cargo +nightly fuzz run ${{ matrix.target }} --locked -- -max_total_time=1800 -rss_limit_mb=4096 -timeout=60
+        # gnu, not cargo-fuzz's musl default: ASan is incompatible with musl's
+        # statically linked libc.
+        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -max_total_time=1800 -rss_limit_mb=4096 -timeout=60
       - name: Save grown corpus
         if: always()
         uses: actions/cache/save@v4
