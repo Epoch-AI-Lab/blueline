@@ -385,7 +385,12 @@ pub fn safe_extract_wheel(
             )));
         };
 
-        validate_entry_path(&enclosed_path).map_err(BluelineError::Extraction)?;
+        // Validate the raw zip name, not the platform PathBuf
+        // `enclosed_name` builds: joining components inserts `\` on Windows,
+        // which trips the backslash refusal on every nested wheel entry. The
+        // raw name is the bytes the archive asked for, and it is what the
+        // refusals above already checked.
+        validate_entry_path(Path::new(raw_name.as_str())).map_err(BluelineError::Extraction)?;
 
         let normalized_key = normalized_entry_key(&enclosed_path);
         if !seen.insert(normalized_key.clone()) {

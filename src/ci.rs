@@ -1519,7 +1519,7 @@ source = "path+file:///some/local/path"
 
     #[test]
     fn lockfile_diff_classifies_changed_and_unchanged_with_stub_registry() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -1578,9 +1578,7 @@ source = "path+file:///some/local/path"
             while !stop_srv.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let mut buf = [0u8; 4096];
-                        let n = stream.read(&mut buf).unwrap_or(0);
-                        let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                        let req = crate::registry::http_util::read_request_head(&mut stream);
                         let path = req
                             .lines()
                             .next()
@@ -1692,7 +1690,7 @@ source = "path+file:///some/local/path"
     /// `aaa-slow` last. It must come first.
     #[test]
     fn parallel_reviews_still_report_in_candidate_order() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -1765,9 +1763,7 @@ source = "path+file:///some/local/path"
             while !stop_srv.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let mut buf = [0u8; 4096];
-                        let n = stream.read(&mut buf).unwrap_or(0);
-                        let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                        let req = crate::registry::http_util::read_request_head(&mut stream);
                         let path = req
                             .lines()
                             .next()
@@ -1861,7 +1857,7 @@ source = "path+file:///some/local/path"
 
     #[test]
     fn lockfile_diff_keeps_pypi_alias_off_cargo_pins() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -1926,9 +1922,7 @@ source = "path+file:///some/local/path"
             while !stop_srv.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let mut buf = [0u8; 4096];
-                        let n = stream.read(&mut buf).unwrap_or(0);
-                        let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                        let req = crate::registry::http_util::read_request_head(&mut stream);
                         let path = req
                             .lines()
                             .next()
