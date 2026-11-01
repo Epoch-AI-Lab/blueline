@@ -427,14 +427,23 @@ impl VersionInfo for Pep440Version {
             return Err(err("trailing data"));
         }
 
-        Ok(Pep440Version {
+        let version = Pep440Version {
             epoch,
             release,
             pre,
             post,
             dev,
             local,
-        })
+        };
+        // The cap above is on the input, but normalization expands (`c` reads
+        // as `rc`, a bare `r<n>` reads as `.post<n>`), so a string under the
+        // cap can canonicalize past it. The canonical form is what baseline
+        // resolution re-parses, so it must satisfy the same cap: fail closed
+        // here rather than emit a string no later parse can accept.
+        if version.canonical().len() > 256 {
+            return Err(err("canonical form exceeds maximum length of 256"));
+        }
+        Ok(version)
     }
 
     fn canonical(&self) -> String {
@@ -1149,6 +1158,21 @@ mod tests {
                 "must reject trailing separator {s}"
             );
         }
+    }
+
+    #[test]
+    fn pep440_a_canonical_form_over_the_cap_is_rejected_at_parse() {
+        // Found by the fuzz smoke: `cr32022` reads as `rc0.post32022`, so this
+        // 256-char input parses, but its canonical form is 259 chars — over
+        // the cap the input itself is held to. The parse must refuse it: the
+        // canonical string is what baseline resolution re-parses, and it must
+        // re-parse.
+        let raw = "442.4202002020200202020.420200202022.420200.420200202020.4202200202022.\
+                   420200.420.422022.420200202020.420200202022.420200.4420200.420.422022.\
+                   420200202020.420200202022.420200.4202020200202020.42020200202020.\
+                   420200202022.420200.420202020.42020020202cr32022+0";
+        assert_eq!(raw.len(), 256);
+        assert!(Pep440Version::parse(raw).is_err());
     }
 
     #[test]

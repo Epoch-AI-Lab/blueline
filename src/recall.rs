@@ -2674,19 +2674,19 @@ mod tests {
         );
     }
 
-    /// Set a file's mtime, so a lock can be made old enough to reap. Shells out
-    /// to `touch` because the stdlib has no portable setter, and the one caller
-    /// is a file-age test on a platform that has one.
+    /// Set a file's mtime, so a lock can be made old enough to reap. The old
+    /// version shelled out to `touch -d`, a GNU flag BSD touch lacks, and
+    /// swallowed the failure — so on macOS the callers' stale-mtime
+    /// precondition silently never held. `File::set_times` is the portable
+    /// setter, and the mtime is load-bearing for the callers, so a failure is
+    /// a fixture error, not a silent skip.
     fn filetime_reset(path: &Path, when: std::time::SystemTime) {
-        let secs = when
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let _ = std::process::Command::new("touch")
-            .arg("-d")
-            .arg(format!("@{secs}"))
-            .arg(path)
-            .status();
+        let file = std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open the lock file to set its mtime");
+        file.set_times(std::fs::FileTimes::new().set_modified(when))
+            .expect("set the lock file's mtime");
     }
 
     /// The reap threshold, sitting exactly on it.
