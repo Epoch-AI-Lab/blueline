@@ -9,6 +9,10 @@ rejects. The nightly soak grows these via the CI cache; the committed seeds
 are the floor every run starts from.
 
 Usage: scripts/gen_fuzz_seeds.py [--force]
+
+Note: .gitignore excludes *.tgz, which silently drops the safe_extract seeds
+on regeneration. Committed seeds are the source of truth; if you regenerate,
+`git add -f fuzz/corpus/safe_extract/*.tgz`.
 """
 
 import argparse
