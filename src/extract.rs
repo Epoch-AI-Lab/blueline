@@ -1641,7 +1641,13 @@ mod wheel_tests {
         let mut buf = Cursor::new(Vec::new());
         let mut zw = zip::ZipWriter::new(&mut buf);
         for (name, data, method) in entries {
-            let opts = SimpleFileOptions::default().compression_method(*method);
+            // Claim Unix in the central directory: the writer defaults the
+            // system to Dos on Windows hosts, and the mode bytes the tests
+            // patch in (the symlink-attrs test) are only honored for
+            // Unix-claimed entries. A real wheel is built the same way.
+            let opts = SimpleFileOptions::default()
+                .compression_method(*method)
+                .system(zip::System::Unix);
             if name.ends_with('/') {
                 zw.add_directory(*name, opts).unwrap();
             } else {
