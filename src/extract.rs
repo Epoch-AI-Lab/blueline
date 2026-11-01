@@ -497,7 +497,11 @@ pub fn validate_entry_path(path: &Path) -> Result<(), String> {
     if path.as_os_str().is_empty() {
         return Err("empty entry path".to_string());
     }
-    if path.is_absolute() {
+    // has_root, not is_absolute: on Windows a leading `/` is rooted but not
+    // `is_absolute` (that also demands a drive prefix), so a tar entry like
+    // `/etc/cron.d/evil` passed the old check and extracted under dest. A
+    // rooted entry is refused on every platform.
+    if path.has_root() {
         return Err(format!("absolute entry path `{}` rejected", path.display()));
     }
     let bytes = path.as_os_str().as_encoded_bytes();

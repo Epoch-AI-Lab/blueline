@@ -749,7 +749,7 @@ mod tests {
     /// never exempt, so the chain must stop at hop one.
     #[test]
     fn a_redirect_off_the_registry_host_is_refused() {
-        use std::io::Write;
+        use std::io::{Read, Write};
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -757,7 +757,13 @@ mod tests {
         let handle = std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let mut stream = stream;
-                let body = "{\"attestations\":[]}";
+                // Read the request before answering: writing the 302 before
+                // the client's request bytes have arrived races ureq's
+                // connect path on macOS loopback, which surfaces as a
+                // status-line parse error instead of the redirect refusal
+                // this test pins.
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
                 let _ = write!(
                     stream,
                     "HTTP/1.1 302 Found\r\n\
@@ -766,7 +772,6 @@ mod tests {
                      Connection: close\r\n\r\n"
                 );
                 let _ = stream.flush();
-                let _ = body;
             }
         });
 
