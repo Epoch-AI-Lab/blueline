@@ -46,7 +46,11 @@ jobs:
         with:
           tool: cargo-fuzz
       - name: Install nightly toolchain
-        run: rustup toolchain install nightly --profile minimal
+        # cargo-fuzz builds against musl with -Zbuild-std, which needs the
+        # rust-src component and the musl std on the nightly toolchain.
+        run: |
+          rustup toolchain install nightly --profile minimal --component rust-src
+          rustup target add x86_64-unknown-linux-musl --toolchain nightly
       - name: Restore fuzz corpus
         uses: actions/cache@v4
         with:

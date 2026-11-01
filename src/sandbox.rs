@@ -2089,6 +2089,10 @@ mod tests {
 
     /// Build a gzipped tarball in memory. The `tar` builder writes honest
     /// archives; malicious ones need hand-rolled headers (see below).
+    // The helpers below serve only the child-spawning tests, which are gated
+    // on Linux; gating them together keeps the test mod warning-clean on the
+    // other platforms.
+    #[cfg(target_os = "linux")]
     fn child_tarball(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         let mut builder = tar::Builder::new(encoder);
@@ -2104,6 +2108,7 @@ mod tests {
 
     /// A tarball whose entry escapes the destination. Hand-rolled because the
     /// builder writes the path it is given and the extractor must refuse it.
+    #[cfg(target_os = "linux")]
     fn child_traversal_tarball() -> Vec<u8> {
         use std::io::Write;
         let mut header = [0u8; 512];
@@ -2127,6 +2132,7 @@ mod tests {
     /// Drive the built binary as an extraction child. This is the one place
     /// that may exec: the target is the compiled binary, never this harness
     /// (`may_spawn_child` forbids re-exec here for exactly that reason).
+    #[cfg(target_os = "linux")]
     fn run_child_binary(kind: &str, dest: &Path, tarball: &[u8]) -> std::process::Output {
         assert_cmd::Command::cargo_bin("blueline")
             .unwrap()
@@ -2138,6 +2144,7 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(target_os = "linux")]
     fn stdout_reply(out: &std::process::Output) -> Reply {
         read_reply(&out.stdout).expect("a finished child leaves a parseable reply on stdout")
     }
