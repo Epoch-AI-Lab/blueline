@@ -1620,6 +1620,8 @@ mod tests {
 
     /// What the process-wide cache currently holds, so a test can tell a miss
     /// it caused from a miss another review caused by evicting the entry.
+    // Its only caller pins inode behavior, which the gate below scopes to unix.
+    #[cfg(unix)]
     fn cache_entry() -> Option<CacheKey> {
         SNAPSHOT_CACHE
             .lock()
@@ -1996,9 +1998,30 @@ mod tests {
             while start.elapsed() < std::time::Duration::from_secs(15) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let mut buf = [0u8; 8192];
-                        let n = stream.read(&mut buf).unwrap_or(0);
-                        let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                        // The accepted stream inherits the listener's
+                        // non-blocking mode, and a single read can return
+                        // before the client's request bytes have arrived —
+                        // observed on macOS loopback. The request then parses
+                        // as "/" and the server answers 404 to a well-formed
+                        // GET, which the client reports as a body closed
+                        // before its Content-Length. Read back in blocking
+                        // mode until the header terminator is on hand.
+                        let _ = stream.set_nonblocking(false);
+                        let mut buf: Vec<u8> = Vec::new();
+                        let mut chunk = [0u8; 8192];
+                        loop {
+                            match stream.read(&mut chunk) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    buf.extend_from_slice(&chunk[..n]);
+                                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        let req = String::from_utf8_lossy(&buf).to_string();
                         let path = req
                             .lines()
                             .next()
