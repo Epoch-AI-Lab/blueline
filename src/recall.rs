@@ -2679,12 +2679,16 @@ mod tests {
     /// swallowed the failure — so on macOS the callers' stale-mtime
     /// precondition silently never held. `File::set_times` is the portable
     /// setter, and the mtime is load-bearing for the callers, so a failure is
-    /// a fixture error, not a silent skip.
+    /// a fixture error, not a silent skip. Creates the file when absent, the
+    /// way `touch` did: the release path unlinks the lock, and a caller that
+    /// plants a stale lock afterwards relies on the file coming into being.
     fn filetime_reset(path: &Path, when: std::time::SystemTime) {
-        let file = std::fs::File::options()
+        let file = std::fs::OpenOptions::new()
             .write(true)
+            .create(true)
+            .truncate(false)
             .open(path)
-            .expect("open the lock file to set its mtime");
+            .expect("open (or create) the lock file to set its mtime");
         file.set_times(std::fs::FileTimes::new().set_modified(when))
             .expect("set the lock file's mtime");
     }
