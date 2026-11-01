@@ -603,8 +603,13 @@ fn set_file_perm(path: &Path) {
     set_perm(path, 0o644);
 }
 
+// The not(unix) helpers delegate to the set_perm stub rather than emptying
+// out: shared extraction code calls these on every platform, and the
+// delegation is what keeps set_perm itself from going dead off unix.
 #[cfg(not(unix))]
-fn set_file_perm(_path: &Path) {}
+fn set_file_perm(_path: &Path) {
+    set_perm(_path, 0o644);
+}
 
 #[cfg(unix)]
 fn set_dir_perm(path: &Path) {
@@ -612,7 +617,9 @@ fn set_dir_perm(path: &Path) {
 }
 
 #[cfg(not(unix))]
-fn set_dir_perm(_path: &Path) {}
+fn set_dir_perm(_path: &Path) {
+    set_perm(_path, 0o755);
+}
 
 #[cfg(test)]
 mod tests {

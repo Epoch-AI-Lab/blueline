@@ -247,6 +247,14 @@ enum Reply {
 /// refused rather than defaulted. Defaulting a new variant to `Extraction` would
 /// downgrade a limit breach to a plain failure, and the limit messages are
 /// asserted on by shipped tests (`references/features/extract.md`).
+///
+/// Everything from here through `wait_with_timeout` is the child protocol, and
+/// a child is only ever spawned on Linux: off it, `spawn_child` returns
+/// `Skip(UnsupportedPlatform)` before any of this runs. The machinery stays
+/// compiled on every platform because the pure halves (`read_reply`,
+/// `map_child_result`, `rebuild_error`) are unit-tested everywhere; the
+/// cfg_attr only marks the production deadness off Linux for `-D warnings`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn rebuild_error(variant: &str, message: String) -> BluelineError {
     match variant {
         "extraction_limit" => BluelineError::ExtractionLimit(message),
@@ -398,6 +406,7 @@ fn write_reply(reply: &Reply) {
 }
 
 /// Read the framed reply, refusing a truncated or oversized one.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn read_reply(stdout: &[u8]) -> Result<Reply, BluelineError> {
     // Bound the raw stdout before parsing anything out of it.
     // `wait_with_output` already collected all of it, so a child that streams
@@ -835,11 +844,13 @@ enum ChildFailure {
     /// The layer was not established. Fall back and disclose.
     Skip(SandboxSkip),
     /// The child could not run, or the protocol broke. `dest` may be partial.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Unusable(BluelineError),
     /// The child ran the extractor and it refused. The child is not at fault,
     /// the archive is, so this surfaces as the extractor's own error rather
     /// than as a sandbox failure. Distinct from `Unusable` because a refusal is
     /// a clean answer rather than a broken handshake.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Refused(BluelineError),
 }
 
@@ -849,6 +860,7 @@ enum ChildFailure {
 /// reason first, stderr only when the reply is missing or says something else,
 /// "no reason" last. Without the first arm every confinement failure would
 /// read as a bare exit with no diagnosis.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn unavailable_reason(stdout: &[u8], stderr: &str) -> String {
     read_reply(stdout)
         .ok()
@@ -906,6 +918,9 @@ pub fn may_spawn_child_given(marker_set: bool) -> bool {
     !cfg!(test) && !marker_set
 }
 
+// `kind`/`bytes`/`dest` feed the Linux spawn; off Linux the body returns
+// `Skip(UnsupportedPlatform)` without touching them.
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 fn spawn_child(kind: ArchiveKind, bytes: &[u8], dest: &Path) -> Result<ExtractStats, ChildFailure> {
     // See `may_spawn_child`: exec from the test harness (or from a child)
     // re-runs tests instead of the extractor and can fork-bomb the machine.
@@ -1016,6 +1031,7 @@ fn spawn_child_on_linux(
 /// Same shape as `unavailable_reason`, kept separate so each exit code pins
 /// which replies it trusts: a confessed failure is believed from either
 /// failure reply, anything else falls back to stderr.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn unusable_reason(stdout: &[u8], stderr: &str) -> String {
     read_reply(stdout)
         .ok()
@@ -1038,6 +1054,7 @@ fn unusable_reason(stdout: &[u8], stderr: &str) -> String {
 /// real child from the harness (`may_spawn_child` forbids it), and the
 /// distinction between "retry in-process" (`Skip`) and "refuse" (`Unusable`)
 /// is the fail-closed core of this module. Every arm below has a test.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn map_child_result(
     code: Option<i32>,
     stdout: &[u8],
@@ -1117,6 +1134,7 @@ fn map_child_result(
 /// `try_wait` is the only non-blocking primitive on `Child`, and it reaps on
 /// success, so the later `wait_with_output` sees an already-reaped child and
 /// returns its status rather than blocking.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn wait_with_timeout(
     child: &mut std::process::Child,
     limit: std::time::Duration,

@@ -2233,6 +2233,10 @@ mod tests {
     /// is derived from the pid of whichever process syncs. A test that plants
     /// the link from the parent plants a name the child never uses, so it
     /// passes against the code it is meant to catch.
+    // Unix-gated as a pair: the planted name is a symlink, a concept the
+    // attack does not have on Windows, and gating the child alone would leave
+    // this parent re-executing a test that no longer exists there.
+    #[cfg(unix)]
     #[test]
     fn sync_does_not_follow_a_planted_symlink_in_the_data_directory() {
         let data_dir = tempfile::tempdir().unwrap();
@@ -2281,6 +2285,7 @@ mod tests {
     /// Child half of the symlink test above, re-executed as its own process so
     /// the planted name matches the pid that actually syncs.
     #[test]
+    #[cfg(unix)]
     #[ignore = "re-executed by sync_does_not_follow_a_planted_symlink"]
     fn sync_child_planted_symlink() {
         let Ok(url) = std::env::var("BLUELINE_TEST_URL") else {
