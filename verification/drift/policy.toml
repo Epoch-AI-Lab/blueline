@@ -1,0 +1,14 @@
+# Policy for the drift watch. Verdicts here must be a function of the tool
+# plus registry metadata — nothing whose state changes overnight on someone
+# else's server.
+#
+# - Advisories are off: OSV gains entries daily, and a new advisory moving a
+#   watchlist band is drift in the world, not in this tool's heuristics.
+# - Everything else stays at defaults, so heuristic and scoring changes are
+#   exactly what this watch is positioned to catch.
+[advisories]
+block_on_malware = false
+block_on_critical_cve = false
+
+[policy]
+check_advisories = false

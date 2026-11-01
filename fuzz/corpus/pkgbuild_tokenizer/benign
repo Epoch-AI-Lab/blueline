@@ -1,0 +1,8 @@
+
+pkgname=benign
+pkgver=1.2.3
+pkgrel=1
+arch=('x86_64')
+source=("https://example.com/$pkgname-$pkgver.tar.gz")
+build() { make; }
+package() { make DESTDIR="$pkgdir" install; }

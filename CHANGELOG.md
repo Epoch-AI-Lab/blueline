@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Tiered verification infrastructure.** Level 1 fills the PR-gate gaps: a
+  report-only `coverage` job (cargo-llvm-cov, lcov artifact + step summary), a
+  `semver` job (cargo-semver-checks against the PR base, guarding the public
+  library surface), a cross-platform `test` matrix (ubuntu/macos/windows — the
+  release pipeline already shipped for all three), and a path-gated
+  `fuzz-smoke` job (60 s per target, only when the diff touches the
+  parse/extract surface). Level 2 turns on the dormant verification assets:
+  the previously-unused `proptest` dependency now backs `tests/properties.rs`
+  (version-ordering totality in all three grammars, policy TOML round-trip,
+  extraction containment over generated hostile archives), the six fuzz
+  targets get a committed seed corpus (`scripts/gen_fuzz_seeds.py`), and
+  `benchmark_suite.py`'s adversarial section actually drives the binary
+  instead of printing hardcoded checkmarks. Level 3 is a new nightly workflow
+  (`.github/workflows/nightly.yml`): a 30-min-per-target fuzz soak with a
+  persistent corpus cache, full-tree mutation testing (the CI jobs only ever
+  mutate a diff), report-only perf tracking under the fork-bomb watchdog, and
+  a live-package drift watch (`scripts/drift_watch.py`,
+  `verification/drift/watchlist.toml`) that fails when a pinned real-world
+  package's verdict changes against the committed baseline. The mutation
+  exclusion regex now lives once in `scripts/mutants_exclude.re`, shared by
+  both mutation jobs and the nightly run. `scripts/verify.sh --fuzz` runs the
+  fuzz smoke locally.
+
 ### Fixed
 
 - **rustls-webpki bumped to 0.103.16 and webpki-roots to 1.0.10**, clearing

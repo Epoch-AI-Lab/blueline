@@ -10,6 +10,7 @@ fail closed on any doubt.
 ```sh
 ./scripts/verify.sh            # fmt + clippy + test + references — the gate
 ./scripts/verify.sh --mutants  # the gate, then mutation testing
+./scripts/verify.sh --fuzz     # the gate, then a 60 s libFuzzer smoke per target
 ./scripts/verify.sh --all      # the gate, plus mutation testing + cargo-deny
 ```
 
@@ -28,10 +29,22 @@ The three underlying commands are:
 The first three are the Rust gate (`.github/workflows/ci.yml`), and if a change
 passes them it passes CI's Rust jobs. They are no longer *exactly* the gate: the
 same workflow also runs `actionlint` over the workflows, a supply-chain audit,
-and two dogfood jobs that run the built binary against this repository's own
-`Cargo.lock` and `package-lock.json`. Mutant scope is `src/**/*.rs`, so a change
-to a module outside `src/` is not mutation-tested at all. The toolchain is
-pinned in `rust-toolchain.toml` — do not run a different one.
+coverage and semver-check jobs, a fuzz smoke (gated on the diff touching the
+parse/extract surface), and two dogfood jobs that run the built binary against
+this repository's own `Cargo.lock` and `package-lock.json`. Mutant scope is
+`src/**/*.rs`, so a change to a module outside `src/` is not mutation-tested at
+all. The toolchain is pinned in `rust-toolchain.toml` — do not run a different
+one.
+
+The heavy verification lives in `.github/workflows/nightly.yml` and never gates
+a PR: a 30-minute fuzz soak per target with a persistent corpus, full-tree
+mutation testing (the CI jobs mutate only the diff), report-only perf tracking,
+and a drift watch that reviews the pinned watchlist in
+`verification/drift/watchlist.toml` against committed verdict baselines. If the
+drift watch goes red, the verdict change is either a regression to fix or
+intended behavior to accept — accept it by running
+`python3 scripts/drift_watch.py --establish` and committing the baseline diff,
+never by editing `baseline.json` by hand.
 
 Two of those cannot be reproduced by the three commands above. A green local
 run is necessary, not sufficient.

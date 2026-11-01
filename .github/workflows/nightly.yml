@@ -1,0 +1,181 @@
+# Nightly adversarial soak: the heavy verification that must never gate a PR
+# but catches what the PR gate cannot see. Runs the six cargo-fuzz targets
+# with a persistent corpus, mutation tests the WHOLE tree (the CI jobs only
+# ever mutate a diff, so long-lived code outside active PRs is never
+# mutated), tracks perf, and reviews a pinned watchlist of real packages so
+# heuristic drift surfaces as a diff instead of a surprise.
+name: Nightly verification
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Same skip list and same derivation rule as ci.yml: only files with no
+  # mutable expressions are skipped, everything else is in scope.
+  BLUELINE_MUTANTS_SKIP: |
+    src/lib.rs
+    src/error.rs
+
+jobs:
+  # One runner per fuzz target, 30 minutes each. The corpus directory carries
+  # over between runs via the cache (keyed by run id so the post-step always
+  # saves, restore-keys pinning to the latest previous corpus), on top of the
+  # committed seeds from scripts/gen_fuzz_seeds.py.
+  fuzz-soak:
+    name: Fuzz soak (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [safe_extract, read_package_json, pypi_version, aur_version, pkgbuild_tokenizer, install_ref_scan]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Install nightly toolchain
+        run: rustup toolchain install nightly --profile minimal
+      - name: Restore fuzz corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: Soak
+        run: cargo +nightly fuzz run ${{ matrix.target }} --locked -- -max_total_time=1800 -rss_limit_mb=4096 -timeout=60
+      - name: Save grown corpus
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts
+
+  # Full-tree mutation testing, sharded 32 ways — same arithmetic, scope
+  # derivation, and exclusion list as the diff-scoped jobs in ci.yml, minus
+  # --in-diff. This is the run that reaches code no active PR touches; the
+  # CVSS-v2 survivor the AGENTS.md documents was found by exactly this kind of
+  # whole-scope enumeration, not by diff testing.
+  mutants-full:
+    name: Mutation testing (full tree, shard ${{ matrix.shard }}/32)
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+            21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+      # Shared with ci.yml's mutation jobs; the file must never drift from
+      # them. Excluded genres and their reasons are documented inside the
+      # mutants-pr job in ci.yml.
+      - name: Load shared mutant exclusions
+        run: printf 'BLUELINE_MUTANTS_EXCLUDE=%s\n' "$(cat scripts/mutants_exclude.re)" >> "$GITHUB_ENV"
+      - name: Resolve mutation targets
+        id: targets
+        run: |
+          mapfile -t files < <(git ls-files 'src/*.rs' 'src/registry/*.rs' \
+            | grep -vxFf <(printf '%s' "$BLUELINE_MUTANTS_SKIP"))
+          test "${#files[@]}" -gt 0 || { echo "no mutation targets resolved" >&2; exit 1; }
+          echo "mutating ${#files[@]} files (shard ${{ matrix.shard }}/32)"
+          args=(); for f in "${files[@]}"; do args+=(--file "$f"); done
+          echo "args=${args[@]}" >> "$GITHUB_OUTPUT"
+      - name: Mutate the full tree
+        run: |
+          cargo mutants --shard ${{ matrix.shard }}/32 \
+            ${{ steps.targets.outputs.args }} \
+            --exclude-re "$BLUELINE_MUTANTS_EXCLUDE" \
+            --in-place --baseline=skip --timeout 300
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-full-${{ matrix.shard }}.out
+          path: mutants.out
+
+  mutants-full-aggregate:
+    name: Mutation testing (full tree)
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [mutants-full]
+    steps:
+      # Read the result explicitly: a skipped or cancelled shard must read as
+      # failure, never as "no survivors". Same reasoning as the aggregate job
+      # in ci.yml.
+      - name: Every shard must have succeeded
+        env:
+          RESULT: ${{ needs.mutants-full.result }}
+        run: |
+          if [ "$RESULT" != "success" ]; then
+            echo "::error::full-tree mutation testing reported '$RESULT'"
+            exit 1
+          fi
+          echo "All 32 full-tree mutation testing shards completed successfully."
+
+  # Perf tracking is report-only: hosted-runner timing is too noisy to gate.
+  # The fork-bomb watchdog wraps everything because these scripts drive the
+  # binary over a loopback registry (see the 2026-10-09 incident in AGENTS.md).
+  perf:
+    name: Perf tracking
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --locked --release
+      - name: Run perf harness under the watchdog
+        run: |
+          {
+            echo "## Perf harness"
+            echo '```'
+            BLUELINE_BIN="$PWD/target/release/blueline" ITERS=7 \
+              scripts/perf_watchdog.sh 1500 60 scripts/perf_harness.py 2>&1
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Run lockfile-delta benchmark under the watchdog
+        run: |
+          {
+            echo "## Lockfile-delta benchmark"
+            echo '```'
+            scripts/perf_watchdog.sh 1500 60 scripts/verify_benchmarks.py 2>&1
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Live-package drift watch. Fails on any verdict change vs the committed
+  # baseline; accepting drift is a one-line re-establish + commit, which is
+  # the point — every heuristic behavior change becomes reviewable.
+  drift-watch:
+    name: Drift watch (real packages)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --locked --release
+      - name: Compare verdicts against the committed baseline
+        run: python3 scripts/drift_watch.py
