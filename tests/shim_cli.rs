@@ -177,6 +177,7 @@ fn write_fake_real_npm(dir: &Path, log: &Path) -> PathBufHelper {
 
 struct PathBufHelper(std::path::PathBuf);
 
+#[cfg(unix)]
 #[test]
 fn shim_installs_gates_and_uninstalls() {
     let fixture = spawn_two_packages();

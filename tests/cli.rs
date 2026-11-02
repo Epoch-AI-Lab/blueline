@@ -496,6 +496,7 @@ fn reviews_delta_against_predecessor_baseline() {
     drop(handle);
 }
 
+#[cfg(unix)]
 #[test]
 fn install_delegates_to_npm_with_ignore_scripts() {
     let temp_dir = tempfile::tempdir().unwrap();

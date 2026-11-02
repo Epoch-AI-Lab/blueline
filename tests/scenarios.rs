@@ -687,6 +687,7 @@ fn unix_now() -> i64 {
 /// — the real package manager must not run. `shim install` bakes
 /// `current_exe()`, so the scenario installs through a *copy* of the binary
 /// and then removes the copy.
+#[cfg(unix)]
 #[test]
 fn shim_fails_closed_when_the_baked_blueline_binary_is_missing() {
     let work = tempfile::tempdir().expect("create shim fixture dir");
