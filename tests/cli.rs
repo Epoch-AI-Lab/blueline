@@ -636,6 +636,7 @@ fn install_delegates_to_npm_with_ignore_scripts() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn install_blocks_unapproved_in_non_interactive_mode() {
     let tarball = make_tarball();
