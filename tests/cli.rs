@@ -652,6 +652,7 @@ fn install_blocks_unapproved_in_non_interactive_mode() {
         .stderr(predicate::str::contains("installation blocked"));
 }
 
+#[cfg(unix)]
 #[test]
 fn install_yes_fails_closed_on_non_low_risk() {
     let tarball = make_tarball();
