@@ -294,6 +294,7 @@ fn shim_installs_gates_and_uninstalls() {
     assert!(!shim.exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn shim_installs_all_eleven_managers() {
     let work = tempfile::tempdir().unwrap();
