@@ -14,6 +14,7 @@ use std::path::Path;
 #[cfg(unix)]
 use std::sync::Arc;
 
+#[cfg(unix)]
 use assert_cmd::Command;
 #[cfg(unix)]
 use base64::Engine;
