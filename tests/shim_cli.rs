@@ -359,6 +359,7 @@ fn shim_installs_all_eleven_managers() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn shim_install_refuses_unknown_manager_and_missing_real_binary() {
     let work = tempfile::tempdir().unwrap();
