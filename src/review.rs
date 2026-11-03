@@ -1838,10 +1838,7 @@ mod tests {
                 "aaa_good_lib-1.0.0.dist-info{}METADATA",
                 std::path::MAIN_SEPARATOR
             ),
-            format!(
-                "evil-1.0.0.dist-info{}METADATA",
-                std::path::MAIN_SEPARATOR
-            ),
+            format!("evil-1.0.0.dist-info{}METADATA", std::path::MAIN_SEPARATOR),
         ] {
             assert!(
                 text.contains(&path),
