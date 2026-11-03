@@ -419,7 +419,11 @@ fn expected_clean_paths(specs: &[Spec]) -> Vec<String> {
             if parent == Path::new("") {
                 break;
             }
-            clean.push(parent.to_string_lossy().into_owned());
+            clean.push(
+                parent
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/"),
+            );
             ancestor = parent.to_path_buf();
         }
     }
@@ -489,7 +493,7 @@ proptest! {
                 .strip_prefix(&dest)
                 .expect("path under dest")
                 .to_string_lossy()
-                .into_owned();
+                .replace(std::path::MAIN_SEPARATOR, "/");
             prop_assert!(
                 is_clean_rel(&rel),
                 "extracted path `{rel}` carries a traversal component or device name"
