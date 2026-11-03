@@ -603,7 +603,7 @@ impl SyncLock {
                 .open(&path)
             {
                 Ok(_) => return Ok(SyncLock(path)),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists || e.kind() == std::io::ErrorKind::PermissionDenied => {}
                 Err(e) => return Err(anyhow::anyhow!("creating {}: {e}", path.display())),
             }
             if Self::reap_if_stale(&path) {
