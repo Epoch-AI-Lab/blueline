@@ -756,7 +756,6 @@ impl BaselineStore {
     }
 
     /// Clear all cached advisories. Returns the number of deleted cache rows.
-    #[allow(dead_code)]
     pub fn clear_advisory_cache(&self) -> Result<usize, BluelineError> {
         let count = self
             .conn
