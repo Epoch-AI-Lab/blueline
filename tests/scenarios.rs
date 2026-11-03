@@ -771,6 +771,7 @@ fn make_executable(path: &std::path::Path) {
 }
 
 #[cfg(not(unix))]
+#[allow(dead_code)]
 fn make_executable(_path: &std::path::Path) {}
 
 // ---------------------------------------------------------------------------
