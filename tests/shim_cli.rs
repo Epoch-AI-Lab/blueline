@@ -3,14 +3,21 @@
 //! risky package, allowed with the real binary exec'd for a clean one),
 //! then uninstall. Fail-closed behavior is proven without any real npm.
 
+#[cfg(unix)]
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::net::{TcpListener, TcpStream};
+#[cfg(unix)]
 use std::path::Path;
+#[cfg(unix)]
 use std::sync::Arc;
 
 use assert_cmd::Command;
+#[cfg(unix)]
 use base64::Engine;
+#[cfg(unix)]
 use sha2::{Digest, Sha512};
 
 #[cfg(unix)]
