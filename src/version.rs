@@ -1211,6 +1211,16 @@ mod tests {
         assert!(Pep440Version::parse("1.0+a._b").is_err());
     }
 
+    #[test]
+    fn pep440_canonical_form_at_cap_is_accepted() {
+        // Kills the `>` -> `>=` mutant on the canonical-form cap: a version
+        // whose canonical form is exactly 256 characters must still parse.
+        let raw = format!("1.0+{}", "a".repeat(252));
+        assert_eq!(raw.len(), 256);
+        let parsed = Pep440Version::parse(&raw).expect("canonical form at the cap must parse");
+        assert_eq!(parsed.canonical().len(), 256);
+    }
+
     fn av(s: &str) -> AurVersionInfo {
         AurVersionInfo::parse(s).unwrap_or_else(|e| panic!("parse {s:?} failed: {e}"))
     }
