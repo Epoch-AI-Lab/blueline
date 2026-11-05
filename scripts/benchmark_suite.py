@@ -78,6 +78,166 @@ class MockRegistryHandler(BaseHTTPRequestHandler):
         self.send_response(404)
         self.end_headers()
 
+BAND_RANK = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "BLOCK": 3}
+
+
+def register_adversarial_packages(registry_url):
+    """Build the hostile packages on the mock registry and return the cases."""
+    hex_blob = "const buf = Buffer.from(\"" + "\\x41" * 512 + "\", \"hex\");"
+
+    cases = [
+        {
+            "id": "windows-extended-devices",
+            "why": "CONIN$/CONOUT$ tar entries must fail closed, never extract",
+            "files": {"lib/CONIN$": "x\n", "lib/CONOUT$": "x\n"},
+            "expect_fail_closed": True,
+        },
+        {
+            "id": "ipv6-multicast-script",
+            "why": "IPv6 multicast/discard URLs in lifecycle scripts trip the network primitive rule",
+            "files": {"lib/index.js": "fetch('http://[ff02::2]:1900/x');\nfetch('http://[100::1]/y');\n"},
+            "scripts": {"preinstall": "curl -fsS http://[ff02::2]:1900/x || wget http://[::]/y"},
+            "expect_finding": ["r03"],
+        },
+        {
+            "id": "osc-escape-flood",
+            "why": "uncapped OSC payloads must not reach a terminal unescaped",
+            "files": {"lib/\x1b]8;;http://evil.example\x07pwned.js": "console.log('x')\n"},
+            "raw_esc_output_forbidden": True,
+        },
+        {
+            "id": "dynamic-function-heuristic",
+            "why": "new Function() and hex-buffer construction must trip the heuristic engine",
+            "files": {"lib/engine.js": "const f = new Function(payload);\n" + hex_blob + "\n"},
+            "expect_finding": ["r03", "function"],
+        },
+    ]
+
+    for case in cases:
+        pkg_name = "adv-" + case["id"]
+        files = dict(case["files"])
+        manifest_obj = {
+            "name": pkg_name,
+            "version": "1.0.0",
+            "scripts": case.get("scripts", {"test": "echo ok"}),
+        }
+        files["package.json"] = json.dumps(manifest_obj)
+        tar_bytes = make_test_tarball(files)
+        sha = base64.b64encode(hashlib.sha512(tar_bytes).digest()).decode("ascii")
+        manifest = {
+            "name": pkg_name,
+            "dist-tags": {"latest": "1.0.0"},
+            "versions": {
+                "1.0.0": {
+                    "name": pkg_name,
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": f"{registry_url}/{pkg_name}/-/{pkg_name}-1.0.0.tgz",
+                        "integrity": f"sha512-{sha}",
+                        "shasum": hashlib.sha1(tar_bytes).hexdigest(),
+                    },
+                }
+            },
+        }
+        MockRegistryHandler.packages[(pkg_name, "1.0.0")] = (manifest, tar_bytes)
+        case["pkg_name"] = pkg_name
+    return cases
+
+
+
+def run_adversarial_checks(current_bin, registry_url):
+    """Review each hostile package with the current binary and assert the
+    invariant its case pins. Every check here drives the real binary end to
+    end; a check that cannot assert on observed behaviour is deleted, never
+    faked with a printed checkmark."""
+    cases = register_adversarial_packages(registry_url)
+    failures = []
+
+    print("\n[2] ADVERSARIAL ROBUSTNESS & INVARIANT VALIDATION:")
+    for case in cases:
+        spec = f"{case['pkg_name']}@1.0.0"
+        tmp_dir = tempfile.mkdtemp()
+        if case.get("raw_esc_output_forbidden"):
+            try:
+                raw = subprocess.run(
+                    [current_bin, "review", spec, "--registry", registry_url, "--output", "text"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=60,
+                    env={**os.environ, "BLUELINE_DATA_DIR": tmp_dir},
+                )
+            except subprocess.TimeoutExpired:
+                failures.append(f"{case['id']}: review of {spec} hung past 60s")
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                continue
+            if b"\x1b" in raw.stdout or b"\x1b" in raw.stderr:
+                failures.append(f"{case['id']}: raw ESC byte reached text output")
+            else:
+                print(f"  ✓ {case['why']} (exit {raw.returncode})")
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            continue
+
+        try:
+            res = subprocess.run(
+                [current_bin, "review", spec, "--registry", registry_url, "--output", "json"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=60,
+                env={**os.environ, "BLUELINE_DATA_DIR": tmp_dir},
+            )
+        except subprocess.TimeoutExpired:
+            failures.append(f"{case['id']}: review of {spec} hung past 60s")
+            continue
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        if case.get("expect_fail_closed"):
+            if res.returncode == 0:
+                failures.append(
+                    f"{case['id']}: binary exited 0 on device-name entries; "
+                    f"expected a fail-closed non-zero exit"
+                )
+            else:
+                print(f"  ✓ {case['why']} (exit {res.returncode})")
+            continue
+
+        if res.returncode not in (0, 2):
+            failures.append(
+                f"{case['id']}: unexpected exit {res.returncode}: "
+                f"{res.stderr.decode('utf-8', errors='replace')[:400]}"
+            )
+            continue
+        try:
+            verdict = json.loads(res.stdout)
+        except json.JSONDecodeError as exc:
+            failures.append(f"{case['id']}: --output json did not parse: {exc}")
+            continue
+
+        band = str(verdict.get("band", "")).upper()
+        if band not in BAND_RANK:
+            failures.append(f"{case['id']}: unknown verdict band {band!r}")
+            continue
+
+        case_failed = False
+        if "expect_finding" in case:
+            joined = " ".join(
+                f"{f.get('rule_id', '')} {f.get('title', '')} {f.get('description', '')}"
+                for f in verdict.get("findings", [])
+            ).lower()
+            for needle in case["expect_finding"]:
+                if needle.lower() not in joined:
+                    failures.append(
+                        f"{case['id']}: no finding mentioning {needle!r}; "
+                        f"findings were: {joined[:300]}"
+                    )
+                    case_failed = True
+
+        if not case_failed:
+            print(f"  ✓ {case['why']} (band {band})")
+
+    return failures
+
+
 def run_benchmarks():
     baseline_bin = "/tmp/blueline-baseline-bin"
     current_bin = os.path.abspath("target/release/blueline")
@@ -209,13 +369,15 @@ def run_benchmarks():
             "speedup": speedup,
         }
 
-    print("\n[2] ADVERSARIAL ROBUSTNESS & INVARIANT VALIDATION:")
-    print("  ✓ Flag delimiter ordering (-- extra_args ... -- pkg) verified.")
-    print("  ✓ Windows extended devices (CONIN$, CONOUT$) verified.")
-    print("  ✓ IPv6 multicast / discard / doc ranges verified.")
-    print("  ✓ Terminal escape sanitization (uncapped OSC payloads) verified.")
-    print("  ✓ Dynamic Function constructor and hex buffer heuristics verified.")
+    failures = run_adversarial_checks(current_bin, registry_url)
+
     print("=" * 70)
+    if failures:
+        print(f"ADVERSARIAL VERIFICATION FAILED: {len(failures)} gate(s) down")
+        for line in failures:
+            print(f"  ✗ {line}")
+        print("=" * 70)
+        sys.exit(1)
     print("BENCHMARK & VERIFICATION COMPLETE: ALL GATES PASSING")
     print("=" * 70)
 

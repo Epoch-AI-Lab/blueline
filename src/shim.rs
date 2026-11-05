@@ -309,6 +309,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn executable_check_requires_file_and_exec_bit() {
         assert!(!is_executable_file(Path::new(
@@ -328,6 +329,7 @@ mod tests {
         )));
     }
 
+    #[cfg(unix)]
     #[test]
     fn executable_check_accepts_755() {
         let dir = tempfile::tempdir().unwrap();

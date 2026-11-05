@@ -1092,6 +1092,7 @@ fn recall_export_osv_preserves_mal_ids_and_ecosystem_strings() {
     assert_eq!(docs[1]["affected"][0]["package"]["ecosystem"], "crates.io");
 }
 
+#[cfg(unix)]
 #[test]
 fn recall_export_osv_refuses_symlink_out() {
     let data_dir = tempfile::tempdir().unwrap();

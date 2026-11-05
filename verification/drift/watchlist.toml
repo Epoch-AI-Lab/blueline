@@ -1,0 +1,183 @@
+# The drift watchlist: pinned real-world packages the nightly job reviews so
+# a heuristic change that moves a real verdict surfaces as a diff, not a
+# surprise. Chosen for diversity (network-heavy, native/binary, scopes,
+# historical compromise subjects, cargo core) and stability — versions are
+# pinned so the only variable between runs is the tool itself.
+#
+# Keep entries well-known and long-lived. An unpublished or renamed package
+# turns the whole nightly red for noise.
+
+[[packages]]
+ecosystem = "npm"
+name = "express"
+version = "4.21.2"
+
+[[packages]]
+ecosystem = "npm"
+name = "lodash"
+version = "4.17.21"
+
+[[packages]]
+ecosystem = "npm"
+name = "axios"
+version = "1.7.9"
+
+[[packages]]
+ecosystem = "npm"
+name = "left-pad"
+version = "1.3.0"
+
+[[packages]]
+ecosystem = "npm"
+name = "chalk"
+version = "5.4.1"
+
+[[packages]]
+ecosystem = "npm"
+name = "typescript"
+version = "5.7.3"
+
+[[packages]]
+ecosystem = "npm"
+name = "is-odd"
+version = "3.0.1"
+
+[[packages]]
+ecosystem = "npm"
+name = "debug"
+version = "4.4.0"
+
+[[packages]]
+ecosystem = "npm"
+name = "minimist"
+version = "1.2.8"
+
+[[packages]]
+ecosystem = "npm"
+name = "rimraf"
+version = "6.0.1"
+
+[[packages]]
+ecosystem = "npm"
+name = "node-fetch"
+version = "3.3.2"
+
+[[packages]]
+ecosystem = "npm"
+name = "semver"
+version = "7.7.1"
+
+[[packages]]
+ecosystem = "npm"
+name = "uuid"
+version = "11.1.0"
+
+[[packages]]
+ecosystem = "npm"
+name = "fastify"
+version = "5.2.1"
+
+[[packages]]
+ecosystem = "npm"
+name = "moment"
+version = "2.30.1"
+
+[[packages]]
+ecosystem = "npm"
+name = "request"
+version = "2.88.2"
+
+[[packages]]
+ecosystem = "npm"
+name = "colors"
+version = "1.4.0"
+
+[[packages]]
+ecosystem = "npm"
+name = "nanoid"
+version = "5.0.9"
+
+[[packages]]
+ecosystem = "npm"
+name = "glob"
+version = "11.0.1"
+
+[[packages]]
+ecosystem = "npm"
+name = "esbuild"
+version = "0.25.0"
+
+[[packages]]
+ecosystem = "cargo"
+name = "serde"
+version = "1.0.219"
+
+[[packages]]
+ecosystem = "cargo"
+name = "tokio"
+version = "1.44.0"
+
+[[packages]]
+ecosystem = "cargo"
+name = "clap"
+version = "4.5.31"
+
+[[packages]]
+ecosystem = "cargo"
+name = "anyhow"
+version = "1.0.97"
+
+[[packages]]
+ecosystem = "cargo"
+name = "reqwest"
+version = "0.12.12"
+
+[[packages]]
+ecosystem = "cargo"
+name = "rand"
+version = "0.9.0"
+
+[[packages]]
+ecosystem = "cargo"
+name = "log"
+version = "0.4.26"
+
+[[packages]]
+ecosystem = "cargo"
+name = "libc"
+version = "0.2.170"
+
+[[packages]]
+ecosystem = "cargo"
+name = "uuid"
+version = "1.15.1"
+
+[[packages]]
+ecosystem = "cargo"
+name = "regex"
+version = "1.11.1"
+
+[[packages]]
+ecosystem = "cargo"
+name = "hyper"
+version = "1.6.0"
+
+[[packages]]
+ecosystem = "cargo"
+name = "futures"
+version = "0.3.31"
+
+[[packages]]
+ecosystem = "cargo"
+name = "syn"
+version = "2.0.100"
+
+[[packages]]
+ecosystem = "cargo"
+name = "bytes"
+version = "1.10.1"
+
+[[packages]]
+ecosystem = "cargo"
+name = "base64"
+version = "0.22.1"

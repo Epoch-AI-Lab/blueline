@@ -461,6 +461,35 @@ impl ureq::Resolver for ValidatingResolver {
     }
 }
 
+/// Read one request head off an accepted stream, for the mock registry
+/// servers in the test mods.
+///
+/// The accepted stream inherits the listener's non-blocking mode when the
+/// listener set one, and a single read can return before the client's request
+/// bytes have arrived (observed on macOS loopback): the request then parses
+/// as empty or `/` and the server answers nothing or 404s a well-formed GET,
+/// which the client reports as a status-line error instead of the refusal the
+/// test pins. Blocking mode, until the header terminator is on hand.
+#[cfg(test)]
+pub(crate) fn read_request_head(stream: &mut std::net::TcpStream) -> String {
+    let _ = stream.set_nonblocking(false);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -749,7 +778,7 @@ mod tests {
     /// never exempt, so the chain must stop at hop one.
     #[test]
     fn a_redirect_off_the_registry_host_is_refused() {
-        use std::io::Write;
+        use std::io::{Read, Write};
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -757,7 +786,13 @@ mod tests {
         let handle = std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let mut stream = stream;
-                let body = "{\"attestations\":[]}";
+                // Read the request before answering: writing the 302 before
+                // the client's request bytes have arrived races ureq's
+                // connect path on macOS loopback, which surfaces as a
+                // status-line parse error instead of the redirect refusal
+                // this test pins.
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
                 let _ = write!(
                     stream,
                     "HTTP/1.1 302 Found\r\n\
@@ -766,7 +801,6 @@ mod tests {
                      Connection: close\r\n\r\n"
                 );
                 let _ = stream.flush();
-                let _ = body;
             }
         });
 

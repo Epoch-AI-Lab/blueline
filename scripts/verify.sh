@@ -9,6 +9,7 @@
 #   ./scripts/verify.sh            fmt + clippy + test + references  (the gate)
 #   ./scripts/verify.sh --fast     same as above; accepted for symmetry
 #   ./scripts/verify.sh --mutants  the gate, then mutation testing
+#   ./scripts/verify.sh --fuzz     the gate, then a libFuzzer smoke per target
 #   ./scripts/verify.sh --all      the gate, mutants, + supply-chain audit
 #
 # Works from any cwd: the repo root is resolved from this script's location.
@@ -25,15 +26,18 @@ MUTANTS_SKIP="src/lib.rs
 src/error.rs"
 
 RUN_MUTANTS=0
+RUN_FUZZ=0
 RUN_ALL=0
 
 usage() {
     cat <<'EOF'
-usage: scripts/verify.sh [--fast] [--mutants] [--all]
+usage: scripts/verify.sh [--fast] [--mutants] [--fuzz] [--all]
 
   (default)  fmt + clippy + test + references — the gate CI enforces
   --fast     same as default
   --mutants  the gate, then cargo-mutants over the security-critical engine
+  --fuzz     the gate, then a libFuzzer smoke per target (60 s each,
+             override with BLUELINE_FUZZ_SECS)
   --all      the gate, mutants, plus the cargo-deny supply-chain audit
 EOF
 }
@@ -42,6 +46,7 @@ for arg in "$@"; do
     case "$arg" in
         --fast)    ;;  # default stage set; accepted for symmetry
         --mutants) RUN_MUTANTS=1 ;;
+        --fuzz)    RUN_FUZZ=1 ;;
         --all)     RUN_MUTANTS=1; RUN_ALL=1 ;;
         -h|--help) usage; exit 0 ;;
         *)         echo "verify.sh: unknown argument '$arg'" >&2; usage >&2; exit 2 ;;
@@ -80,7 +85,9 @@ stage_mutants() {
     echo "mutating ${#files[@]} files"
     local args=() f
     for f in "${files[@]}"; do args+=(--file "$f"); done
-    cargo mutants "${args[@]}" --in-place --baseline=skip --timeout 30
+    local exclude
+    exclude="$(cat scripts/mutants_exclude.re)"
+    cargo mutants "${args[@]}" --in-place --baseline=skip --timeout 300 --exclude-re "$exclude"
 }
 
 stage_deny() {
@@ -91,8 +98,42 @@ stage_deny() {
     cargo deny check
 }
 
+# Same invocation as the fuzz-smoke job in ci.yml: nightly toolchain (cargo-fuzz
+# builds with sanitizer flags that need it), the committed seed corpus, a short
+# budget per target. The nightly soak owns the long runs; this is the smoke.
+stage_fuzz() {
+    if ! cargo fuzz --version >/dev/null 2>&1; then
+        echo "cargo-fuzz not installed. CI installs it via taiki-e/install-action;" >&2
+        echo "locally: cargo install cargo-fuzz --locked" >&2
+        return 127
+    fi
+    if ! rustup toolchain list | grep -q '^nightly'; then
+        echo "nightly toolchain not installed (cargo-fuzz needs it): rustup toolchain install nightly --profile minimal" >&2
+        return 127
+    fi
+    local secs="${BLUELINE_FUZZ_SECS:-60}"
+    # Run against a throwaway copy of the committed seeds: libFuzzer writes
+    # every grown input back into its corpus dir, and the committed corpus is
+    # a reviewed floor, not a scratch space (the nightly soak owns growth).
+    local rc=0
+    FUZZ_CORPUS_DIR="$(mktemp -d)"
+    trap 'rm -rf "$FUZZ_CORPUS_DIR"' EXIT
+    for target in safe_extract read_package_json pypi_version aur_version pkgbuild_tokenizer install_ref_scan; do
+        rm -rf "$FUZZ_CORPUS_DIR/$target"
+        cp -r "fuzz/corpus/$target" "$FUZZ_CORPUS_DIR/$target"
+        # gnu, not cargo-fuzz's musl default: ASan is incompatible with musl's
+        # statically linked libc. Same invocation as the CI fuzz-smoke job.
+        if ! cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$target" "$FUZZ_CORPUS_DIR/$target" -- \
+            -max_total_time="$secs" -rss_limit_mb=4096 -timeout=25; then
+            rc=1
+        fi
+    done
+    return "$rc"
+}
+
 stages="fmt, clippy, test, references"
 [ "$RUN_MUTANTS" -eq 1 ] && stages="$stages, mutants"
+[ "$RUN_FUZZ" -eq 1 ] && stages="$stages, fuzz-smoke"
 [ "$RUN_ALL" -eq 1 ] && stages="$stages, cargo-deny"
 
 echo "repo:      $REPO_ROOT"
@@ -126,6 +167,10 @@ fi
 
 if [ "$RUN_MUTANTS" -eq 1 ]; then
     stage "Mutation testing" stage_mutants
+fi
+
+if [ "$RUN_FUZZ" -eq 1 ]; then
+    stage "Fuzz smoke" stage_fuzz
 fi
 
 printf '\n\033[1;32mPASS\033[0m  %s\n' "$(IFS=, ; echo "${PASSED[*]}")"

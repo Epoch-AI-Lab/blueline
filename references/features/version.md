@@ -57,7 +57,10 @@ validated against pacman's `vercmptest.sh` vectors.
   versions skipped ⇒ `list_releases` errors with `"parseable .SRCINFO"`.
 - **PEP 440 parse bounds:** version string ≤ 256 bytes, ≤ 32 release segments,
   local segments `[A-Za-z0-9]` plus `. _ -` with no leading/trailing/adjacent
-  separator. Overflow (`epoch`, local numeric) is a hard error.
+  separator. Overflow (`epoch`, local numeric) is a hard error. The cap is also
+  applied to the canonical form: a parse whose canonical string exceeds 256
+  bytes is refused, because normalization expands (`c` → `rc`, a bare `r<n>`
+  reads as `.post<n>`).
 - **`AurVersionInfo` compares pkgrel only when both sides carry one**, so
   `1.5 == 1.5-1` and an indexed `1.0` matches a queried `1.0-1`. Recall's
   version matching depends on exactly this.

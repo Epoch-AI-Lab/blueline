@@ -385,7 +385,12 @@ pub fn safe_extract_wheel(
             )));
         };
 
-        validate_entry_path(&enclosed_path).map_err(BluelineError::Extraction)?;
+        // Validate the raw zip name, not the platform PathBuf
+        // `enclosed_name` builds: joining components inserts `\` on Windows,
+        // which trips the backslash refusal on every nested wheel entry. The
+        // raw name is the bytes the archive asked for, and it is what the
+        // refusals above already checked.
+        validate_entry_path(Path::new(raw_name.as_str())).map_err(BluelineError::Extraction)?;
 
         let normalized_key = normalized_entry_key(&enclosed_path);
         if !seen.insert(normalized_key.clone()) {
@@ -497,7 +502,11 @@ pub fn validate_entry_path(path: &Path) -> Result<(), String> {
     if path.as_os_str().is_empty() {
         return Err("empty entry path".to_string());
     }
-    if path.is_absolute() {
+    // has_root, not is_absolute: on Windows a leading `/` is rooted but not
+    // `is_absolute` (that also demands a drive prefix), so a tar entry like
+    // `/etc/cron.d/evil` passed the old check and extracted under dest. A
+    // rooted entry is refused on every platform.
+    if path.has_root() {
         return Err(format!("absolute entry path `{}` rejected", path.display()));
     }
     let bytes = path.as_os_str().as_encoded_bytes();
@@ -603,8 +612,13 @@ fn set_file_perm(path: &Path) {
     set_perm(path, 0o644);
 }
 
+// The not(unix) helpers delegate to the set_perm stub rather than emptying
+// out: shared extraction code calls these on every platform, and the
+// delegation is what keeps set_perm itself from going dead off unix.
 #[cfg(not(unix))]
-fn set_file_perm(_path: &Path) {}
+fn set_file_perm(_path: &Path) {
+    set_perm(_path, 0o644);
+}
 
 #[cfg(unix)]
 fn set_dir_perm(path: &Path) {
@@ -612,7 +626,9 @@ fn set_dir_perm(path: &Path) {
 }
 
 #[cfg(not(unix))]
-fn set_dir_perm(_path: &Path) {}
+fn set_dir_perm(_path: &Path) {
+    set_perm(_path, 0o755);
+}
 
 #[cfg(test)]
 mod tests {
@@ -1625,7 +1641,13 @@ mod wheel_tests {
         let mut buf = Cursor::new(Vec::new());
         let mut zw = zip::ZipWriter::new(&mut buf);
         for (name, data, method) in entries {
-            let opts = SimpleFileOptions::default().compression_method(*method);
+            // Claim Unix in the central directory: the writer defaults the
+            // system to Dos on Windows hosts, and the mode bytes the tests
+            // patch in (the symlink-attrs test) are only honored for
+            // Unix-claimed entries. A real wheel is built the same way.
+            let opts = SimpleFileOptions::default()
+                .compression_method(*method)
+                .system(zip::System::Unix);
             if name.ends_with('/') {
                 zw.add_directory(*name, opts).unwrap();
             } else {

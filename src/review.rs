@@ -1834,11 +1834,14 @@ mod tests {
             "the refusal must say how many candidates there were: {err}"
         );
         for path in [
-            "aaa_good_lib-1.0.0.dist-info/METADATA",
-            "evil-1.0.0.dist-info/METADATA",
+            format!(
+                "aaa_good_lib-1.0.0.dist-info{}METADATA",
+                std::path::MAIN_SEPARATOR
+            ),
+            format!("evil-1.0.0.dist-info{}METADATA", std::path::MAIN_SEPARATOR),
         ] {
             assert!(
-                text.contains(path),
+                text.contains(&path),
                 "the refusal must name each candidate so the operator can see which one \
                  pip would install: {err}"
             );

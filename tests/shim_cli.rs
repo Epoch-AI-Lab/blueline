@@ -3,21 +3,31 @@
 //! risky package, allowed with the real binary exec'd for a clean one),
 //! then uninstall. Fail-closed behavior is proven without any real npm.
 
+#[cfg(unix)]
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::net::{TcpListener, TcpStream};
+#[cfg(unix)]
 use std::path::Path;
+#[cfg(unix)]
 use std::sync::Arc;
 
+#[cfg(unix)]
 use assert_cmd::Command;
+#[cfg(unix)]
 use base64::Engine;
+#[cfg(unix)]
 use sha2::{Digest, Sha512};
 
+#[cfg(unix)]
 struct Fixture {
     base: String,
     _server: std::thread::JoinHandle<()>,
 }
 
+#[cfg(unix)]
 fn spawn_fixture<F>(build: F) -> Fixture
 where
     F: FnOnce(&str) -> HashMap<String, (String, Vec<u8>)> + Send + 'static,
@@ -38,6 +48,7 @@ where
     }
 }
 
+#[cfg(unix)]
 fn serve(stream: &mut TcpStream, packages: &Arc<HashMap<String, (String, Vec<u8>)>>) {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 2048];
@@ -88,6 +99,7 @@ fn serve(stream: &mut TcpStream, packages: &Arc<HashMap<String, (String, Vec<u8>
     let _ = stream.write_all(&body);
 }
 
+#[cfg(unix)]
 fn tarball_with(json: &str, extra: &[(&str, &[u8])]) -> Vec<u8> {
     let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     let mut builder = tar::Builder::new(encoder);
@@ -108,6 +120,7 @@ fn tarball_with(json: &str, extra: &[(&str, &[u8])]) -> Vec<u8> {
     builder.into_inner().unwrap().finish().unwrap()
 }
 
+#[cfg(unix)]
 fn sha512_b64(data: &[u8]) -> String {
     let digest = Sha512::digest(data);
     format!(
@@ -116,6 +129,7 @@ fn sha512_b64(data: &[u8]) -> String {
     )
 }
 
+#[cfg(unix)]
 fn packument(name: &str, base: &str, version: &str, integrity: &str) -> String {
     serde_json::json!({
         "name": name,
@@ -135,6 +149,7 @@ fn packument(name: &str, base: &str, version: &str, integrity: &str) -> String {
     .to_string()
 }
 
+#[cfg(unix)]
 fn spawn_two_packages() -> Fixture {
     let ok_json = r#"{"name":"ok","version":"1.0.0"}"#;
     let ok_tar = tarball_with(ok_json, &[]);
@@ -161,6 +176,7 @@ fn spawn_two_packages() -> Fixture {
     })
 }
 
+#[cfg(unix)]
 fn write_fake_real_npm(dir: &Path, log: &Path) -> PathBufHelper {
     let bin_dir = dir.join("realbin");
     std::fs::create_dir_all(&bin_dir).unwrap();
@@ -175,8 +191,10 @@ fn write_fake_real_npm(dir: &Path, log: &Path) -> PathBufHelper {
     PathBufHelper(bin_dir)
 }
 
+#[cfg(unix)]
 struct PathBufHelper(std::path::PathBuf);
 
+#[cfg(unix)]
 #[test]
 fn shim_installs_gates_and_uninstalls() {
     let fixture = spawn_two_packages();
@@ -293,6 +311,7 @@ fn shim_installs_gates_and_uninstalls() {
     assert!(!shim.exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn shim_installs_all_eleven_managers() {
     let work = tempfile::tempdir().unwrap();
@@ -341,6 +360,7 @@ fn shim_installs_all_eleven_managers() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn shim_install_refuses_unknown_manager_and_missing_real_binary() {
     let work = tempfile::tempdir().unwrap();

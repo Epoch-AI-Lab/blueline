@@ -427,14 +427,23 @@ impl VersionInfo for Pep440Version {
             return Err(err("trailing data"));
         }
 
-        Ok(Pep440Version {
+        let version = Pep440Version {
             epoch,
             release,
             pre,
             post,
             dev,
             local,
-        })
+        };
+        // The cap above is on the input, but normalization expands (`c` reads
+        // as `rc`, a bare `r<n>` reads as `.post<n>`), so a string under the
+        // cap can canonicalize past it. The canonical form is what baseline
+        // resolution re-parses, so it must satisfy the same cap: fail closed
+        // here rather than emit a string no later parse can accept.
+        if version.canonical().len() > 256 {
+            return Err(err("canonical form exceeds maximum length of 256"));
+        }
+        Ok(version)
     }
 
     fn canonical(&self) -> String {
@@ -1152,6 +1161,21 @@ mod tests {
     }
 
     #[test]
+    fn pep440_a_canonical_form_over_the_cap_is_rejected_at_parse() {
+        // Found by the fuzz smoke: `cr32022` reads as `rc0.post32022`, so this
+        // 256-char input parses, but its canonical form is 259 chars — over
+        // the cap the input itself is held to. The parse must refuse it: the
+        // canonical string is what baseline resolution re-parses, and it must
+        // re-parse.
+        let raw = "442.4202002020200202020.420200202022.420200.420200202020.4202200202022.\
+                   420200.420.422022.420200202020.420200202022.420200.4420200.420.422022.\
+                   420200202020.420200202022.420200.4202020200202020.42020200202020.\
+                   420200202022.420200.420202020.42020020202cr32022+0";
+        assert_eq!(raw.len(), 256);
+        assert!(Pep440Version::parse(raw).is_err());
+    }
+
+    #[test]
     fn pep440_exact_length_and_segment_limits() {
         // 256 chars is allowed, 257 is rejected
         let v256 = format!("1.{}", "0".repeat(254));
@@ -1185,6 +1209,16 @@ mod tests {
         assert!(Pep440Version::parse("1.0+a__b").is_err());
         assert!(Pep440Version::parse("1.0+a--b").is_err());
         assert!(Pep440Version::parse("1.0+a._b").is_err());
+    }
+
+    #[test]
+    fn pep440_canonical_form_at_cap_is_accepted() {
+        // Kills the `>` -> `>=` mutant on the canonical-form cap: a version
+        // whose canonical form is exactly 256 characters must still parse.
+        let raw = format!("1.0+{}", "a".repeat(252));
+        assert_eq!(raw.len(), 256);
+        let parsed = Pep440Version::parse(&raw).expect("canonical form at the cap must parse");
+        assert_eq!(parsed.canonical().len(), 256);
     }
 
     fn av(s: &str) -> AurVersionInfo {

@@ -496,6 +496,7 @@ fn reviews_delta_against_predecessor_baseline() {
     drop(handle);
 }
 
+#[cfg(unix)]
 #[test]
 fn install_delegates_to_npm_with_ignore_scripts() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -635,6 +636,7 @@ fn install_delegates_to_npm_with_ignore_scripts() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn install_blocks_unapproved_in_non_interactive_mode() {
     let tarball = make_tarball();
@@ -650,6 +652,7 @@ fn install_blocks_unapproved_in_non_interactive_mode() {
         .stderr(predicate::str::contains("installation blocked"));
 }
 
+#[cfg(unix)]
 #[test]
 fn install_yes_fails_closed_on_non_low_risk() {
     let tarball = make_tarball();

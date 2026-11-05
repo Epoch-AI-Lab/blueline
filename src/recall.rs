@@ -603,7 +603,9 @@ impl SyncLock {
                 .open(&path)
             {
                 Ok(_) => return Ok(SyncLock(path)),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::AlreadyExists
+                        || e.kind() == std::io::ErrorKind::PermissionDenied => {}
                 Err(e) => return Err(anyhow::anyhow!("creating {}: {e}", path.display())),
             }
             if Self::reap_if_stale(&path) {
@@ -1620,6 +1622,8 @@ mod tests {
 
     /// What the process-wide cache currently holds, so a test can tell a miss
     /// it caused from a miss another review caused by evicting the entry.
+    // Its only caller pins inode behavior, which the gate below scopes to unix.
+    #[cfg(unix)]
     fn cache_entry() -> Option<CacheKey> {
         SNAPSHOT_CACHE
             .lock()
@@ -1987,7 +1991,7 @@ mod tests {
     }
 
     fn serve_recall_once(body: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
-        use std::io::{Read, Write};
+        use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
@@ -1996,9 +2000,7 @@ mod tests {
             while start.elapsed() < std::time::Duration::from_secs(15) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let mut buf = [0u8; 8192];
-                        let n = stream.read(&mut buf).unwrap_or(0);
-                        let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                        let req = crate::registry::http_util::read_request_head(&mut stream);
                         let path = req
                             .lines()
                             .next()
@@ -2233,6 +2235,10 @@ mod tests {
     /// is derived from the pid of whichever process syncs. A test that plants
     /// the link from the parent plants a name the child never uses, so it
     /// passes against the code it is meant to catch.
+    // Unix-gated as a pair: the planted name is a symlink, a concept the
+    // attack does not have on Windows, and gating the child alone would leave
+    // this parent re-executing a test that no longer exists there.
+    #[cfg(unix)]
     #[test]
     fn sync_does_not_follow_a_planted_symlink_in_the_data_directory() {
         let data_dir = tempfile::tempdir().unwrap();
@@ -2281,6 +2287,7 @@ mod tests {
     /// Child half of the symlink test above, re-executed as its own process so
     /// the planted name matches the pid that actually syncs.
     #[test]
+    #[cfg(unix)]
     #[ignore = "re-executed by sync_does_not_follow_a_planted_symlink"]
     fn sync_child_planted_symlink() {
         let Ok(url) = std::env::var("BLUELINE_TEST_URL") else {
@@ -2669,19 +2676,23 @@ mod tests {
         );
     }
 
-    /// Set a file's mtime, so a lock can be made old enough to reap. Shells out
-    /// to `touch` because the stdlib has no portable setter, and the one caller
-    /// is a file-age test on a platform that has one.
+    /// Set a file's mtime, so a lock can be made old enough to reap. The old
+    /// version shelled out to `touch -d`, a GNU flag BSD touch lacks, and
+    /// swallowed the failure — so on macOS the callers' stale-mtime
+    /// precondition silently never held. `File::set_times` is the portable
+    /// setter, and the mtime is load-bearing for the callers, so a failure is
+    /// a fixture error, not a silent skip. Creates the file when absent, the
+    /// way `touch` did: the release path unlinks the lock, and a caller that
+    /// plants a stale lock afterwards relies on the file coming into being.
     fn filetime_reset(path: &Path, when: std::time::SystemTime) {
-        let secs = when
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let _ = std::process::Command::new("touch")
-            .arg("-d")
-            .arg(format!("@{secs}"))
-            .arg(path)
-            .status();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .expect("open (or create) the lock file to set its mtime");
+        file.set_times(std::fs::FileTimes::new().set_modified(when))
+            .expect("set the lock file's mtime");
     }
 
     /// The reap threshold, sitting exactly on it.

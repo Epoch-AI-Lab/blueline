@@ -942,7 +942,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
+    // Linux, not merely unix: APFS refuses to create a file whose name is not
+    // valid UTF-8 (EILSEQ), so the fixture cannot even be built on macOS and
+    // the property this pins is unobservable there.
+    #[cfg(target_os = "linux")]
     fn non_utf8_filename_is_reviewed_rather_than_fatal() {
         use std::os::unix::ffi::OsStrExt;
         let base = tempfile::tempdir().unwrap();
@@ -1039,6 +1042,11 @@ mod tests {
     ///   "became opaque" arm can put it in `new_binaries`.
     /// * `bin-to-bin` is binary on both sides, which is the only way into
     ///   `modified_binaries`.
+    // Executability is wired through unix permission bits (`from_mode`); a
+    // Windows executable is a filename convention, so the scenario has no
+    // equivalent there and the gate keeps the suite compiling without
+    // weakening what Linux asserts.
+    #[cfg(unix)]
     #[test]
     fn the_merge_path_classifies_executables_and_binaries() {
         use std::os::unix::fs::PermissionsExt;

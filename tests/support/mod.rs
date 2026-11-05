@@ -47,7 +47,8 @@ pub use cli::{Band, Cli, Run, Verdict};
 pub use registry::{RecallService, Registry};
 #[allow(unused_imports)]
 pub use tarball::{
-    Entry, EntryKind, Release, ReleaseBuilder, gzip, pad_to_512, pax_record, raw_header, sha512_sri,
+    Entry, EntryKind, Release, ReleaseBuilder, archive, gzip, pad_to_512, pax_record, raw_header,
+    sha512_sri,
 };
 
 use std::path::{Path, PathBuf};

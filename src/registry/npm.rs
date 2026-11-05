@@ -591,7 +591,7 @@ mod tests {
 
     #[test]
     fn mock_http_resolve_and_dist_tags() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -606,9 +606,7 @@ mod tests {
             // loop below would then block on accept().
             for _ in 0..3 {
                 if let Ok((mut stream, _)) = listener.accept() {
-                    let mut buf = [0u8; 1024];
-                    let n = stream.read(&mut buf).unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let req = crate::registry::http_util::read_request_head(&mut stream);
 
                     if req.contains("GET /testpkg ") {
                         let body = r#"{"name":"testpkg","dist-tags":{"latest":"2.1.0"},"versions":{"2.1.0":{"name":"testpkg","version":"2.1.0","dist":{"tarball":"http://127.0.0.1:1/pkg.tgz","integrity":"sha512-dWJ6JIJkmHG8N3fH1b/hbpmBQ7wKIpEw3zsVl2873OtFXh9QhR1KUU3uojohuIJ/xd+hb1R0q/57C8sMt4tstQ=="}}}}"#;
@@ -669,7 +667,7 @@ mod tests {
     /// signature lookup that follows them.
     #[test]
     fn a_packument_is_fetched_once_per_package() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::net::TcpListener;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -690,9 +688,7 @@ mod tests {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         idle = 0;
-                        let mut buf = [0u8; 1024];
-                        let n = stream.read(&mut buf).unwrap_or(0);
-                        let req = String::from_utf8_lossy(&buf[..n]);
+                        let req = crate::registry::http_util::read_request_head(&mut stream);
                         if !req.contains("GET /counted ") {
                             break;
                         }
@@ -738,7 +734,7 @@ mod tests {
 
     #[test]
     fn mock_http_redirect_handling() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -762,9 +758,7 @@ mod tests {
                 if let Ok((mut stream, _)) = listener.accept() {
                     served += 1;
                     last = std::time::Instant::now();
-                    let mut buf = [0u8; 1024];
-                    let n = stream.read(&mut buf).unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let req = crate::registry::http_util::read_request_head(&mut stream);
                     if req.contains("GET /redirect1 ") {
                         let resp = format!(
                             "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/final.tgz\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -819,7 +813,7 @@ mod tests {
 
     #[test]
     fn packument_and_tarball_size_above_false_equivalent_cap() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -844,9 +838,7 @@ mod tests {
                 if let Ok((mut stream, _)) = listener.accept() {
                     served += 1;
                     last = std::time::Instant::now();
-                    let mut buf = [0u8; 1024];
-                    let n = stream.read(&mut buf).unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let req = crate::registry::http_util::read_request_head(&mut stream);
 
                     if req.contains("GET /bigpkg ") {
                         // Packument of 6000 bytes (above 64 + 1024 + 1024 = 2112 bytes)
@@ -889,7 +881,7 @@ mod tests {
 
     #[test]
     fn packument_exact_limits_boundary() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -911,9 +903,7 @@ mod tests {
                 if let Ok((mut stream, _)) = listener.accept() {
                     served += 1;
                     last = std::time::Instant::now();
-                    let mut buf = [0u8; 1024];
-                    let n = stream.read(&mut buf).unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let req = crate::registry::http_util::read_request_head(&mut stream);
 
                     if req.contains("GET /exactpkg ") {
                         let resp = format!(
@@ -958,7 +948,7 @@ mod tests {
 
     #[test]
     fn tarball_exact_limits_boundary() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -988,9 +978,7 @@ mod tests {
                 if let Ok((mut stream, _)) = listener.accept() {
                     served += 1;
                     last = std::time::Instant::now();
-                    let mut buf = [0u8; 1024];
-                    let n = stream.read(&mut buf).unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let req = crate::registry::http_util::read_request_head(&mut stream);
 
                     if req.contains("GET /exact.tgz ") {
                         let resp = format!(
@@ -1047,7 +1035,7 @@ mod tests {
 
     #[test]
     fn redirect_exact_limits_boundary() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1071,9 +1059,7 @@ mod tests {
                 if let Ok((mut stream, _)) = listener.accept() {
                     served += 1;
                     last = std::time::Instant::now();
-                    let mut buf = [0u8; 1024];
-                    let n = stream.read(&mut buf).unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let req = crate::registry::http_util::read_request_head(&mut stream);
 
                     if req.contains("GET /r1 ") {
                         let resp = format!(
@@ -1155,7 +1141,7 @@ mod tests {
     /// while the version under review does not must not inherit it.
     #[test]
     fn release_signatures_reads_the_blocks_for_the_resolved_version_only() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1173,9 +1159,7 @@ mod tests {
                 if let Ok((mut stream, _)) = listener.accept() {
                     served += 1;
                     last = std::time::Instant::now();
-                    let mut buf = [0u8; 1024];
-                    let n = stream.read(&mut buf).unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let req = crate::registry::http_util::read_request_head(&mut stream);
                     if req.contains("GET /signed ") {
                         let body = format!(
                             r#"{{"name":"signed","dist-tags":{{"latest":"2.0.0"}},"versions":{{"1.0.0":{{"name":"signed","version":"1.0.0","dist":{{"tarball":"http://127.0.0.1:{port}/one.tgz","integrity":null,"signatures":[{{"keyid":"SHA256:one","sig":"c2lnMQ=="}}]}}}},"2.0.0":{{"name":"signed","version":"2.0.0","dist":{{"tarball":"http://127.0.0.1:{port}/two.tgz","integrity":null}}}}}}}}"#
@@ -1235,7 +1219,7 @@ mod tests {
     /// carries it; see `CHANGELOG.md` and `ARCHITECTURE.md`.
     #[test]
     fn the_npm_lane_contributes_no_blocklist_identity() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1253,9 +1237,7 @@ mod tests {
                 if let Ok((mut stream, _)) = listener.accept() {
                     served += 1;
                     last = std::time::Instant::now();
-                    let mut buf = [0u8; 1024];
-                    let n = stream.read(&mut buf).unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let req = crate::registry::http_util::read_request_head(&mut stream);
                     if req.contains("GET /orgpkg ") {
                         // As generous as the wire gets: the member the
                         // abbreviated format never publishes, carrying several
@@ -1293,7 +1275,7 @@ mod tests {
 
     #[test]
     fn packument_404_reports_not_found() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1311,9 +1293,7 @@ mod tests {
                 if let Ok((mut stream, _)) = listener.accept() {
                     served += 1;
                     last = std::time::Instant::now();
-                    let mut buf = [0u8; 1024];
-                    let n = stream.read(&mut buf).unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let req = crate::registry::http_util::read_request_head(&mut stream);
                     if req.contains("GET /ghost ") {
                         let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                         let _ = stream.write_all(resp.as_bytes());

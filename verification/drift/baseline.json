@@ -1,0 +1,341 @@
+{
+  "cargo:anyhow@1.0.97": {
+    "band": "MEDIUM",
+    "risk_score": 10,
+    "rule_ids": [
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "cargo:base64@0.22.1": {
+    "band": "HIGH",
+    "risk_score": 35,
+    "rule_ids": [
+      "R03_HIGH_ENTROPY",
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "cargo:bytes@1.10.1": {
+    "band": "MEDIUM",
+    "risk_score": 10,
+    "rule_ids": [
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "cargo:clap@4.5.31": {
+    "band": "MEDIUM",
+    "risk_score": 10,
+    "rule_ids": [
+      "R04_DEPENDENCY_MODIFIED",
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "cargo:futures@0.3.31": {
+    "band": "MEDIUM",
+    "risk_score": 10,
+    "rule_ids": [
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "cargo:hyper@1.6.0": {
+    "band": "MEDIUM",
+    "risk_score": 10,
+    "rule_ids": [
+      "R04_DEPENDENCY_MODIFIED",
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "cargo:libc@0.2.170": {
+    "band": "MEDIUM",
+    "risk_score": 20,
+    "rule_ids": [
+      "R05_LARGE_PATCH_DIFF",
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "cargo:log@0.4.26": {
+    "band": "MEDIUM",
+    "risk_score": 10,
+    "rule_ids": [
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "cargo:rand@0.9.0": {
+    "band": "HIGH",
+    "risk_score": 45,
+    "rule_ids": [
+      "R03_EVAL_USAGE",
+      "R04_DEPENDENCY_ADDED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "cargo:regex@1.11.1": {
+    "band": "MEDIUM",
+    "risk_score": 10,
+    "rule_ids": [
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "cargo:reqwest@0.12.12": {
+    "band": "MEDIUM",
+    "risk_score": 10,
+    "rule_ids": [
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "cargo:serde@1.0.219": {
+    "band": "MEDIUM",
+    "risk_score": 10,
+    "rule_ids": [
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "cargo:syn@2.0.100": {
+    "band": "MEDIUM",
+    "risk_score": 10,
+    "rule_ids": [
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "cargo:tokio@1.44.0": {
+    "band": "BLOCK",
+    "risk_score": 100,
+    "rule_ids": [
+      "R03_CHILD_PROCESS",
+      "R03_CHILD_PROCESS",
+      "R03_CHILD_PROCESS",
+      "R03_CHILD_PROCESS",
+      "R03_CHILD_PROCESS",
+      "R03_CHILD_PROCESS",
+      "R03_CHILD_PROCESS",
+      "R03_CHILD_PROCESS",
+      "R03_CHILD_PROCESS",
+      "R04_DEPENDENCY_ADDED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "cargo:uuid@1.15.1": {
+    "band": "MEDIUM",
+    "risk_score": 10,
+    "rule_ids": [
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "npm:axios@1.7.9": {
+    "band": "BLOCK",
+    "risk_score": 100,
+    "rule_ids": [
+      "P03_PROVENANCE_NOT_CRYPTO_VERIFIED",
+      "R03_BASE64_DECODE",
+      "R03_BASE64_DECODE",
+      "R03_BASE64_DECODE",
+      "R03_BASE64_DECODE",
+      "R03_BASE64_DECODE",
+      "R03_BASE64_DECODE",
+      "R03_BASE64_DECODE",
+      "R03_BASE64_DECODE",
+      "R03_EVAL_USAGE",
+      "R03_EVAL_USAGE",
+      "R03_EVAL_USAGE",
+      "R03_EVAL_USAGE",
+      "R03_EVAL_USAGE",
+      "R03_EVAL_USAGE",
+      "R03_EVAL_USAGE",
+      "R03_EVAL_USAGE",
+      "R03_HIGH_ENTROPY",
+      "R03_HIGH_ENTROPY",
+      "R03_NETWORK_PRIMITIVE",
+      "R05_LARGE_PATCH_DIFF",
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "npm:chalk@5.4.1": {
+    "band": "MEDIUM",
+    "risk_score": 10,
+    "rule_ids": [
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "npm:colors@1.4.0": {
+    "band": "HIGH",
+    "risk_score": 35,
+    "rule_ids": [
+      "R03_EVAL_USAGE",
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "npm:debug@4.4.0": {
+    "band": "MEDIUM",
+    "risk_score": 10,
+    "rule_ids": [
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "npm:esbuild@0.25.0": {
+    "band": "HIGH",
+    "risk_score": 35,
+    "rule_ids": [
+      "R03_CHILD_PROCESS",
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "npm:express@4.21.2": {
+    "band": "MEDIUM",
+    "risk_score": 10,
+    "rule_ids": [
+      "R04_DEPENDENCY_MODIFIED",
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "npm:fastify@5.2.1": {
+    "band": "HIGH",
+    "risk_score": 45,
+    "rule_ids": [
+      "R01_LIFECYCLE_SCRIPT_MODIFIED",
+      "R04_DEPENDENCY_ADDED",
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "npm:glob@11.0.1": {
+    "band": "HIGH",
+    "risk_score": 35,
+    "rule_ids": [
+      "R01_LIFECYCLE_SCRIPT_MODIFIED",
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "npm:is-odd@3.0.1": {
+    "band": "MEDIUM",
+    "risk_score": 10,
+    "rule_ids": [
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "npm:left-pad@1.3.0": {
+    "band": "MEDIUM",
+    "risk_score": 10,
+    "rule_ids": [
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "npm:lodash@4.17.21": {
+    "band": "HIGH",
+    "risk_score": 60,
+    "rule_ids": [
+      "R03_EVAL_USAGE",
+      "R03_EVAL_USAGE",
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "npm:minimist@1.2.8": {
+    "band": "HIGH",
+    "risk_score": 45,
+    "rule_ids": [
+      "R03_EVAL_USAGE",
+      "R05_LARGE_PATCH_DIFF",
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "npm:moment@2.30.1": {
+    "band": "MEDIUM",
+    "risk_score": 10,
+    "rule_ids": [
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "npm:nanoid@5.0.9": {
+    "band": "MEDIUM",
+    "risk_score": 10,
+    "rule_ids": [
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "npm:node-fetch@3.3.2": {
+    "band": "MEDIUM",
+    "risk_score": 10,
+    "rule_ids": [
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "npm:request@2.88.2": {
+    "band": "MEDIUM",
+    "risk_score": 20,
+    "rule_ids": [
+      "R03_NETWORK_PRIMITIVE",
+      "R04_DEPENDENCY_MODIFIED",
+      "R04_DEPENDENCY_MODIFIED",
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "npm:rimraf@6.0.1": {
+    "band": "HIGH",
+    "risk_score": 70,
+    "rule_ids": [
+      "R03_EVAL_USAGE",
+      "R03_EVAL_USAGE",
+      "R04_DEPENDENCY_ADDED",
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "npm:semver@7.7.1": {
+    "band": "MEDIUM",
+    "risk_score": 10,
+    "rule_ids": [
+      "P03_PROVENANCE_NOT_CRYPTO_VERIFIED",
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "npm:typescript@5.7.3": {
+    "band": "HIGH",
+    "risk_score": 60,
+    "rule_ids": [
+      "R02_OPAQUE_LARGE_FILE_ADDED",
+      "R02_OPAQUE_LARGE_FILE_ADDED",
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  },
+  "npm:uuid@11.1.0": {
+    "band": "MEDIUM",
+    "risk_score": 10,
+    "rule_ids": [
+      "R07_UNREVIEWED_PREDECESSOR_BASELINE"
+    ]
+  }
+}

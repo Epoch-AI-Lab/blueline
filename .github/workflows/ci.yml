@@ -72,9 +72,16 @@ jobs:
       - uses: swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --locked -- -D warnings
 
+  # The release pipeline ships darwin and windows binaries, so the suite runs
+  # on all three platforms. Path-separator and platform-conditional behaviour
+  # that Linux silently absorbs has to surface here, not at release time.
   test:
-    name: Tests
-    runs-on: ubuntu-latest
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     env:
       CARGO_BUILD_WARNINGS: deny
     steps:
@@ -84,6 +91,144 @@ jobs:
         with:
           tool: cargo-nextest
       - run: cargo nextest run --all-targets --locked --test-threads 8
+
+  # Report-only: the number exists so "is this code even tested?" has an
+  # answer. A merge-blocking floor is deliberately absent until the baseline
+  # number is known — a floor set blind on a suite this size gates on noise.
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Measure coverage
+        run: cargo llvm-cov --all-targets --locked --lcov --output-path lcov.info
+      - name: Summarize coverage
+        run: |
+          python3 - <<'EOF'
+          import os, sys
+
+          # lcov tracefile format: per-file SF sections carrying hit (LH) and
+          # total (LF) line counters.
+          total_hit = total_line = 0
+          files = 0
+          hit = line = None
+          def flush():
+              global total_hit, total_line, files
+              if hit is not None and line:
+                  total_hit += hit
+                  total_line += line
+                  files += 1
+
+          with open("lcov.info") as fh:
+              for raw in fh:
+                  entry = raw.strip()
+                  if entry.startswith("SF:"):
+                      flush()
+                      hit = line = 0
+                  elif entry.startswith("LH:"):
+                      hit = int(entry[3:])
+                  elif entry.startswith("LF:"):
+                      line = int(entry[3:])
+                  elif entry == "end_of_record":
+                      flush()
+                      hit = line = None
+          flush()
+
+          if total_line == 0:
+              print("coverage trace contained no line records", file=sys.stderr)
+              sys.exit(1)
+          pct = 100.0 * total_hit / total_line
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
+              fh.write(f"## Coverage\n\n{pct:.1f}% line coverage "
+                       f"({total_hit}/{total_line} lines across {files} files)\n")
+          print(f"coverage: {pct:.1f}% ({total_hit}/{total_line})")
+          EOF
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-lcov
+          path: lcov.info
+
+  # The library surface (src/lib.rs) is public API for the fuzz crate and any
+  # downstream embedder. Breaking it silently breaks consumers; this is the
+  # check cargo cannot run for you. Baseline is the PR's merge base.
+  semver:
+    name: Semver (public API)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks
+      - name: Check for breaking API changes
+        env:
+          BASE_BRANCH: ${{ github.base_ref }}
+        run: cargo semver-checks --baseline-rev "origin/$BASE_BRANCH"
+
+  # libFuzzer smoke over the parse/extract surface: 60 seconds per target, no
+  # corpus persistence (the nightly soak owns that). A crash or a sanitizer
+  # trip on the first minute of input fails the PR. Only runs when the diff
+  # touches a module a fuzz target reaches; elsewhere this is dead weight.
+  fuzz-smoke:
+    name: Fuzz smoke (parse surface)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: swatinem/rust-cache@v2
+      - name: Check the parse surface changed vs base
+        id: changed
+        env:
+          BASE_BRANCH: ${{ github.base_ref }}
+        run: |
+          BASE="origin/$BASE_BRANCH"
+          CHANGED="$(git diff --name-only "$BASE"...HEAD)"
+          if printf '%s\n' "$CHANGED" | grep -qE '^(src/(extract|manifest|version|pkgbuild|install_ref|wheel_extract)\.rs|fuzz/|Cargo\.lock|fuzz/Cargo\.lock)$'; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "parse surface unchanged vs $BASE — skipping fuzz smoke"
+          fi
+      - uses: taiki-e/install-action@v2
+        if: steps.changed.outputs.changed == 'true'
+        with:
+          tool: cargo-fuzz
+      - name: Install nightly toolchain
+        if: steps.changed.outputs.changed == 'true'
+        # cargo-fuzz builds against gnu with the sanitizer flags; musl is
+        # deliberately not used (ASan is incompatible with its statically
+        # linked libc) and -Zbuild-std is not needed.
+        run: |
+          rustup toolchain install nightly --profile minimal
+      - name: Smoke each fuzz target
+        if: steps.changed.outputs.changed == 'true'
+        run: |
+          # A throwaway copy of the committed seeds, so grown inputs never
+          # dirty the workspace (the nightly soak owns corpus growth).
+          corpus_dir="$(mktemp -d)"
+          trap 'rm -rf "$corpus_dir"' EXIT
+          for target in safe_extract read_package_json pypi_version aur_version pkgbuild_tokenizer install_ref_scan; do
+            cp -r "fuzz/corpus/$target" "$corpus_dir/$target"
+            # gnu, not cargo-fuzz's musl default: ASan is incompatible with
+            # musl's statically linked libc.
+            cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$target" "$corpus_dir/$target" -- \
+              -max_total_time=60 -rss_limit_mb=4096 -timeout=25
+          done
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-smoke-crashes
+          path: fuzz/artifacts
 
   audit:
     name: Supply-chain audit
@@ -361,6 +506,13 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-mutants
+      # The exclusion list lives in scripts/mutants_exclude.re, shared verbatim
+      # with the nightly full-tree mutation job. Every entry carries a
+      # documented reason in the giant comment block below; the two jobs must
+      # never drift, which a shared file guarantees and two copies of a regex
+      # this size did not.
+      - name: Load shared mutant exclusions
+        run: printf 'BLUELINE_MUTANTS_EXCLUDE=%s\n' "$(cat scripts/mutants_exclude.re)" >> "$GITHUB_ENV"
       - name: Diff against PR base
         env:
           BASE_REF: ${{ github.base_ref }}
@@ -387,8 +539,10 @@ jobs:
       # rather than by arithmetic a mutant can invert. The step below stays a
       # plain invocation, so a mutant that exhausts memory is loud again.
       - name: Mutate the changed lines
-        env:
-          # Two mutation genres cannot compile against this tree, so cargo-mutants
+        # The exclusion list is loaded from scripts/mutants_exclude.re in the
+        # step above; every entry below carries its documented reason.
+        #
+        # Two mutation genres cannot compile against this tree, so cargo-mutants
           # reports them `Unviable` and the shard exits non-zero. Neither is a
           # surviving mutant; both are the harness failing to build its own edit.
           #
@@ -455,7 +609,12 @@ jobs:
           # function guards the empty-parent filter, and `tempfile_in("")` and
           # `tempfile_in(".")` both create the temp file in the current
           # directory, so no input distinguishes them.
-          BLUELINE_MUTANTS_EXCLUDE: 'with .*Default::default\(\)|replace && with \|\| in .*|delete ! in (spawn_child|may_spawn_child|may_spawn_child_given|export_osv)|replace may_spawn_child(_given)? -> bool with true|replace <= with > in evaluate_candidates|replace == with != in scan_file|replace < with <= in levenshtein_at_most_one|replace < with > in levenshtein_at_most_one|replace \+= with \*= in levenshtein_at_most_one|replace > with < in levenshtein_at_most_one'
+          #
+          # `replace set_file_perm with ()` and `replace set_dir_perm with ()`
+          # are true equivalents: both functions are `#[cfg(not(unix))]` stubs
+          # that delegate to the `set_perm` stub, which is a no-op off unix
+          # and unbuildable on a Linux runner. No test can distinguish them
+          # from the empty body cargo mutants produces.
         run: |
           cargo mutants --in-diff pr.diff --shard ${{ matrix.shard }}/32 \
             --file 'src/**/*.rs' \
@@ -525,15 +684,6 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUSTFLAGS: ""
-      # Same two unbuildable mutation genres as mutants-pr, and the same reason:
-      # `replace <return type> with Default::default()` needs a `Default` impl
-      # several security types deliberately lack, and `||` is not valid inside a
-      # `let` chain, so neither edit ever becomes a tree that could be killed.
-      # The fork-bomb guard mutants are excluded for the same reason as in
-      # mutants-pr: executing them re-execs the test harness and detonates the
-      # runner, so they can only be pinned by the fast `may_spawn_child`
-      # assertion, never by running the mutant to completion.
-      BLUELINE_MUTANTS_EXCLUDE: 'with .*Default::default\(\)|replace && with \|\| in .*|delete ! in (spawn_child|may_spawn_child|may_spawn_child_given|export_osv)|replace may_spawn_child(_given)? -> bool with true|replace <= with > in evaluate_candidates|replace == with != in scan_file|replace < with <= in levenshtein_at_most_one|replace < with > in levenshtein_at_most_one|replace \+= with \*= in levenshtein_at_most_one|replace > with < in levenshtein_at_most_one'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -542,6 +692,11 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-mutants
+      # Shared exclusion list, loaded from scripts/mutants_exclude.re — the
+      # same file mutants-pr reads. The excluded genres and their reasons are
+      # documented in the comment block inside the mutants-pr job.
+      - name: Load shared mutant exclusions
+        run: printf 'BLUELINE_MUTANTS_EXCLUDE=%s\n' "$(cat scripts/mutants_exclude.re)" >> "$GITHUB_ENV"
       - name: Diff against previous commit
         run: git diff HEAD~1..HEAD -- > push.diff
       - name: Mutate the changed lines

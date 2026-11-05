@@ -7,7 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Tiered verification infrastructure.** Level 1 fills the PR-gate gaps: a
+  report-only `coverage` job (cargo-llvm-cov, lcov artifact + step summary), a
+  `semver` job (cargo-semver-checks against the PR base, guarding the public
+  library surface), a cross-platform `test` matrix (ubuntu/macos/windows — the
+  release pipeline already shipped for all three), and a path-gated
+  `fuzz-smoke` job (60 s per target, only when the diff touches the
+  parse/extract surface). Level 2 turns on the dormant verification assets:
+  the previously-unused `proptest` dependency now backs `tests/properties.rs`
+  (version-ordering totality in all three grammars, policy TOML round-trip,
+  extraction containment over generated hostile archives), the six fuzz
+  targets get a committed seed corpus (`scripts/gen_fuzz_seeds.py`), and
+  `benchmark_suite.py`'s adversarial section actually drives the binary
+  instead of printing hardcoded checkmarks. Level 3 is a new nightly workflow
+  (`.github/workflows/nightly.yml`): a 30-min-per-target fuzz soak with a
+  persistent corpus cache, full-tree mutation testing (the CI jobs only ever
+  mutate a diff), report-only perf tracking under the fork-bomb watchdog, and
+  a live-package drift watch (`scripts/drift_watch.py`,
+  `verification/drift/watchlist.toml`) that fails when a pinned real-world
+  package's verdict changes against the committed baseline. The mutation
+  exclusion regex now lives once in `scripts/mutants_exclude.re`, shared by
+  both mutation jobs and the nightly run. `scripts/verify.sh --fuzz` runs the
+  fuzz smoke locally.
+
 ### Fixed
+
+- **PEP 440 parses whose canonical form exceeds 256 bytes are rejected.** Inputs
+  longer than 256 bytes were already refused; normalization can canonicalize a
+  shorter input into a longer one (`c` reads as `rc`, a bare `r<n>` reads as
+  `.post<n>`), so the canonical string is now held to the same cap. Found by
+  the fuzz smoke.
+- **`safe_extract` refuses rooted tar entry paths on every platform.** A
+  leading `/` (or a Windows prefix like `C:\`) used to only fail on Linux; the
+  `has_root` check now runs everywhere. The wheel path checks the raw zip name
+  for the same reason before any `enclosed_name` sanitization can hide it.
+
+- **Gate four integration tests on Unix so the cross-platform test matrix passes on Windows.** `recall_export_osv_refuses_symlink_out`, `install_delegates_to_npm_with_ignore_scripts`, `shim_installs_gates_and_uninstalls` and `shim_fails_closed_when_the_baked_blueline_binary_is_missing` either create or execute on-disk `#!/bin/sh` scripts / symlinks that Windows cannot create or exec, so they now run only on Unix like the other platform-specific tests in the suite.
 
 - **rustls-webpki bumped to 0.103.16 and webpki-roots to 1.0.10**, clearing
   RUSTSEC-2026-0382 and RUSTSEC-2026-0381 (distrusted emSign intermediates;
