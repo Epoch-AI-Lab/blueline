@@ -445,7 +445,7 @@ fn rel_components_under(root: &Path, out: &mut Vec<PathBuf>) {
 /// fails loudly if the extractor ever starts refusing everything.
 #[test]
 fn benign_archive_extracts_cleanly_and_stays_inside() {
-    let specs = vec![
+    let specs = [
         Spec::File {
             path: "package/lib/ok.js".to_string(),
             contents: "ok".to_string(),
