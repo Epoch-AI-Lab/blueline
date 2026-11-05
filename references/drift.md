@@ -24,7 +24,7 @@ Severity is this file's own judgement, not the project's.
 | 9 | ~~`hex_to_bytes` uses `.unwrap_or(0)`, mapping invalid hex to byte `0`~~ **resolved** — the helper is fallible and `to_sri` returns `Result` | Low |
 | 5 | ~~`registry/mod.rs` doc comments are stale~~ **resolved** — both were deleted; the four adapters are all real. See below | Low |
 | 6 | ~~Manager count is six in `CHANGELOG` 0.3.1, eleven in `ARCHITECTURE.md` §5; `--help` says eleven~~ — **resolved:** the 0.3.1 entry now says eleven, matching `--help` and `SHIM_MANAGERS` | Low — `--help` was authoritative |
-| 7 | ~~Dead code: `Policy::is_maintainer_blocked`, `blocklist.maintainers`, `allowlist.packages[].max_risk` / `.integrity`~~ **resolved** — the three policy keys are now refused at load. Still dead: `BaselineStore::clear_advisory_cache` | Low — test-only helper, `#[allow(dead_code)]` |
+| 7 | ~~Dead code: `Policy::is_maintainer_blocked`, `blocklist.maintainers`, `allowlist.packages[].max_risk` / `.integrity`~~ **resolved** — the three policy keys are now refused at load; the remaining `clear_advisory_cache` allow was redundant and is removed | Low — method is reachable public API with one test caller |
 
 ## Lane verification basis
 
@@ -139,10 +139,9 @@ Each finding is cited in its lane file with the exact source location.
    entry now says eleven.
 7. **~~`BaselineStore::clear_advisory_cache` and
    `BaselineResolution::display_summary` are dead~~ — `display_summary` is
-   deleted; `impl BaselineResolution` carries only `package()`. The one that
-   remains is `clear_advisory_cache`, `#[allow(dead_code)]` with one test
-   caller, so the marker is deliberate rather than rot. See
-   [store](features/store.md).
+   deleted; `impl BaselineResolution` carries only `package()`.
+   `clear_advisory_cache` stays as public API; its `#[allow(dead_code)]` was
+   redundant, so it has been removed. See [store](features/store.md).
 
    This item originally also listed `Policy::is_maintainer_blocked`,
    `blocklist.maintainers`, and `allowlist.packages[].max_risk` / `.integrity`.
