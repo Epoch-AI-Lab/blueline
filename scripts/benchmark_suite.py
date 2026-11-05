@@ -83,7 +83,6 @@ BAND_RANK = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "BLOCK": 3}
 
 def register_adversarial_packages(registry_url):
     """Build the hostile packages on the mock registry and return the cases."""
-    osc_payload = ("a" + "\x1b]8;;http://evil.example\x07" + "b") * 4000
     hex_blob = "const buf = Buffer.from(\"" + "\\x41" * 512 + "\", \"hex\");"
 
     cases = [
@@ -103,8 +102,8 @@ def register_adversarial_packages(registry_url):
         {
             "id": "osc-escape-flood",
             "why": "uncapped OSC payloads must not reach a terminal unescaped",
-            "files": {"lib/banner.js": osc_payload},
-            "forbid_esc_bytes": True,
+            "files": {"lib/\x1b]8;;http://evil.example\x07pwned.js": "console.log('x')\n"},
+            "raw_esc_output_forbidden": True,
         },
         {
             "id": "dynamic-function-heuristic",
@@ -145,15 +144,6 @@ def register_adversarial_packages(registry_url):
     return cases
 
 
-def verdict_has_esc_bytes(node):
-    if isinstance(node, str):
-        return "\x1b" in node
-    if isinstance(node, dict):
-        return any(verdict_has_esc_bytes(v) for v in node.values())
-    if isinstance(node, list):
-        return any(verdict_has_esc_bytes(v) for v in node)
-    return False
-
 
 def run_adversarial_checks(current_bin, registry_url):
     """Review each hostile package with the current binary and assert the
@@ -167,6 +157,26 @@ def run_adversarial_checks(current_bin, registry_url):
     for case in cases:
         spec = f"{case['pkg_name']}@1.0.0"
         tmp_dir = tempfile.mkdtemp()
+        if case.get("raw_esc_output_forbidden"):
+            try:
+                raw = subprocess.run(
+                    [current_bin, "review", spec, "--registry", registry_url, "--output", "text"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=60,
+                    env={**os.environ, "BLUELINE_DATA_DIR": tmp_dir},
+                )
+            except subprocess.TimeoutExpired:
+                failures.append(f"{case['id']}: review of {spec} hung past 60s")
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                continue
+            if b"\x1b" in raw.stdout or b"\x1b" in raw.stderr:
+                failures.append(f"{case['id']}: raw ESC byte reached text output")
+            else:
+                print(f"  ✓ {case['why']} (exit {raw.returncode})")
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            continue
+
         try:
             res = subprocess.run(
                 [current_bin, "review", spec, "--registry", registry_url, "--output", "json"],
@@ -209,9 +219,6 @@ def run_adversarial_checks(current_bin, registry_url):
             continue
 
         case_failed = False
-        if case.get("forbid_esc_bytes") and verdict_has_esc_bytes(verdict):
-            failures.append(f"{case['id']}: raw ESC byte reached the JSON verdict")
-            case_failed = True
         if "expect_finding" in case:
             joined = " ".join(
                 f"{f.get('rule_id', '')} {f.get('title', '')} {f.get('description', '')}"

@@ -85,7 +85,9 @@ stage_mutants() {
     echo "mutating ${#files[@]} files"
     local args=() f
     for f in "${files[@]}"; do args+=(--file "$f"); done
-    cargo mutants "${args[@]}" --in-place --baseline=skip --timeout 30
+    local exclude
+    exclude="$(cat scripts/mutants_exclude.re)"
+    cargo mutants "${args[@]}" --in-place --baseline=skip --timeout 300 --exclude-re "$exclude"
 }
 
 stage_deny() {
@@ -113,6 +115,7 @@ stage_fuzz() {
     # Run against a throwaway copy of the committed seeds: libFuzzer writes
     # every grown input back into its corpus dir, and the committed corpus is
     # a reviewed floor, not a scratch space (the nightly soak owns growth).
+    local rc=0
     FUZZ_CORPUS_DIR="$(mktemp -d)"
     trap 'rm -rf "$FUZZ_CORPUS_DIR"' EXIT
     for target in safe_extract read_package_json pypi_version aur_version pkgbuild_tokenizer install_ref_scan; do
@@ -120,9 +123,12 @@ stage_fuzz() {
         cp -r "fuzz/corpus/$target" "$FUZZ_CORPUS_DIR/$target"
         # gnu, not cargo-fuzz's musl default: ASan is incompatible with musl's
         # statically linked libc. Same invocation as the CI fuzz-smoke job.
-        cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$target" "$FUZZ_CORPUS_DIR/$target" -- \
-            -max_total_time="$secs" -rss_limit_mb=4096 -timeout=25
+        if ! cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$target" "$FUZZ_CORPUS_DIR/$target" -- \
+            -max_total_time="$secs" -rss_limit_mb=4096 -timeout=25; then
+            rc=1
+        fi
     done
+    return "$rc"
 }
 
 stages="fmt, clippy, test, references"

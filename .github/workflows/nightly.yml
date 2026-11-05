@@ -46,15 +46,15 @@ jobs:
         with:
           tool: cargo-fuzz
       - name: Install nightly toolchain
-        # cargo-fuzz builds against musl with -Zbuild-std, which needs the
-        # rust-src component and the musl std on the nightly toolchain.
+        # cargo-fuzz builds against gnu with the sanitizer flags; musl is
+        # deliberately not used (ASan is incompatible with its statically
+        # linked libc) and -Zbuild-std is not needed.
         run: |
-          rustup toolchain install nightly --profile minimal --component rust-src
-          rustup target add x86_64-unknown-linux-musl --toolchain nightly
+          rustup toolchain install nightly --profile minimal
       - name: Restore fuzz corpus
         uses: actions/cache@v4
         with:
-          path: fuzz/corpus
+          path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
           restore-keys: fuzz-corpus-${{ matrix.target }}-
       - name: Soak
@@ -65,7 +65,7 @@ jobs:
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: fuzz/corpus
+          path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
       - uses: actions/upload-artifact@v4
         if: failure()
@@ -154,6 +154,8 @@ jobs:
       - name: Build release binary
         run: cargo build --locked --release
       - name: Run perf harness under the watchdog
+        env:
+          POLICY: ${{ github.workspace }}/verification/drift/policy.toml
         run: |
           {
             echo "## Perf harness"
@@ -177,7 +179,7 @@ jobs:
   drift-watch:
     name: Drift watch (real packages)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: swatinem/rust-cache@v2

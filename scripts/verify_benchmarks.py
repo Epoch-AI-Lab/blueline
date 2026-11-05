@@ -52,7 +52,7 @@ def benchmark_lockfile_ci(bin_path, iterations=15):
         subprocess.run(["git", "commit", "-m", "base"], cwd=td, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         with open(os.path.join(td, "blueline.toml"), "w") as f:
-            f.write("[ci]\nmax_evaluations = 10\n[provenance]\nrequire_provenance = false\n")
+            f.write("[ci]\nmax_evaluations = 10\n[provenance]\nrequire_provenance = false\n[policy]\ncheck_advisories = false\n")
 
         with open(base_lock, "w") as f:
             f.write(head_json)
