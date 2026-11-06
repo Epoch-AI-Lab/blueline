@@ -289,9 +289,8 @@ fn extract_local(
 ) -> Result<ExtractStats, BluelineError> {
     let limits = ExtractionLimits::default();
     match kind {
-        // `src/wheel_extract.rs` is a one-line re-export of
-        // `safe_extract_wheel`, so going through it would be ceremony preserving
-        // a module with no other reason to exist.
+        // The wheel path lives in `crate::extract::safe_extract_wheel`;
+        // call it directly, without a re-export module.
         ArchiveKind::Tar => crate::extract::safe_extract(bytes, dest, &limits),
         ArchiveKind::Wheel => crate::extract::safe_extract_wheel(bytes, dest, &limits),
     }

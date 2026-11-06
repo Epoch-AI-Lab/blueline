@@ -745,6 +745,38 @@ pub fn render_text_summary_to_string(report: &CiReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn npm_tgz(name: &str, version: &str) -> Vec<u8> {
+        use std::io::Write as _;
+        let manifest = format!(r#"{{"name":"{name}","version":"{version}"}}"#);
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(manifest.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "package/package.json", manifest.as_bytes())
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&tar_data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn sri_sha512(bytes: &[u8]) -> String {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+        let mut hasher = sha2::Sha512::new();
+        hasher.update(bytes);
+        format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
+        )
+    }
+
     fn test_bases(registry: &str) -> crate::cli::RegistryBases {
         crate::cli::RegistryBases::from_flags(registry, "https://index.crates.io")
     }
@@ -1524,39 +1556,6 @@ source = "path+file:///some/local/path"
             Arc,
             atomic::{AtomicBool, Ordering},
         };
-
-        fn npm_tgz(name: &str, version: &str) -> Vec<u8> {
-            use std::io::Write as _;
-            let manifest = format!(r#"{{"name":"{name}","version":"{version}"}}"#);
-            let mut tar_data = Vec::new();
-            {
-                let mut builder = tar::Builder::new(&mut tar_data);
-                let mut header = tar::Header::new_gnu();
-                header.set_size(manifest.len() as u64);
-                header.set_mode(0o644);
-                header.set_cksum();
-                builder
-                    .append_data(&mut header, "package/package.json", manifest.as_bytes())
-                    .unwrap();
-                builder.finish().unwrap();
-            }
-            let mut encoder =
-                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-            encoder.write_all(&tar_data).unwrap();
-            encoder.finish().unwrap()
-        }
-
-        fn sri_sha512(bytes: &[u8]) -> String {
-            use base64::Engine as _;
-            use sha2::Digest as _;
-            let mut hasher = sha2::Sha512::new();
-            hasher.update(bytes);
-            format!(
-                "sha512-{}",
-                base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
-            )
-        }
-
         let tgz_dash = npm_tgz("foo-bar", "2.0.0");
         let tgz_dot = npm_tgz("foo.bar", "2.0.0");
         let integ_dash = sri_sha512(&tgz_dash);
@@ -1695,39 +1694,6 @@ source = "path+file:///some/local/path"
             Arc,
             atomic::{AtomicBool, Ordering},
         };
-
-        fn npm_tgz(name: &str, version: &str) -> Vec<u8> {
-            use std::io::Write as _;
-            let manifest = format!(r#"{{"name":"{name}","version":"{version}"}}"#);
-            let mut tar_data = Vec::new();
-            {
-                let mut builder = tar::Builder::new(&mut tar_data);
-                let mut header = tar::Header::new_gnu();
-                header.set_size(manifest.len() as u64);
-                header.set_mode(0o644);
-                header.set_cksum();
-                builder
-                    .append_data(&mut header, "package/package.json", manifest.as_bytes())
-                    .unwrap();
-                builder.finish().unwrap();
-            }
-            let mut encoder =
-                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-            encoder.write_all(&tar_data).unwrap();
-            encoder.finish().unwrap()
-        }
-
-        fn sri_sha512(bytes: &[u8]) -> String {
-            use base64::Engine as _;
-            use sha2::Digest as _;
-            let mut hasher = sha2::Sha512::new();
-            hasher.update(bytes);
-            format!(
-                "sha512-{}",
-                base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
-            )
-        }
-
         const SLOW: &str = "aaa-slow";
         const FAST: [&str; 4] = ["bbb-fast", "ccc-fast", "ddd-fast", "eee-fast"];
         const SLOW_DELAY_MS: u64 = 700;

@@ -51,7 +51,6 @@ the prose docs.
 | [policy](features/policy.md) | `src/policy.rs` production + 15 test names |
 | [baseline](features/baseline.md) | `src/baseline.rs` production + 12 test names |
 | [review](features/review.md) | `src/review.rs` production + 31 test names |
-| [wheel_extract](features/wheel_extract.md) | `src/wheel_extract.rs` (one line) |
 
 ## Evidence
 

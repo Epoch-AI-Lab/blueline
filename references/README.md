@@ -34,7 +34,6 @@ and fix this file in the same branch.
 | [Heuristics & scoring](features/heuristic.md) | rule engine, risk-score arithmetic, band escalation | `src/heuristic.rs` |
 | [Extraction](features/extract.md) | bounded tar/wheel unpack, entry-type rejection, path validation | `src/extract.rs` |
 | [Extraction sandbox](features/sandbox.md) | Landlock child around extraction, reply protocol, P05 disclosure, `require_sandbox` | `src/sandbox.rs` |
-| [Wheel extraction](features/wheel_extract.md) | the `.data/scripts` and `.data/data` payload split | `src/wheel_extract.rs` |
 | [Diff](features/diff.md) | file/line delta, executable + binary classification | `src/diff.rs` |
 | [Manifest parsing](features/manifest.md) | `package.json`, packed `Cargo.toml`, `.SRCINFO` | `src/manifest.rs` |
 | [Render](features/render.md) | review card, JSON purity, terminal/BiDi sanitizers | `src/render.rs` |

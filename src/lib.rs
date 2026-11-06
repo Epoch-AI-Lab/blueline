@@ -33,4 +33,3 @@ pub mod store;
 pub(crate) mod test_support;
 pub mod verdict;
 pub mod version;
-pub mod wheel_extract;
