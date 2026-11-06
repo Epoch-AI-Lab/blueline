@@ -19,6 +19,8 @@ pub fn fixture_git(dir: &Path, args: &[&str]) {
     );
 }
 
+/// Read one HTTP request off the stream: headers through the blank line,
+/// then the full `Content-Length` body. Returns (body offset, buffer).
 pub fn read_http_request(stream: &mut TcpStream) -> Option<(usize, Vec<u8>)> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
@@ -51,6 +53,8 @@ pub fn read_http_request(stream: &mut TcpStream) -> Option<(usize, Vec<u8>)> {
     Some((head_end, buf))
 }
 
+/// One stateless `git upload-pack` round: feed the request body on stdin,
+/// return the response bytes. `--advertise-refs` serves the info/refs GET.
 pub fn upload_pack(bare: &Path, advertise: bool, body: &[u8]) -> Option<Vec<u8>> {
     let mut args = vec!["upload-pack", "--stateless-rpc"];
     if advertise {

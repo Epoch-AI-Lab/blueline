@@ -322,12 +322,6 @@ fn spawn_aur_first_sighting_fixture() -> AurReviewFixture {
     }
 }
 
-/// Read one HTTP request off the stream: headers through the blank line,
-/// then the full `Content-Length` body. Returns (body offset, buffer).
-
-/// One stateless `git upload-pack` round: feed the request body on stdin,
-/// return the response bytes. `--advertise-refs` serves the info/refs GET.
-
 fn serve_aur(stream: &mut TcpStream, rpc: &str, bare: &Path) {
     let Some((head_end, req)) = read_http_request(stream) else {
         return;
