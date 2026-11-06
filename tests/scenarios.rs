@@ -729,7 +729,7 @@ fn shim_fails_closed_when_the_baked_blueline_binary_is_missing() {
     assert!(
         install.status.success(),
         "shim install failed: {}",
-        String::from_utf8_lossy(&install.stderr)
+        stderr(&install)
     );
 
     let shim = shim_dir.join("npm");
@@ -841,3 +841,7 @@ const ROUTABLE_LITERALS: &[&str] = &[
     "osv.dev",
     "https://",
 ];
+
+fn stderr(out: &std::process::Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}

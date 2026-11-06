@@ -4,13 +4,17 @@
 //! behavior lives in `src/registry/aur.rs` unit tests and
 //! `tests/aur_adapter.rs`.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+
+mod aur_fixture;
+
+use aur_fixture::{fixture_git, read_http_request, upload_pack};
 
 #[test]
 fn install_refuses_aur_before_any_network_use() {
@@ -172,19 +176,6 @@ struct AurReviewFixture {
     _dir: tempfile::TempDir,
 }
 
-fn fixture_git(dir: &Path, args: &[&str]) {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
 fn write_fixture_pkg(repo: &Path, pkgver: &str, keys: &str) {
     std::fs::write(
         repo.join("PKGBUILD"),
@@ -333,58 +324,9 @@ fn spawn_aur_first_sighting_fixture() -> AurReviewFixture {
 
 /// Read one HTTP request off the stream: headers through the blank line,
 /// then the full `Content-Length` body. Returns (body offset, buffer).
-fn read_http_request(stream: &mut TcpStream) -> Option<(usize, Vec<u8>)> {
-    let mut buf = Vec::new();
-    let mut tmp = [0u8; 4096];
-    let head_end = loop {
-        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos + 4;
-        }
-        if buf.len() > 65_536 {
-            return None;
-        }
-        let n = stream.read(&mut tmp).ok()?;
-        if n == 0 {
-            return None;
-        }
-        buf.extend_from_slice(&tmp[..n]);
-    };
-    let headers = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
-    let content_length: usize = headers
-        .lines()
-        .find_map(|l| l.strip_prefix("content-length:"))
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0);
-    while buf.len() < head_end + content_length {
-        let n = stream.read(&mut tmp).ok()?;
-        if n == 0 {
-            return None;
-        }
-        buf.extend_from_slice(&tmp[..n]);
-    }
-    Some((head_end, buf))
-}
 
 /// One stateless `git upload-pack` round: feed the request body on stdin,
 /// return the response bytes. `--advertise-refs` serves the info/refs GET.
-fn upload_pack(bare: &Path, advertise: bool, body: &[u8]) -> Option<Vec<u8>> {
-    let mut args = vec!["upload-pack", "--stateless-rpc"];
-    if advertise {
-        args.push("--advertise-refs");
-    }
-    let mut child = std::process::Command::new("git")
-        .args(&args)
-        .arg(".")
-        .current_dir(bare)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-    child.stdin.take()?.write_all(body).ok()?;
-    let out = child.wait_with_output().ok()?;
-    out.status.success().then_some(out.stdout)
-}
 
 fn serve_aur(stream: &mut TcpStream, rpc: &str, bare: &Path) {
     let Some((head_end, req)) = read_http_request(stream) else {

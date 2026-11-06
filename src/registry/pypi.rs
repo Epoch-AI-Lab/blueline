@@ -7,7 +7,6 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use ureq::Agent;
-const USER_AGENT: &str = concat!("blueline/", env!("CARGO_PKG_VERSION"));
 const SIMPLE_ACCEPT: &str = "application/vnd.pypi.simple.v1+json";
 
 /// How many Simple API pages one logical read will walk before refusing.
@@ -49,7 +48,7 @@ impl PyPIRegistry {
         Self::with_limits(base, RegistryLimits::default())
     }
     pub fn with_limits(base: &str, limits: RegistryLimits) -> Self {
-        let agent = super::http_util::registry_agent(USER_AGENT, base);
+        let agent = super::http_util::registry_agent(super::http_util::USER_AGENT, base);
         Self {
             agent,
             base: base.trim_end_matches('/').to_string(),

@@ -6,148 +6,16 @@
 #[cfg(unix)]
 use std::collections::HashMap;
 #[cfg(unix)]
-use std::io::{Read, Write};
-#[cfg(unix)]
-use std::net::{TcpListener, TcpStream};
-#[cfg(unix)]
 use std::path::Path;
-#[cfg(unix)]
-use std::sync::Arc;
 
 #[cfg(unix)]
 use assert_cmd::Command;
-#[cfg(unix)]
-use base64::Engine;
-#[cfg(unix)]
-use sha2::{Digest, Sha512};
 
 #[cfg(unix)]
-struct Fixture {
-    base: String,
-    _server: std::thread::JoinHandle<()>,
-}
+mod mock_registry;
 
 #[cfg(unix)]
-fn spawn_fixture<F>(build: F) -> Fixture
-where
-    F: FnOnce(&str) -> HashMap<String, (String, Vec<u8>)> + Send + 'static,
-{
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    let packages = Arc::new(build(&base));
-    let handle = std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            let packages = packages.clone();
-            std::thread::spawn(move || serve(&mut stream, &packages));
-        }
-    });
-    Fixture {
-        base,
-        _server: handle,
-    }
-}
-
-#[cfg(unix)]
-fn serve(stream: &mut TcpStream, packages: &Arc<HashMap<String, (String, Vec<u8>)>>) {
-    let mut buf = Vec::new();
-    let mut tmp = [0u8; 2048];
-    loop {
-        match stream.read(&mut tmp) {
-            Ok(0) | Err(_) => return,
-            Ok(n) => {
-                buf.extend_from_slice(&tmp[..n]);
-                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-                if buf.len() > 65_536 {
-                    return;
-                }
-            }
-        }
-    }
-    let req = String::from_utf8_lossy(&buf);
-    let path = req
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .unwrap_or("/")
-        .trim_start_matches('/')
-        .to_string();
-    let body: Vec<u8> = if let Some((pack, _)) = packages.get(&path) {
-        pack.as_bytes().to_vec()
-    } else {
-        let segments: Vec<&str> = path.split('/').collect();
-        if segments.len() == 3 {
-            let tgz = segments[2].strip_suffix(".tgz").unwrap_or(segments[2]);
-            match tgz.rsplit_once('-') {
-                Some((name, _)) => match packages.get(name) {
-                    Some((_, tar)) => tar.clone(),
-                    None => return,
-                },
-                None => return,
-            }
-        } else {
-            return;
-        }
-    };
-    let head = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    let _ = stream.write_all(head.as_bytes());
-    let _ = stream.write_all(&body);
-}
-
-#[cfg(unix)]
-fn tarball_with(json: &str, extra: &[(&str, &[u8])]) -> Vec<u8> {
-    let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    let mut builder = tar::Builder::new(encoder);
-    let mut h = tar::Header::new_gnu();
-    h.set_size(json.len() as u64);
-    h.set_mode(0o644);
-    h.set_cksum();
-    builder
-        .append_data(&mut h, "package/package.json", json.as_bytes())
-        .unwrap();
-    for (path, content) in extra {
-        let mut h = tar::Header::new_gnu();
-        h.set_size(content.len() as u64);
-        h.set_mode(0o644);
-        h.set_cksum();
-        builder.append_data(&mut h, *path, *content).unwrap();
-    }
-    builder.into_inner().unwrap().finish().unwrap()
-}
-
-#[cfg(unix)]
-fn sha512_b64(data: &[u8]) -> String {
-    let digest = Sha512::digest(data);
-    format!(
-        "sha512-{}",
-        base64::engine::general_purpose::STANDARD.encode(digest)
-    )
-}
-
-#[cfg(unix)]
-fn packument(name: &str, base: &str, version: &str, integrity: &str) -> String {
-    serde_json::json!({
-        "name": name,
-        "dist-tags": { "latest": version },
-        "versions": {
-            version: {
-                "name": name,
-                "version": version,
-                "dist": {
-                    "tarball": format!("{base}/{name}/-/{name}-{version}.tgz"),
-                    "integrity": integrity,
-                    "shasum": "0".repeat(40)
-                }
-            }
-        }
-    })
-    .to_string()
-}
+use mock_registry::{Fixture, packument, sha512_b64, spawn_fixture, tarball_with};
 
 #[cfg(unix)]
 fn spawn_two_packages() -> Fixture {
@@ -239,11 +107,7 @@ fn shim_installs_gates_and_uninstalls() {
         )
         .output()
         .unwrap();
-    assert!(
-        out.status.success(),
-        "install failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert!(out.status.success(), "install failed: {}", stderr(&out));
     let shim = shim_dir.join("npm");
     assert!(shim.is_file(), "shim script must exist");
 
@@ -350,7 +214,7 @@ fn shim_installs_all_eleven_managers() {
     assert!(
         out.status.success(),
         "installing all managers failed: {}",
-        String::from_utf8_lossy(&out.stderr)
+        stderr(&out)
     );
     for manager in managers {
         assert!(
@@ -412,4 +276,8 @@ fn shim_install_refuses_unknown_manager_and_missing_real_binary() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(!shim_dir.join("npm").exists());
+}
+
+fn stderr(out: &std::process::Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
 }

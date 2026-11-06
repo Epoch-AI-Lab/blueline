@@ -4,129 +4,14 @@
 //! per policy), and prove the curation export works.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{BufRead, BufReader};
 use std::process::{Child, Stdio};
-use std::sync::Arc;
 
 use assert_cmd::Command;
-use base64::Engine;
-use sha2::{Digest, Sha512};
 
-struct Fixture {
-    base: String,
-    _server: std::thread::JoinHandle<()>,
-}
+mod mock_registry;
 
-fn spawn_fixture<F>(build: F) -> Fixture
-where
-    F: FnOnce(&str) -> HashMap<String, (String, Vec<u8>)> + Send + 'static,
-{
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    let packages = Arc::new(build(&base));
-    let handle = std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            let packages = packages.clone();
-            std::thread::spawn(move || serve(&mut stream, &packages));
-        }
-    });
-    Fixture {
-        base,
-        _server: handle,
-    }
-}
-
-fn serve(stream: &mut TcpStream, packages: &Arc<HashMap<String, (String, Vec<u8>)>>) {
-    let mut buf = Vec::new();
-    let mut tmp = [0u8; 2048];
-    loop {
-        match stream.read(&mut tmp) {
-            Ok(0) | Err(_) => return,
-            Ok(n) => {
-                buf.extend_from_slice(&tmp[..n]);
-                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-                if buf.len() > 65_536 {
-                    return;
-                }
-            }
-        }
-    }
-    let req = String::from_utf8_lossy(&buf);
-    let path = req
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .unwrap_or("/")
-        .trim_start_matches('/')
-        .to_string();
-    let body: Vec<u8> = if let Some((pack, _)) = packages.get(&path) {
-        pack.as_bytes().to_vec()
-    } else {
-        let segments: Vec<&str> = path.split('/').collect();
-        if segments.len() == 3 {
-            let tgz = segments[2].strip_suffix(".tgz").unwrap_or(segments[2]);
-            match tgz.rsplit_once('-') {
-                Some((name, _)) => match packages.get(name) {
-                    Some((_, tar)) => tar.clone(),
-                    None => return,
-                },
-                None => return,
-            }
-        } else {
-            return;
-        }
-    };
-    let head = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    let _ = stream.write_all(head.as_bytes());
-    let _ = stream.write_all(&body);
-}
-
-fn tarball_with(json: &str) -> Vec<u8> {
-    let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    let mut builder = tar::Builder::new(encoder);
-    let mut h = tar::Header::new_gnu();
-    h.set_size(json.len() as u64);
-    h.set_mode(0o644);
-    h.set_cksum();
-    builder
-        .append_data(&mut h, "package/package.json", json.as_bytes())
-        .unwrap();
-    builder.into_inner().unwrap().finish().unwrap()
-}
-
-fn sha512_b64(data: &[u8]) -> String {
-    let digest = Sha512::digest(data);
-    format!(
-        "sha512-{}",
-        base64::engine::general_purpose::STANDARD.encode(digest)
-    )
-}
-
-fn packument(name: &str, base: &str, version: &str, integrity: &str) -> String {
-    serde_json::json!({
-        "name": name,
-        "dist-tags": { "latest": version },
-        "versions": {
-            version: {
-                "name": name,
-                "version": version,
-                "dist": {
-                    "tarball": format!("{base}/{name}/-/{name}-{version}.tgz"),
-                    "integrity": integrity,
-                    "shasum": "0".repeat(40)
-                }
-            }
-        }
-    })
-    .to_string()
-}
+use mock_registry::{packument, sha512_b64, spawn_fixture, tarball_with};
 
 struct RecallServer {
     url: String,
@@ -178,6 +63,25 @@ fn blueline(data_dir: &std::path::Path) -> Command {
     cmd
 }
 
+/// Runs `blueline recall export-osv` and returns the raw result.
+fn export_osv(
+    data_dir: &std::path::Path,
+    snap_path: &std::path::Path,
+    out_path: &std::path::Path,
+) -> std::process::Output {
+    blueline(data_dir)
+        .args([
+            "recall",
+            "export-osv",
+            "--snapshot",
+            snap_path.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap()
+}
+
 fn curated_index(now: i64) -> String {
     serde_json::json!({
         "schema": 1,
@@ -220,15 +124,11 @@ fn recall_index_hit_blocks_a_clean_looking_release() {
         .args(["recall", "sync", "--url", &server.url])
         .output()
         .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert!(out.status.success(), "{}", stderr(&out));
 
     // The package itself is perfectly clean — the index is what blocks it.
     let json = r#"{"name":"evil-pkg","version":"1.0.0"}"#;
-    let tar = tarball_with(json);
+    let tar = tarball_with(json, &[]);
     let fixture = spawn_fixture(move |base| {
         let mut packages = HashMap::new();
         packages.insert(
@@ -338,7 +238,7 @@ fn backward_sequence_is_refused_without_write_and_equal_sequence_is_idempotent()
     assert!(
         out.status.success(),
         "equal sequence must re-sync cleanly: {}",
-        String::from_utf8_lossy(&out.stderr)
+        stderr(&out)
     );
     let stored: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&snapshot_path).unwrap()).unwrap();
@@ -362,7 +262,7 @@ fn stale_index_is_disclosed_and_escalates_per_policy() {
     std::fs::write(&snapshot_path, synced.to_string()).unwrap();
 
     let json = r#"{"name":"clean","version":"1.0.0"}"#;
-    let tar = tarball_with(json);
+    let tar = tarball_with(json, &[]);
     let fixture = spawn_fixture(move |base| {
         let mut packages = HashMap::new();
         packages.insert(
@@ -442,7 +342,7 @@ fn corrupt_snapshot_is_disclosed_high_and_blocks_low() {
     .unwrap();
 
     let json = r#"{"name":"clean","version":"1.0.0"}"#;
-    let tar = tarball_with(json);
+    let tar = tarball_with(json, &[]);
     let fixture = spawn_fixture(move |base| {
         let mut packages = HashMap::new();
         packages.insert(
@@ -516,11 +416,7 @@ fn audit_export_candidates_lists_denials_for_curation() {
         ])
         .output()
         .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert!(out.status.success(), "{}", stderr(&out));
     let candidates: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
     let entries = candidates.as_array().unwrap();
@@ -539,30 +435,13 @@ fn audit_export_candidates_lists_denials_for_curation() {
 #[test]
 fn recall_export_osv_writes_osv_documents_from_curated_snapshot() {
     let data_dir = tempfile::tempdir().unwrap();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = now_secs();
     let snap_path = data_dir.path().join("snap.json");
     std::fs::write(&snap_path, curated_index(now)).unwrap();
 
     let out_path = data_dir.path().join("osv.json");
-    let out = blueline(data_dir.path())
-        .args([
-            "recall",
-            "export-osv",
-            "--snapshot",
-            snap_path.to_str().unwrap(),
-            "--out",
-            out_path.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let out = export_osv(data_dir.path(), &snap_path, &out_path);
+    assert!(out.status.success(), "{}", stderr(&out));
     // Nothing was skipped, so nothing may be reported as skipped. The counter
     // gate is `> 0`, not `>= 0`.
     assert!(
@@ -585,17 +464,7 @@ fn recall_export_osv_refuses_corrupt_snapshot() {
     let snap_path = data_dir.path().join("bad.json");
     std::fs::write(&snap_path, "{not json").unwrap();
     let out_path = data_dir.path().join("out.json");
-    let out = blueline(data_dir.path())
-        .args([
-            "recall",
-            "export-osv",
-            "--snapshot",
-            snap_path.to_str().unwrap(),
-            "--out",
-            out_path.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
+    let out = export_osv(data_dir.path(), &snap_path, &out_path);
     assert!(!out.status.success(), "corrupt snapshot must be refused");
 }
 
@@ -603,10 +472,7 @@ fn recall_export_osv_refuses_corrupt_snapshot() {
 fn recall_export_osv_skips_aur_and_reports_count() {
     let data_dir = tempfile::tempdir().unwrap();
     let snap_path = data_dir.path().join("snap.json");
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = now_secs();
     // AUR-only revocation: OSV has no AUR ecosystem, so nothing is exported.
     let snap = serde_json::json!({
         "schema": 1,
@@ -623,17 +489,7 @@ fn recall_export_osv_skips_aur_and_reports_count() {
     });
     std::fs::write(&snap_path, snap.to_string()).unwrap();
     let out_path = data_dir.path().join("out.json");
-    let out = blueline(data_dir.path())
-        .args([
-            "recall",
-            "export-osv",
-            "--snapshot",
-            snap_path.to_str().unwrap(),
-            "--out",
-            out_path.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
+    let out = export_osv(data_dir.path(), &snap_path, &out_path);
     assert!(out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("skipped 1"), "stderr: {stderr}");
@@ -645,10 +501,7 @@ fn recall_export_osv_skips_aur_and_reports_count() {
 #[test]
 fn recall_export_osv_all_versions_emits_semver_range() {
     let data_dir = tempfile::tempdir().unwrap();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = now_secs();
     let snap_path = data_dir.path().join("snap.json");
     let snap = serde_json::json!({
         "schema": 1,
@@ -665,22 +518,8 @@ fn recall_export_osv_all_versions_emits_semver_range() {
     });
     std::fs::write(&snap_path, snap.to_string()).unwrap();
     let out_path = data_dir.path().join("out.json");
-    let out = blueline(data_dir.path())
-        .args([
-            "recall",
-            "export-osv",
-            "--snapshot",
-            snap_path.to_str().unwrap(),
-            "--out",
-            out_path.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let out = export_osv(data_dir.path(), &snap_path, &out_path);
+    assert!(out.status.success(), "{}", stderr(&out));
     let docs: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
     let d = &docs.as_array().unwrap()[0];
@@ -701,10 +540,7 @@ fn recall_export_osv_all_versions_emits_semver_range() {
 #[test]
 fn recall_export_osv_handles_pypi_ecosystem() {
     let data_dir = tempfile::tempdir().unwrap();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = now_secs();
     let snap_path = data_dir.path().join("snap.json");
     let snap = serde_json::json!({
         "schema": 1,
@@ -721,22 +557,8 @@ fn recall_export_osv_handles_pypi_ecosystem() {
     });
     std::fs::write(&snap_path, snap.to_string()).unwrap();
     let out_path = data_dir.path().join("out.json");
-    let out = blueline(data_dir.path())
-        .args([
-            "recall",
-            "export-osv",
-            "--snapshot",
-            snap_path.to_str().unwrap(),
-            "--out",
-            out_path.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let out = export_osv(data_dir.path(), &snap_path, &out_path);
+    assert!(out.status.success(), "{}", stderr(&out));
     let docs: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
     assert_eq!(docs[0]["affected"][0]["package"]["ecosystem"], "PyPI");
@@ -745,10 +567,7 @@ fn recall_export_osv_handles_pypi_ecosystem() {
 #[test]
 fn recall_export_osv_prefixes_and_preserves_ids() {
     let data_dir = tempfile::tempdir().unwrap();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = now_secs();
     let snap_path = data_dir.path().join("snap.json");
     let snap = serde_json::json!({
         "schema": 1,
@@ -761,22 +580,8 @@ fn recall_export_osv_prefixes_and_preserves_ids() {
     });
     std::fs::write(&snap_path, snap.to_string()).unwrap();
     let out_path = data_dir.path().join("out.json");
-    let out = blueline(data_dir.path())
-        .args([
-            "recall",
-            "export-osv",
-            "--snapshot",
-            snap_path.to_str().unwrap(),
-            "--out",
-            out_path.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let out = export_osv(data_dir.path(), &snap_path, &out_path);
+    assert!(out.status.success(), "{}", stderr(&out));
     let docs: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
     let docs = docs.as_array().unwrap();
@@ -793,17 +598,7 @@ fn recall_export_osv_refuses_oversized_snapshot() {
     let big = padded_snapshot(8 * 1024 * 1024 + 100);
     std::fs::write(&snap_path, &big).unwrap();
     let out_path = data_dir.path().join("out.json");
-    let out = blueline(data_dir.path())
-        .args([
-            "recall",
-            "export-osv",
-            "--snapshot",
-            snap_path.to_str().unwrap(),
-            "--out",
-            out_path.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
+    let out = export_osv(data_dir.path(), &snap_path, &out_path);
     assert!(!out.status.success(), "oversized snapshot must be refused");
     assert!(!out_path.exists(), "out must not be created on refusal");
 }
@@ -811,10 +606,7 @@ fn recall_export_osv_refuses_oversized_snapshot() {
 #[test]
 fn recall_export_osv_refuses_invalid_snapshot() {
     let data_dir = tempfile::tempdir().unwrap();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = now_secs();
     let snap_path = data_dir.path().join("bad.json");
     let snap = serde_json::json!({
         "schema": 99,
@@ -824,27 +616,14 @@ fn recall_export_osv_refuses_invalid_snapshot() {
     });
     std::fs::write(&snap_path, snap.to_string()).unwrap();
     let out_path = data_dir.path().join("out.json");
-    let out = blueline(data_dir.path())
-        .args([
-            "recall",
-            "export-osv",
-            "--snapshot",
-            snap_path.to_str().unwrap(),
-            "--out",
-            out_path.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
+    let out = export_osv(data_dir.path(), &snap_path, &out_path);
     assert!(!out.status.success(), "invalid snapshot must be refused");
 }
 
 #[test]
 fn recall_export_osv_accepts_synced_snapshot() {
     let data_dir = tempfile::tempdir().unwrap();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = now_secs();
     let snap_path = data_dir.path().join("synced.json");
     let snap = serde_json::json!({
         "fetched_at": now,
@@ -865,22 +644,8 @@ fn recall_export_osv_accepts_synced_snapshot() {
     });
     std::fs::write(&snap_path, snap.to_string()).unwrap();
     let out_path = data_dir.path().join("out.json");
-    let out = blueline(data_dir.path())
-        .args([
-            "recall",
-            "export-osv",
-            "--snapshot",
-            snap_path.to_str().unwrap(),
-            "--out",
-            out_path.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let out = export_osv(data_dir.path(), &snap_path, &out_path);
+    assert!(out.status.success(), "{}", stderr(&out));
     let docs: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
     assert_eq!(docs[0]["affected"][0]["package"]["name"], "evil-pkg");
@@ -944,11 +709,7 @@ fn audit_export_candidates_filters_by_action_or_verdict() {
         ])
         .output()
         .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert!(out.status.success(), "{}", stderr(&out));
     let candidates: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
     let entries = candidates.as_array().unwrap();
@@ -980,21 +741,11 @@ fn recall_export_osv_accepts_a_snapshot_sitting_exactly_on_the_cap() {
     let snap_path = data_dir.path().join("snap.json");
     std::fs::write(&snap_path, padded_snapshot(8 * 1024 * 1024)).unwrap();
     let out_path = data_dir.path().join("out.json");
-    let out = blueline(data_dir.path())
-        .args([
-            "recall",
-            "export-osv",
-            "--snapshot",
-            snap_path.to_str().unwrap(),
-            "--out",
-            out_path.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
+    let out = export_osv(data_dir.path(), &snap_path, &out_path);
     assert!(
         out.status.success(),
         "a snapshot on the cap must be accepted: {}",
-        String::from_utf8_lossy(&out.stderr)
+        stderr(&out)
     );
     assert!(out_path.exists(), "out must be written");
 }
@@ -1002,10 +753,7 @@ fn recall_export_osv_accepts_a_snapshot_sitting_exactly_on_the_cap() {
 #[test]
 fn recall_export_osv_creates_a_missing_out_directory() {
     let data_dir = tempfile::tempdir().unwrap();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = now_secs();
     let snap_path = data_dir.path().join("snap.json");
     let snap = serde_json::json!({
         "schema": 1,
@@ -1026,21 +774,11 @@ fn recall_export_osv_creates_a_missing_out_directory() {
         .join("newdir")
         .join("deeper")
         .join("out.json");
-    let out = blueline(data_dir.path())
-        .args([
-            "recall",
-            "export-osv",
-            "--snapshot",
-            snap_path.to_str().unwrap(),
-            "--out",
-            out_path.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
+    let out = export_osv(data_dir.path(), &snap_path, &out_path);
     assert!(
         out.status.success(),
         "a missing out directory must be created: {}",
-        String::from_utf8_lossy(&out.stderr)
+        stderr(&out)
     );
     assert!(
         out_path.exists(),
@@ -1051,10 +789,7 @@ fn recall_export_osv_creates_a_missing_out_directory() {
 #[test]
 fn recall_export_osv_preserves_mal_ids_and_ecosystem_strings() {
     let data_dir = tempfile::tempdir().unwrap();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = now_secs();
     let snap_path = data_dir.path().join("snap.json");
     let snap = serde_json::json!({
         "schema": 1,
@@ -1067,22 +802,8 @@ fn recall_export_osv_preserves_mal_ids_and_ecosystem_strings() {
     });
     std::fs::write(&snap_path, snap.to_string()).unwrap();
     let out_path = data_dir.path().join("out.json");
-    let out = blueline(data_dir.path())
-        .args([
-            "recall",
-            "export-osv",
-            "--snapshot",
-            snap_path.to_str().unwrap(),
-            "--out",
-            out_path.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let out = export_osv(data_dir.path(), &snap_path, &out_path);
+    assert!(out.status.success(), "{}", stderr(&out));
     let docs: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
     let docs = docs.as_array().unwrap();
@@ -1096,10 +817,7 @@ fn recall_export_osv_preserves_mal_ids_and_ecosystem_strings() {
 #[test]
 fn recall_export_osv_refuses_symlink_out() {
     let data_dir = tempfile::tempdir().unwrap();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = now_secs();
     let snap_path = data_dir.path().join("snap.json");
     let snap = serde_json::json!({
         "schema": 1,
@@ -1133,4 +851,8 @@ fn recall_export_osv_refuses_symlink_out() {
         .unwrap();
     assert!(!out.status.success(), "symlink out must be refused");
     assert_eq!(std::fs::read(&victim).unwrap(), b"original");
+}
+
+fn stderr(out: &std::process::Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
 }

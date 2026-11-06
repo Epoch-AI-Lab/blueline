@@ -14,7 +14,6 @@ use std::process::{Command, Stdio};
 use std::sync::{Mutex, PoisonError};
 use ureq::Agent;
 
-const USER_AGENT: &str = concat!("blueline/", env!("CARGO_PKG_VERSION"));
 const RPC_VERSION: u8 = 5;
 
 /// AUR RPC v5 metadata for one package (the `multiinfo` result shape).
@@ -114,7 +113,7 @@ impl AurRpc {
     }
 
     pub fn with_limits(base: &str, limits: RegistryLimits) -> Self {
-        let agent = super::http_util::registry_agent(USER_AGENT, base);
+        let agent = super::http_util::registry_agent(super::http_util::USER_AGENT, base);
         Self {
             agent,
             base: base.trim_end_matches('/').to_string(),
@@ -904,6 +903,9 @@ impl Registry for AurRegistry {
 
 #[cfg(test)]
 mod tests {
+    fn stderr(out: &std::process::Output) -> String {
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    }
     use super::*;
     use std::io::Write;
     use std::net::TcpListener;
@@ -1260,7 +1262,7 @@ mod tests {
         assert!(
             out.status.success(),
             "git {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
+            stderr(&out)
         );
     }
 
@@ -1637,7 +1639,7 @@ mod tests {
         assert!(
             out.status.success(),
             "oversize commit failed: {}",
-            String::from_utf8_lossy(&out.stderr)
+            stderr(&out)
         );
         let reg = fx.registry();
 

@@ -475,20 +475,11 @@ mod tests {
         let delta = crate::diff::Delta {
             baseline_version: Some("1.0.0".into()),
             target_version: "1.1.0".into(),
-            files_added: vec![],
-            files_removed: vec![],
-            files_modified: vec![],
             total_lines_added: 10,
             total_lines_deleted: 2,
-            new_executables: vec![],
-            new_binaries: vec![],
-            modified_binaries: vec![],
             new_lifecycle_scripts: vec!["postinstall".into()],
             modified_lifecycle_scripts: vec!["preinstall".into()],
-            new_dependencies: vec![],
-            modified_dependencies: vec![],
-            binding_gyp_added: false,
-            removed_dependencies: Vec::new(),
+            ..Default::default()
         };
         let verdict = crate::verdict::Verdict {
             name: "my-pkg".into(),

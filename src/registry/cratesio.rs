@@ -9,8 +9,6 @@ use crate::error::BluelineError;
 use crate::registry::http_util::{RegistryLimits, download_bounded, validate_download_url};
 use crate::registry::{Checksum, ChecksumAlg, Ecosystem, Package, Registry, Release, hex_encode};
 
-const USER_AGENT: &str = concat!("blueline/", env!("CARGO_PKG_VERSION"));
-
 /// crates.io sparse-index registry client.
 ///
 /// Speaks the cargo sparse protocol (`config.json`, NDJSON index paths,
@@ -29,7 +27,7 @@ impl CratesIoRegistry {
     }
 
     pub fn with_limits(base: &str, limits: RegistryLimits) -> Self {
-        let agent = super::http_util::registry_agent(USER_AGENT, base);
+        let agent = super::http_util::registry_agent(super::http_util::USER_AGENT, base);
         Self {
             agent,
             base: base.trim_end_matches('/').to_string(),

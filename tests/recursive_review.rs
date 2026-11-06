@@ -9,13 +9,10 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 
 use assert_cmd::Command;
-use base64::Engine;
-use sha2::{Digest, Sha512};
 
-struct Fixture {
-    base: String,
-    _server: std::thread::JoinHandle<()>,
-}
+mod mock_registry;
+
+use mock_registry::{Fixture, packument, sha512_b64, tarball_with};
 
 /// Mini HTTP/1.1 registry serving two packages: packuments at `/{name}`
 /// and tarballs at `/{name}/-/{name}-{version}.tgz`.
@@ -92,53 +89,6 @@ fn serve(stream: &mut TcpStream, packages: &Arc<HashMap<String, (String, Vec<u8>
     );
     let _ = stream.write_all(head.as_bytes());
     let _ = stream.write_all(&body);
-}
-
-fn tarball_with(json: &str, extra: &[(&str, &[u8])]) -> Vec<u8> {
-    let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    let mut builder = tar::Builder::new(encoder);
-    let mut h = tar::Header::new_gnu();
-    h.set_size(json.len() as u64);
-    h.set_mode(0o644);
-    h.set_cksum();
-    builder
-        .append_data(&mut h, "package/package.json", json.as_bytes())
-        .unwrap();
-    for (path, content) in extra {
-        let mut h = tar::Header::new_gnu();
-        h.set_size(content.len() as u64);
-        h.set_mode(0o644);
-        h.set_cksum();
-        builder.append_data(&mut h, *path, *content).unwrap();
-    }
-    builder.into_inner().unwrap().finish().unwrap()
-}
-
-fn sha512_b64(data: &[u8]) -> String {
-    let digest = Sha512::digest(data);
-    format!(
-        "sha512-{}",
-        base64::engine::general_purpose::STANDARD.encode(digest)
-    )
-}
-
-fn packument(name: &str, base: &str, version: &str, integrity: &str) -> String {
-    serde_json::json!({
-        "name": name,
-        "dist-tags": { "latest": version },
-        "versions": {
-            version: {
-                "name": name,
-                "version": version,
-                "dist": {
-                    "tarball": format!("{base}/{name}/-/{name}-{version}.tgz"),
-                    "integrity": integrity,
-                    "shasum": "0".repeat(40)
-                }
-            }
-        }
-    })
-    .to_string()
 }
 
 fn review_json(base: &str, spec: &str) -> (i32, String) {

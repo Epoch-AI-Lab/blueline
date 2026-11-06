@@ -29,6 +29,8 @@ pub mod review;
 pub mod sandbox;
 pub mod shim;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod verdict;
 pub mod version;
 pub mod wheel_extract;

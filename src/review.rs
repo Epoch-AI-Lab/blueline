@@ -2056,6 +2056,10 @@ mod recursive_tests {
     use crate::store::BaselineStore;
     use std::collections::HashMap;
 
+    fn has_finding(verdict: &crate::verdict::Verdict, rule_id: &str) -> bool {
+        verdict.findings.iter().any(|f| f.rule_id == rule_id)
+    }
+
     struct FakeRegistry {
         packages: HashMap<String, String>,
         fetches: std::sync::Arc<std::sync::atomic::AtomicU32>,
@@ -2665,10 +2669,7 @@ mod recursive_tests {
             &policy,
         );
         assert!(
-            !verdict
-                .findings
-                .iter()
-                .any(|f| f.rule_id == "P03_SIGNATURE_REQUIRED_MISSING"),
+            !has_finding(&verdict, "P03_SIGNATURE_REQUIRED_MISSING"),
             "this test exists to show a published block satisfies the key, which is why the \
              key is refused at load: {:?}",
             verdict
@@ -2727,10 +2728,7 @@ mod recursive_tests {
             &policy,
         );
         assert!(
-            !verdict
-                .findings
-                .iter()
-                .any(|f| f.rule_id == "P03_SIGNATURE_REQUIRED_MISSING"),
+            !has_finding(&verdict, "P03_SIGNATURE_REQUIRED_MISSING"),
             "{:?}",
             verdict.findings
         );
@@ -2780,10 +2778,7 @@ mod recursive_tests {
         assert_eq!(child.chain, vec!["a@1.0.0", "npm:b@1.0.0"]);
         // A Medium child stays below the default HIGH roll-up threshold.
         assert!(
-            !verdict
-                .findings
-                .iter()
-                .any(|f| f.rule_id == "R27_SECOND_ORDER"),
+            !has_finding(&verdict, "R27_SECOND_ORDER"),
             "Medium child must not roll up at the HIGH threshold"
         );
     }
@@ -2832,10 +2827,7 @@ mod recursive_tests {
             "a cached reuse must survive budget exhaustion"
         );
         assert!(
-            !verdict
-                .findings
-                .iter()
-                .any(|f| f.rule_id == "R25_RECURSION_DEPTH"),
+            !has_finding(&verdict, "R25_RECURSION_DEPTH"),
             "reusing a completed review is not a cap violation"
         );
     }
@@ -2902,10 +2894,7 @@ mod recursive_tests {
                 .collect::<Vec<_>>()
         );
         assert!(
-            !verdict
-                .findings
-                .iter()
-                .any(|f| f.rule_id == "R25_RECURSION_DEPTH"),
+            !has_finding(&verdict, "R25_RECURSION_DEPTH"),
             "reusing the exact completed review is not a cap violation"
         );
     }
@@ -2938,10 +2927,7 @@ mod recursive_tests {
         let (verdict, _, _, _) =
             evaluate_package("a", "1.0.0", Ecosystem::Npm, &store, &policy, &mut ctx).unwrap();
         assert!(
-            verdict
-                .findings
-                .iter()
-                .any(|f| f.rule_id == "R24_LIFECYCLE_INSTALL_REF"),
+            has_finding(&verdict, "R24_LIFECYCLE_INSTALL_REF"),
             "R24 must fire on a baseline review too: {:?}",
             verdict
                 .findings
@@ -3083,10 +3069,7 @@ mod recursive_tests {
                 .collect::<Vec<_>>()
         );
         assert!(
-            verdict
-                .findings
-                .iter()
-                .any(|f| f.rule_id == "R27_SECOND_ORDER"),
+            has_finding(&verdict, "R27_SECOND_ORDER"),
             "child HIGH cycle must roll up: {:?}",
             verdict
                 .findings
@@ -3135,12 +3118,7 @@ mod recursive_tests {
             &policy,
         );
         assert_eq!(verdict.recursive.len(), 1);
-        assert!(
-            verdict
-                .findings
-                .iter()
-                .any(|f| f.rule_id == "R25_RECURSION_DEPTH")
-        );
+        assert!(has_finding(&verdict, "R25_RECURSION_DEPTH"));
     }
 
     #[test]
@@ -3159,12 +3137,7 @@ mod recursive_tests {
             &policy,
         );
         assert!(verdict.recursive.is_empty());
-        assert!(
-            verdict
-                .findings
-                .iter()
-                .any(|f| f.rule_id == "R25_RECURSION_DEPTH")
-        );
+        assert!(has_finding(&verdict, "R25_RECURSION_DEPTH"));
     }
 
     #[test]
