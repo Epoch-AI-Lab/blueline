@@ -941,6 +941,9 @@ pub fn serve(port: u16, index: &Path) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    fn stderr(out: &std::process::Output) -> String {
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    }
     use super::*;
 
     #[test]
@@ -2046,11 +2049,7 @@ mod tests {
             .output()
             .unwrap();
         seed_handle.join().unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        assert!(out.status.success(), "{}", stderr(&out));
         let stored_bytes = std::fs::read(&snapshot_path).unwrap();
 
         let (old_url, old_handle) =
@@ -2089,11 +2088,7 @@ mod tests {
             .output()
             .unwrap();
         handle.join().unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        assert!(out.status.success(), "{}", stderr(&out));
         let stored: SyncedSnapshot =
             serde_json::from_slice(&std::fs::read(&snapshot_path).unwrap()).unwrap();
         assert_eq!(stored.snapshot.sequence, 42);
@@ -2110,11 +2105,7 @@ mod tests {
             .output()
             .unwrap();
         handle.join().unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        assert!(out.status.success(), "{}", stderr(&out));
         let stored: SyncedSnapshot = serde_json::from_slice(
             &std::fs::read(data_dir.path().join("recall_snapshot.json")).unwrap(),
         )
@@ -2133,7 +2124,7 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&out.stderr).contains("exceeds"),
             "{}",
-            String::from_utf8_lossy(&out.stderr)
+            stderr(&out)
         );
     }
 
@@ -2178,7 +2169,7 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&out.stderr).contains("exceeds"),
             "{}",
-            String::from_utf8_lossy(&out.stderr)
+            stderr(&out)
         );
     }
 
@@ -2405,11 +2396,7 @@ mod tests {
             .output()
             .unwrap();
         seed_handle.join().unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        assert!(out.status.success(), "{}", stderr(&out));
 
         let held = SyncLock::acquire(data_dir.path()).unwrap();
 

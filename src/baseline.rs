@@ -139,18 +139,8 @@ pub fn resolve_baseline<V: VersionInfo>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::{Checksum, ChecksumAlg, Ecosystem, Release};
-    use sha2::{Digest, Sha512};
-
-    /// Deterministic valid sha512 checksum derived from the version string.
-    fn checksum_for(tag: &str) -> Checksum {
-        let mut hasher = Sha512::new();
-        hasher.update(tag.as_bytes());
-        Checksum {
-            alg: ChecksumAlg::Sha512,
-            value_hex: format!("{:x}", hasher.finalize()),
-        }
-    }
+    use crate::registry::{Checksum, Ecosystem, Release};
+    use crate::test_support::checksum as checksum_for;
 
     struct MockRegistry {
         versions: Vec<String>,

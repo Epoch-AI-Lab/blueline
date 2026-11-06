@@ -9,6 +9,9 @@ use ureq::Agent;
 
 use crate::error::BluelineError;
 
+/// Shared User-Agent for the registry adapters.
+pub(crate) const USER_AGENT: &str = concat!("blueline/", env!("CARGO_PKG_VERSION"));
+
 /// Ceiling on establishing the connection. Applied alongside the whole-request
 /// deadline below, because `ureq` derives read and write timeouts from that
 /// deadline rather than from the per-operation settings.

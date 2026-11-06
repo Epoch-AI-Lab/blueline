@@ -12,7 +12,6 @@ use crate::registry::{Checksum, ChecksumAlg, Ecosystem, Package, Registry, Relea
 /// Abbreviated packument (corgi) media type — small enough to be sane
 /// for large packages like express.
 const CORGI_ACCEPT: &str = "application/vnd.npm.install-v1+json";
-const USER_AGENT: &str = concat!("blueline/", env!("CARGO_PKG_VERSION"));
 
 pub struct NpmRegistry {
     agent: Agent,
@@ -39,7 +38,7 @@ impl NpmRegistry {
     }
 
     pub fn with_limits(base: &str, limits: RegistryLimits) -> Self {
-        let agent = super::http_util::registry_agent(USER_AGENT, base);
+        let agent = super::http_util::registry_agent(super::http_util::USER_AGENT, base);
         Self {
             agent,
             base: base.trim_end_matches('/').to_string(),
@@ -492,6 +491,35 @@ mod tests {
     use super::*;
     use base64::Engine as _;
 
+    /// Spawn a mock registry that answers `expected` connections through
+    /// `handler` before returning. Polls rather than blocks on accept so a
+    /// test whose requests never arrive fails on the deadline instead of
+    /// hanging, and stops early once the last connection drains.
+    fn serve_once(
+        listener: std::net::TcpListener,
+        expected: usize,
+        handler: impl Fn(&mut std::net::TcpStream) + Send + 'static,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let _ = listener.set_nonblocking(true);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut served = 0usize;
+            let mut last = std::time::Instant::now();
+            while served < expected && std::time::Instant::now() < deadline {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    served += 1;
+                    last = std::time::Instant::now();
+                    handler(&mut stream);
+                } else {
+                    if served > 0 && last.elapsed() > std::time::Duration::from_millis(50) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        })
+    }
+
     /// sha512 SRI of the bytes "tarball-content".
     const TEST_SRI: &str = "sha512-dWJ6JIJkmHG8N3fH1b/hbpmBQ7wKIpEw3zsVl2873OtFXh9QhR1KUU3uojohuIJ/xd+hb1R0q/57C8sMt4tstQ==";
 
@@ -747,42 +775,25 @@ mod tests {
         let hash = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
         let integrity = format!("sha512-{hash}");
 
-        let handle = std::thread::spawn(move || {
-            let _ = listener.set_nonblocking(true);
-            let start = std::time::Instant::now();
-            let deadline = start + std::time::Duration::from_secs(5);
-            let expected = 8usize;
-            let mut served = 0usize;
-            let mut last = std::time::Instant::now();
-            while served < expected && std::time::Instant::now() < deadline {
-                if let Ok((mut stream, _)) = listener.accept() {
-                    served += 1;
-                    last = std::time::Instant::now();
-                    let req = crate::registry::http_util::read_request_head(&mut stream);
-                    if req.contains("GET /redirect1 ") {
-                        let resp = format!(
-                            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/final.tgz\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        );
-                        let _ = stream.write_all(resp.as_bytes());
-                    } else if req.contains("GET /final.tgz ") {
-                        let resp = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            payload.len()
-                        );
-                        let _ = stream.write_all(resp.as_bytes());
-                        let _ = stream.write_all(payload);
-                    } else if req.contains("GET /loop ") {
-                        let resp = format!(
-                            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/loop\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        );
-                        let _ = stream.write_all(resp.as_bytes());
-                    }
-                } else {
-                    if served > 0 && last.elapsed() > std::time::Duration::from_millis(50) {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
+        let handle = serve_once(listener, 8, move |stream| {
+            let req = crate::registry::http_util::read_request_head(stream);
+            if req.contains("GET /redirect1 ") {
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/final.tgz\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            } else if req.contains("GET /final.tgz ") {
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.write_all(payload);
+            } else if req.contains("GET /loop ") {
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/loop\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(resp.as_bytes());
             }
         });
 
@@ -827,45 +838,28 @@ mod tests {
         let hash = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
         let integrity = format!("sha512-{hash}");
 
-        let handle = std::thread::spawn(move || {
-            let _ = listener.set_nonblocking(true);
-            let start = std::time::Instant::now();
-            let deadline = start + std::time::Duration::from_secs(5);
-            let expected = 2usize;
-            let mut served = 0usize;
-            let mut last = std::time::Instant::now();
-            while served < expected && std::time::Instant::now() < deadline {
-                if let Ok((mut stream, _)) = listener.accept() {
-                    served += 1;
-                    last = std::time::Instant::now();
-                    let req = crate::registry::http_util::read_request_head(&mut stream);
+        let handle = serve_once(listener, 2, move |stream| {
+            let req = crate::registry::http_util::read_request_head(stream);
 
-                    if req.contains("GET /bigpkg ") {
-                        // Packument of 6000 bytes (above 64 + 1024 + 1024 = 2112 bytes)
-                        let padding = "a".repeat(5000);
-                        let body = format!(
-                            r#"{{"name":"bigpkg","description":"{padding}","dist-tags":{{"latest":"1.0.0"}},"versions":{{"1.0.0":{{"name":"bigpkg","version":"1.0.0","dist":{{"tarball":"http://127.0.0.1:{port}/big.tgz","integrity":"{integrity}"}}}}}}}}"#
-                        );
-                        let resp = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                            body.len(),
-                            body
-                        );
-                        let _ = stream.write_all(resp.as_bytes());
-                    } else if req.contains("GET /big.tgz ") {
-                        let resp = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            payload.len()
-                        );
-                        let _ = stream.write_all(resp.as_bytes());
-                        let _ = stream.write_all(&payload);
-                    }
-                } else {
-                    if served > 0 && last.elapsed() > std::time::Duration::from_millis(50) {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
+            if req.contains("GET /bigpkg ") {
+                // Packument of 6000 bytes (above 64 + 1024 + 1024 = 2112 bytes)
+                let padding = "a".repeat(5000);
+                let body = format!(
+                    r#"{{"name":"bigpkg","description":"{padding}","dist-tags":{{"latest":"1.0.0"}},"versions":{{"1.0.0":{{"name":"bigpkg","version":"1.0.0","dist":{{"tarball":"http://127.0.0.1:{port}/big.tgz","integrity":"{integrity}"}}}}}}}}"#
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            } else if req.contains("GET /big.tgz ") {
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.write_all(&payload);
             }
         });
 
@@ -892,40 +886,23 @@ mod tests {
         let exact_len = body_exact.len();
         let body_over = format!("{body_exact} ");
 
-        let handle = std::thread::spawn(move || {
-            let _ = listener.set_nonblocking(true);
-            let start = std::time::Instant::now();
-            let deadline = start + std::time::Duration::from_secs(5);
-            let expected = 2usize;
-            let mut served = 0usize;
-            let mut last = std::time::Instant::now();
-            while served < expected && std::time::Instant::now() < deadline {
-                if let Ok((mut stream, _)) = listener.accept() {
-                    served += 1;
-                    last = std::time::Instant::now();
-                    let req = crate::registry::http_util::read_request_head(&mut stream);
+        let handle = serve_once(listener, 2, move |stream| {
+            let req = crate::registry::http_util::read_request_head(stream);
 
-                    if req.contains("GET /exactpkg ") {
-                        let resp = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                            body_exact.len(),
-                            body_exact
-                        );
-                        let _ = stream.write_all(resp.as_bytes());
-                    } else if req.contains("GET /overpkg ") {
-                        let resp = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                            body_over.len(),
-                            body_over
-                        );
-                        let _ = stream.write_all(resp.as_bytes());
-                    }
-                } else {
-                    if served > 0 && last.elapsed() > std::time::Duration::from_millis(50) {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
+            if req.contains("GET /exactpkg ") {
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body_exact.len(),
+                    body_exact
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            } else if req.contains("GET /overpkg ") {
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body_over.len(),
+                    body_over
+                );
+                let _ = stream.write_all(resp.as_bytes());
             }
         });
 
@@ -967,40 +944,23 @@ mod tests {
         let hash2 = base64::engine::general_purpose::STANDARD.encode(hasher2.finalize());
         let over_integrity = format!("sha512-{hash2}");
 
-        let handle = std::thread::spawn(move || {
-            let _ = listener.set_nonblocking(true);
-            let start = std::time::Instant::now();
-            let deadline = start + std::time::Duration::from_secs(5);
-            let expected = 2usize;
-            let mut served = 0usize;
-            let mut last = std::time::Instant::now();
-            while served < expected && std::time::Instant::now() < deadline {
-                if let Ok((mut stream, _)) = listener.accept() {
-                    served += 1;
-                    last = std::time::Instant::now();
-                    let req = crate::registry::http_util::read_request_head(&mut stream);
+        let handle = serve_once(listener, 2, move |stream| {
+            let req = crate::registry::http_util::read_request_head(stream);
 
-                    if req.contains("GET /exact.tgz ") {
-                        let resp = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            exact_payload.len()
-                        );
-                        let _ = stream.write_all(resp.as_bytes());
-                        let _ = stream.write_all(&exact_payload);
-                    } else if req.contains("GET /over.tgz ") {
-                        let resp = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            over_payload.len()
-                        );
-                        let _ = stream.write_all(resp.as_bytes());
-                        let _ = stream.write_all(&over_payload);
-                    }
-                } else {
-                    if served > 0 && last.elapsed() > std::time::Duration::from_millis(50) {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
+            if req.contains("GET /exact.tgz ") {
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    exact_payload.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.write_all(&exact_payload);
+            } else if req.contains("GET /over.tgz ") {
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    over_payload.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.write_all(&over_payload);
             }
         });
 
@@ -1048,58 +1008,41 @@ mod tests {
         let hash = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
         let integrity = format!("sha512-{hash}");
 
-        let handle = std::thread::spawn(move || {
-            let _ = listener.set_nonblocking(true);
-            let start = std::time::Instant::now();
-            let deadline = start + std::time::Duration::from_secs(5);
-            let expected = 6usize;
-            let mut served = 0usize;
-            let mut last = std::time::Instant::now();
-            while served < expected && std::time::Instant::now() < deadline {
-                if let Ok((mut stream, _)) = listener.accept() {
-                    served += 1;
-                    last = std::time::Instant::now();
-                    let req = crate::registry::http_util::read_request_head(&mut stream);
+        let handle = serve_once(listener, 6, move |stream| {
+            let req = crate::registry::http_util::read_request_head(stream);
 
-                    if req.contains("GET /r1 ") {
-                        let resp = format!(
-                            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/r2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        );
-                        let _ = stream.write_all(resp.as_bytes());
-                    } else if req.contains("GET /r2 ") {
-                        let resp = format!(
-                            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/ok.tgz\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        );
-                        let _ = stream.write_all(resp.as_bytes());
-                    } else if req.contains("GET /ok.tgz ") {
-                        let resp = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            payload.len()
-                        );
-                        let _ = stream.write_all(resp.as_bytes());
-                        let _ = stream.write_all(payload);
-                    } else if req.contains("GET /over1 ") {
-                        let resp = format!(
-                            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/over2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        );
-                        let _ = stream.write_all(resp.as_bytes());
-                    } else if req.contains("GET /over2 ") {
-                        let resp = format!(
-                            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/over3\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        );
-                        let _ = stream.write_all(resp.as_bytes());
-                    } else if req.contains("GET /over3 ") {
-                        let resp = format!(
-                            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/over4\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        );
-                        let _ = stream.write_all(resp.as_bytes());
-                    }
-                } else {
-                    if served > 0 && last.elapsed() > std::time::Duration::from_millis(50) {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
+            if req.contains("GET /r1 ") {
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/r2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            } else if req.contains("GET /r2 ") {
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/ok.tgz\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            } else if req.contains("GET /ok.tgz ") {
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.write_all(payload);
+            } else if req.contains("GET /over1 ") {
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/over2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            } else if req.contains("GET /over2 ") {
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/over3\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            } else if req.contains("GET /over3 ") {
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/over4\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(resp.as_bytes());
             }
         });
 
@@ -1148,35 +1091,18 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let base = format!("http://127.0.0.1:{port}");
 
-        let handle = std::thread::spawn(move || {
-            let _ = listener.set_nonblocking(true);
-            let start = std::time::Instant::now();
-            let deadline = start + std::time::Duration::from_secs(5);
-            let expected = 1usize;
-            let mut served = 0usize;
-            let mut last = std::time::Instant::now();
-            while served < expected && std::time::Instant::now() < deadline {
-                if let Ok((mut stream, _)) = listener.accept() {
-                    served += 1;
-                    last = std::time::Instant::now();
-                    let req = crate::registry::http_util::read_request_head(&mut stream);
-                    if req.contains("GET /signed ") {
-                        let body = format!(
-                            r#"{{"name":"signed","dist-tags":{{"latest":"2.0.0"}},"versions":{{"1.0.0":{{"name":"signed","version":"1.0.0","dist":{{"tarball":"http://127.0.0.1:{port}/one.tgz","integrity":null,"signatures":[{{"keyid":"SHA256:one","sig":"c2lnMQ=="}}]}}}},"2.0.0":{{"name":"signed","version":"2.0.0","dist":{{"tarball":"http://127.0.0.1:{port}/two.tgz","integrity":null}}}}}}}}"#
-                        );
-                        let resp = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                            body.len(),
-                            body
-                        );
-                        let _ = stream.write_all(resp.as_bytes());
-                    }
-                } else {
-                    if served > 0 && last.elapsed() > std::time::Duration::from_millis(50) {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
+        let handle = serve_once(listener, 1, move |stream| {
+            let req = crate::registry::http_util::read_request_head(stream);
+            if req.contains("GET /signed ") {
+                let body = format!(
+                    r#"{{"name":"signed","dist-tags":{{"latest":"2.0.0"}},"versions":{{"1.0.0":{{"name":"signed","version":"1.0.0","dist":{{"tarball":"http://127.0.0.1:{port}/one.tgz","integrity":null,"signatures":[{{"keyid":"SHA256:one","sig":"c2lnMQ=="}}]}}}},"2.0.0":{{"name":"signed","version":"2.0.0","dist":{{"tarball":"http://127.0.0.1:{port}/two.tgz","integrity":null}}}}}}}}"#
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
             }
         });
 
@@ -1226,38 +1152,21 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let base = format!("http://127.0.0.1:{port}");
 
-        let handle = std::thread::spawn(move || {
-            let _ = listener.set_nonblocking(true);
-            let start = std::time::Instant::now();
-            let deadline = start + std::time::Duration::from_secs(5);
-            let expected = 1usize;
-            let mut served = 0usize;
-            let mut last = std::time::Instant::now();
-            while served < expected && std::time::Instant::now() < deadline {
-                if let Ok((mut stream, _)) = listener.accept() {
-                    served += 1;
-                    last = std::time::Instant::now();
-                    let req = crate::registry::http_util::read_request_head(&mut stream);
-                    if req.contains("GET /orgpkg ") {
-                        // As generous as the wire gets: the member the
-                        // abbreviated format never publishes, carrying several
-                        // identities including a bot.
-                        let body = format!(
-                            r#"{{"name":"orgpkg","maintainers":[{{"name":"alice","email":"alice@example.com"}},{{"name":"mallory","email":"mallory@example.com"}},{{"name":"orgpkg-bot","email":"bot@example.com"}}],"dist-tags":{{"latest":"1.0.0"}},"versions":{{"1.0.0":{{"name":"orgpkg","version":"1.0.0","dist":{{"tarball":"http://127.0.0.1:{port}/o.tgz","integrity":null}}}}}}}}"#
-                        );
-                        let resp = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                            body.len(),
-                            body
-                        );
-                        let _ = stream.write_all(resp.as_bytes());
-                    }
-                } else {
-                    if served > 0 && last.elapsed() > std::time::Duration::from_millis(50) {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
+        let handle = serve_once(listener, 1, move |stream| {
+            let req = crate::registry::http_util::read_request_head(stream);
+            if req.contains("GET /orgpkg ") {
+                // As generous as the wire gets: the member the
+                // abbreviated format never publishes, carrying several
+                // identities including a bot.
+                let body = format!(
+                    r#"{{"name":"orgpkg","maintainers":[{{"name":"alice","email":"alice@example.com"}},{{"name":"mallory","email":"mallory@example.com"}},{{"name":"orgpkg-bot","email":"bot@example.com"}}],"dist-tags":{{"latest":"1.0.0"}},"versions":{{"1.0.0":{{"name":"orgpkg","version":"1.0.0","dist":{{"tarball":"http://127.0.0.1:{port}/o.tgz","integrity":null}}}}}}}}"#
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
             }
         });
 
@@ -1282,28 +1191,12 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let base = format!("http://127.0.0.1:{port}");
 
-        let handle = std::thread::spawn(move || {
-            let _ = listener.set_nonblocking(true);
-            let start = std::time::Instant::now();
-            let deadline = start + std::time::Duration::from_secs(5);
-            let expected = 1usize;
-            let mut served = 0usize;
-            let mut last = std::time::Instant::now();
-            while served < expected && std::time::Instant::now() < deadline {
-                if let Ok((mut stream, _)) = listener.accept() {
-                    served += 1;
-                    last = std::time::Instant::now();
-                    let req = crate::registry::http_util::read_request_head(&mut stream);
-                    if req.contains("GET /ghost ") {
-                        let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                        let _ = stream.write_all(resp.as_bytes());
-                    }
-                } else {
-                    if served > 0 && last.elapsed() > std::time::Duration::from_millis(50) {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
+        let handle = serve_once(listener, 1, move |stream| {
+            let req = crate::registry::http_util::read_request_head(stream);
+            if req.contains("GET /ghost ") {
+                let resp =
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(resp.as_bytes());
             }
         });
 

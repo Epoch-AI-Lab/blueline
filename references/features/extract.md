@@ -1,6 +1,6 @@
 # Extraction
 
-`src/extract.rs`, `src/wheel_extract.rs` (a one-line re-export). Every byte the
+`src/extract.rs`. Every byte the
 heuristics ever see passes through here first. This is the lane where a naive
 edit most directly becomes a sandbox escape.
 

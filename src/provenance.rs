@@ -633,16 +633,7 @@ pub fn inspect_provenance_pypi(
 mod tests {
     use super::*;
     use crate::registry::ChecksumAlg;
-    use sha2::{Digest, Sha512};
-
-    fn ck(tag: &str) -> Checksum {
-        let mut hasher = Sha512::new();
-        hasher.update(tag.as_bytes());
-        Checksum {
-            alg: ChecksumAlg::Sha512,
-            value_hex: format!("{:x}", hasher.finalize()),
-        }
-    }
+    use crate::test_support::checksum as ck;
 
     #[test]
     fn parses_valid_intoto_statement() {

@@ -35,6 +35,15 @@ pub struct PkgFinding {
     pub evidence: String,
 }
 
+/// One finding with the rule id as a constant string.
+fn finding(rule_id: &str, severity: VerdictBand, evidence: String) -> PkgFinding {
+    PkgFinding {
+        rule_id: rule_id.to_string(),
+        severity,
+        evidence,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum WordPart {
     Literal(String),
@@ -1664,11 +1673,11 @@ fn check_r11(folded: &FoldedPkgbuild) -> Vec<PkgFinding> {
     // INFO until tuned: the benign corpus shows real maintainers skip
     // verification routinely (spotify indexed SKIPs, dropbox, nightly -bin
     // balls, -git VCS balls). The signal is true but too loud for HIGH.
-    vec![PkgFinding {
-        rule_id: "R11_CHECKSUM_SKIP".to_string(),
-        severity: VerdictBand::Low,
-        evidence: format!("checksum SKIP without signed story: {}", skipped.join(", ")),
-    }]
+    vec![finding(
+        "R11_CHECKSUM_SKIP",
+        VerdictBand::Low,
+        format!("checksum SKIP without signed story: {}", skipped.join(", ")),
+    )]
 }
 
 fn source_known_urls(folded: &FoldedPkgbuild) -> (Vec<String>, bool) {
@@ -1692,11 +1701,11 @@ fn check_r12_pair(baseline: &FoldedPkgbuild, target: &FoldedPkgbuild) -> Vec<Pkg
     let mut findings = Vec::new();
     if base_blind || target_blind {
         // Fail-closed lean: unresolvable entries make the drift check blind.
-        findings.push(PkgFinding {
-            rule_id: "R12_SOURCE_URL_DRIFT".to_string(),
-            severity: VerdictBand::Low,
-            evidence: "source entries unresolvable; drift comparison blind".to_string(),
-        });
+        findings.push(finding(
+            "R12_SOURCE_URL_DRIFT",
+            VerdictBand::Low,
+            "source entries unresolvable; drift comparison blind".to_string(),
+        ));
     }
     if base_urls == target_urls {
         return findings;
@@ -1927,11 +1936,11 @@ fn check_r13(folded: &FoldedPkgbuild) -> Vec<PkgFinding> {
             let norm = normalize_body_line(line);
             if line_matches_pipe_to_shell(&norm) || line_matches_interpreter_procsub(&norm) {
                 let short: String = line.trim().chars().take(120).collect();
-                return vec![PkgFinding {
-                    rule_id: "R13_PIPE_TO_SHELL".to_string(),
-                    severity: VerdictBand::High,
-                    evidence: format!("{name}(): {short}"),
-                }];
+                return vec![finding(
+                    "R13_PIPE_TO_SHELL",
+                    VerdictBand::High,
+                    format!("{name}(): {short}"),
+                )];
             }
         }
     }
@@ -1970,30 +1979,30 @@ fn check_r14(folded: &FoldedPkgbuild) -> Vec<PkgFinding> {
                     continue;
                 }
                 let short: String = line.trim().chars().take(120).collect();
-                return vec![PkgFinding {
-                    rule_id: "R14_EVAL_FAMILY".to_string(),
-                    severity: VerdictBand::High,
-                    evidence: format!("{name}(): {short}"),
-                }];
+                return vec![finding(
+                    "R14_EVAL_FAMILY",
+                    VerdictBand::High,
+                    format!("{name}(): {short}"),
+                )];
             }
             if (words.first() == Some(&"source") || words.first() == Some(&"."))
                 && let Some(arg) = words.get(1)
             {
                 if arg.starts_with("http://") || arg.starts_with("https://") {
                     let short: String = line.trim().chars().take(120).collect();
-                    return vec![PkgFinding {
-                        rule_id: "R14_EVAL_FAMILY".to_string(),
-                        severity: VerdictBand::High,
-                        evidence: format!("{name}(): remote source {short}"),
-                    }];
+                    return vec![finding(
+                        "R14_EVAL_FAMILY",
+                        VerdictBand::High,
+                        format!("{name}(): remote source {short}"),
+                    )];
                 }
                 if *arg == "<(" || arg.starts_with("<(") {
                     let short: String = line.trim().chars().take(120).collect();
-                    return vec![PkgFinding {
-                        rule_id: "R14_EVAL_FAMILY".to_string(),
-                        severity: VerdictBand::High,
-                        evidence: format!("{name}(): process-substitution source {short}"),
-                    }];
+                    return vec![finding(
+                        "R14_EVAL_FAMILY",
+                        VerdictBand::High,
+                        format!("{name}(): process-substitution source {short}"),
+                    )];
                 }
                 if arg.starts_with('$')
                     || arg.starts_with('`')
@@ -2002,22 +2011,22 @@ fn check_r14(folded: &FoldedPkgbuild) -> Vec<PkgFinding> {
                     || arg.starts_with("/dev/tcp/")
                 {
                     let short: String = line.trim().chars().take(120).collect();
-                    return vec![PkgFinding {
-                        rule_id: "R14_EVAL_FAMILY".to_string(),
-                        severity: VerdictBand::Medium,
-                        evidence: format!("{name}(): unresolvable source target {short}"),
-                    }];
+                    return vec![finding(
+                        "R14_EVAL_FAMILY",
+                        VerdictBand::Medium,
+                        format!("{name}(): unresolvable source target {short}"),
+                    )];
                 }
             }
             if let Some(first) = words.first()
                 && (first.starts_with("source<") || first.starts_with(".<"))
             {
                 let short: String = line.trim().chars().take(120).collect();
-                return vec![PkgFinding {
-                    rule_id: "R14_EVAL_FAMILY".to_string(),
-                    severity: VerdictBand::High,
-                    evidence: format!("{name}(): process-substitution source {short}"),
-                }];
+                return vec![finding(
+                    "R14_EVAL_FAMILY",
+                    VerdictBand::High,
+                    format!("{name}(): process-substitution source {short}"),
+                )];
             }
             let dynamic = lower.contains('$') || lower.contains('`');
             let fetcher = ["curl", "wget"].iter().any(|tool| lower.contains(tool));
@@ -2027,11 +2036,11 @@ fn check_r14(folded: &FoldedPkgbuild) -> Vec<PkgFinding> {
             });
             if dash_c && (dynamic || fetcher) {
                 let short: String = line.trim().chars().take(120).collect();
-                return vec![PkgFinding {
-                    rule_id: "R14_EVAL_FAMILY".to_string(),
-                    severity: VerdictBand::High,
-                    evidence: format!("{name}(): dynamic shell -c {short}"),
-                }];
+                return vec![finding(
+                    "R14_EVAL_FAMILY",
+                    VerdictBand::High,
+                    format!("{name}(): dynamic shell -c {short}"),
+                )];
             }
         }
     }
@@ -2134,11 +2143,11 @@ pub fn npm_delivery_refs(content: &str) -> Vec<crate::install_ref::InstallRef> {
 
 fn check_r15(folded: &FoldedPkgbuild) -> Vec<PkgFinding> {
     if folded.has_indirection {
-        return vec![PkgFinding {
-            rule_id: "R15_DYNAMIC_INDIRECTION".to_string(),
-            severity: VerdictBand::Medium,
-            evidence: "indirect expansion `${!...}` present; value unresolvable".to_string(),
-        }];
+        return vec![finding(
+            "R15_DYNAMIC_INDIRECTION",
+            VerdictBand::Medium,
+            "indirect expansion `${!...}` present; value unresolvable".to_string(),
+        )];
     }
     Vec::new()
 }
@@ -2179,11 +2188,11 @@ fn check_r17(folded: &FoldedPkgbuild) -> Vec<PkgFinding> {
                 // (tor-browser-bin pulls checksums to verify, logseq fetches).
                 // Intent is unreadable statically, so this stays surface-only.
                 let short: String = line.trim().chars().take(120).collect();
-                return vec![PkgFinding {
-                    rule_id: "R17_BUILD_TIME_NETWORK".to_string(),
-                    severity: VerdictBand::Low,
-                    evidence: format!("{name}(): network fetch {short}"),
-                }];
+                return vec![finding(
+                    "R17_BUILD_TIME_NETWORK",
+                    VerdictBand::Low,
+                    format!("{name}(): network fetch {short}"),
+                )];
             }
         }
     }
@@ -2192,11 +2201,11 @@ fn check_r17(folded: &FoldedPkgbuild) -> Vec<PkgFinding> {
 
 fn check_r18(folded: &FoldedPkgbuild) -> Vec<PkgFinding> {
     if folded.suspicious_unicode {
-        return vec![PkgFinding {
-            rule_id: "R18_HOMOGLYPH".to_string(),
-            severity: VerdictBand::High,
-            evidence: "zero-width, BiDi, or invisible unicode present".to_string(),
-        }];
+        return vec![finding(
+            "R18_HOMOGLYPH",
+            VerdictBand::High,
+            "zero-width, BiDi, or invisible unicode present".to_string(),
+        )];
     }
     Vec::new()
 }
@@ -2277,11 +2286,11 @@ fn check_r19_pair(baseline: &FoldedPkgbuild, target: &FoldedPkgbuild) -> Vec<Pkg
     if base_keys.iter().any(|key| key == "<unknown>")
         || target_keys.iter().any(|key| key == "<unknown>")
     {
-        return vec![PkgFinding {
-            rule_id: "R19_VALIDPGPKEYS_CHANGE".to_string(),
-            severity: VerdictBand::Low,
-            evidence: "validpgpkeys unresolvable; cannot compare across releases".to_string(),
-        }];
+        return vec![finding(
+            "R19_VALIDPGPKEYS_CHANGE",
+            VerdictBand::Low,
+            "validpgpkeys unresolvable; cannot compare across releases".to_string(),
+        )];
     }
     vec![PkgFinding {
         rule_id: "R19_VALIDPGPKEYS_CHANGE".to_string(),
@@ -2312,11 +2321,11 @@ fn check_r21(folded: &FoldedPkgbuild) -> Vec<PkgFinding> {
                 // INFO until tuned: bare `git+https://` tracking HEAD is the
                 // AUR -git norm (two dozen corpus hits). True but ubiquitous.
                 let short: String = url.chars().take(120).collect();
-                return vec![PkgFinding {
-                    rule_id: "R21_UNPINNED_VCS_SOURCE".to_string(),
-                    severity: VerdictBand::Low,
-                    evidence: format!("unpinned VCS source without #tag= or #commit=: {short}"),
-                }];
+                return vec![finding(
+                    "R21_UNPINNED_VCS_SOURCE",
+                    VerdictBand::Low,
+                    format!("unpinned VCS source without #tag= or #commit=: {short}"),
+                )];
             }
         }
     }
@@ -2348,11 +2357,11 @@ fn check_r22(folded: &FoldedPkgbuild) -> Vec<PkgFinding> {
                 // date) and port helpers (syncthingtray shuf) trip this.
                 // Cannot prove intent, so surface only.
                 let short: String = line.trim().chars().take(120).collect();
-                return vec![PkgFinding {
-                    rule_id: "R22_CONDITIONAL_EXECUTION".to_string(),
-                    severity: VerdictBand::Low,
-                    evidence: format!("{name}(): conditional guard {short}"),
-                }];
+                return vec![finding(
+                    "R22_CONDITIONAL_EXECUTION",
+                    VerdictBand::Low,
+                    format!("{name}(): conditional guard {short}"),
+                )];
             }
         }
     }

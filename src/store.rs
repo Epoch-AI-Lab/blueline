@@ -979,16 +979,8 @@ fn default_db_path() -> Result<std::path::PathBuf, BluelineError> {
 mod tests {
     use super::*;
     use crate::registry::ChecksumAlg;
+    use crate::test_support::checksum as ck;
     use sha2::{Digest, Sha512};
-
-    fn ck(tag: &str) -> Checksum {
-        let mut hasher = Sha512::new();
-        hasher.update(tag.as_bytes());
-        Checksum {
-            alg: ChecksumAlg::Sha512,
-            value_hex: format!("{:x}", hasher.finalize()),
-        }
-    }
 
     #[test]
     fn records_verified_witness_as_unclean() {
@@ -1725,20 +1717,11 @@ mod tests {
 
     mod proptest_invariants {
         use super::*;
-        use crate::registry::ChecksumAlg;
         use proptest::collection;
         use proptest::prelude::*;
-        use sha2::{Digest, Sha512};
         use std::collections::BTreeMap;
 
-        fn ck(tag: &str) -> Checksum {
-            let mut hasher = Sha512::new();
-            hasher.update(tag.as_bytes());
-            Checksum {
-                alg: ChecksumAlg::Sha512,
-                value_hex: format!("{:x}", hasher.finalize()),
-            }
-        }
+        use crate::test_support::checksum as ck;
 
         // K distinct (name, version) keys plus a sequence of actions that
         // reference them. Each action re-verifies a key with either its true

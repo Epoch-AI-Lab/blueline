@@ -495,6 +495,14 @@ pub fn parse_cvss_vector(vector: &str) -> Option<f64> {
     let mut i: Option<f64> = None;
     let mut a: Option<f64> = None;
 
+    // Impact metrics share one weight table (confidentiality, integrity, availability).
+    let cia = |v: &str| match v {
+        "H" => Some(0.56),
+        "L" => Some(0.22),
+        "N" => Some(0.0),
+        _ => None,
+    };
+
     for part in vector.split('/') {
         let mut kv = part.splitn(2, ':');
         let k = kv.next()?;
@@ -529,30 +537,9 @@ pub fn parse_cvss_vector(vector: &str) -> Option<f64> {
             "S" => {
                 scope_changed = v == "C";
             }
-            "C" => {
-                c = match v {
-                    "H" => Some(0.56),
-                    "L" => Some(0.22),
-                    "N" => Some(0.0),
-                    _ => None,
-                };
-            }
-            "I" => {
-                i = match v {
-                    "H" => Some(0.56),
-                    "L" => Some(0.22),
-                    "N" => Some(0.0),
-                    _ => None,
-                };
-            }
-            "A" => {
-                a = match v {
-                    "H" => Some(0.56),
-                    "L" => Some(0.22),
-                    "N" => Some(0.0),
-                    _ => None,
-                };
-            }
+            "C" => c = cia(v),
+            "I" => i = cia(v),
+            "A" => a = cia(v),
             _ => {}
         }
     }

@@ -2143,49 +2143,87 @@ mod tests {
     use super::*;
     use crate::diff::FileChange;
 
-    #[test]
-    fn blocks_on_lifecycle_scripts() {
-        let delta = Delta {
+    fn has_finding(verdict: &Verdict, rule_id: &str) -> bool {
+        verdict.findings.iter().any(|f| f.rule_id == rule_id)
+    }
+
+    /// A clean npm release through the policy path, everything default.
+    fn npm_verdict(delta: &Delta) -> Verdict {
+        evaluate_with_policy(
+            "test-pkg",
+            Ecosystem::Npm,
+            "verified (sha512)",
+            delta,
+            false,
+            &Policy::default(),
+        )
+    }
+
+    /// A clean npm release through the trust path, with everything not
+    /// under test at its default.
+    fn npm_clean_verdict(
+        delta: &Delta,
+        release_author: Option<&str>,
+        advisories: Option<&AdvisoryReport>,
+        provenance: Option<&ProvenanceReport>,
+    ) -> Verdict {
+        evaluate_with_trust(
+            "pkg",
+            Ecosystem::Npm,
+            "verified (sha512)",
+            delta,
+            false,
+            false,
+            None,
+            false,
+            None,
+            false,
+            release_author,
+            &Policy::default(),
+            advisories,
+            provenance,
+        )
+    }
+
+    /// Empty delta; tests override the fields they care about.
+    fn base_delta() -> Delta {
+        Delta {
             baseline_version: Some("1.0.0".into()),
             target_version: "1.0.1".into(),
             files_added: vec![],
             files_removed: vec![],
             files_modified: vec![],
-            total_lines_added: 5,
+            total_lines_added: 0,
             total_lines_deleted: 0,
             new_executables: vec![],
             new_binaries: vec![],
             modified_binaries: vec![],
-            new_lifecycle_scripts: vec!["postinstall".into()],
+            new_lifecycle_scripts: vec![],
             modified_lifecycle_scripts: vec![],
             new_dependencies: vec![],
             modified_dependencies: vec![],
             binding_gyp_added: false,
             removed_dependencies: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn blocks_on_lifecycle_scripts() {
+        let delta = Delta {
+            total_lines_added: 5,
+            new_lifecycle_scripts: vec!["postinstall".into()],
+            ..base_delta()
         };
 
-        let verdict = evaluate_with_policy(
-            "test-pkg",
-            Ecosystem::Npm,
-            "verified (sha512)",
-            &delta,
-            false,
-            &Policy::default(),
-        );
+        let verdict = npm_verdict(&delta);
         assert_eq!(verdict.band, VerdictBand::Block);
         assert!(verdict.risk_score >= 50);
-        assert!(
-            verdict
-                .findings
-                .iter()
-                .any(|f| f.rule_id == "R01_LIFECYCLE_SCRIPT_ADDED")
-        );
+        assert!(has_finding(&verdict, "R01_LIFECYCLE_SCRIPT_ADDED"));
     }
 
     #[test]
     fn flags_suspicious_eval_and_binaries() {
         let delta = Delta {
-            baseline_version: Some("1.0.0".into()),
             target_version: "1.1.0".into(),
             files_added: vec![FileChange {
                 relative_path: "index.js".into(),
@@ -2195,49 +2233,21 @@ mod tests {
                 is_executable: false,
                 unified_diff: Some("+const x = eval(payload);\n".into()),
             }],
-            files_removed: vec![],
-            files_modified: vec![],
             total_lines_added: 2,
-            total_lines_deleted: 0,
             new_executables: vec!["payload.node".into()],
             new_binaries: vec!["payload.node".into()],
-            modified_binaries: vec![],
-            new_lifecycle_scripts: vec![],
-            modified_lifecycle_scripts: vec![],
-            new_dependencies: vec![],
-            modified_dependencies: vec![],
-            binding_gyp_added: false,
-            removed_dependencies: Vec::new(),
+            ..base_delta()
         };
 
-        let verdict = evaluate_with_policy(
-            "test-pkg",
-            Ecosystem::Npm,
-            "verified (sha512)",
-            &delta,
-            false,
-            &Policy::default(),
-        );
+        let verdict = npm_verdict(&delta);
         assert_eq!(verdict.band, VerdictBand::High);
-        assert!(
-            verdict
-                .findings
-                .iter()
-                .any(|f| f.rule_id == "R03_EVAL_USAGE")
-        );
-        assert!(
-            verdict
-                .findings
-                .iter()
-                .any(|f| f.rule_id == "R02_EXECUTABLE_ADDED")
-        );
+        assert!(has_finding(&verdict, "R03_EVAL_USAGE"));
+        assert!(has_finding(&verdict, "R02_EXECUTABLE_ADDED"));
     }
 
     #[test]
     fn flags_opaque_large_file_added() {
         let delta = Delta {
-            baseline_version: Some("1.0.0".into()),
-            target_version: "1.0.1".into(),
             files_added: vec![FileChange {
                 relative_path: "large.bin".into(),
                 kind: FileKind::OpaqueTooLarge,
@@ -2246,36 +2256,13 @@ mod tests {
                 is_executable: false,
                 unified_diff: None,
             }],
-            files_removed: vec![],
-            files_modified: vec![],
-            total_lines_added: 0,
-            total_lines_deleted: 0,
-            new_executables: vec![],
             new_binaries: vec!["large.bin".into()],
-            modified_binaries: vec![],
-            new_lifecycle_scripts: vec![],
-            modified_lifecycle_scripts: vec![],
-            new_dependencies: vec![],
-            modified_dependencies: vec![],
-            binding_gyp_added: false,
-            removed_dependencies: Vec::new(),
+            ..base_delta()
         };
 
-        let verdict = evaluate_with_policy(
-            "test-pkg",
-            Ecosystem::Npm,
-            "verified (sha512)",
-            &delta,
-            false,
-            &Policy::default(),
-        );
+        let verdict = npm_verdict(&delta);
         assert_eq!(verdict.band, VerdictBand::High);
-        assert!(
-            verdict
-                .findings
-                .iter()
-                .any(|f| f.rule_id == "R02_OPAQUE_LARGE_FILE_ADDED")
-        );
+        assert!(has_finding(&verdict, "R02_OPAQUE_LARGE_FILE_ADDED"));
     }
 
     /// A plain added binary that is neither executable nor opaque-large: the
@@ -2285,8 +2272,6 @@ mod tests {
     /// whose constant never exercises it.
     fn delta_with_added_binary(path: &str) -> Delta {
         Delta {
-            baseline_version: Some("1.0.0".into()),
-            target_version: "1.0.1".into(),
             files_added: vec![FileChange {
                 relative_path: path.into(),
                 kind: FileKind::Binary,
@@ -2295,19 +2280,8 @@ mod tests {
                 is_executable: false,
                 unified_diff: None,
             }],
-            files_removed: vec![],
-            files_modified: vec![],
-            total_lines_added: 0,
-            total_lines_deleted: 0,
-            new_executables: vec![],
             new_binaries: vec![path.into()],
-            modified_binaries: vec![],
-            new_lifecycle_scripts: vec![],
-            modified_lifecycle_scripts: vec![],
-            new_dependencies: vec![],
-            modified_dependencies: vec![],
-            binding_gyp_added: false,
-            removed_dependencies: Vec::new(),
+            ..base_delta()
         }
     }
 
@@ -3024,8 +2998,6 @@ mod tests {
     #[test]
     fn blocks_on_binding_gyp_addition() {
         let delta = Delta {
-            baseline_version: Some("1.0.0".into()),
-            target_version: "1.0.1".into(),
             files_added: vec![FileChange {
                 relative_path: "binding.gyp".into(),
                 kind: FileKind::Text,
@@ -3034,36 +3006,14 @@ mod tests {
                 is_executable: false,
                 unified_diff: None,
             }],
-            files_removed: vec![],
-            files_modified: vec![],
             total_lines_added: 5,
-            total_lines_deleted: 0,
-            new_executables: vec![],
-            new_binaries: vec![],
-            modified_binaries: vec![],
-            new_lifecycle_scripts: vec![],
-            modified_lifecycle_scripts: vec![],
-            new_dependencies: vec![],
-            modified_dependencies: vec![],
             binding_gyp_added: true,
-            removed_dependencies: Vec::new(),
+            ..base_delta()
         };
 
-        let verdict = evaluate_with_policy(
-            "test-pkg",
-            Ecosystem::Npm,
-            "verified (sha512)",
-            &delta,
-            false,
-            &Policy::default(),
-        );
+        let verdict = npm_verdict(&delta);
         assert_eq!(verdict.band, VerdictBand::Block);
-        assert!(
-            verdict
-                .findings
-                .iter()
-                .any(|f| f.rule_id == "R01_BINDING_GYP_ADDED")
-        );
+        assert!(has_finding(&verdict, "R01_BINDING_GYP_ADDED"));
     }
 
     #[test]
@@ -3092,32 +3042,11 @@ mod tests {
     #[test]
     fn detects_non_semver_urls_in_dependencies() {
         let delta = Delta {
-            baseline_version: Some("1.0.0".into()),
-            target_version: "1.0.1".into(),
-            files_added: vec![],
-            files_removed: vec![],
-            files_modified: vec![],
-            total_lines_added: 0,
-            total_lines_deleted: 0,
-            new_executables: vec![],
-            new_binaries: vec![],
-            modified_binaries: vec![],
-            new_lifecycle_scripts: vec![],
-            modified_lifecycle_scripts: vec![],
             new_dependencies: vec![("malicious-pkg".into(), "ssh://git@host/repo".into())],
-            modified_dependencies: vec![],
-            binding_gyp_added: false,
-            removed_dependencies: Vec::new(),
+            ..base_delta()
         };
 
-        let verdict = evaluate_with_policy(
-            "test-pkg",
-            Ecosystem::Npm,
-            "verified (sha512)",
-            &delta,
-            false,
-            &Policy::default(),
-        );
+        let verdict = npm_verdict(&delta);
         assert_eq!(verdict.band, VerdictBand::High);
         assert!(
             verdict
@@ -3140,29 +3069,11 @@ mod tests {
                 is_executable: false,
                 unified_diff: None,
             }],
-            files_removed: vec![],
-            files_modified: vec![],
             total_lines_added: 1,
-            total_lines_deleted: 0,
-            new_executables: vec![],
-            new_binaries: vec![],
-            modified_binaries: vec![],
-            new_lifecycle_scripts: vec![],
-            modified_lifecycle_scripts: vec![],
-            new_dependencies: vec![],
-            modified_dependencies: vec![],
-            binding_gyp_added: false,
-            removed_dependencies: Vec::new(),
+            ..base_delta()
         };
 
-        let verdict = evaluate_with_policy(
-            "test-pkg",
-            Ecosystem::Npm,
-            "verified (sha512)",
-            &delta,
-            false,
-            &Policy::default(),
-        );
+        let verdict = npm_verdict(&delta);
         assert_eq!(verdict.band, VerdictBand::Medium);
         assert_eq!(verdict.risk_score, 15);
         assert!(
@@ -3175,24 +3086,7 @@ mod tests {
 
     #[test]
     fn flags_unreviewed_predecessor_baseline() {
-        let delta = Delta {
-            baseline_version: Some("1.0.0".into()),
-            target_version: "1.0.1".into(),
-            files_added: vec![],
-            files_removed: vec![],
-            files_modified: vec![],
-            total_lines_added: 0,
-            total_lines_deleted: 0,
-            new_executables: vec![],
-            new_binaries: vec![],
-            modified_binaries: vec![],
-            new_lifecycle_scripts: vec![],
-            modified_lifecycle_scripts: vec![],
-            new_dependencies: vec![],
-            modified_dependencies: vec![],
-            binding_gyp_added: false,
-            removed_dependencies: Vec::new(),
-        };
+        let delta = Delta { ..base_delta() };
 
         let verdict = evaluate_with_policy(
             "test-pkg",
@@ -3203,12 +3097,7 @@ mod tests {
             &Policy::default(),
         );
         assert_eq!(verdict.band, VerdictBand::Medium);
-        assert!(
-            verdict
-                .findings
-                .iter()
-                .any(|f| f.rule_id == "R07_UNREVIEWED_PREDECESSOR_BASELINE")
-        );
+        assert!(has_finding(&verdict, "R07_UNREVIEWED_PREDECESSOR_BASELINE"));
     }
 
     #[test]
@@ -3216,20 +3105,7 @@ mod tests {
         let first_sighting = Delta {
             baseline_version: None,
             target_version: "1.0.0".into(),
-            files_added: vec![],
-            files_removed: vec![],
-            files_modified: vec![],
-            total_lines_added: 0,
-            total_lines_deleted: 0,
-            new_executables: vec![],
-            new_binaries: vec![],
-            modified_binaries: vec![],
-            new_lifecycle_scripts: vec![],
-            modified_lifecycle_scripts: vec![],
-            new_dependencies: vec![],
-            modified_dependencies: vec![],
-            binding_gyp_added: false,
-            removed_dependencies: Vec::new(),
+            ..base_delta()
         };
         let unreviewed = Delta {
             baseline_version: Some("1.0.0".into()),
@@ -3294,10 +3170,6 @@ mod tests {
         use crate::diff::{FileChange, FileKind};
 
         let delta = Delta {
-            baseline_version: Some("1.0.0".into()),
-            target_version: "1.0.1".into(),
-            files_added: vec![],
-            files_removed: vec![],
             files_modified: vec![FileChange {
                 relative_path: "index.js".into(),
                 kind: FileKind::Text,
@@ -3307,16 +3179,7 @@ mod tests {
                 unified_diff: Some("+eval(process.argv[2])".into()),
             }],
             total_lines_added: 1,
-            total_lines_deleted: 0,
-            new_executables: vec![],
-            new_binaries: vec![],
-            modified_binaries: vec![],
-            new_lifecycle_scripts: vec![],
-            modified_lifecycle_scripts: vec![],
-            new_dependencies: vec![],
-            modified_dependencies: vec![],
-            binding_gyp_added: false,
-            removed_dependencies: Vec::new(),
+            ..base_delta()
         };
 
         let mut policy = Policy::default();
@@ -3383,10 +3246,6 @@ mod tests {
     #[test]
     fn detects_modified_binaries() {
         let delta = Delta {
-            baseline_version: Some("1.0.0".into()),
-            target_version: "1.0.1".into(),
-            files_added: vec![],
-            files_removed: vec![],
             files_modified: vec![FileChange {
                 relative_path: "binding.node".into(),
                 kind: FileKind::Binary,
@@ -3395,76 +3254,29 @@ mod tests {
                 is_executable: false,
                 unified_diff: None,
             }],
-            total_lines_added: 0,
-            total_lines_deleted: 0,
-            new_executables: vec![],
-            new_binaries: vec![],
             modified_binaries: vec!["binding.node".into()],
-            new_lifecycle_scripts: vec![],
-            modified_lifecycle_scripts: vec![],
-            new_dependencies: vec![],
-            modified_dependencies: vec![],
-            binding_gyp_added: false,
-            removed_dependencies: Vec::new(),
+            ..base_delta()
         };
 
-        let verdict = evaluate_with_policy(
-            "test-pkg",
-            Ecosystem::Npm,
-            "verified (sha512)",
-            &delta,
-            false,
-            &Policy::default(),
-        );
+        let verdict = npm_verdict(&delta);
         assert_eq!(verdict.band, VerdictBand::High);
-        assert!(
-            verdict
-                .findings
-                .iter()
-                .any(|f| f.rule_id == "R02_BINARY_BLOB_MODIFIED")
-        );
+        assert!(has_finding(&verdict, "R02_BINARY_BLOB_MODIFIED"));
     }
 
     #[test]
     fn detects_modified_dependency_non_semver_url() {
         let delta = Delta {
-            baseline_version: Some("1.0.0".into()),
-            target_version: "1.0.1".into(),
-            files_added: vec![],
-            files_removed: vec![],
-            files_modified: vec![],
-            total_lines_added: 0,
-            total_lines_deleted: 0,
-            new_executables: vec![],
-            new_binaries: vec![],
-            modified_binaries: vec![],
-            new_lifecycle_scripts: vec![],
-            modified_lifecycle_scripts: vec![],
-            new_dependencies: vec![],
             modified_dependencies: vec![(
                 "cookie".into(),
                 "0.7.1".into(),
                 "https://evil.com/cookie.tgz".into(),
             )],
-            binding_gyp_added: false,
-            removed_dependencies: Vec::new(),
+            ..base_delta()
         };
 
-        let verdict = evaluate_with_policy(
-            "test-pkg",
-            Ecosystem::Npm,
-            "verified (sha512)",
-            &delta,
-            false,
-            &Policy::default(),
-        );
+        let verdict = npm_verdict(&delta);
         assert_eq!(verdict.band, VerdictBand::High);
-        assert!(
-            verdict
-                .findings
-                .iter()
-                .any(|f| f.rule_id == "R04_DEPENDENCY_MODIFIED")
-        );
+        assert!(has_finding(&verdict, "R04_DEPENDENCY_MODIFIED"));
     }
 
     #[test]
@@ -3481,7 +3293,6 @@ mod tests {
     #[test]
     fn escalates_to_block_on_high_accumulated_score() {
         let delta = Delta {
-            baseline_version: Some("1.0.0".into()),
             target_version: "1.1.0".into(),
             files_added: vec![
                 FileChange {
@@ -3517,58 +3328,23 @@ mod tests {
                     unified_diff: None,
                 },
             ],
-            files_removed: vec![],
-            files_modified: vec![],
-            total_lines_added: 0,
-            total_lines_deleted: 0,
             new_executables: vec![
                 "p1.exe".into(),
                 "p2.exe".into(),
                 "p3.exe".into(),
                 "p4.exe".into(),
             ],
-            new_binaries: vec![],
-            modified_binaries: vec![],
-            new_lifecycle_scripts: vec![],
-            modified_lifecycle_scripts: vec![],
-            new_dependencies: vec![],
-            modified_dependencies: vec![],
-            binding_gyp_added: false,
-            removed_dependencies: Vec::new(),
+            ..base_delta()
         };
 
-        let verdict = evaluate_with_policy(
-            "test-pkg",
-            Ecosystem::Npm,
-            "verified (sha512)",
-            &delta,
-            false,
-            &Policy::default(),
-        );
+        let verdict = npm_verdict(&delta);
         assert_eq!(verdict.risk_score, 100);
         assert_eq!(verdict.band, VerdictBand::Block);
     }
 
     #[test]
     fn policy_blocks_blacklisted_package() {
-        let delta = Delta {
-            baseline_version: Some("1.0.0".into()),
-            target_version: "1.0.1".into(),
-            files_added: vec![],
-            files_removed: vec![],
-            files_modified: vec![],
-            total_lines_added: 0,
-            total_lines_deleted: 0,
-            new_executables: vec![],
-            new_binaries: vec![],
-            modified_binaries: vec![],
-            new_lifecycle_scripts: vec![],
-            modified_lifecycle_scripts: vec![],
-            new_dependencies: vec![],
-            modified_dependencies: vec![],
-            binding_gyp_added: false,
-            removed_dependencies: Vec::new(),
-        };
+        let delta = Delta { ..base_delta() };
 
         let mut policy = Policy::default();
         policy
@@ -3588,33 +3364,14 @@ mod tests {
             &policy,
         );
         assert_eq!(verdict.band, VerdictBand::Block);
-        assert!(
-            verdict
-                .findings
-                .iter()
-                .any(|f| f.rule_id == "P01_PACKAGE_BLOCKED")
-        );
+        assert!(has_finding(&verdict, "P01_PACKAGE_BLOCKED"));
     }
 
     #[test]
     fn policy_allows_whitelisted_lifecycle_script() {
         let delta = Delta {
-            baseline_version: Some("1.0.0".into()),
-            target_version: "1.0.1".into(),
-            files_added: vec![],
-            files_removed: vec![],
-            files_modified: vec![],
-            total_lines_added: 0,
-            total_lines_deleted: 0,
-            new_executables: vec![],
-            new_binaries: vec![],
-            modified_binaries: vec![],
             new_lifecycle_scripts: vec!["postinstall".into()],
-            modified_lifecycle_scripts: vec![],
-            new_dependencies: vec![],
-            modified_dependencies: vec![],
-            binding_gyp_added: false,
-            removed_dependencies: Vec::new(),
+            ..base_delta()
         };
 
         let mut policy = Policy::default();
@@ -3640,12 +3397,7 @@ mod tests {
             &policy,
         );
         assert_eq!(verdict.band, VerdictBand::Low);
-        assert!(
-            verdict
-                .findings
-                .iter()
-                .any(|f| f.rule_id == "P02_LIFECYCLE_SCRIPT_ALLOWED")
-        );
+        assert!(has_finding(&verdict, "P02_LIFECYCLE_SCRIPT_ALLOWED"));
     }
 
     #[test]
@@ -3662,24 +3414,7 @@ mod tests {
 
     #[test]
     fn blocks_on_malware_advisory() {
-        let delta = Delta {
-            baseline_version: Some("1.0.0".into()),
-            target_version: "1.0.1".into(),
-            files_added: vec![],
-            files_removed: vec![],
-            files_modified: vec![],
-            total_lines_added: 0,
-            total_lines_deleted: 0,
-            new_executables: vec![],
-            new_binaries: vec![],
-            modified_binaries: vec![],
-            new_lifecycle_scripts: vec![],
-            modified_lifecycle_scripts: vec![],
-            new_dependencies: vec![],
-            modified_dependencies: vec![],
-            binding_gyp_added: false,
-            removed_dependencies: Vec::new(),
-        };
+        let delta = Delta { ..base_delta() };
 
         let adv = AdvisoryReport {
             status: crate::advisory::AdvisoryStatus::Vulnerable,
@@ -3696,52 +3431,15 @@ mod tests {
             message: None,
         };
 
-        let verdict = evaluate_with_trust(
-            "pkg",
-            Ecosystem::Npm,
-            "verified (sha512)",
-            &delta,
-            false,
-            false,
-            None,
-            false,
-            None,
-            false,
-            None,
-            &Policy::default(),
-            Some(&adv),
-            None,
-        );
+        let verdict = npm_clean_verdict(&delta, None, Some(&adv), None);
 
         assert_eq!(verdict.band, VerdictBand::Block);
-        assert!(
-            verdict
-                .findings
-                .iter()
-                .any(|f| f.rule_id == "R09_ADVISORY_MALWARE")
-        );
+        assert!(has_finding(&verdict, "R09_ADVISORY_MALWARE"));
     }
 
     #[test]
     fn blocks_on_critical_cve_advisory() {
-        let delta = Delta {
-            baseline_version: Some("1.0.0".into()),
-            target_version: "1.0.1".into(),
-            files_added: vec![],
-            files_removed: vec![],
-            files_modified: vec![],
-            total_lines_added: 0,
-            total_lines_deleted: 0,
-            new_executables: vec![],
-            new_binaries: vec![],
-            modified_binaries: vec![],
-            new_lifecycle_scripts: vec![],
-            modified_lifecycle_scripts: vec![],
-            new_dependencies: vec![],
-            modified_dependencies: vec![],
-            binding_gyp_added: false,
-            removed_dependencies: Vec::new(),
-        };
+        let delta = Delta { ..base_delta() };
 
         let adv = AdvisoryReport {
             status: crate::advisory::AdvisoryStatus::Vulnerable,
@@ -3758,101 +3456,27 @@ mod tests {
             message: None,
         };
 
-        let verdict = evaluate_with_trust(
-            "pkg",
-            Ecosystem::Npm,
-            "verified (sha512)",
-            &delta,
-            false,
-            false,
-            None,
-            false,
-            None,
-            false,
-            None,
-            &Policy::default(),
-            Some(&adv),
-            None,
-        );
+        let verdict = npm_clean_verdict(&delta, None, Some(&adv), None);
 
         assert_eq!(verdict.band, VerdictBand::Block);
-        assert!(
-            verdict
-                .findings
-                .iter()
-                .any(|f| f.rule_id == "R09_ADVISORY_CRITICAL_CVE")
-        );
+        assert!(has_finding(&verdict, "R09_ADVISORY_CRITICAL_CVE"));
     }
 
     #[test]
     fn blocks_on_provenance_digest_mismatch() {
-        let delta = Delta {
-            baseline_version: Some("1.0.0".into()),
-            target_version: "1.0.1".into(),
-            files_added: vec![],
-            files_removed: vec![],
-            files_modified: vec![],
-            total_lines_added: 0,
-            total_lines_deleted: 0,
-            new_executables: vec![],
-            new_binaries: vec![],
-            modified_binaries: vec![],
-            new_lifecycle_scripts: vec![],
-            modified_lifecycle_scripts: vec![],
-            new_dependencies: vec![],
-            modified_dependencies: vec![],
-            binding_gyp_added: false,
-            removed_dependencies: Vec::new(),
-        };
+        let delta = Delta { ..base_delta() };
 
         let prov = ProvenanceReport::failed_mismatch("digest hash mismatch");
 
-        let verdict = evaluate_with_trust(
-            "pkg",
-            Ecosystem::Npm,
-            "verified (sha512)",
-            &delta,
-            false,
-            false,
-            None,
-            false,
-            None,
-            false,
-            None,
-            &Policy::default(),
-            None,
-            Some(&prov),
-        );
+        let verdict = npm_clean_verdict(&delta, None, None, Some(&prov));
 
         assert_eq!(verdict.band, VerdictBand::Block);
-        assert!(
-            verdict
-                .findings
-                .iter()
-                .any(|f| f.rule_id == "P03_PROVENANCE_DIGEST_MISMATCH")
-        );
+        assert!(has_finding(&verdict, "P03_PROVENANCE_DIGEST_MISMATCH"));
     }
 
     #[test]
     fn holds_when_required_provenance_missing_or_blocks_unauthorized_repo() {
-        let delta = Delta {
-            baseline_version: Some("1.0.0".into()),
-            target_version: "1.0.1".into(),
-            files_added: vec![],
-            files_removed: vec![],
-            files_modified: vec![],
-            total_lines_added: 0,
-            total_lines_deleted: 0,
-            new_executables: vec![],
-            new_binaries: vec![],
-            modified_binaries: vec![],
-            new_lifecycle_scripts: vec![],
-            modified_lifecycle_scripts: vec![],
-            new_dependencies: vec![],
-            modified_dependencies: vec![],
-            binding_gyp_added: false,
-            removed_dependencies: Vec::new(),
-        };
+        let delta = Delta { ..base_delta() };
 
         let mut policy = Policy::default();
         policy.provenance.require_provenance = true;
@@ -3888,10 +3512,7 @@ mod tests {
             "absence must leave a clean release at LOW so the tool exits 0"
         );
         assert!(
-            verdict
-                .findings
-                .iter()
-                .any(|f| f.rule_id == "P03_PROVENANCE_REQUIRED_MISSING"),
+            has_finding(&verdict, "P03_PROVENANCE_REQUIRED_MISSING"),
             "but it is still disclosed, or the policy setting is invisible"
         );
         assert_eq!(
@@ -4222,22 +3843,8 @@ mod tests {
 
     fn yanked_delta() -> Delta {
         Delta {
-            baseline_version: Some("1.0.0".into()),
             target_version: "1.1.0".into(),
-            files_added: vec![],
-            files_removed: vec![],
-            files_modified: vec![],
-            total_lines_added: 0,
-            total_lines_deleted: 0,
-            new_executables: vec![],
-            new_binaries: vec![],
-            modified_binaries: vec![],
-            new_lifecycle_scripts: vec![],
-            modified_lifecycle_scripts: vec![],
-            new_dependencies: vec![],
-            modified_dependencies: vec![],
-            binding_gyp_added: false,
-            removed_dependencies: Vec::new(),
+            ..base_delta()
         }
     }
 
@@ -4435,12 +4042,7 @@ mod tests {
             None,
             None,
         );
-        assert!(
-            !verdict
-                .findings
-                .iter()
-                .any(|f| f.rule_id == "R08_YANKED_PREDECESSOR")
-        );
+        assert!(!has_finding(&verdict, "R08_YANKED_PREDECESSOR"));
         assert_eq!(verdict.band, VerdictBand::Low);
         assert_eq!(verdict.ecosystem, Ecosystem::Cargo);
     }
@@ -4497,12 +4099,7 @@ mod tests {
             None,
             None,
         );
-        assert!(
-            !verdict
-                .findings
-                .iter()
-                .any(|f| f.rule_id == "R10_MAINTAINER_TRANSITION")
-        );
+        assert!(!has_finding(&verdict, "R10_MAINTAINER_TRANSITION"));
         assert_eq!(verdict.band, VerdictBand::Low);
     }
 
@@ -4511,20 +4108,8 @@ mod tests {
         let delta = Delta {
             baseline_version: Some("1.0-1".into()),
             target_version: "1.0-2".into(),
-            files_added: vec![],
-            files_removed: vec![],
-            files_modified: vec![],
             total_lines_added: 1,
-            total_lines_deleted: 0,
-            new_executables: vec![],
-            new_binaries: vec![],
-            modified_binaries: vec![],
-            new_lifecycle_scripts: vec![],
-            modified_lifecycle_scripts: vec![],
-            new_dependencies: vec![],
-            modified_dependencies: vec![],
-            binding_gyp_added: false,
-            removed_dependencies: Vec::new(),
+            ..base_delta()
         };
         let verdict = evaluate_with_trust(
             "test-pkg",
@@ -4543,10 +4128,7 @@ mod tests {
             None,
         );
         assert!(
-            !verdict
-                .findings
-                .iter()
-                .any(|f| f.rule_id == "R05_NON_STANDARD_VERSION"),
+            !has_finding(&verdict, "R05_NON_STANDARD_VERSION"),
             "ordinary AUR versions must not trip R05, got {:?}",
             verdict.findings
         );
@@ -4564,24 +4146,7 @@ maintainers = ["badactor@example.com"]
 "#,
         )
         .unwrap();
-        let delta = Delta {
-            baseline_version: Some("1.0.0".into()),
-            target_version: "1.0.1".into(),
-            files_added: vec![],
-            files_removed: vec![],
-            files_modified: vec![],
-            total_lines_added: 0,
-            total_lines_deleted: 0,
-            new_executables: vec![],
-            new_binaries: vec![],
-            modified_binaries: vec![],
-            new_lifecycle_scripts: vec![],
-            modified_lifecycle_scripts: vec![],
-            new_dependencies: vec![],
-            modified_dependencies: vec![],
-            binding_gyp_added: false,
-            removed_dependencies: Vec::new(),
-        };
+        let delta = Delta { ..base_delta() };
         let verdict = evaluate_with_trust(
             "pkg",
             Ecosystem::Npm,
@@ -4600,10 +4165,7 @@ maintainers = ["badactor@example.com"]
         );
         assert_eq!(verdict.band, VerdictBand::Block);
         assert!(
-            verdict
-                .findings
-                .iter()
-                .any(|f| f.rule_id == "P04_MAINTAINER_BLOCKED"),
+            has_finding(&verdict, "P04_MAINTAINER_BLOCKED"),
             "expected P04_MAINTAINER_BLOCKED, got {:?}",
             verdict
                 .findings
@@ -4624,24 +4186,7 @@ maintainers = ["  BadActor@Example.com "]
 "#,
         )
         .unwrap();
-        let delta = Delta {
-            baseline_version: Some("1.0.0".into()),
-            target_version: "1.0.1".into(),
-            files_added: vec![],
-            files_removed: vec![],
-            files_modified: vec![],
-            total_lines_added: 0,
-            total_lines_deleted: 0,
-            new_executables: vec![],
-            new_binaries: vec![],
-            modified_binaries: vec![],
-            new_lifecycle_scripts: vec![],
-            modified_lifecycle_scripts: vec![],
-            new_dependencies: vec![],
-            modified_dependencies: vec![],
-            binding_gyp_added: false,
-            removed_dependencies: Vec::new(),
-        };
+        let delta = Delta { ..base_delta() };
         let verdict = evaluate_with_trust(
             "pkg",
             Ecosystem::Npm,
@@ -4659,10 +4204,7 @@ maintainers = ["  BadActor@Example.com "]
             None,
         );
         assert!(
-            verdict
-                .findings
-                .iter()
-                .any(|f| f.rule_id == "P04_MAINTAINER_BLOCKED"),
+            has_finding(&verdict, "P04_MAINTAINER_BLOCKED"),
             "a padded, differently-cased blocklist entry must still match"
         );
     }
@@ -4678,24 +4220,7 @@ maintainers = ["badactor@example.com"]
 "#,
         )
         .unwrap();
-        let delta = Delta {
-            baseline_version: Some("1.0.0".into()),
-            target_version: "1.0.1".into(),
-            files_added: vec![],
-            files_removed: vec![],
-            files_modified: vec![],
-            total_lines_added: 0,
-            total_lines_deleted: 0,
-            new_executables: vec![],
-            new_binaries: vec![],
-            modified_binaries: vec![],
-            new_lifecycle_scripts: vec![],
-            modified_lifecycle_scripts: vec![],
-            new_dependencies: vec![],
-            modified_dependencies: vec![],
-            binding_gyp_added: false,
-            removed_dependencies: Vec::new(),
-        };
+        let delta = Delta { ..base_delta() };
         let verdict = evaluate_with_trust(
             "pkg",
             Ecosystem::Npm,
@@ -4713,17 +4238,11 @@ maintainers = ["badactor@example.com"]
             None,
         );
         assert!(
-            !verdict
-                .findings
-                .iter()
-                .any(|f| f.rule_id == "P04_MAINTAINER_BLOCKED"),
+            !has_finding(&verdict, "P04_MAINTAINER_BLOCKED"),
             "an identity that is not on the list must not block"
         );
         assert!(
-            !verdict
-                .findings
-                .iter()
-                .any(|f| f.rule_id == "P04_MAINTAINER_UNEVALUABLE"),
+            !has_finding(&verdict, "P04_MAINTAINER_UNEVALUABLE"),
             "the list was applied here, so there is nothing to disclose"
         );
     }
@@ -4751,24 +4270,7 @@ maintainers = ["badactor@example.com"]
 "#,
         )
         .unwrap();
-        let delta = Delta {
-            baseline_version: Some("1.0.0".into()),
-            target_version: "1.0.1".into(),
-            files_added: vec![],
-            files_removed: vec![],
-            files_modified: vec![],
-            total_lines_added: 0,
-            total_lines_deleted: 0,
-            new_executables: vec![],
-            new_binaries: vec![],
-            modified_binaries: vec![],
-            new_lifecycle_scripts: vec![],
-            modified_lifecycle_scripts: vec![],
-            new_dependencies: vec![],
-            modified_dependencies: vec![],
-            binding_gyp_added: false,
-            removed_dependencies: Vec::new(),
-        };
+        let delta = Delta { ..base_delta() };
         let verdict = evaluate_with_trust(
             "pkg",
             Ecosystem::Npm,
@@ -4826,20 +4328,7 @@ maintainers = ["badactor@example.com"]
         let delta = Delta {
             baseline_version: Some("1.0.0-1".into()),
             target_version: "1.2.0-1".into(),
-            files_added: vec![],
-            files_removed: vec![],
-            files_modified: vec![],
-            total_lines_added: 0,
-            total_lines_deleted: 0,
-            new_executables: vec![],
-            new_binaries: vec![],
-            modified_binaries: vec![],
-            new_lifecycle_scripts: vec![],
-            modified_lifecycle_scripts: vec![],
-            new_dependencies: vec![],
-            modified_dependencies: vec![],
-            binding_gyp_added: false,
-            removed_dependencies: Vec::new(),
+            ..base_delta()
         };
         let verdict = evaluate_with_trust(
             "yay",
@@ -4859,10 +4348,7 @@ maintainers = ["badactor@example.com"]
         );
         assert_eq!(verdict.band, VerdictBand::Block);
         assert!(
-            verdict
-                .findings
-                .iter()
-                .any(|f| f.rule_id == "P04_MAINTAINER_BLOCKED"),
+            has_finding(&verdict, "P04_MAINTAINER_BLOCKED"),
             "an AUR commit author on the blocklist must block, got {:?}",
             verdict
                 .findings
@@ -4871,10 +4357,7 @@ maintainers = ["badactor@example.com"]
                 .collect::<Vec<_>>()
         );
         assert!(
-            !verdict
-                .findings
-                .iter()
-                .any(|f| f.rule_id == "P04_MAINTAINER_UNEVALUABLE"),
+            !has_finding(&verdict, "P04_MAINTAINER_UNEVALUABLE"),
             "the identity was available, so there is nothing to disclose"
         );
     }
@@ -4884,40 +4367,8 @@ maintainers = ["badactor@example.com"]
     /// block every npm review for every user who never asked for the check.
     #[test]
     fn an_empty_maintainer_blocklist_discloses_nothing() {
-        let delta = Delta {
-            baseline_version: Some("1.0.0".into()),
-            target_version: "1.0.1".into(),
-            files_added: vec![],
-            files_removed: vec![],
-            files_modified: vec![],
-            total_lines_added: 0,
-            total_lines_deleted: 0,
-            new_executables: vec![],
-            new_binaries: vec![],
-            modified_binaries: vec![],
-            new_lifecycle_scripts: vec![],
-            modified_lifecycle_scripts: vec![],
-            new_dependencies: vec![],
-            modified_dependencies: vec![],
-            binding_gyp_added: false,
-            removed_dependencies: Vec::new(),
-        };
-        let verdict = evaluate_with_trust(
-            "pkg",
-            Ecosystem::Npm,
-            "verified (sha512)",
-            &delta,
-            false,
-            false,
-            None,
-            false,
-            None,
-            false,
-            None,
-            &Policy::default(),
-            None,
-            None,
-        );
+        let delta = Delta { ..base_delta() };
+        let verdict = npm_clean_verdict(&delta, None, None, None);
         assert!(
             !verdict
                 .findings
@@ -4941,11 +4392,9 @@ maintainers = ["badactor@example.com"]
 
     fn opaque_large_file_delta(names: &[&str]) -> Delta {
         Delta {
-            baseline_version: Some("1.0.0".into()),
-            target_version: "1.0.1".into(),
             files_added: names.iter().map(|n| opaque_large_file(n)).collect(),
             new_binaries: names.iter().map(|n| (*n).into()).collect(),
-            ..Delta::default()
+            ..base_delta()
         }
     }
 
@@ -5185,10 +4634,7 @@ allowed_builders = [
                 Some(&prov),
             );
             assert!(
-                !verdict
-                    .findings
-                    .iter()
-                    .any(|f| f.rule_id == "P03_UNAUTHORIZED_BUILD_BUILDER"),
+                !has_finding(&verdict, "P03_UNAUTHORIZED_BUILD_BUILDER"),
                 "builder {builder:?} must not produce P03_UNAUTHORIZED_BUILD_BUILDER"
             );
             assert_eq!(verdict.band, VerdictBand::Low, "builder {builder:?}");
@@ -5197,15 +4643,13 @@ allowed_builders = [
 
     fn git_dependency_delta() -> Delta {
         Delta {
-            baseline_version: Some("1.0.0".into()),
-            target_version: "1.0.1".into(),
             new_dependencies: vec![("tool".into(), "git+https://github.com/acme/tool.git".into())],
             modified_dependencies: vec![(
                 "cookie".into(),
                 "0.7.1".into(),
                 "https://evil.example/cookie.tgz".into(),
             )],
-            ..Delta::default()
+            ..base_delta()
         }
     }
 
@@ -5282,10 +4726,8 @@ allowed_builders = [
         // Registry dependencies are not what the key is about: a plain semver
         // bump stays score-neutral either way.
         let registry_only = Delta {
-            baseline_version: Some("1.0.0".into()),
-            target_version: "1.0.1".into(),
             new_dependencies: vec![("left-pad".into(), "1.3.0".into())],
-            ..Delta::default()
+            ..base_delta()
         };
         let verdict = evaluate_with_policy(
             "test-pkg",

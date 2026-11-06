@@ -314,6 +314,17 @@ fn write_error<W: Write>(out: &mut W, message: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Shared `ecosystem` tool argument schema: the enum and the default are the
+/// same for every tool, only the description differs.
+fn ecosystem_schema(description: &str) -> serde_json::Value {
+    json!({
+        "type": "string",
+        "enum": ["npm", "cargo", "pypi", "aur"],
+        "default": "npm",
+        "description": description,
+    })
+}
+
 fn handle_request(
     method: &str,
     params: Option<serde_json::Value>,
@@ -347,12 +358,7 @@ fn handle_request(
                                 "type": "string",
                                 "description": "Package specification in the format '<name>@<version>' (e.g. 'lodash@4.17.21')"
                             },
-                            "ecosystem": {
-                                "type": "string",
-                                "enum": ["npm", "cargo", "pypi", "aur"],
-                                "default": "npm",
-                                "description": "Package ecosystem. npm reviews use dist-tags/semver; cargo reviews use the crates.io sparse index and refuse installs."
-                            }
+                            "ecosystem": ecosystem_schema("Package ecosystem. npm reviews use dist-tags/semver; cargo reviews use the crates.io sparse index and refuse installs."),
                         },
                         "required": ["package"]
                     }
@@ -371,12 +377,7 @@ fn handle_request(
                                 "type": "string",
                                 "description": "Package version (e.g. '4.17.21')"
                             },
-                            "ecosystem": {
-                                "type": "string",
-                                "enum": ["npm", "cargo", "pypi", "aur"],
-                                "default": "npm",
-                                "description": "Package ecosystem to scope the baseline lookup."
-                            }
+                            "ecosystem": ecosystem_schema("Package ecosystem to scope the baseline lookup."),
                         },
                         "required": ["name", "version"]
                     }
@@ -391,12 +392,7 @@ fn handle_request(
                                 "type": "string",
                                 "description": "Package specification '<name>@<version>'"
                             },
-                            "ecosystem": {
-                                "type": "string",
-                                "enum": ["npm", "cargo", "pypi", "aur"],
-                                "default": "npm",
-                                "description": "Package ecosystem to review against."
-                            }
+                            "ecosystem": ecosystem_schema("Package ecosystem to review against."),
                         },
                         "required": ["package"]
                     }
@@ -781,16 +777,7 @@ mod tests {
 
     #[test]
     fn check_known_clean_reports_true_only_for_marked_version() {
-        use crate::registry::{Checksum, ChecksumAlg};
-        use sha2::{Digest, Sha512};
-        fn ck(tag: &str) -> Checksum {
-            let mut hasher = Sha512::new();
-            hasher.update(tag.as_bytes());
-            Checksum {
-                alg: ChecksumAlg::Sha512,
-                value_hex: format!("{:x}", hasher.finalize()),
-            }
-        }
+        use crate::test_support::checksum as ck;
 
         let temp = tempfile::tempdir().unwrap();
         let store = BaselineStore::open_at(&temp.path().join("store.db")).unwrap();
