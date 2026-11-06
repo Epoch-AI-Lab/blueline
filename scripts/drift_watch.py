@@ -34,8 +34,8 @@ WATCHLIST = REPO_ROOT / "verification" / "drift" / "watchlist.toml"
 POLICY = REPO_ROOT / "verification" / "drift" / "policy.toml"
 BASELINE = REPO_ROOT / "verification" / "drift" / "baseline.json"
 
-ATTEMPTS = 3
-PER_RUN_TIMEOUT_SECS = 180
+ATTEMPTS = 2
+PER_RUN_TIMEOUT_SECS = 90
 
 
 def load_watchlist():
@@ -140,10 +140,16 @@ def main():
 
     summary_path = __import__("os").environ.get("GITHUB_STEP_SUMMARY")
     lines = [f"DRIFT: {len(drifted)} watchlist verdict(s) changed", ""]
-    lines.append("| package | baseline band | current band |")
+    lines.append("| package | baseline | current |")
     lines.append("| --- | --- | --- |")
     for key, old, new in drifted:
-        lines.append(f"| {key} | {old} | {new} |")
+        if key in baseline and key in current:
+            b, c = baseline[key], current[key]
+            old_s = f"{b['band']} (score {b['risk_score']}, {len(b['rule_ids'])} rules)"
+            new_s = f"{c['band']} (score {c['risk_score']}, {len(c['rule_ids'])} rules)"
+        else:
+            old_s, new_s = old, new
+        lines.append(f"| {key} | {old_s} | {new_s} |")
     lines += ["", "Accept intentional drift by re-running "
               "`scripts/drift_watch.py --establish` and committing the diff."]
     report = "\n".join(lines)

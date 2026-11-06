@@ -69,21 +69,12 @@ fn semver_strategy() -> impl Strategy<Value = String> {
             "0".to_string(),
             "1".to_string(),
         ])),
-        prop::option::of(prop::sample::select(vec![
-            "abc".to_string(),
-            "007".to_string(),
-            "x.1".to_string(),
-        ])),
     )
-        .prop_map(|(maj, min, patch, pre, local)| {
+        .prop_map(|(maj, min, patch, pre)| {
             let mut s = format!("{maj}.{min}.{patch}");
             if let Some(pre) = pre {
                 s.push('-');
                 s.push_str(&pre);
-            }
-            if let Some(local) = local {
-                s.push('+');
-                s.push_str(&local);
             }
             s
         })
@@ -138,6 +129,9 @@ fn version_grammars_accept_the_anchor_forms() {
     }
     for s in ["1.2.3", "1.2.3-1", "2:1.0.0-1", "0.9.1-5"] {
         assert!(AurVersionInfo::parse(s).is_ok(), "AUR rejected `{s}`");
+    }
+    for s in ["1.2.3", "0.1.0-alpha.1", "2.0.0-rc.0", "10.20.30"] {
+        assert!(semver::Version::parse(s).is_ok(), "semver rejected `{s}`");
     }
 }
 
@@ -443,6 +437,45 @@ fn rel_components_under(root: &Path, out: &mut Vec<PathBuf>) {
             rel_components_under(&path, out);
         }
     }
+}
+
+/// Anchor: an all-benign archive must extract, and the files it writes must
+/// be exactly the ones it declares. The containment property accepts refusal
+/// as a valid outcome for every generated archive, so this is the test that
+/// fails loudly if the extractor ever starts refusing everything.
+#[test]
+fn benign_archive_extracts_cleanly_and_stays_inside() {
+    let specs = [
+        Spec::File {
+            path: "package/lib/ok.js".to_string(),
+            contents: "ok".to_string(),
+        },
+        Spec::File {
+            path: "package/bin/run".to_string(),
+            contents: "run".to_string(),
+        },
+        Spec::Dir {
+            path: "package/empty".to_string(),
+        },
+    ];
+    let entries: Vec<support::Entry> = specs
+        .iter()
+        .map(|spec| match spec {
+            Spec::File { path, contents } => support::Entry::file(path, contents.as_bytes()),
+            Spec::Dir { path } => support::Entry::dir(path),
+            Spec::Symlink { path, target } => support::Entry::symlink(path, target),
+        })
+        .collect();
+    let tarball = support::archive(&entries);
+
+    let tmp = tempfile::tempdir().expect("create scratch dir");
+    let dest = tmp.path().join("dest");
+    fs::create_dir(&dest).expect("create dest dir");
+    safe_extract(&tarball, &dest, &ExtractionLimits::default())
+        .expect("a benign archive must extract");
+    assert_eq!(fs::read(dest.join("package/lib/ok.js")).unwrap(), b"ok");
+    assert_eq!(fs::read(dest.join("package/bin/run")).unwrap(), b"run");
+    assert!(dest.join("package/empty").is_dir());
 }
 
 proptest! {

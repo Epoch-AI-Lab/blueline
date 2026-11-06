@@ -34,6 +34,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **PEP 440 parses whose canonical form exceeds 256 bytes are rejected.** Inputs
+  longer than 256 bytes were already refused; normalization can canonicalize a
+  shorter input into a longer one (`c` reads as `rc`, a bare `r<n>` reads as
+  `.post<n>`), so the canonical string is now held to the same cap. Found by
+  the fuzz smoke.
+- **`safe_extract` refuses rooted tar entry paths on every platform.** A
+  leading `/` (or a Windows prefix like `C:\`) used to only fail on Linux; the
+  `has_root` check now runs everywhere. The wheel path checks the raw zip name
+  for the same reason before any `enclosed_name` sanitization can hide it.
+
 - **Gate four integration tests on Unix so the cross-platform test matrix passes on Windows.** `recall_export_osv_refuses_symlink_out`, `install_delegates_to_npm_with_ignore_scripts`, `shim_installs_gates_and_uninstalls` and `shim_fails_closed_when_the_baked_blueline_binary_is_missing` either create or execute on-disk `#!/bin/sh` scripts / symlinks that Windows cannot create or exec, so they now run only on Unix like the other platform-specific tests in the suite.
 
 - **rustls-webpki bumped to 0.103.16 and webpki-roots to 1.0.10**, clearing

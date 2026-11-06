@@ -61,6 +61,11 @@ hard error *before* any byte is returned from `fetch_tarball`.
 - **Setuid/setgid are STRIPPED, not rejected**, and `strip_special_bits`
   unconditionally ORs `0o700` into directories on unix — the doc comment says
   that exists so tempdir cleanup succeeds. Making it stricter can break cleanup.
+- **`validate_entry_path` refuses rooted paths on every platform.** A leading
+  `/` (or a Windows prefix like `C:\`) no longer only fails on Linux: the
+  `has_root` check runs everywhere, so a tar entry such as `/etc/cron.d/evil`
+  is rejected before it can be unpacked in-place. The wheel path checks the
+  raw zip name itself for the same reason.
 - **`validate_entry_path` rejects backslashes and colons unconditionally on
   Linux.** That kills `C:\` and ADS forms. Removing them as "Windows-only"
   breaks `rejects_backslash_in_path` and the colon half of
