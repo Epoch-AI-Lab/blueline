@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **`BaselineStore::clear_advisory_cache` no longer carries `#[allow(dead_code)]`.** The method is public and reachable, and the advisory-cache tests exercise it, so the allow was redundant.
+
 - **The dev and test profiles now build at `opt-level = 1`.** The gate's test
   stage goes from 46.4 s to 20 to 24 s wall and 53.2 s to 14 to 15 s CPU, with
   peak RSS down from 342 MB to about 270 MB, measured at `fae8050` under
